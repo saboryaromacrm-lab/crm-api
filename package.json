@@ -1,0 +1,44 @@
+{
+  "name": "crm-api",
+  "version": "0.1.0",
+  "description": "API del CRM/ERP (NestJS + Drizzle + PostgreSQL). Sirve el subsistema de inventario y compras.",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main.js",
+    "db:generate": "drizzle-kit generate",
+    "db:create": "ts-node -r tsconfig-paths/register src/db/create.ts",
+    "db:migrate": "ts-node -r tsconfig-paths/register src/db/migrate.ts",
+    "db:seed": "ts-node -r tsconfig-paths/register src/db/seed.ts",
+    "db:reset": "ts-node -r tsconfig-paths/register src/db/reset.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^10.4.7",
+    "@nestjs/config": "^3.3.0",
+    "@nestjs/core": "^10.4.7",
+    "@nestjs/platform-express": "^10.4.7",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.1",
+    "drizzle-orm": "^0.36.4",
+    "pg": "^8.13.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^10.4.5",
+    "@nestjs/schematics": "^10.2.3",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "dotenv": "^16.4.5",
+    "drizzle-kit": "^0.28.1",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.6.3"
+  }
+}

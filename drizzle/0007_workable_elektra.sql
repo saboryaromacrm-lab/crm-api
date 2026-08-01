@@ -1,0 +1,1 @@
+ALTER TABLE "presentaciones" DROP COLUMN IF EXISTS "ganancia";

@@ -1,0 +1,1 @@
+ALTER TABLE "comprobantes" ADD COLUMN "fecha_carga" timestamp with time zone DEFAULT now() NOT NULL;
