@@ -15,7 +15,8 @@
     "db:create": "ts-node -r tsconfig-paths/register src/db/create.ts",
     "db:migrate": "ts-node -r tsconfig-paths/register src/db/migrate.ts",
     "db:seed": "ts-node -r tsconfig-paths/register src/db/seed.ts",
-    "db:reset": "ts-node -r tsconfig-paths/register src/db/reset.ts"
+    "db:reset": "ts-node -r tsconfig-paths/register src/db/reset.ts",
+    "db:reconciliar": "ts-node -r tsconfig-paths/register src/db/reconciliar-pagos.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.7",

@@ -2,16 +2,24 @@ import 'dotenv/config';
 import { Pool } from 'pg';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { schema, sucursales, proveedores, usuarios, productos, presentaciones, productoProveedores, listasPrecio } from './schema';
+import {
+  schema, sucursales, proveedores, usuarios, productos, presentaciones, productoProveedores,
+  modalidadesVenta, listasVenta, productoListas, reglasMarca,
+  marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
+} from './schema';
 import { truncateAll } from './truncate';
 import { InventarioService } from '../inventario/inventario.service';
 import { ComprobantesService } from '../comprobantes/comprobantes.module';
+import { PagosProveedorService } from '../pagos/pagos.module';
 import { ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { VentasService } from '../ventas/ventas.module';
+import { OfertasService } from '../ofertas/ofertas.module';
 import { CobranzasService } from '../cobranzas/cobranzas.module';
 import { CajaService } from '../caja/caja.module';
-import { PreciosService } from '../precios/precios.module';
+import { HistorialPreciosService, PreciosService } from '../precios/precios.module';
+import { ListasService } from '../listas/listas.module';
+import { hashPassword } from '../usuarios/usuarios.module';
 
 /**
  * Datos de ejemplo. Réplica del seed del frontend, ahora persistido. Inserta el
@@ -23,13 +31,17 @@ async function main() {
   const pool = new Pool({ connectionString: url });
   const db = drizzle(pool, { schema, casing: 'snake_case' });
   const cfgSvc = new ConfiguracionService(db as any);
-  const inv = new InventarioService(db as any, cfgSvc);
-  const precios = new PreciosService(db as any);
-  const comp = new ComprobantesService(db as any, inv, precios);
+  const listasSvc = new ListasService(db as any);
+  const inv = new InventarioService(db as any, cfgSvc, listasSvc);
+  const evolucion = new HistorialPreciosService(db as any, cfgSvc);
+  const precios = new PreciosService(db as any, evolucion);
+  const pagosSvc = new PagosProveedorService(db as any);
+  const comp = new ComprobantesService(db as any, inv, precios, pagosSvc);
   const cfg = cfgSvc;
   const cli = new ClientesService(db as any);
   const caja = new CajaService(db as any);
-  const vtas = new VentasService(db as any, inv, cfg, cli, caja);
+  const ofertasSvc = new OfertasService(db as any);
+  const vtas = new VentasService(db as any, inv, cfg, cli, caja, listasSvc, ofertasSvc);
   const cobr = new CobranzasService(db as any, cli, cfg, vtas);
 
   await truncateAll(pool);
@@ -48,18 +60,66 @@ async function main() {
   const [bebidas] = await db.insert(proveedores).values({ nombre: 'Bebidas SA', cuit: '30-70567890-2', telefono: '11-4700-2200', direccion: 'Panamericana km 32' }).returning();
   const [yerbatera] = await db.insert(proveedores).values({ nombre: 'Yerbatera Misiones', cuit: '30-71005566-8', telefono: '3764-42-7788', direccion: 'RN 12, Apóstoles' }).returning();
 
-  /* ---- Usuarios ---- */
-  const [ana] = await db.insert(usuarios).values({ nombre: 'Ana (Admin)', rol: 'admin' }).returning();
-  const [bruno] = await db.insert(usuarios).values({ nombre: 'Bruno (Fraccionador)', rol: 'fraccionador' }).returning();
-  const [carla] = await db.insert(usuarios).values({ nombre: 'Carla (Vendedora)', rol: 'vendedor' }).returning();
+  /* ---- Roles y usuarios ---- */
+  const [rSuper] = await db.insert(schema.roles).values({
+    clave: 'superadmin', nombre: 'Superadmin', esSistema: true, permisos: ['*'],
+    descripcion: 'Maneja todo el sistema: crea roles, permisos y usuarios.',
+  }).returning();
+  const [rAdmin] = await db.insert(schema.roles).values({
+    clave: 'admin', nombre: 'Administrador', esSistema: true,
+    permisos: ['ventas', 'presupuestos', 'devoluciones', 'diferencias', 'precios', 'ofertas', 'facturas', 'inventario', 'merma', 'defectuoso', 'incidencia_crear', 'etiquetas', 'pedidos', 'preparar', 'fraccionar', 'config', 'ver'],
+    descripcion: 'Cargas de facturas, controles de inventario y almacenes.',
+  }).returning();
+  const [rFrac] = await db.insert(schema.roles).values({
+    clave: 'fraccionador', nombre: 'Fraccionador', esSistema: true,
+    permisos: ['fraccionar', 'etiquetas', 'merma', 'defectuoso', 'incidencia_crear', 'ver'],
+    descripcion: 'Fracciona lo a granel y arma su lista en los envíos.',
+  }).returning();
+  const [rCajero] = await db.insert(schema.roles).values({
+    clave: 'cajero', nombre: 'Cajero', esSistema: true,
+    permisos: ['ventas', 'devoluciones', 'diferencias', 'incidencia_crear', 'pedidos', 'ver'],
+    descripcion: 'Cobra en caja y hace pedidos de mercadería entre sucursales.',
+  }).returning();
+
+  // Contraseña inicial de todos en el demo: 1234 (se cambia desde Gerencia).
+  const pw1234 = hashPassword('1234');
+  const [lucas] = await db.insert(usuarios).values({ nombre: 'Lucas', rolId: rSuper.id, passwordHash: pw1234, activo: true }).returning();
+  const [ana] = await db.insert(usuarios).values({ nombre: 'Ana (Admin)', rolId: rAdmin.id, passwordHash: pw1234 }).returning();
+  const [bruno] = await db.insert(usuarios).values({ nombre: 'Bruno (Fraccionador)', rolId: rFrac.id, passwordHash: pw1234 }).returning();
+  const [carla] = await db.insert(usuarios).values({ nombre: 'Carla (Cajera)', rolId: rCajero.id, passwordHash: pw1234 }).returning();
+  void lucas;
+
+  /* ---- Catálogos del producto (marca, categoría › subcategoría, etiquetas) ---- */
+  const marca = async (nombre: string) => (await db.insert(marcas).values({ nombre }).returning())[0];
+  const [mMolienda, mNorte, mPampa, mRosario, mColaCo, mSelva] = await Promise.all(
+    ['Molienda del Sur', 'Del Norte', 'Pampa', 'Rosario', 'ColaCo', 'Selva'].map(marca),
+  );
+  const [alimentos] = await db.insert(categorias).values({ nombre: 'Alimentos' }).returning();
+  const [bebidasCat] = await db.insert(categorias).values({ nombre: 'Bebidas' }).returning();
+  const [subHarinas] = await db.insert(subcategorias).values({ categoriaId: alimentos.id, nombre: 'Harinas' }).returning();
+  const [subLegumbres] = await db.insert(subcategorias).values({ categoriaId: alimentos.id, nombre: 'Legumbres' }).returning();
+  const [subGalletitas] = await db.insert(subcategorias).values({ categoriaId: alimentos.id, nombre: 'Galletitas' }).returning();
+  const [subGaseosas] = await db.insert(subcategorias).values({ categoriaId: bebidasCat.id, nombre: 'Gaseosas' }).returning();
+  const [etSinTacc] = await db.insert(etiquetas).values({ nombre: 'SIN TACC', color: '#2e7d32' }).returning();
+  const [etSinAzucar] = await db.insert(etiquetas).values({ nombre: 'SIN AZÚCAR', color: '#1565c0' }).returning();
+  const [etOrganico] = await db.insert(etiquetas).values({ nombre: 'ORGÁNICO', color: '#6a1b9a' }).returning();
 
   /* ---- Productos ---- */
-  const [harina] = await db.insert(productos).values({ nombre: 'Harina Integral', codigoBarras: '7791234000015', marca: 'Molienda del Sur', categoria: 'Alimentos', iva: 10.5, tipo: 'granel' }).returning();
-  const [lentejas] = await db.insert(productos).values({ nombre: 'Lentejas', codigoBarras: '7791234000022', marca: 'Del Norte', categoria: 'Alimentos', iva: 10.5, tipo: 'granel' }).returning();
-  const [avena] = await db.insert(productos).values({ nombre: 'Avena', codigoBarras: '7791234000039', marca: 'Pampa', categoria: 'Alimentos', iva: 10.5, tipo: 'granel' }).returning();
-  const [galletitas] = await db.insert(productos).values({ nombre: 'Galletitas Integrales', codigoBarras: '7791234000046', marca: 'Rosario', categoria: 'Alimentos', iva: 21, tipo: 'entero' }).returning();
-  const [gaseosa] = await db.insert(productos).values({ nombre: 'Gaseosa Cola 2,25L', codigoBarras: '7791234000053', marca: 'ColaCo', categoria: 'Bebidas', iva: 21, tipo: 'entero' }).returning();
-  const [yerba] = await db.insert(productos).values({ nombre: 'Yerba Orgánica 1kg', codigoBarras: '7791234000060', marca: 'Selva', categoria: 'Alimentos', iva: 21, tipo: 'entero' }).returning();
+  const [harina] = await db.insert(productos).values({ nombre: 'Harina Integral', codigoPropio: '1001', codigoBarras: '7791234000015', marcaId: mMolienda.id, categoriaId: alimentos.id, subcategoriaId: subHarinas.id, unidadesPorBulto: 10, iva: 10.5, tipo: 'granel' }).returning();
+  const [lentejas] = await db.insert(productos).values({ nombre: 'Lentejas', codigoPropio: '1002', codigoBarras: '7791234000022', marcaId: mNorte.id, categoriaId: alimentos.id, subcategoriaId: subLegumbres.id, unidadesPorBulto: 10, iva: 10.5, tipo: 'granel' }).returning();
+  const [avena] = await db.insert(productos).values({ nombre: 'Avena', codigoPropio: '1003', codigoBarras: '7791234000039', marcaId: mPampa.id, categoriaId: alimentos.id, iva: 10.5, tipo: 'granel' }).returning();
+  const [galletitas] = await db.insert(productos).values({ nombre: 'Galletitas Integrales', codigoPropio: '1004', codigoBarras: '7791234000046', dun: '17791234000043', unidadesPorBulto: 12, marcaId: mRosario.id, categoriaId: alimentos.id, subcategoriaId: subGalletitas.id, iva: 21, tipo: 'entero' }).returning();
+  const [gaseosa] = await db.insert(productos).values({ nombre: 'Gaseosa Cola 2,25L', codigoPropio: '1005', codigoBarras: '7791234000053', dun: '17791234000050', unidadesPorBulto: 6, marcaId: mColaCo.id, categoriaId: bebidasCat.id, subcategoriaId: subGaseosas.id, iva: 21, tipo: 'entero' }).returning();
+  const [yerba] = await db.insert(productos).values({ nombre: 'Yerba Orgánica 1kg', codigoPropio: '1006', codigoBarras: '7791234000060', marcaId: mSelva.id, categoriaId: alimentos.id, iva: 21, tipo: 'entero' }).returning();
+
+  /* Etiquetas: transversales a la categoría, es lo que las hace útiles. */
+  await db.insert(productoEtiquetas).values([
+    { productoId: harina.id, etiquetaId: etOrganico.id },
+    { productoId: lentejas.id, etiquetaId: etSinTacc.id },
+    { productoId: avena.id, etiquetaId: etSinTacc.id },
+    { productoId: galletitas.id, etiquetaId: etSinAzucar.id },
+    { productoId: yerba.id, etiquetaId: etOrganico.id },
+  ]);
 
   /* ---- Presentaciones (granel): tamaño + % ganancia ---- */
   const presHarina = await db.insert(presentaciones).values([
@@ -78,27 +138,107 @@ async function main() {
   const harina1kg = presHarina.find((p) => Math.abs(p.tamKg - 1) < 1e-6)!;
   const harina05 = presHarina.find((p) => Math.abs(p.tamKg - 0.5) < 1e-6)!;
 
-  /* ---- Costos por proveedor + proveedor activo ---- */
+  /* ---- FORMATOS DE COMPRA ----
+   * Todos los importes son del BULTO. `usarParaPrecio` marca el único que
+   * define el costo con el que se calcula el precio de venta.
+   *
+   * La harina muestra el caso completo: dos proveedores, y el segundo vende por
+   * bolsón de 25 kg — el costo unitario es lo que los hace comparables.
+   * Las galletitas muestran la escala de descuentos en cascada (20 y 10 = 28%).
+   */
   await db.insert(productoProveedores).values([
-    { productoId: harina.id, proveedorId: molino.id, costo: 700, descuento: 5, flete: 3 },
-    { productoId: harina.id, proveedorId: legum.id, costo: 760, descuento: 0, flete: 2 },
+    { productoId: harina.id, proveedorId: molino.id, cantidad: 1, costo: 700, descuento: 5, flete: 3, usarParaPrecio: true, codigoProveedor: 'MOL-HI-1' },
+    { productoId: harina.id, proveedorId: legum.id, cantidad: 25, costo: 19000, descuento: 0, flete: 2, codigoProveedor: 'LN-4410' },
   ]);
-  await db.update(productos).set({ proveedorActivoId: molino.id }).where(eq(productos.id, harina.id));
-  await db.insert(productoProveedores).values({ productoId: lentejas.id, proveedorId: legum.id, costo: 1300, descuento: 8, flete: 4 });
-  await db.update(productos).set({ proveedorActivoId: legum.id }).where(eq(productos.id, lentejas.id));
-  await db.insert(productoProveedores).values({ productoId: galletitas.id, proveedorId: galletera.id, costo: 1200, descuento: 0, flete: 5 });
-  await db.update(productos).set({ proveedorActivoId: galletera.id }).where(eq(productos.id, galletitas.id));
+  await db.insert(productoProveedores).values({ productoId: lentejas.id, proveedorId: legum.id, cantidad: 1, costo: 1300, descuento: 8, flete: 4, usarParaPrecio: true, codigoProveedor: 'LN-2201' });
+  await db.insert(productoProveedores).values({ productoId: galletitas.id, proveedorId: galletera.id, cantidad: 12, costo: 14400, descuento: 20, descuento2: 10, flete: 5, usarParaPrecio: true, codigoProveedor: 'GR-INT-12' });
+  await db.insert(productoProveedores).values({ productoId: gaseosa.id, proveedorId: bebidas.id, cantidad: 6, costo: 6600, flete: 4, usarParaPrecio: true, codigoProveedor: 'BEB-C6' });
 
-  /* ---- Listas de precio ---- */
-  await db.insert(listasPrecio).values([
-    { productoId: harina.id, nombre: 'Minorista', ganancia: 65 },
-    { productoId: harina.id, nombre: 'Mayorista', ganancia: 30 },
-    { productoId: harina.id, nombre: 'Oferta', ganancia: 12 },
-    { productoId: lentejas.id, nombre: 'Minorista', ganancia: 55 },
-    { productoId: lentejas.id, nombre: 'Mayorista', ganancia: 25 },
-    { productoId: galletitas.id, nombre: 'Minorista', ganancia: 50 },
-    { productoId: galletitas.id, nombre: 'Oferta', ganancia: 20 },
+  /* ---- Modalidades y listas ----
+   * La lista es SOLO identidad. El `orden` es la preferencia: entre las que el
+   * renglón habilite gana la de orden menor, por eso las mayoristas van
+   * primero y el mostrador queda último (es el piso).
+   */
+  const [modMin] = await db.insert(modalidadesVenta).values({ nombre: 'Minorista', orden: 1 }).returning();
+  const [modMay] = await db.insert(modalidadesVenta).values({ nombre: 'Mayorista', orden: 2 }).returning();
+
+  const [mayA] = await db.insert(listasVenta).values({
+    modalidadId: modMay.id, numero: 1, nombre: 'Mayorista', orden: 10,
+  }).returning();
+  const [minOferta] = await db.insert(listasVenta).values({
+    modalidadId: modMin.id, numero: 2, nombre: 'Oferta', orden: 30,
+  }).returning();
+  const [minGeneral] = await db.insert(listasVenta).values({
+    modalidadId: modMin.id, numero: 1, nombre: 'Mostrador', orden: 90,
+  }).returning();
+
+  await cfg.set('ventas', {
+    listaBaseId: minGeneral.id,
+    // Acceso mayorista por monto: se sugiere al pasar los $40.000 y solo vale
+    // en efectivo. Alcanza únicamente a los productos con lista mayorista.
+    montoMinimoMayorista: 40000,
+    modalidadMontoId: modMay.id,
+    mediosPagoMonto: ['efectivo'],
+  });
+
+  /* ---- FORMATO DE VENTA: el markup es de cada producto, no de la lista ----
+   * La misma "Mayorista 1" va al 30% en la harina y al 22% en la gaseosa. Sin
+   * fila, el producto no se vende en esa lista (galletitas no tiene mayorista).
+   */
+  await db.insert(productoListas).values([
+    // Harina: las tres listas, con markups propios. Mayorista desde 10 unidades.
+    { productoId: harina.id, listaId: minGeneral.id, markup: 65 },
+    { productoId: harina.id, listaId: minOferta.id, markup: 12 },
+    { productoId: harina.id, listaId: mayA.id, markup: 30, unidadesMinimas: 10 },
+    // Lentejas: mayorista propio desde 6, sin oferta.
+    { productoId: lentejas.id, listaId: minGeneral.id, markup: 55 },
+    { productoId: lentejas.id, listaId: mayA.id, markup: 25, unidadesMinimas: 6 },
+    // Galletitas: sin mayorista. La Oferta va con PRECIO DEFINIDO: $1.500
+    // finales por unidad, fijados a mano — no se mueven aunque cambie el costo.
+    { productoId: galletitas.id, listaId: minGeneral.id, markup: 50 },
+    { productoId: galletitas.id, listaId: minOferta.id, modoPrecio: 'precio', precioFijo: 1500 },
+    // Gaseosa: minorista por unidad; mayorista POR CAJA DE 6, con el código de
+    // barras de la caja — escanearlo en el POS carga las 6 de una.
+    { productoId: gaseosa.id, listaId: minGeneral.id, markup: 70 },
+    { productoId: gaseosa.id, listaId: mayA.id, markup: 22, unidades: 6, codigoBarras: '27791234000057' },
+    // Avena: solo mostrador.
+    { productoId: avena.id, listaId: minGeneral.id, markup: 60 },
   ]);
+
+  /* La única regla GLOBAL: "12 unidades de ColaCo habilitan Mayorista". */
+  await db.insert(reglasMarca).values({
+    marcaId: mColaCo.id, unidadesMinimas: 12, modalidadId: modMay.id,
+  });
+
+  /* ---- Ofertas (por el servicio real: valida igual que la pantalla) ---- */
+  await ofertasSvc.crear({
+    nombre: '2ª unidad al 50% en Galletitas', tipo: 'segunda_unidad', porcentaje: 50,
+    alcances: [{ tipo: 'producto', refId: galletitas.id }],
+  } as any);
+  await ofertasSvc.crear({
+    nombre: '3×2 en Yerbas', tipo: 'nxm', lleva: 3, paga: 2,
+    alcances: [{ tipo: 'producto', refId: yerba.id }],
+  } as any);
+  await ofertasSvc.crear({
+    nombre: '10% en efectivo desde $30.000', tipo: 'ticket',
+    porcentaje: 10, montoMinimo: 30000, mediosPago: 'efectivo',
+  } as any);
+
+  /* ---- Evolución de precios ----
+   * Snapshot inicial (el "alta" de cada precio) y un aumento de ejemplo por el
+   * SERVICIO REAL: genera historial de costos + evolución, igual que en vivo.
+   */
+  await evolucion.snapshot(
+    [harina.id, lentejas.id, avena.id, galletitas.id, gaseosa.id, yerba.id],
+    'inicial',
+  );
+  const [ppHarina] = await db.select().from(productoProveedores).where(eq(productoProveedores.productoId, harina.id));
+  await precios.actualizarCostos({
+    cambios: [{ id: ppHarina.id, costo: 770 }],
+    origen: 'manual',
+    motivo: 'Aumento Molino Sur agosto (+10%)',
+    usuarioId: ana.id,
+  } as any);
 
   /* ---- Operaciones (motor real) ---- */
   await inv.opCompra({ productoId: harina.id, sucursalId: dist.id, cantidad: 55, proveedorId: molino.id, usuarioId: ana.id });
@@ -112,13 +252,17 @@ async function main() {
     { presId: harina1kg.id, cant: 5 }, { presId: harina05.id, cant: 10 },
   ] });
 
+  // Circuito completo con la preparación en dos listas: tomar el pedido,
+  // confirmar Enteros y Fraccionados (ahí se reserva), despachar y recibir.
   const t1 = await inv.crearTransferencia({ origenId: dist.id, destinoId: ex1.id, usuarioId: ana.id, items: [
     { productoId: harina.id, presId: harina1kg.id, cantidad: 3 },
     { productoId: galletitas.id, cantidad: 12 },
   ] });
-  await inv.avanzarTransferencia(t1.id);
-  await inv.avanzarTransferencia(t1.id);
-  await inv.avanzarTransferencia(t1.id);
+  await inv.avanzarTransferencia(t1.id, ana.id, 'pendiente');
+  await inv.confirmarListaTransferencia(t1.id, { tipo: 'enteros', listo: true, usuarioId: ana.id });
+  await inv.confirmarListaTransferencia(t1.id, { tipo: 'granel', listo: true, usuarioId: bruno.id });
+  await inv.avanzarTransferencia(t1.id, ana.id, 'preparada');
+  await inv.recibirTransferencia(t1.id, { usuarioId: ana.id });
 
   await inv.crearTransferencia({ origenId: dist.id, destinoId: ex2.id, usuarioId: ana.id, items: [{ productoId: avena.id, cantidad: 5 }] });
 
@@ -145,15 +289,20 @@ async function main() {
   const kiosco = await cli.create({
     nombre: 'Kiosco La Esquina', nombreFantasia: 'La Esquina', tipoDoc: 'cuit', numeroDoc: '30712345678',
     condicionIva: 'responsable_inscripto', direccion: 'San Martín 450', localidad: 'Pilar',
-    telefono: '11-4300-1122', email: 'compras@laesquina.com', listaPrecio: 'Mayorista', descuento: 5,
+    telefono: '11-4300-1122', email: 'compras@laesquina.com', descuento: 5,
     ctaCteHabilitada: true, limiteCredito: 150000, diasPlazo: 30, sucursalId: dist.id, vendedorId: carla.id,
   });
   const dietetica = await cli.create({
     nombre: 'Dietética Vida Sana', tipoDoc: 'cuit', numeroDoc: '30709988771',
     condicionIva: 'monotributo', direccion: 'Rivadavia 1200', localidad: 'Escobar',
-    telefono: '348-442-7788', listaPrecio: 'Mayorista',
+    telefono: '348-442-7788',
     ctaCteHabilitada: true, limiteCredito: 80000, diasPlazo: 15, sucursalId: dist.id, vendedorId: carla.id,
   });
+  // Al kiosco la mayorista le corresponde por contrato: no necesita llegar a
+  // ningún mínimo. La dietética compra en oferta; el resto cae al piso.
+  await listasSvc.setListasDeCliente(kiosco.id, [mayA.id, minGeneral.id]);
+  await listasSvc.setListasDeCliente(dietetica.id, [minOferta.id, minGeneral.id]);
+
   await cli.create({
     nombre: 'Pérez, Marcela', tipoDoc: 'dni', numeroDoc: '28444555',
     condicionIva: 'consumidor_final', telefono: '11-6000-4455', localidad: 'Pilar', sucursalId: ex1.id,

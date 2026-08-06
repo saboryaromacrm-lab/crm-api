@@ -8,10 +8,14 @@ import {
 } from 'class-validator';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { comprobantes, comprobanteItems, productoProveedores, proveedores } from '../db/schema';
+import {
+  comprobantes, comprobanteItems, productoProveedores, proveedores,
+  proveedorImputaciones, proveedorPagos, sucursales, usuarios,
+} from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { PreciosModule, PreciosService } from '../precios/precios.module';
+import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
 const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'] as const;
 
@@ -31,9 +35,41 @@ class ComprobanteItemDto {
  */
 class ActualizarCostoDto {
   @IsInt() productoId!: number;
+  /** Costo DEL BULTO, como viene en el papel. */
   @IsNumber() costo!: number;
+  /**
+   * Kg (granel) o unidades (entero) del bulto de ESTA entrega. Viaja junto con
+   * el costo porque son un solo hecho — "la bolsa de 20 kg sale $40.000" — y
+   * actualizar el precio con los kilos viejos dejaría el $/kg (que es lo que
+   * fija la góndola) mintiendo.
+   */
+  @IsOptional() @IsNumber() cantidad?: number;
   @IsOptional() @IsNumber() descuento?: number;
   @IsOptional() @IsNumber() flete?: number;
+}
+
+/**
+ * Pago que se registra EN EL MISMO ACTO de cargar el comprobante: el "contado"
+ * de verdad. Hasta ahora `condicionPago: 'contado'` era solo una etiqueta —no
+ * movía plata—, así que una factura pagada en efectivo seguía figurando como
+ * deuda del proveedor.
+ *
+ * `cajaSesionId` decide de dónde sale: con turno, la plata sale de la caja de
+ * esa sucursal y el arqueo lo muestra; sin turno, es plata de administración
+ * que no pasa por ninguna caja (una transferencia del negocio).
+ */
+class PagoContadoDto {
+  @IsNumber() importe!: number;
+  @IsOptional() @IsIn(['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'])
+  medio?: string;
+  @IsOptional() @IsInt() cajaSesionId?: number;
+  @IsOptional() @IsString() referencia?: string;
+}
+
+/** Pago de sucursal YA registrado que este comprobante toma (total o parcial). */
+class TomarPagoDto {
+  @IsInt() pagoId!: number;
+  @IsNumber() importe!: number;
 }
 
 class CreateComprobanteDto {
@@ -64,6 +100,18 @@ class CreateComprobanteDto {
    */
   @IsOptional() @IsArray() @IsInt({ each: true })
   activarProveedor?: number[];
+
+  /** El resto que se paga ahora (contado). Ver `PagoContadoDto`. */
+  @IsOptional() @ValidateNested() @Type(() => PagoContadoDto)
+  pagoContado?: PagoContadoDto;
+
+  /**
+   * Pagos que la cajera hizo desde la sucursal y este comprobante toma. Es la
+   * forma en que se "aplica" un pago: al cargar la factura, no con un botón
+   * suelto en la bandeja.
+   */
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => TomarPagoDto)
+  tomarPagos?: TomarPagoDto[];
 }
 
 @Injectable()
@@ -72,11 +120,54 @@ export class ComprobantesService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly inv: InventarioService,
     private readonly precios: PreciosService,
+    /** El pago es del proveedor, no del comprobante: acá solo se lo invoca. */
+    private readonly pagos: PagosProveedorService,
   ) {}
 
   private async withItems(c: any) {
     const items = await this.db.select().from(comprobanteItems).where(eq(comprobanteItems.comprobanteId, c.id));
     return { ...c, items };
+  }
+
+  /**
+   * De dónde salió la plata de estos comprobantes, en UNA consulta para todos.
+   *
+   * Es lo que hace identificable en la tabla que una factura se pagó con plata
+   * que salió de la caja de una sucursal: viaja el nombre de la sucursal, el
+   * turno y el cajero. Devuelve un Map por comprobanteId.
+   */
+  private async pagosDe(ids: number[]) {
+    const porId = new Map<number, any[]>();
+    if (!ids.length) return porId;
+
+    const filas = await this.db.select({
+      comprobanteId: proveedorImputaciones.comprobanteId,
+      importe: proveedorImputaciones.importe,
+      pagoId: proveedorPagos.id,
+      fecha: proveedorPagos.fecha,
+      medio: proveedorPagos.medio,
+      concepto: proveedorPagos.concepto,
+      cajaSesionId: proveedorPagos.cajaSesionId,
+      sucursalId: proveedorPagos.sucursalId,
+      sucursalNombre: sucursales.nombre,
+      usuarioNombre: usuarios.nombre,
+    })
+      .from(proveedorImputaciones)
+      .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
+      .leftJoin(sucursales, eq(sucursales.id, proveedorPagos.sucursalId))
+      .leftJoin(usuarios, eq(usuarios.id, proveedorPagos.usuarioId))
+      .where(and(
+        inArray(proveedorImputaciones.comprobanteId, ids),
+        eq(proveedorPagos.estado, 'activo'),
+      ))
+      .orderBy(proveedorImputaciones.id);
+
+    for (const f of filas) {
+      const arr = porId.get(f.comprobanteId!) ?? [];
+      arr.push(f);
+      porId.set(f.comprobanteId!, arr);
+    }
+    return porId;
   }
 
   async list(q: { proveedorId?: number; tipo?: string; estado?: string }) {
@@ -86,13 +177,49 @@ export class ComprobantesService {
     if (q.estado) conds.push(eq(comprobantes.estado, q.estado as any));
     const where = conds.length ? and(...conds) : undefined;
     const rows = await this.db.select().from(comprobantes).where(where).orderBy(desc(comprobantes.id));
-    return Promise.all(rows.map((c) => this.withItems(c)));
+    if (!rows.length) return [];
+
+    /*
+     * Ítems y pagos de TODOS los comprobantes en dos consultas, no una por
+     * fila. Antes esto hacía un SELECT de ítems por comprobante: con seis
+     * facturas no se nota, con las miles de un año son miles de viajes por
+     * cada vez que se abre la pantalla.
+     */
+    const ids = rows.map((c) => c.id);
+    const [items, pagos] = await Promise.all([
+      this.db.select().from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, ids)),
+      this.pagosDe(ids),
+    ]);
+    const itemsPorId = new Map<number, any[]>();
+    for (const it of items) {
+      const arr = itemsPorId.get(it.comprobanteId) ?? [];
+      arr.push(it);
+      itemsPorId.set(it.comprobanteId, arr);
+    }
+
+    return rows.map((c) => ({
+      ...c,
+      items: itemsPorId.get(c.id) ?? [],
+      pagos: pagos.get(c.id) ?? [],
+      saldo: Math.round((c.total - c.pagado) * 100) / 100,
+    }));
   }
 
+  /**
+   * Un comprobante con lo mismo que devuelve el listado: ítems, los pagos que
+   * lo cancelaron (con su sucursal y turno) y el saldo. La forma es idéntica
+   * para que el detalle y la tabla lean el mismo objeto y no haya un campo que
+   * exista en una pantalla y falte en la otra.
+   */
   async get(id: number) {
     const [c] = await this.db.select().from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
     if (!c) throw new NotFoundException('Comprobante inexistente.');
-    return this.withItems(c);
+    const [conItems, pagos] = await Promise.all([this.withItems(c), this.pagosDe([id])]);
+    return {
+      ...conItems,
+      pagos: pagos.get(id) ?? [],
+      saldo: Math.round((c.total - c.pagado) * 100) / 100,
+    };
   }
 
   async create(dto: CreateComprobanteDto) {
@@ -161,6 +288,22 @@ export class ComprobantesService {
             inArray(productoProveedores.productoId, pedidos.map((x) => x.productoId)),
           ));
         const porProducto = new Map(entradas.map((e: any) => [e.productoId, e.id]));
+
+        /**
+         * El tamaño del bulto de ESTA entrega (kg o unidades) se actualiza en
+         * la misma transacción y ANTES que el costo: si la bolsa pasó de 25 a
+         * 20 kg, el precio nuevo del bulto solo tiene sentido con los kilos
+         * nuevos — por separado, el $/kg quedaría mal y la góndola con él.
+         */
+        for (const x of pedidos) {
+          const cant = Number(x.cantidad);
+          const id = porProducto.get(x.productoId);
+          if (id && cant > 0) {
+            await tx.update(productoProveedores).set({ cantidad: cant })
+              .where(eq(productoProveedores.id, id));
+          }
+        }
+
         const cambios = pedidos
           .map((x) => {
             const id = porProducto.get(x.productoId);
@@ -193,20 +336,103 @@ export class ComprobantesService {
       }
       return c.id;
     });
+    // La evolución de precios se registra DESPUÉS del commit: dentro de la
+    // transacción los costos nuevos todavía no son visibles para el snapshot.
+    const tocados = [
+      ...(dto.actualizarCostos ?? []).map((x) => x.productoId),
+      ...(dto.activarProveedor ?? []),
+    ];
+    if (tocados.length) {
+      await this.precios.registrarEvolucion(tocados, 'costo', {
+        detalle: 'Recepción de comprobante', usuarioId: dto.usuarioId ?? null,
+      });
+    }
+
+    /*
+     * EL PAGO, después del commit del comprobante y a propósito.
+     *
+     * Va afuera de la transacción porque `PagosProveedorService` maneja la suya
+     * (el pago, su egreso de caja y el recálculo son una sola operación). Si el
+     * pago falla —turno cerrado, el pago que se quiso tomar ya no tiene saldo—,
+     * el comprobante queda cargado y con deuda: un estado válido y recuperable
+     * desde el detalle. Perder también la carga de la factura sería peor.
+     *
+     * Solo los documentos que GENERAN deuda se pagan. Una nota de crédito
+     * resta deuda: pagarla no significa nada.
+     */
+    const generaDeuda = estado === 'confirmado' && (dto.tipo === 'factura' || dto.tipo === 'nota_debito');
+    if (generaDeuda) {
+      // Primero los pagos que ya existían: es plata que ya salió del cajón y
+      // la factura viene a explicarla.
+      for (const t of dto.tomarPagos ?? []) {
+        await this.pagos.imputar(Number(t.pagoId), {
+          imputaciones: [{ comprobanteId: id, importe: Number(t.importe) }],
+          usuarioId: dto.usuarioId,
+        });
+      }
+      // Y después el resto que se paga en el acto.
+      const contado = Number(dto.pagoContado?.importe) || 0;
+      if (contado > 0) {
+        await this.pagos.crear({
+          proveedorId: prov.id,
+          destino: 'mercaderia',
+          importe: contado,
+          medio: dto.pagoContado?.medio,
+          fecha: dto.fecha,
+          concepto: `${dto.tipo} ${dto.letra ?? 'A'} ${dto.puntoVenta ?? ''}-${dto.numero ?? id}`.trim(),
+          referencia: dto.pagoContado?.referencia,
+          sucursalId: dto.sucursalId,
+          cajaSesionId: dto.pagoContado?.cajaSesionId,
+          usuarioId: dto.usuarioId,
+          imputaciones: [{ comprobanteId: id, importe: contado }],
+        });
+      }
+
+      /*
+       * La CONDICIÓN se deriva de lo que realmente se pagó en el acto, no de lo
+       * que dijo el que llamó: quedó saldado = contado, quedó saldo = cuenta
+       * corriente. Así el campo no puede contradecir al saldo — que es
+       * exactamente lo que pasaba antes, cuando "contado" era solo una etiqueta.
+       *
+       * Se fija UNA vez, al crear: describe cómo se acordó esta compra. Que una
+       * factura en cuenta corriente se pague después no la convierte en contado.
+       */
+      if ((dto.tomarPagos?.length || contado > 0)) {
+        const [final] = await this.db.select({ total: comprobantes.total, pagado: comprobantes.pagado })
+          .from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
+        const saldado = final && final.pagado >= final.total - 0.009;
+        await this.db.update(comprobantes)
+          .set({ condicionPago: saldado ? 'contado' : 'cuenta_corriente' })
+          .where(eq(comprobantes.id, id));
+      }
+    }
     return this.get(id);
   }
 
-  /** Saldo de cuenta corriente del proveedor: facturas + ND (cta. cte.) − NC. */
+  /**
+   * Cuenta corriente del proveedor por MERCADERÍA: facturas + ND − NC, menos lo
+   * que ya se le pagó contra esos comprobantes (`pagado`, que mantiene el
+   * módulo de Pagos a proveedores).
+   *
+   * Ojo con el alcance: acá solo entran los comprobantes de compra. La cuenta
+   * COMPLETA del proveedor —que además suma sus gastos y sus pagos a cuenta sin
+   * aplicar— la arma `GET /pagos-proveedor/cuenta/:id`.
+   */
   async cuenta(proveedorId: number) {
     const cs = await this.db.select().from(comprobantes)
       .where(and(eq(comprobantes.proveedorId, proveedorId), eq(comprobantes.estado, 'confirmado')))
       .orderBy(desc(comprobantes.id));
-    let saldo = 0;
+    let deuda = 0;
+    let pagado = 0;
     for (const c of cs) {
-      if ((c.tipo === 'factura' || c.tipo === 'nota_debito') && c.condicionPago === 'cuenta_corriente') saldo += c.total;
-      else if (c.tipo === 'nota_credito') saldo -= c.total;
+      // Antes solo contaba la cta. cte.: una factura al contado sin pago
+      // registrado desaparecía del saldo aunque no se hubiera pagado nunca.
+      // Ahora la deuda la define el documento y la cancela el pago.
+      if (c.tipo === 'factura' || c.tipo === 'nota_debito') { deuda += c.total; pagado += c.pagado; }
+      else if (c.tipo === 'nota_credito') deuda -= c.total;
     }
-    return { proveedorId, saldo, comprobantes: cs };
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    return { proveedorId, saldo: r2(deuda - pagado), deuda: r2(deuda), pagado: r2(pagado), comprobantes: cs };
   }
 }
 
@@ -236,7 +462,7 @@ export class ComprobantesController {
 }
 
 @Module({
-  imports: [InventarioModule, PreciosModule],
+  imports: [InventarioModule, PreciosModule, PagosModule],
   controllers: [ComprobantesController],
   providers: [ComprobantesService],
 })

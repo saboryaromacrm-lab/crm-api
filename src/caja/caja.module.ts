@@ -20,7 +20,7 @@ import { IsIn, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
+  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
 } from '../db/schema';
 
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -28,13 +28,20 @@ export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 class AbrirCajaDto {
   @IsInt() sucursalId!: number;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsOptional() @IsNumber() montoInicial?: number;
+  // Obligatorio: un turno SIEMPRE arranca declarando su fondo (ver `abrir`).
+  @IsNumber() montoInicial!: number;
   @IsOptional() @IsString() observaciones?: string;
 }
 
 class CerrarCajaDto {
   @IsNumber() declaradoEfectivo!: number;
   @IsOptional() @IsString() observaciones?: string;
+}
+
+class ControlCajaDto {
+  @IsNumber() contadoEfectivo!: number;
+  @IsOptional() @IsString() observaciones?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class MovimientoCajaDto {
@@ -94,7 +101,7 @@ export class CajaService {
   async arqueo(id: number) {
     const sesion = await this.get(id);
 
-    const [porVenta, porCobranza, movs] = await Promise.all([
+    const [porVenta, porCobranza, movs, controles] = await Promise.all([
       this.db.select({ medio: ventaPagos.medio, total: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)` })
         .from(ventaPagos)
         .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
@@ -106,6 +113,7 @@ export class CajaService {
         .where(and(eq(cobranzas.cajaSesionId, id), eq(cobranzas.estado, 'confirmada')))
         .groupBy(cobranzaPagos.medio),
       this.db.select().from(cajaMovimientos).where(eq(cajaMovimientos.cajaSesionId, id)).orderBy(cajaMovimientos.id),
+      this.db.select().from(cajaControles).where(eq(cajaControles.cajaSesionId, id)).orderBy(cajaControles.id),
     ]);
 
     /** { efectivo: {ventas, cobranzas, total}, … } */
@@ -139,6 +147,7 @@ export class CajaService {
       sesion,
       medios,
       movimientos: movs,
+      controles,
       ingresos,
       egresos,
       montoInicial: sesion.montoInicial,
@@ -155,8 +164,10 @@ export class CajaService {
     if (abierta) {
       throw new BadRequestException('Ya hay un turno de caja abierto en esta sucursal. Cerralo antes de abrir otro.');
     }
-    const montoInicial = money(dto.montoInicial ?? 0);
-    if (montoInicial < 0) throw new BadRequestException('El monto inicial no puede ser negativo.');
+    // El fondo inicial es OBLIGATORIO y positivo: un turno sin fondo declarado
+    // no se puede arquear (no hay punto de partida contra el cual comparar).
+    const montoInicial = money(dto.montoInicial);
+    if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
 
     const [c] = await this.db.insert(cajaSesiones).values({
       sucursalId: dto.sucursalId,
@@ -184,6 +195,29 @@ export class CajaService {
       estado: 'cerrada',
       observaciones: dto.observaciones ?? sesion.observaciones,
     }).where(eq(cajaSesiones.id, id)).returning();
+    return c;
+  }
+
+  /**
+   * Control de caja intermedio: se cuenta el efectivo SIN cerrar el turno.
+   * Guarda la foto (fecha/hora, esperado, contado, diferencia, quién) y nada
+   * más — no mueve dinero ni cambia el estado. Es puro control entre arqueos.
+   */
+  async control(id: number, dto: ControlCajaDto) {
+    const sesion = await this.get(id);
+    if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado: los controles son entre la apertura y el cierre.');
+    const contado = money(dto.contadoEfectivo);
+    if (contado < 0) throw new BadRequestException('El efectivo contado no puede ser negativo.');
+
+    const a = await this.arqueo(id);
+    const [c] = await this.db.insert(cajaControles).values({
+      cajaSesionId: id,
+      esperadoEfectivo: a.esperadoEfectivo,
+      contadoEfectivo: contado,
+      diferencia: money(contado - a.esperadoEfectivo),
+      observaciones: (dto.observaciones ?? '').trim(),
+      usuarioId: dto.usuarioId ?? null,
+    }).returning();
     return c;
   }
 
@@ -233,6 +267,7 @@ export class CajaController {
 
   @Post('abrir') abrir(@Body() dto: AbrirCajaDto) { return this.svc.abrir(dto); }
   @Post(':id/cerrar') cerrar(@Param('id', ParseIntPipe) id: number, @Body() dto: CerrarCajaDto) { return this.svc.cerrar(id, dto); }
+  @Post(':id/control') control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto) { return this.svc.control(id, dto); }
   @Post(':id/movimiento') mov(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoCajaDto) { return this.svc.movimiento(id, dto); }
 }
 

@@ -1,0 +1,1 @@
+ALTER TABLE "venta_items" ADD COLUMN "lista" text DEFAULT '' NOT NULL;

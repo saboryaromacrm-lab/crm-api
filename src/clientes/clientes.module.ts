@@ -36,7 +36,6 @@ export class UpsertClienteDto {
   @IsOptional() @IsString() localidad?: string;
   @IsOptional() @IsString() telefono?: string;
   @IsOptional() @IsString() email?: string;
-  @IsOptional() @IsString() listaPrecio?: string;
   @IsOptional() @IsNumber() @Min(0) descuento?: number;
   @IsOptional() @IsInt() vendedorId?: number | null;
   @IsOptional() @IsInt() sucursalId?: number | null;
@@ -126,7 +125,6 @@ export class ClientesService {
       localidad: (dto.localidad ?? '').trim(),
       telefono: (dto.telefono ?? '').trim(),
       email: (dto.email ?? '').trim(),
-      listaPrecio: (dto.listaPrecio ?? '').trim(),
       descuento: Number(dto.descuento) || 0,
       vendedorId: dto.vendedorId ?? null,
       sucursalId: dto.sucursalId ?? null,

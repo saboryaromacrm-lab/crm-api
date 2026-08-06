@@ -1,9 +1,9 @@
 import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
-  Param, ParseIntPipe, Patch, Post,
+  Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
-import { IsIn, IsOptional, IsString } from 'class-validator';
-import { eq } from 'drizzle-orm';
+import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
+import { and, eq } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { proveedores } from '../db/schema';
 
@@ -16,14 +16,30 @@ class UpsertProveedorDto {
   @IsOptional() @IsString() direccion?: string;
   @IsOptional() @IsString() telefono?: string;
   @IsOptional() @IsString() email?: string;
+  /**
+   * Clasificación, no permiso: en qué buscador aparece. Un proveedor puede ser
+   * las dos cosas (el que trae mercadería y además te cobra el flete).
+   */
+  @IsOptional() @IsBoolean() proveeMercaderia?: boolean;
+  @IsOptional() @IsBoolean() proveeGastos?: boolean;
 }
 
 @Injectable()
 export class ProveedoresService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  list() {
-    return this.db.select().from(proveedores).orderBy(proveedores.nombre);
+  /**
+   * `tipo` filtra por clasificación ('mercaderia' | 'gastos'); sin él vienen
+   * todos. El filtro NO es excluyente: un proveedor marcado como los dos sale
+   * en las dos listas, que es exactamente lo que se quiere.
+   */
+  list(tipo?: string) {
+    const conds: any[] = [];
+    if (tipo === 'mercaderia') conds.push(eq(proveedores.proveeMercaderia, true));
+    if (tipo === 'gastos') conds.push(eq(proveedores.proveeGastos, true));
+    return this.db.select().from(proveedores)
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(proveedores.nombre);
   }
 
   async get(id: number) {
@@ -36,15 +52,22 @@ export class ProveedoresService {
     const [p] = await this.db.insert(proveedores).values({
       nombre: dto.nombre.trim(), cuit: dto.cuit ?? '', condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
       telefono: dto.telefono ?? '', email: dto.email ?? '',
+      // Sin indicar nada se asume el proveedor clásico: el que trae mercadería.
+      proveeMercaderia: dto.proveeMercaderia ?? true,
+      proveeGastos: dto.proveeGastos ?? false,
     }).returning();
     return p;
   }
 
   async update(id: number, dto: UpsertProveedorDto) {
-    await this.get(id);
+    const actual = await this.get(id);
     const [p] = await this.db.update(proveedores).set({
       nombre: dto.nombre.trim(), cuit: dto.cuit ?? '', condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
       telefono: dto.telefono ?? '', email: dto.email ?? '',
+      // Un formulario viejo que no manda los flags no puede reclasificar al
+      // proveedor sin querer: si no vienen, se conserva lo que ya tenía.
+      proveeMercaderia: dto.proveeMercaderia ?? actual.proveeMercaderia,
+      proveeGastos: dto.proveeGastos ?? actual.proveeGastos,
     }).where(eq(proveedores.id, id)).returning();
     return p;
   }
@@ -61,7 +84,7 @@ export class ProveedoresService {
 export class ProveedoresController {
   constructor(private readonly svc: ProveedoresService) {}
 
-  @Get() list() { return this.svc.list(); }
+  @Get() list(@Query('tipo') tipo?: string) { return this.svc.list(tipo); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto) { return this.svc.update(id, dto); }

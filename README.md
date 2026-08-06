@@ -197,7 +197,46 @@ Base: `http://localhost:3001/api`
 | GET | `/caja/:id/arqueo` | Arqueo en vivo: totales por medio, movimientos y efectivo esperado |
 | POST | `/caja/abrir` | Abrir turno con fondo inicial (uno solo por sucursal) |
 | POST | `/caja/:id/cerrar` | Cerrar con el efectivo contado; calcula y guarda la diferencia |
-| POST | `/caja/:id/movimiento` | Ingreso o egreso de dinero (retiros, gastos, refuerzo de cambio) |
+| POST | `/caja/:id/movimiento` | Ingreso o egreso de dinero (retiros, refuerzo de cambio, **pago a un proveedor**) |
+
+### Administración: gastos y pagos a proveedores
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| GET/POST/PATCH | `/gastos` · `/gastos/:id` | Comprobantes de gasto (lo que se paga y no es mercadería), imputados a rubro, sucursal y **negocio** (distribuidora/cafetería) |
+| POST | `/gastos/:id/anular` · `/gastos/:id/pagar` | Anular / pagar (crea el pago y lo imputa en un paso) |
+| GET | `/gastos/cuentas-a-pagar` · `/gastos/resumen` | Vencimientos y resumen por rubro |
+| GET/POST/PATCH | `/gastos/categorias` · `/gastos/fijos` | Rubros y gastos fijos recurrentes |
+| GET/POST | `/pagos-proveedor` | **El pago es DEL PROVEEDOR, no del documento**: la cajera paga desde su caja (egreso en el arqueo) y el pago queda a cuenta con `destino` mercadería/gastos |
+| POST | `/pagos-proveedor/:id/imputar` | Aplicar a facturas de compra o gastos (polimórfico, con CHECK en la base). Aplicar **no vuelve a mover plata** |
+| GET | `/pagos-proveedor/disponibles/:proveedorId?destino=` | Pagos a cuenta sin aplicar (la bandeja) |
+| POST | `/pagos-proveedor/:id/anular` · PATCH `/:id/destino` | Anular (revierte el egreso si el turno sigue abierto) / corregir la bandeja |
+| DELETE | `/pagos-proveedor/imputaciones/:id` | Desaplicar (no mueve plata) |
+
+### Cafetería (puente con coffit)
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| GET/POST | `/cafeteria/envios` · `/cafeteria/envios/:id` | Envíos y devoluciones **a costo congelado** hacia el otro negocio del dueño (mismo CUIT). Renglones con destino `venta`/`uso` y snapshot (nombre, unidad, códigos) para el import de coffit |
+| POST | `/cafeteria/envios/:id/anular` | Revierte el stock con la operación contraria |
+| GET | `/cafeteria/resumen?desde=&hasta=` | Mercadería neta + gastos imputados al negocio cafetería = costo del período |
+
+El CRM **no** lleva el stock del café: coffit es el dueño. Estos endpoints son
+los que coffit va a leer en la fase de integración por API (con token acotado).
+
+### Tienda y sitio público
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| GET | `/tienda/catalogo` | Productos publicados con precio y stock (lo consume `sitio-web`) |
+| POST | `/tienda/pedidos` | El checkout del sitio crea la **orden web** (aparece con alerta en el CRM) |
+| POST | `/tienda/eventos` | Estadísticas propias del sitio |
+| GET | `/tienda/imagenes/...` | Imágenes del catálogo |
+| GET/PUT | `/web/*` | Administración del sitio desde el CRM (publicados, banners, configuración) |
+
+> Los 4 endpoints de `/tienda` son los **únicos** que quedarán públicos cuando
+> la API tenga autenticación (requisito previo al deploy). Con rate-limit
+> propio por ruta y `trust proxy` ya activo.
 
 ## Arquitectura
 
@@ -220,10 +259,16 @@ Un solo criterio en todo el sistema evita descuadres de centavos entre los dos c
 
 ## Pendiente / próximos pasos
 
-- Autenticación (hoy la API es abierta para desarrollo).
-- **Presupuestos**: documento no vinculante con precio congelado y reserva de stock opcional.
-- **Redondeo de efectivo**: la opción existe en la configuración pero todavía no se aplica; falta decidir dónde imputar la diferencia (descuento del ticket vs. diferencia de arqueo).
-- **Nota de crédito** (compra y venta) con saldo acreditable por ítem.
-- Órdenes de pago a proveedores (gemelo de cobranzas).
-- Facturación electrónica ARCA (estado `pendiente_cae` ya previsto en el enum).
+La lista viva y completa está en el CRM: **Info de sistema › Pendientes**. Los
+grandes titulares:
+
+- **Autenticación — BLOQUEANTE del deploy**: sesiones con token en toda la API
+  salvo los 4 endpoints públicos de `/tienda`; Node escuchando solo en
+  localhost detrás de nginx.
+- **Nota de crédito** (compra y venta) con saldo acreditable.
+- **Anular comprobante de compra** (debe liberar las imputaciones de pagos).
+- **Facturación electrónica ARCA** (estado `pendiente_cae` ya previsto).
+- **Cafetería fases 2 y 3**: importador de remitos del lado coffit y conexión
+  por API con token acotado + confirmación de recepción.
+- Importador masivo del catálogo de WooCommerce (~550 productos).
 - Deploy en VPS de Hostinger.

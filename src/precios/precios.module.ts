@@ -28,10 +28,205 @@ import {
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
+  listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
+  productoProveedorCostos, productoProveedores, productos, proveedores, roles, usuarios,
 } from '../db/schema';
+import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
+import { costoNetoEntry, formatoActivo, precioFinal, precioLista, precioVentaFila } from '../inventario/pricing';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * EVOLUCIÓN DE PRECIOS — snapshot-diff.
+ *
+ * El precio se deriva, así que "cambió el precio" no es un evento: es la
+ * consecuencia de otra operación. Después de cada una que puede moverlo, se
+ * recalcula el precio FINAL de cada producto×lista tocado y se compara contra
+ * el último registrado: solo la diferencia se escribe. Llamarlo dos veces
+ * seguidas no duplica nada — es idempotente por construcción.
+ */
+@Injectable()
+export class HistorialPreciosService {
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly cfg: ConfiguracionService,
+  ) {}
+
+  /** Precio final vigente de cada lista de un conjunto de productos. */
+  private async preciosActuales(productoIds: number[]) {
+    const cfg = await this.cfg.get('ventas');
+    const [prods, formatos, plistas, listas] = await Promise.all([
+      this.db.select().from(productos).where(inArray(productos.id, productoIds)),
+      this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, productoIds)),
+      this.db.select().from(productoListas).where(inArray(productoListas.productoId, productoIds)),
+      this.db.select().from(listasVenta).where(eq(listasVenta.activa, true)),
+    ]);
+    const listasVivas = new Set(listas.map((l) => l.id));
+    const out: { productoId: number; listaId: number; precio: number }[] = [];
+    for (const p of prods) {
+      const cn = costoNetoEntry(formatoActivo(formatos.filter((f) => f.productoId === p.id)), p.iva);
+      // Mismo criterio que las pantallas: el redondeo del producto pisa al de
+      // configuración. Si acá difiriera, el historial registraría un precio
+      // que ninguna etiqueta mostró jamás.
+      const redondeo = p.redondeo ?? cfg.redondeoPrecio;
+      for (const pl of plistas.filter((x) => x.productoId === p.id)) {
+        if (!listasVivas.has(pl.listaId)) continue;
+        // El precio que se registra es el FINAL UNITARIO, venga de un markup o
+        // de un precio definido — la unidad es la base comparable en el tiempo.
+        const pv = precioVentaFila(cn, pl as any, { iva: p.iva, redondeo });
+        out.push({ productoId: p.id, listaId: pl.listaId, precio: pv.finalUnitario });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Registra los cambios de precio de estos productos. `origen` dice qué
+   * palanca se movió; el % lo calcula quien lee, con los dos precios.
+   */
+  async snapshot(
+    productoIds: number[],
+    origen: 'inicial' | 'costo' | 'formato_compra' | 'formato_venta' | 'activacion' | 'reversion',
+    opts: { detalle?: string; usuarioId?: number | null } = {},
+  ) {
+    const ids = [...new Set(productoIds)].filter(Boolean);
+    if (!ids.length) return { registrados: 0 };
+
+    const actuales = await this.preciosActuales(ids);
+    // El último precio registrado de cada producto×lista, en UNA consulta.
+    const ultimos = await this.db.execute(sql`
+      SELECT DISTINCT ON (producto_id, lista_id) producto_id, lista_id, precio
+      FROM precio_historial
+      WHERE producto_id IN (${sql.join(ids.map((i) => sql`${i}`), sql`, `)})
+      ORDER BY producto_id, lista_id, id DESC
+    `);
+    const ultimo = new Map(
+      (ultimos.rows as any[]).map((r) => [`${r.producto_id}:${r.lista_id}`, Number(r.precio)]),
+    );
+
+    const filas = actuales
+      .filter((a) => {
+        const prev = ultimo.get(`${a.productoId}:${a.listaId}`);
+        return prev === undefined || Math.abs(prev - a.precio) > 0.005;
+      })
+      .map((a) => {
+        const prev = ultimo.get(`${a.productoId}:${a.listaId}`);
+        return {
+          productoId: a.productoId,
+          listaId: a.listaId,
+          precioAnterior: prev === undefined ? null : prev,
+          precio: money(a.precio),
+          origen: (prev === undefined ? 'inicial' : origen) as any,
+          detalle: opts.detalle ?? '',
+          usuarioId: opts.usuarioId ?? null,
+        };
+      });
+
+    if (filas.length) await this.db.insert(precioHistorial).values(filas);
+    return { registrados: filas.length };
+  }
+
+  /**
+   * FIRMA DEL ÚLTIMO CAMBIO DE PRECIO. Endpoint deliberadamente barato: lo
+   * pollea cada CRM abierto para avisarle al cajero que los precios que tiene
+   * en pantalla quedaron viejos.
+   *
+   * La firma es el `id` más alto del historial, no la fecha: es monotónico,
+   * no discute con zonas horarias y dos tandas en el mismo segundo no se
+   * confunden. `productos` cuenta los distintos de ESA tanda — `snapshot()`
+   * inserta todo en una transacción, así que comparten el `now()`.
+   *
+   * Del AUTOR viajan tres datos y cada uno decide algo en el aviso:
+   *   - `usuarioId`: para no avisarle a quien hizo el cambio — ya lo sabe, y un
+   *     cartel sobre lo que él mismo acaba de hacer entrena a ignorar carteles.
+   *   - `usuarioRol`: el aviso salta solo si lo cambió la ADMINISTRACIÓN, que es
+   *     la única que toca precios. Un `null` acá significa cambio sin autor
+   *     registrado, que también es de administración (un cajero no tiene con
+   *     qué mover un precio), así que ese caso también avisa.
+   *   - `usuarioNombre`: para que el cartel diga de quién vino.
+   */
+  async ultimoCambio() {
+    const [ultimo] = await this.db
+      .select({
+        id: precioHistorial.id,
+        fecha: precioHistorial.fecha,
+        origen: precioHistorial.origen,
+        detalle: precioHistorial.detalle,
+        usuarioId: precioHistorial.usuarioId,
+        usuarioNombre: usuarios.nombre,
+        usuarioRol: roles.clave,
+      })
+      .from(precioHistorial)
+      .leftJoin(usuarios, eq(usuarios.id, precioHistorial.usuarioId))
+      .leftJoin(roles, eq(roles.id, usuarios.rolId))
+      .orderBy(desc(precioHistorial.id))
+      .limit(1);
+
+    if (!ultimo) {
+      return {
+        id: 0, fecha: null, origen: null, detalle: '',
+        usuarioId: null, usuarioNombre: null, usuarioRol: null, productos: 0,
+      };
+    }
+
+    const [tanda] = await this.db
+      .select({ n: sql<number>`count(distinct ${precioHistorial.productoId})::int` })
+      .from(precioHistorial)
+      .where(eq(precioHistorial.fecha, ultimo.fecha));
+
+    return { ...ultimo, productos: Number(tanda?.n) || 1 };
+  }
+
+  /**
+   * La evolución, lista para mostrar: con producto, marca y lista resueltos.
+   * Los filtros finos (búsqueda, marca) los aplica la pantalla en memoria —
+   * el volumen es chico y el modal filtra con cada tecla.
+   */
+  async evolucion(q: { productoId?: number; desde?: string; limit?: number } = {}) {
+    const conds: any[] = [];
+    if (q.productoId) conds.push(eq(precioHistorial.productoId, q.productoId));
+    if (q.desde) conds.push(sql`${precioHistorial.fecha} >= ${new Date(q.desde)}`);
+
+    const filas = await this.db
+      .select({
+        id: precioHistorial.id,
+        fecha: precioHistorial.fecha,
+        productoId: precioHistorial.productoId,
+        listaId: precioHistorial.listaId,
+        precioAnterior: precioHistorial.precioAnterior,
+        precio: precioHistorial.precio,
+        origen: precioHistorial.origen,
+        detalle: precioHistorial.detalle,
+        producto: productos.nombre,
+        codigo: productos.codigoBarras,
+        codigoPropio: productos.codigoPropio,
+        marcaId: productos.marcaId,
+        marca: marcas.nombre,
+        listaNumero: listasVenta.numero,
+        listaNombre: listasVenta.nombre,
+        modalidad: modalidadesVenta.nombre,
+        usuario: usuarios.nombre,
+      })
+      .from(precioHistorial)
+      .innerJoin(productos, eq(productos.id, precioHistorial.productoId))
+      .leftJoin(marcas, eq(marcas.id, productos.marcaId))
+      .innerJoin(listasVenta, eq(listasVenta.id, precioHistorial.listaId))
+      .innerJoin(modalidadesVenta, eq(modalidadesVenta.id, listasVenta.modalidadId))
+      .leftJoin(usuarios, eq(usuarios.id, precioHistorial.usuarioId))
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(precioHistorial.id))
+      .limit(Math.min(q.limit ?? 500, 2000));
+
+    return filas.map((f) => ({
+      ...f,
+      lista: `${f.modalidad} ${f.listaNumero}${f.listaNombre ? ` · ${f.listaNombre}` : ''}`,
+      // El % acá y no en cada pantalla: una sola definición del número.
+      variacion: f.precioAnterior && f.precioAnterior > 0
+        ? money(((f.precio - f.precioAnterior) / f.precioAnterior) * 100)
+        : null,
+    }));
+  }
+}
 
 class CambioCostoDto {
   /** id de `producto_proveedores`. */
@@ -55,15 +250,28 @@ class CambioMargenDto {
 }
 
 class ActualizarMargenesDto {
-  /** 'ganancia_lista' toca `listas_precio.ganancia`; el otro, `presentaciones.recargo`. */
-  @IsIn(['ganancia_lista', 'ganancia_presentacion']) tipo!: 'ganancia_lista' | 'ganancia_presentacion';
+  /**
+   * `markup_lista` opera sobre `producto_listas` (el formato de venta por
+   * producto); `recargo_presentacion` sobre `presentaciones.recargo`.
+   */
+  @IsIn(['markup_lista', 'recargo_presentacion']) tipo!: 'markup_lista' | 'recargo_presentacion';
   @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => CambioMargenDto)
   cambios!: CambioMargenDto[];
+  @IsOptional() @IsString() motivo?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 @Injectable()
 export class PreciosService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly evolucion: HistorialPreciosService,
+  ) {}
+
+  /** Punto único para registrar evolución desde afuera (recepción de comprobantes). */
+  registrarEvolucion(productoIds: number[], origen: any, opts: any = {}) {
+    return this.evolucion.snapshot(productoIds, origen, opts);
+  }
 
   /* ------------------------------ Costos ------------------------------ */
 
@@ -127,32 +335,80 @@ export class PreciosService {
         comprobanteId: (dto as any).comprobanteId ?? null,
       })));
 
-      return { ok: true, actualizados: finales.length, lote };
+      // `anterior` es la fila completa de producto_proveedores: de ahí sale el
+      // producto para el snapshot de evolución de precios.
+      return { ok: true, actualizados: finales.length, lote, productoIds: [...new Set(finales.map((f) => f.anterior.productoId))] };
     };
 
     // Si viene `tx`, corre dentro de la transacción del llamador (recepción de
-    // comprobante): el costo y el comprobante se guardan juntos o no se guarda nada.
-    return tx ? ejecutar(tx) : this.db.transaction(ejecutar);
+    // comprobante): el costo y el comprobante se guardan juntos o no se guarda
+    // nada — y la evolución de precios la registra el llamador DESPUÉS del
+    // commit, porque acá los datos nuevos todavía no son visibles.
+    if (tx) return ejecutar(tx);
+    const res = await this.db.transaction(ejecutar);
+    await this.evolucion.snapshot(res.productoIds ?? [], 'costo', { detalle: dto.motivo ?? '', usuarioId: dto.usuarioId ?? null });
+    return res;
   }
 
   /* ------------------------------ Márgenes ------------------------------ */
 
-  /** Los márgenes no llevan historial: son decisión propia y siempre reversibles a mano. */
+  /**
+   * Masiva de márgenes con dos destinos:
+   *
+   * - `markup_lista`: el markup de las filas de `producto_listas` (el formato
+   *   de venta por producto). Las filas en modo **precio definido** se saltean:
+   *   su precio lo fijó una persona y un % masivo no debe pisarlo. Mueve la
+   *   góndola, así que registra evolución de precios (origen `formato_venta`).
+   *
+   * - `recargo_presentacion`: el recargo de fraccionamiento. No lleva
+   *   historial: es decisión propia y reversible a mano.
+   */
   async actualizarMargenes(dto: ActualizarMargenesDto) {
-    const tabla = dto.tipo === 'ganancia_lista' ? 'listas_precio' : 'presentaciones';
-    const columna = dto.tipo === 'ganancia_lista' ? 'ganancia' : 'recargo';
-
     const cambios = dto.cambios.filter((c) => Number.isInteger(c.id) && Number.isFinite(c.valor));
     if (!cambios.length) throw new BadRequestException('No hay cambios para aplicar.');
     if (cambios.length > 5000) throw new BadRequestException('Demasiadas filas en una sola actualización (máximo 5000).');
+
+    if (dto.tipo === 'markup_lista') {
+      const ids = [...new Set(cambios.map((c) => c.id))];
+      const actuales = await this.db.select().from(productoListas).where(inArray(productoListas.id, ids));
+      const porId = new Map(actuales.map((f) => [f.id, f]));
+
+      // Solo filas reales, en modo markup y con un valor efectivamente distinto.
+      const finales = cambios
+        .map((c) => {
+          const a = porId.get(c.id);
+          if (!a || a.modoPrecio === 'precio') return null;
+          const nuevo = money(Math.max(0, c.valor));
+          return Math.abs(nuevo - a.markup) < 0.005 ? null : { id: c.id, valor: nuevo, productoId: a.productoId };
+        })
+        .filter(Boolean) as { id: number; valor: number; productoId: number }[];
+      if (!finales.length) return { ok: true, actualizados: 0 };
+
+      const valores = sql.join(
+        finales.map((f) => sql`(${f.id}::int, ${f.valor}::double precision)`),
+        sql`, `,
+      );
+      await this.db.execute(sql`
+        UPDATE producto_listas AS t
+        SET markup = v.valor
+        FROM (VALUES ${valores}) AS v(id, valor)
+        WHERE t.id = v.id
+      `);
+      await this.evolucion.snapshot(
+        [...new Set(finales.map((f) => f.productoId))],
+        'formato_venta',
+        { detalle: dto.motivo ?? 'Actualización masiva de márgenes', usuarioId: dto.usuarioId ?? null },
+      );
+      return { ok: true, actualizados: finales.length };
+    }
 
     const valores = sql.join(
       cambios.map((c) => sql`(${c.id}::int, ${money(Math.max(0, c.valor))}::double precision)`),
       sql`, `,
     );
     await this.db.execute(sql`
-      UPDATE ${sql.raw(tabla)} AS t
-      SET ${sql.raw(columna)} = v.valor
+      UPDATE presentaciones AS t
+      SET recargo = v.valor
       FROM (VALUES ${valores}) AS v(id, valor)
       WHERE t.id = v.id
     `);
@@ -184,45 +440,62 @@ export class PreciosService {
       const ids = [...new Set(o.productoIds || [])].filter(Boolean);
       if (!ids.length) return { ok: true, activados: 0, lote: '' };
 
-      const prods = await db.select().from(productos).where(inArray(productos.id, ids));
-      const pendientes = prods.filter((p: any) => p.proveedorActivoId !== o.proveedorId);
-      if (!pendientes.length) return { ok: true, activados: 0, lote: '' };
+      // Todos los formatos de compra de esos productos, para saber cuál manda
+      // hoy y cuál pasaría a mandar.
+      const formatos = await db.select().from(productoProveedores)
+        .where(inArray(productoProveedores.productoId, ids));
+      const porProducto = new Map<number, any[]>();
+      for (const f of formatos as any[]) {
+        const arr = porProducto.get(f.productoId);
+        if (arr) arr.push(f); else porProducto.set(f.productoId, [f]);
+      }
 
-      // La fila de historial cuelga de la entrada producto/proveedor que pasa a mandar.
-      const entradas = await db.select().from(productoProveedores).where(and(
-        eq(productoProveedores.proveedorId, o.proveedorId),
-        inArray(productoProveedores.productoId, pendientes.map((p: any) => p.id)),
-      ));
-      const entradaDe = new Map(entradas.map((e: any) => [e.productoId, e]));
+      const cambios: { actual: any; destino: any }[] = [];
+      for (const pid of ids) {
+        const suyos = porProducto.get(pid) ?? [];
+        const destino = suyos.find((f) => f.proveedorId === o.proveedorId);
+        if (!destino) continue;                       // ese proveedor no lo vende
+        const actual = suyos.find((f) => f.usarParaPrecio) ?? null;
+        if (actual && actual.id === destino.id) continue;   // ya manda
+        cambios.push({ actual, destino });
+      }
+      if (!cambios.length) return { ok: true, activados: 0, lote: '' };
 
-      const aplicables = pendientes.filter((p: any) => entradaDe.has(p.id));
-      if (!aplicables.length) return { ok: true, activados: 0, lote: '' };
-
-      await db.update(productos)
-        .set({ proveedorActivoId: o.proveedorId })
-        .where(inArray(productos.id, aplicables.map((p: any) => p.id)));
+      for (const { destino } of cambios) {
+        await db.update(productoProveedores).set({ usarParaPrecio: false })
+          .where(eq(productoProveedores.productoId, destino.productoId));
+        await db.update(productoProveedores).set({ usarParaPrecio: true })
+          .where(eq(productoProveedores.id, destino.id));
+      }
 
       const lote = `A${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
-      await db.insert(productoProveedorCostos).values(aplicables.map((p: any) => {
-        const e: any = entradaDe.get(p.id);
-        return {
-          productoProveedorId: e.id,
-          // El costo no cambia acá: lo que cambia es CUÁL costo se usa.
-          costoAnterior: e.costo, descuentoAnterior: e.descuento, fleteAnterior: e.flete,
-          costo: e.costo, descuento: e.descuento, flete: e.flete,
-          activoAnterior: p.proveedorActivoId ?? null,
-          activoNuevo: o.proveedorId,
-          origen: (o.origen ?? 'manual') as any,
-          motivo: o.motivo ?? 'Cambio de proveedor activo',
-          lote,
-          usuarioId: o.usuarioId ?? null,
-          comprobanteId: o.comprobanteId ?? null,
-        };
-      }));
+      await db.insert(productoProveedorCostos).values(cambios.map(({ actual, destino }) => ({
+        productoProveedorId: destino.id,
+        // El costo no cambia acá: lo que cambia es CUÁL costo se usa.
+        costoAnterior: destino.costo, descuentoAnterior: destino.descuento, fleteAnterior: destino.flete,
+        costo: destino.costo, descuento: destino.descuento, flete: destino.flete,
+        // Guardan FORMATOS, no proveedores: con dos formatos del mismo
+        // proveedor, el id del proveedor ya no alcanza para volver atrás.
+        activoAnterior: actual?.id ?? null,
+        activoNuevo: destino.id,
+        origen: (o.origen ?? 'manual') as any,
+        motivo: o.motivo ?? 'Cambio de formato de compra activo',
+        lote,
+        usuarioId: o.usuarioId ?? null,
+        comprobanteId: o.comprobanteId ?? null,
+      })));
 
-      return { ok: true, activados: aplicables.length, lote };
+      return {
+        ok: true, activados: cambios.length, lote,
+        productoIds: cambios.map(({ destino }) => destino.productoId),
+      };
     };
-    return tx ? ejecutar(tx) : this.db.transaction(ejecutar);
+    if (tx) return ejecutar(tx);
+    const res: any = await this.db.transaction(ejecutar);
+    if (res.productoIds?.length) {
+      await this.evolucion.snapshot(res.productoIds ?? [], 'activacion', { detalle: o.motivo ?? '', usuarioId: o.usuarioId ?? null });
+    }
+    return res;
   }
 
   /* ------------------------------ Auditoría ------------------------------ */
@@ -280,7 +553,7 @@ export class PreciosService {
   async revertirLote(lote: string, usuarioId?: number) {
     if (!lote) throw new BadRequestException('Indicá el lote a revertir.');
 
-    return this.db.transaction(async (tx) => {
+    const res: any = await this.db.transaction(async (tx) => {
       const filas = await tx.select().from(productoProveedorCostos)
         .where(eq(productoProveedorCostos.lote, lote));
       if (!filas.length) throw new BadRequestException('No existe ese lote de actualización.');
@@ -306,12 +579,14 @@ export class PreciosService {
           && Math.abs(a.flete - f.flete) < 0.005;
         if (!intacta) { salteadas.push({ id: f.productoProveedorId, motivo: 'Cambió después de este lote.' }); continue; }
 
-        // Si la fila cambió el proveedor activo, ese cambio también tiene que
+        // Si la fila cambió el formato activo, ese cambio también tiene que
         // seguir vigente; si no, revertirlo pisaría una decisión más nueva.
-        const p: any = prodPorId.get(a.productoId);
-        if (f.activoNuevo != null && p && p.proveedorActivoId !== f.activoNuevo) {
-          salteadas.push({ id: f.productoProveedorId, motivo: 'El proveedor activo cambió después de este lote.' });
-          continue;
+        if (f.activoNuevo != null) {
+          const vigente: any = porId.get(f.activoNuevo);
+          if (!vigente?.usarParaPrecio) {
+            salteadas.push({ id: f.productoProveedorId, motivo: 'El formato activo cambió después de este lote.' });
+            continue;
+          }
         }
         revertibles.push({ f, a });
       }
@@ -328,12 +603,15 @@ export class PreciosService {
           WHERE t.id = v.id
         `);
 
-        // Los cambios de proveedor activo del lote también vuelven atrás.
+        // Los cambios de formato activo del lote también vuelven atrás.
         for (const { f, a } of revertibles) {
           if (f.activoNuevo == null) continue;
-          await tx.update(productos)
-            .set({ proveedorActivoId: f.activoAnterior ?? null })
-            .where(eq(productos.id, a.productoId));
+          await tx.update(productoProveedores).set({ usarParaPrecio: false })
+            .where(eq(productoProveedores.productoId, a.productoId));
+          if (f.activoAnterior != null) {
+            await tx.update(productoProveedores).set({ usarParaPrecio: true })
+              .where(eq(productoProveedores.id, f.activoAnterior));
+          }
         }
 
         const nuevoLote = `R${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
@@ -351,14 +629,43 @@ export class PreciosService {
         })));
       }
 
-      return { ok: true, revertidos: revertibles.length, salteados: salteadas };
+      return { ok: true, revertidos: revertibles.length, salteados: salteadas, productoIds: prodIds };
     });
+    // Después del commit: la reversión también mueve precios y queda en la evolución.
+    if (res.productoIds?.length) {
+      await this.evolucion.snapshot(res.productoIds ?? [], 'reversion', { detalle: `Reversión del lote ${lote}`, usuarioId: usuarioId ?? null });
+    }
+    return res;
   }
 }
 
 @Controller('precios')
 export class PreciosController {
-  constructor(private readonly svc: PreciosService) {}
+  constructor(
+    private readonly svc: PreciosService,
+    private readonly evolucionSvc: HistorialPreciosService,
+  ) {}
+
+  /**
+   * Firma del último cambio de precio. Lo pollea cada CRM abierto para avisarle
+   * al cajero que su catálogo quedó viejo; por eso tiene que ser barato.
+   */
+  @Get('ultimo-cambio')
+  ultimoCambio() { return this.evolucionSvc.ultimoCambio(); }
+
+  /** Evolución del PRECIO DE VENTA (no del costo): para Alt+F5 y la pestaña del producto. */
+  @Get('evolucion')
+  evolucion(
+    @Query('productoId') productoId?: string,
+    @Query('desde') desde?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.evolucionSvc.evolucion({
+      productoId: productoId ? Number(productoId) : undefined,
+      desde,
+      limit: limit ? Number(limit) : undefined,
+    });
+  }
 
   @Get('historial')
   historial(
@@ -381,8 +688,9 @@ export class PreciosController {
 }
 
 @Module({
+  imports: [ConfiguracionModule],
   controllers: [PreciosController],
-  providers: [PreciosService],
-  exports: [PreciosService],
+  providers: [PreciosService, HistorialPreciosService],
+  exports: [PreciosService, HistorialPreciosService],
 })
 export class PreciosModule {}

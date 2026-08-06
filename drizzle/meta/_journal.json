@@ -64,6 +64,202 @@
       "when": 1785589940559,
       "tag": "0008_silky_hellion",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1785593409311,
+      "tag": "0009_daily_vapor",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1785593410311,
+      "tag": "0010_listas_modalidades",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1785593411311,
+      "tag": "0011_formato_venta",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1785593412311,
+      "tag": "0012_catalogos_producto",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1785593413311,
+      "tag": "0013_formato_compra",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1785593414311,
+      "tag": "0014_ofertas",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1785593415311,
+      "tag": "0015_precio_historial",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1785593416311,
+      "tag": "0016_almacen_transito",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1785593417311,
+      "tag": "0017_formato_venta_precio",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785770230980,
+      "tag": "0018_preparacion_listas",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785779966644,
+      "tag": "0019_usuarios_roles",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785798078021,
+      "tag": "0020_presupuestos",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785798195940,
+      "tag": "0021_presupuesto_reservado",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785798357998,
+      "tag": "0022_venta_presupuesto",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785845272979,
+      "tag": "0023_producto_imagen",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785869595454,
+      "tag": "0024_permisos_secciones",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1785871873874,
+      "tag": "0025_caja_controles",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1785878913396,
+      "tag": "0026_modulo_web",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1785882345782,
+      "tag": "0027_ordenes_web",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1785885114292,
+      "tag": "0028_web_eventos",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1785929025732,
+      "tag": "0029_web_stock_min",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1785936738985,
+      "tag": "0030_web_configuracion",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1785937438616,
+      "tag": "0031_imagen_logo_favicon",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1785952100000,
+      "tag": "0032_gastos",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1785954200000,
+      "tag": "0033_pagos_proveedor",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1785963400000,
+      "tag": "0034_destino_pago",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1786120000000,
+      "tag": "0035_cafeteria",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1786121000000,
+      "tag": "0036_permiso_cafeteria",
+      "breakpoints": true
     }
   ]
 }

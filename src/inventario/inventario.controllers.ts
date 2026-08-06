@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Query } from '@nestjs/common';
 import { InventarioService } from './inventario.service';
 
 @Controller('stock')
@@ -46,6 +46,16 @@ export class MovimientosController {
 export class OperacionesController {
   constructor(private readonly inv: InventarioService) {}
 
+  /** El libro del almacén: una fila por documento, valuada a costo. */
+  @Get('almacen')
+  almacen(
+    @Query('sucursalId') sucursalId?: string,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
+  ) {
+    return this.inv.operacionesAlmacen({ sucursalId: Number(sucursalId), desde, hasta });
+  }
+
   @Post('compra')
   compra(@Body() body: any) {
     return this.inv.opCompra(body);
@@ -82,8 +92,44 @@ export class TransferenciasController {
   }
 
   @Post(':id/avanzar')
-  avanzar(@Param('id', ParseIntPipe) id: number) {
-    return this.inv.avanzarTransferencia(id);
+  avanzar(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.avanzarTransferencia(id, body?.usuarioId, body?.desde);
+  }
+
+  /* --- Preparación en dos listas (fase "preparada") --- */
+
+  /** Edita cantidad preparada / motivo de un renglón (lista sin confirmar). */
+  @Patch(':id/items/:itemId')
+  editarItem(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('itemId', ParseIntPipe) itemId: number,
+    @Body() body: any,
+  ) {
+    return this.inv.editarItemTransferencia(id, itemId, body ?? {});
+  }
+
+  /** Agrega un renglón durante la preparación (mercadería que llegó a último momento). */
+  @Post(':id/items')
+  agregarItem(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.agregarItemTransferencia(id, body ?? {});
+  }
+
+  /** Quita un renglón AGREGADO (los pedidos por el destino se ponen en 0, no se borran). */
+  @Delete(':id/items/:itemId')
+  quitarItem(@Param('id', ParseIntPipe) id: number, @Param('itemId', ParseIntPipe) itemId: number) {
+    return this.inv.quitarItemTransferencia(id, itemId);
+  }
+
+  /** Confirma o desconfirma una lista (enteros | granel). Confirmar = reservar stock. */
+  @Post(':id/lista')
+  confirmarLista(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.confirmarListaTransferencia(id, body ?? {});
+  }
+
+  /** Recepción CONTADA: cantidades por renglón; la diferencia va a incidencia. */
+  @Post(':id/recibir')
+  recibir(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.recibirTransferencia(id, body ?? {});
   }
 
   @Post(':id/cancelar')
