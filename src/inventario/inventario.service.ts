@@ -386,25 +386,74 @@ export class InventarioService {
    */
   async egresarStockItems(tx: any, o: any) {
     const tipoMov = o.tipoMovimiento || null;
+    // Por defecto egresa lo DISPONIBLE; un documento puede egresar otro estado
+    // (el envío a Cafetería cierra sacando lo que viajaba en_transito).
+    const estado: EstadoStock = o.estado || 'disponible';
     for (const it of o.items || []) {
       const presId = it.presentacionId || null;
       const cantidad = Number(it.cantidad) || 0;
       if (cantidad <= 0) continue;
       const prod = await this.getProducto(tx, it.productoId);
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
-      const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, 'disponible');
+      const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, estado);
       if (!o.permitirNegativo && cantidad > disp + 1e-9) {
         throw new BadRequestException(
           `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`,
         );
       }
-      await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado: 'disponible' }, -cantidad);
+      await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado }, -cantidad);
       const esGranelSuelto = prod.tipo === 'granel' && !presId;
       await this.mov(tx, {
         tipo: tipoMov || (esGranelSuelto ? 'venta_granel' : 'venta_fraccionada'),
         productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: -1,
-        cantidad, unidad: this.unidadDe(prod.tipo, presId), estadoDesde: 'disponible',
+        cantidad, unidad: this.unidadDe(prod.tipo, presId), estadoDesde: estado,
         usuarioId: o.usuarioId ?? null, descripcion: o.descripcion || 'Egreso por documento',
+      });
+    }
+  }
+
+  /**
+   * Pone (o devuelve) mercadería EN TRÁNSITO por un documento que la despacha
+   * hacia afuera del sistema (el envío a Cafetería). Mientras viaja sigue
+   * siendo del origen — si el flete se pierde, la pérdida es de quien despachó
+   * y el inventario total no miente. Valida TODO antes de mover.
+   */
+  async transitarStockItems(tx: any, o: {
+    sucursalId: number;
+    usuarioId?: number | null;
+    descripcion: string;
+    tipoMovimiento?: string;
+    /** true = la vuelta: en_transito → disponible (anulación del despacho). */
+    volver?: boolean;
+    items: { productoId: number; presentacionId?: number | null; cantidad: number }[];
+  }) {
+    const desde: EstadoStock = o.volver ? 'en_transito' : 'disponible';
+    const hacia: EstadoStock = o.volver ? 'disponible' : 'en_transito';
+
+    const faltas: string[] = [];
+    for (const it of o.items || []) {
+      const c = Number(it.cantidad) || 0;
+      if (c <= 0) continue;
+      const presId = it.presentacionId || null;
+      const hay = await this.cant(tx, it.productoId, o.sucursalId, presId, desde);
+      if (c > hay + 1e-9) {
+        const prod = await this.getProducto(tx, it.productoId);
+        faltas.push(`${prod?.nombre ?? '#' + it.productoId}: hace falta ${this.fmtCant(prod?.tipo ?? 'entero', presId, c)}, hay ${this.fmtCant(prod?.tipo ?? 'entero', presId, hay)}`);
+      }
+    }
+    if (faltas.length) throw new BadRequestException(`Stock insuficiente — ${faltas.join(' · ')}`);
+
+    for (const it of o.items || []) {
+      const c = Number(it.cantidad) || 0;
+      if (c <= 0) continue;
+      const presId = it.presentacionId || null;
+      const prod = await this.getProducto(tx, it.productoId);
+      await this.move(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId }, desde, hacia, c);
+      await this.mov(tx, {
+        tipo: o.tipoMovimiento || 'ajuste',
+        productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: 0,
+        cantidad: c, unidad: this.unidadDe(prod.tipo, presId), estadoDesde: desde, estadoHacia: hacia,
+        usuarioId: o.usuarioId ?? null, descripcion: o.descripcion,
       });
     }
   }

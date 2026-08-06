@@ -260,6 +260,13 @@
       "when": 1786121000000,
       "tag": "0036_permiso_cafeteria",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1786130000000,
+      "tag": "0037_estados_envio_cafe",
+      "breakpoints": true
     }
   ]
 }

@@ -15,6 +15,19 @@
  *  - El destino de cada renglón (venta | uso) es un DATO PARA COFFIT: le dice
  *    al import si eso es producto de góndola o insumo de receta.
  *  - La vuelta existe desde el día 1: la devolución reingresa a costo.
+ *
+ * CICLO DE VIDA del envío (espejo chico de las transferencias, con el stock
+ * acompañando cada estado — los estados dicen la verdad, no son etiquetas):
+ *
+ *   pedido ──despachar──► transito ──recibir──► recibido
+ *   (demanda del café:     salió el flete:       llegó al café:
+ *    NO toca stock)        disponible →          en_transito EGRESA
+ *                          en_transito, y acá    del CRM — recién acá
+ *                          se CONGELA el costo   es de coffit
+ *
+ * Anular deshace exactamente lo de su etapa: pedido no tocó nada; en tránsito
+ * vuelve a disponible; recibido reingresa. La devolución es de un solo paso
+ * (nace 'recibido': la mercadería ya está acá cuando se registra).
  */
 import {
   Body, Controller, Get, Inject, Injectable, Module, Param, ParseIntPipe, Post, Query,
@@ -56,7 +69,15 @@ class CrearEnvioDto {
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** true = "el flete ya salió": crea el pedido y lo despacha en el mismo acto. */
+  @IsOptional() despachar?: boolean;
   @IsArray() @ValidateNested({ each: true }) @Type(() => EnvioItemDto) items!: EnvioItemDto[];
+}
+
+class AvanzarEnvioDto {
+  /** La intención del botón: evita que un doble clic ejecute dos pasos. */
+  @IsIn(['pedido', 'transito']) desde!: 'pedido' | 'transito';
+  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class AnularEnvioDto {
@@ -71,11 +92,33 @@ export class CafeteriaService {
     private readonly inv: InventarioService,
   ) {}
 
+  /** Costo unitario de HOY del formato activo ($/kg del granel, $/paquete de la presentación). */
+  private async valuarItems(tx: any, items: { productoId: number; presentacionId?: number | null }[]) {
+    const ids = [...new Set(items.map((it) => it.productoId))];
+    const provs = await tx.select().from(productoProveedores)
+      .where(inArray(productoProveedores.productoId, ids));
+    const out = new Map<string, { prod: any; pres: any; costoU: number }>();
+    for (const it of items) {
+      const clave = `${it.productoId}-${it.presentacionId ?? 0}`;
+      if (out.has(clave)) continue;
+      const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
+      if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
+      let pres: any = null;
+      if (it.presentacionId) {
+        [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
+        if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
+      }
+      const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
+      out.set(clave, { prod, pres, costoU: pres ? cnKg * (pres.tamKg ?? 1) : cnKg });
+    }
+    return out;
+  }
+
   /**
-   * Crea un envío (o una devolución) y mueve el stock en la MISMA transacción.
-   * El costo se congela acá, del formato ACTIVO de cada producto: el remito
-   * tiene que decir lo mismo dentro de seis meses, cambie lo que cambie el
-   * proveedor. Presentación fraccionada → costo del paquete ($/kg × tamaño).
+   * Crea el documento. El ENVÍO nace como 'pedido' (demanda del café: no toca
+   * stock; el costo cargado es el ESTIMADO de hoy y se recongela al despachar).
+   * Con `despachar: true` sale en el mismo acto. La DEVOLUCIÓN es de un paso:
+   * nace 'recibido' y reingresa a costo ya mismo.
    */
   async crear(o: CrearEnvioDto) {
     const tipo = o.tipo === 'devolucion' ? 'devolucion' : 'envio';
@@ -87,27 +130,13 @@ export class CafeteriaService {
         || (await tx.select().from(sucursales).where(eq(sucursales.tipo, 'distribuidora')).limit(1))[0]?.id;
       if (!sucId) throw new BadRequestException('No hay sucursal de origen.');
 
-      const ids = [...new Set(items.map((it) => it.productoId))];
-      const provs = await tx.select().from(productoProveedores)
-        .where(inArray(productoProveedores.productoId, ids));
-
-      // Primero se valúa y arma TODO; el stock se mueve al final con los
-      // helpers del inventario (validan disponible y registran movimientos).
+      const val = await this.valuarItems(tx, items);
       let total = 0;
       const filas: any[] = [];
       for (const it of items) {
-        const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
-        if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
-        let pres: any = null;
-        if (it.presentacionId) {
-          [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
-          if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
-        }
-        const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
-        const costoU = pres ? cnKg * (pres.tamKg ?? 1) : cnKg;
+        const { prod, pres, costoU } = val.get(`${it.productoId}-${it.presentacionId ?? 0}`)!;
         const cantidad = Number(it.cantidad);
         total += costoU * cantidad;
-
         const esKg = prod.tipo === 'granel' && !pres;
         const tam = pres ? (pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`) : '';
         filas.push({
@@ -125,41 +154,94 @@ export class CafeteriaService {
         });
       }
 
+      const estadoInicial = tipo === 'devolucion' ? 'recibido' : 'pedido';
       const [envio] = await tx.insert(enviosCafeteria).values({
         codigo: '', tipo, fecha: fechaLocal(o.fecha) ?? new Date(), sucursalId: sucId,
-        usuarioId: o.usuarioId ?? null, estado: 'confirmado', totalCosto: r2(total),
+        usuarioId: o.usuarioId ?? null, estado: estadoInicial as any, totalCosto: r2(total),
         observaciones: (o.observaciones ?? '').trim(),
       }).returning();
       const codigo = (tipo === 'envio' ? 'CAF' : 'CAFD') + String(envio.id).padStart(4, '0');
       await tx.update(enviosCafeteria).set({ codigo }).where(eq(enviosCafeteria.id, envio.id));
       await tx.insert(envioCafeteriaItems).values(filas.map((f) => ({ ...f, envioId: envio.id })));
 
-      const paraStock = {
-        sucursalId: sucId,
-        usuarioId: o.usuarioId ?? null,
-        items: filas.map((f) => ({ productoId: f.productoId, presentacionId: f.presentacionId, cantidad: f.cantidad })),
-      };
-      if (tipo === 'envio') {
-        await this.inv.egresarStockItems(tx, {
-          ...paraStock, tipoMovimiento: 'envio_cafeteria',
-          descripcion: `${codigo}: envío a Cafetería (coffit)`,
-        });
-      } else {
+      if (tipo === 'devolucion') {
         await this.inv.reingresarStockItems(tx, {
-          ...paraStock, descripcion: `${codigo}: devolución desde Cafetería`,
+          sucursalId: sucId, usuarioId: o.usuarioId ?? null,
+          items: filas.map((f) => ({ productoId: f.productoId, presentacionId: f.presentacionId, cantidad: f.cantidad })),
+          descripcion: `${codigo}: devolución desde Cafetería`,
         });
+      } else if (o.despachar) {
+        await this.despacharTx(tx, { ...envio, codigo }, o.usuarioId ?? null);
+        await tx.update(enviosCafeteria).set({ estado: 'transito' as any }).where(eq(enviosCafeteria.id, envio.id));
       }
-      return { ok: true, id: envio.id, codigo, totalCosto: r2(total) };
+      return { ok: true, id: envio.id, codigo, totalCosto: r2(total), estado: tipo === 'devolucion' ? 'recibido' : (o.despachar ? 'transito' : 'pedido') };
     });
   }
 
-  async list(q: { desde?: string; hasta?: string; tipo?: string; limit?: number }) {
+  /**
+   * pedido → transito. Acá se RECONGELA el costo (el remito viaja con el costo
+   * del día que salió, no del día que se pidió) y la mercadería pasa a
+   * en_transito: sigue siendo de la distribuidora mientras viaja.
+   */
+  private async despacharTx(tx: any, envio: any, usuarioId: number | null) {
+    const items = await tx.select().from(envioCafeteriaItems).where(eq(envioCafeteriaItems.envioId, envio.id));
+    const val = await this.valuarItems(tx, items);
+    let total = 0;
+    for (const it of items) {
+      const { costoU } = val.get(`${it.productoId}-${it.presentacionId ?? 0}`)!;
+      total += costoU * it.cantidad;
+      await tx.update(envioCafeteriaItems).set({ costoUnitario: costoU }).where(eq(envioCafeteriaItems.id, it.id));
+    }
+    await tx.update(enviosCafeteria).set({ totalCosto: r2(total) }).where(eq(enviosCafeteria.id, envio.id));
+    await this.inv.transitarStockItems(tx, {
+      sucursalId: envio.sucursalId, usuarioId, tipoMovimiento: 'envio_cafeteria',
+      items: items.map((f: any) => ({ productoId: f.productoId, presentacionId: f.presentacionId, cantidad: f.cantidad })),
+      descripcion: `${envio.codigo}: despachado hacia Cafetería`,
+    });
+  }
+
+  /** transito → recibido: lo que viajaba EGRESA del CRM — recién acá es de coffit. */
+  private async recibirTx(tx: any, envio: any, usuarioId: number | null) {
+    const items = await tx.select().from(envioCafeteriaItems).where(eq(envioCafeteriaItems.envioId, envio.id));
+    await this.inv.egresarStockItems(tx, {
+      sucursalId: envio.sucursalId, usuarioId, estado: 'en_transito', tipoMovimiento: 'envio_cafeteria',
+      items: items.map((f: any) => ({ productoId: f.productoId, presentacionId: f.presentacionId, cantidad: f.cantidad })),
+      descripcion: `${envio.codigo}: recibido en Cafetería`,
+    });
+  }
+
+  /** Avanza pedido→transito→recibido, con reclamo atómico del estado. */
+  async avanzar(id: number, o: AvanzarEnvioDto) {
+    return this.db.transaction(async (tx) => {
+      const [envio] = await tx.select().from(enviosCafeteria).where(eq(enviosCafeteria.id, id)).limit(1);
+      if (!envio) throw new NotFoundException('Envío inexistente.');
+      if (envio.tipo !== 'envio') throw new BadRequestException('La devolución no tiene etapas: entra en un solo paso.');
+      if (envio.estado !== o.desde) throw new BadRequestException('El envío cambió de estado — actualizá la pantalla.');
+      const siguiente = o.desde === 'pedido' ? 'transito' : 'recibido';
+
+      // Dos clics simultáneos leen el mismo estado; solo uno gana este UPDATE.
+      const gano = await tx.update(enviosCafeteria)
+        .set({ estado: siguiente as any })
+        .where(and(eq(enviosCafeteria.id, id), eq(enviosCafeteria.estado, o.desde as any)))
+        .returning({ id: enviosCafeteria.id });
+      if (!gano.length) throw new BadRequestException('El envío cambió de estado — actualizá la pantalla.');
+
+      if (siguiente === 'transito') await this.despacharTx(tx, envio, o.usuarioId ?? null);
+      else await this.recibirTx(tx, envio, o.usuarioId ?? null);
+      return { ok: true, estado: siguiente };
+    });
+  }
+
+  async list(q: { desde?: string; hasta?: string; tipo?: string; estado?: string; limit?: number }) {
     const conds: any[] = [];
     const desde = fechaLocal(q.desde);
     const hasta = fechaLocal(q.hasta);
     if (desde) conds.push(gte(enviosCafeteria.fecha, desde));
     if (hasta) { hasta.setHours(23, 59, 59, 999); conds.push(lte(enviosCafeteria.fecha, hasta)); }
     if (q.tipo === 'envio' || q.tipo === 'devolucion') conds.push(eq(enviosCafeteria.tipo, q.tipo as any));
+    if (q.estado && ['pedido', 'transito', 'recibido', 'anulado'].includes(q.estado)) {
+      conds.push(eq(enviosCafeteria.estado, q.estado as any));
+    }
     const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 300);
 
     const rows = await this.db.select({
@@ -204,8 +286,9 @@ export class CafeteriaService {
   }
 
   /**
-   * Anular revierte el stock con la operación contraria (el envío reingresa;
-   * la devolución vuelve a egresar — y si ese stock ya no está, se rechaza:
+   * Anular deshace EXACTAMENTE lo de su etapa: un pedido no tocó stock; lo que
+   * está en tránsito vuelve a disponible; lo recibido reingresa (y la
+   * devolución anulada vuelve a egresar — si ese stock ya no está, se rechaza:
    * un inventario en negativo no se recupera más).
    */
   async anular(id: number, o: AnularEnvioDto) {
@@ -213,12 +296,14 @@ export class CafeteriaService {
     return this.db.transaction(async (tx) => {
       const [envio] = await tx.select().from(enviosCafeteria).where(eq(enviosCafeteria.id, id)).limit(1);
       if (!envio) throw new NotFoundException('Envío inexistente.');
-      // Reclamo atómico del estado: dos anulaciones simultáneas duplicarían el reingreso.
+      if (envio.estado === 'anulado') throw new BadRequestException('El envío ya está anulado.');
+      // Reclamo atómico del estado: dos anulaciones simultáneas duplicarían la
+      // reversión, y anular mientras otro avanza revertiría la etapa equivocada.
       const gano = await tx.update(enviosCafeteria)
         .set({ estado: 'anulado', motivoAnulacion: o.motivo.trim() })
-        .where(and(eq(enviosCafeteria.id, id), eq(enviosCafeteria.estado, 'confirmado')))
+        .where(and(eq(enviosCafeteria.id, id), eq(enviosCafeteria.estado, envio.estado)))
         .returning({ id: enviosCafeteria.id });
-      if (!gano.length) throw new BadRequestException('El envío ya está anulado.');
+      if (!gano.length) throw new BadRequestException('El envío cambió de estado — actualizá la pantalla.');
 
       const items = await tx.select().from(envioCafeteriaItems).where(eq(envioCafeteriaItems.envioId, id));
       const paraStock = {
@@ -226,16 +311,23 @@ export class CafeteriaService {
         usuarioId: o.usuarioId ?? null,
         items: items.map((f) => ({ productoId: f.productoId, presentacionId: f.presentacionId, cantidad: f.cantidad })),
       };
-      if (envio.tipo === 'envio') {
-        await this.inv.reingresarStockItems(tx, {
-          ...paraStock, descripcion: `${envio.codigo}: envío a Cafetería ANULADO — reingreso`,
-        });
-      } else {
+      if (envio.tipo === 'devolucion') {
+        // La devolución había reingresado: vuelve a salir.
         await this.inv.egresarStockItems(tx, {
           ...paraStock, tipoMovimiento: 'envio_cafeteria',
           descripcion: `${envio.codigo}: devolución de Cafetería ANULADA — vuelve a salir`,
         });
+      } else if (envio.estado === 'transito') {
+        await this.inv.transitarStockItems(tx, {
+          ...paraStock, volver: true, tipoMovimiento: 'envio_cafeteria',
+          descripcion: `${envio.codigo}: despacho ANULADO — vuelve a disponible`,
+        });
+      } else if (envio.estado === 'recibido') {
+        await this.inv.reingresarStockItems(tx, {
+          ...paraStock, descripcion: `${envio.codigo}: envío a Cafetería ANULADO — reingreso`,
+        });
       }
+      // estado 'pedido': nunca tocó stock — no hay nada que revertir.
       return { ok: true };
     });
   }
@@ -249,7 +341,9 @@ export class CafeteriaService {
     const desde = fechaLocal(q.desde);
     const hasta = fechaLocal(q.hasta);
     if (hasta) hasta.setHours(23, 59, 59, 999);
-    const condsEnvio: any[] = [eq(enviosCafeteria.estado, 'confirmado')];
+    // Cuenta lo que SALIÓ (en tránsito o recibido): un pedido todavía no es
+    // costo — es demanda, y su importe es solo un estimado.
+    const condsEnvio: any[] = [inArray(enviosCafeteria.estado, ['transito', 'recibido'])];
     const condsGasto: any[] = [eq(gastos.negocio, 'cafeteria'), ne(gastos.estado, 'anulado')];
     if (desde) { condsEnvio.push(gte(enviosCafeteria.fecha, desde)); condsGasto.push(gte(gastos.fecha, desde)); }
     if (hasta) { condsEnvio.push(lte(enviosCafeteria.fecha, hasta)); condsGasto.push(lte(gastos.fecha, hasta)); }
@@ -286,9 +380,10 @@ export class CafeteriaController {
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
     @Query('tipo') tipo?: string,
+    @Query('estado') estado?: string,
     @Query('limit') limit?: string,
   ) {
-    return this.svc.list({ desde, hasta, tipo, limit: limit ? Number(limit) : undefined });
+    return this.svc.list({ desde, hasta, tipo, estado, limit: limit ? Number(limit) : undefined });
   }
 
   @Get('resumen') resumen(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
@@ -301,6 +396,10 @@ export class CafeteriaController {
 
   @Post('envios') crear(@Body() dto: CrearEnvioDto) {
     return this.svc.crear(dto);
+  }
+
+  @Post('envios/:id/avanzar') avanzar(@Param('id', ParseIntPipe) id: number, @Body() dto: AvanzarEnvioDto) {
+    return this.svc.avanzar(id, dto);
   }
 
   @Post('envios/:id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularEnvioDto) {

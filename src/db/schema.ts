@@ -1337,7 +1337,12 @@ export const gastos = pgTable('gastos', {
 export const tipoEnvioCafeEnum = pgEnum('tipo_envio_cafe', ['envio', 'devolucion']);
 /** Qué hace la cafetería con esto: reventa tal cual, o insumo de receta. Le importa a coffit. */
 export const destinoEnvioCafeEnum = pgEnum('destino_envio_cafe', ['venta', 'uso']);
-export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['confirmado', 'anulado']);
+/**
+ * Ciclo de vida, con el stock acompañando: pedido (demanda, sin stock) →
+ * transito (disponible → en_transito, costo congelado) → recibido (egresa del
+ * CRM). La devolución nace 'recibido'. Anular deshace lo de su etapa.
+ */
+export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['pedido', 'transito', 'recibido', 'anulado']);
 
 export const enviosCafeteria = pgTable('envios_cafeteria', {
   id: serial('id').primaryKey(),
@@ -1347,7 +1352,7 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
   /** De qué sucursal sale la mercadería (o adónde vuelve en la devolución). */
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-  estado: estadoEnvioCafeEnum('estado').notNull().default('confirmado'),
+  estado: estadoEnvioCafeEnum('estado').notNull().default('pedido'),
   /** Suma de renglones a costo — lo que este envío le "cuesta" a la cafetería. */
   totalCosto: doublePrecision('total_costo').notNull().default(0),
   observaciones: text('observaciones').notNull().default(''),
