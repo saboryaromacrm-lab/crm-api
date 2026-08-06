@@ -23,6 +23,7 @@ import { WebModule } from './web/web.module';
 import { GastosModule } from './gastos/gastos.module';
 import { PagosModule } from './pagos/pagos.module';
 import { CafeteriaModule } from './cafeteria/cafeteria.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -51,6 +52,7 @@ import { CafeteriaModule } from './cafeteria/cafeteria.module';
     PagosModule,
     GastosModule,
     CafeteriaModule,
+    ChatModule,
   ],
   controllers: [HealthController],
 })

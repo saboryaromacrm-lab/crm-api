@@ -1361,6 +1361,35 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
 }));
 
+/* ============================================================================
+ * CHAT INTERNO — el mostrador le pregunta a administración sin dejar el puesto
+ * ============================================================================
+ * Un canal por sucursal (hoy habilitado SOLO en la distribuidora: el gate lo
+ * decide la API por el tipo de sucursal, no el cliente). Sin WebSockets: el
+ * cliente pollea como los demás avisos del sistema, y la base es la verdad —
+ * historial consultable, sobrevive recargas, y el que llega tarde ve todo.
+ * `chat_lecturas` guarda hasta dónde leyó cada usuario: el "no leídos" es por
+ * usuario y sobrevive al F5 (no vive en el navegador).
+ */
+export const chatMensajes = pgTable('chat_mensajes', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  texto: text('texto').notNull(),
+}, (t) => ({
+  ixCanal: index('ix_chat_mensajes_canal').on(t.sucursalId, t.id),
+}));
+
+export const chatLecturas = pgTable('chat_lecturas', {
+  id: serial('id').primaryKey(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
+  ultimoMensajeId: integer('ultimo_mensaje_id').notNull().default(0),
+}, (t) => ({
+  uq: uniqueIndex('uq_chat_lectura').on(t.sucursalId, t.usuarioId),
+}));
+
 export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
   id: serial('id').primaryKey(),
   envioId: integer('envio_id').notNull().references(() => enviosCafeteria.id, { onDelete: 'cascade' }),
