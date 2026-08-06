@@ -1376,18 +1376,23 @@ export const chatMensajes = pgTable('chat_mensajes', {
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** NULL = canal grupal del local; con valor = mensaje PRIVADO para ese usuario. */
+  paraUsuarioId: integer('para_usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   texto: text('texto').notNull(),
 }, (t) => ({
   ixCanal: index('ix_chat_mensajes_canal').on(t.sucursalId, t.id),
+  ixPara: index('ix_chat_mensajes_para').on(t.sucursalId, t.paraUsuarioId, t.id),
 }));
 
 export const chatLecturas = pgTable('chat_lecturas', {
   id: serial('id').primaryKey(),
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
   usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
+  /** Qué conversación: 0 = canal grupal; otro valor = el privado con ESE usuario. */
+  canalUsuarioId: integer('canal_usuario_id').notNull().default(0),
   ultimoMensajeId: integer('ultimo_mensaje_id').notNull().default(0),
 }, (t) => ({
-  uq: uniqueIndex('uq_chat_lectura').on(t.sucursalId, t.usuarioId),
+  uq: uniqueIndex('uq_chat_lectura').on(t.sucursalId, t.usuarioId, t.canalUsuarioId),
 }));
 
 export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
