@@ -32,7 +32,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, isNotNull, isNull, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   cajaMovimientos, cajaSesiones, comprobantes, gastos, proveedorImputaciones,
@@ -116,6 +116,23 @@ export class PagosProveedorService {
       // Un gasto anulado no vuelve a la vida por una imputación.
       estado: g.estado === 'anulado' ? 'anulado' : (pagado >= money(g.total) - EPS ? 'pagado' : 'pendiente'),
     }).where(eq(gastos.id, gastoId));
+  }
+
+  /**
+   * EL AJUSTE QUE LE HICIERON SUS NOTAS a un comprobante: la ND suma, la NC
+   * resta. Va con `tx` porque la validación de "no le podés aplicar más" corre
+   * dentro de la transacción que imputa, y ahí el saldo tiene que ser el de este
+   * instante — no el de cuando se pintó la pantalla.
+   */
+  private async ajusteDe(tx: any, comprobanteId: number) {
+    const [r] = await tx.select({
+      total: sql<number>`coalesce(sum(case when ${comprobantes.tipo} = 'nota_debito' then ${comprobantes.total} else -${comprobantes.total} end), 0)`,
+    }).from(comprobantes).where(and(
+      eq(comprobantes.refComprobanteId, comprobanteId),
+      inArray(comprobantes.tipo, ['nota_credito', 'nota_debito']),
+      eq(comprobantes.estado, 'confirmado'),
+    ));
+    return money(Number(r?.total) || 0);
   }
 
   private async recalcularComprobante(tx: any, comprobanteId: number) {
@@ -287,13 +304,57 @@ export class PagosProveedorService {
         ne(gastos.estado, 'anulado'),
         sql`${gastos.total} - ${gastos.pagado} > ${EPS}`,
       )).orderBy(gastos.fecha),
+      /*
+       * EL SALDO DE LA FACTURA DESCUENTA SUS NOTAS.
+       * ------------------------------------------------------------------------
+       * `total - pagado` no alcanzaba: una NC de $50.000 contra una factura de
+       * $200.000 restaba de la deuda TOTAL del proveedor, pero acá la factura
+       * seguía ofreciendo $200.000 — y el que paga factura por factura le pagaba
+       * de más. Ahora el saldo suma las ND y resta las NC que la referencian.
+       *
+       * Y la ND que referencia una factura NO se lista aparte: su importe ya
+       * está sumado en el saldo de esa factura, así que listarla también sería
+       * cobrarla dos veces. La ND sin referencia sí sigue siendo un documento
+       * pagable por sí mismo (un ajuste general del proveedor).
+       *
+       * NO se filtra el saldo en SQL a propósito. Se probó con una subconsulta
+       * correlacionada y **falló en silencio**: Drizzle renderiza la columna del
+       * SELECT sin calificar (`"id"`), así que dentro de la subconsulta esa `id`
+       * resolvía a la fila de ADENTRO y la condición quedaba
+       * `n.ref_comprobante_id = n.id` — nunca verdadera, ajuste siempre 0, sin
+       * ningún error. El ajuste se calcula abajo en JS: es una consulta más, el
+       * conjunto es de UN proveedor, y no hay correlación que se rompa sola.
+       *
+       * Tampoco se prefiltra por `total - pagado > 0`: una factura ya pagada a la
+       * que después le llega una ND vuelve a deber, y ese prefiltro la habría
+       * escondido.
+       */
       destino === 'gastos' ? [] : this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
         inArray(comprobantes.tipo, ['factura', 'nota_debito']),
-        sql`${comprobantes.total} - ${comprobantes.pagado} > ${EPS}`,
+        // La ND que ajusta una factura vive dentro del saldo de esa factura.
+        or(ne(comprobantes.tipo, 'nota_debito'), isNull(comprobantes.refComprobanteId)),
       )).orderBy(comprobantes.fecha),
     ]);
+
+    /* Lo que las notas le sumaron o restaron a cada uno de esos documentos. */
+    const ajustes = new Map<number, number>();
+    if (cs.length) {
+      const notas = await this.db.select({
+        ref: comprobantes.refComprobanteId,
+        tipo: comprobantes.tipo,
+        total: comprobantes.total,
+      }).from(comprobantes).where(and(
+        inArray(comprobantes.refComprobanteId, cs.map((c) => c.id)),
+        inArray(comprobantes.tipo, ['nota_credito', 'nota_debito']),
+        eq(comprobantes.estado, 'confirmado'),
+      ));
+      for (const n of notas) {
+        const signo = n.tipo === 'nota_debito' ? 1 : -1;
+        ajustes.set(n.ref!, money((ajustes.get(n.ref!) ?? 0) + signo * n.total));
+      }
+    }
 
     return [
       ...gs.map((g) => ({
@@ -307,17 +368,24 @@ export class PagosProveedorService {
         pagado: g.pagado,
         saldo: money(g.total - g.pagado),
       })),
-      ...cs.map((c) => ({
-        tipo: 'comprobante' as const,
-        docId: c.id,
-        fecha: c.fecha,
-        vencimiento: c.vencimientoPago,
-        etiqueta: `${c.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${c.letra} ${c.puntoVenta}-${c.numero ?? c.id}`,
-        detalle: c.observaciones,
-        total: c.total,
-        pagado: c.pagado,
-        saldo: money(c.total - c.pagado),
-      })),
+      ...cs.map((c) => {
+        const ajuste = ajustes.get(c.id) ?? 0;
+        return {
+          tipo: 'comprobante' as const,
+          docId: c.id,
+          fecha: c.fecha,
+          vencimiento: c.vencimientoPago,
+          etiqueta: `${c.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${c.letra} ${c.puntoVenta}-${c.numero ?? c.id}`,
+          detalle: c.observaciones,
+          total: c.total,
+          pagado: c.pagado,
+          // Lo que le sumaron o restaron sus notas. Viaja para que la pantalla
+          // pueda decir POR QUÉ el saldo no es total − pagado.
+          ajuste: money(ajuste),
+          saldo: money(c.total + ajuste - c.pagado),
+        };
+      // Saldado (o dado vuelta por una NC grande) no se ofrece para pagar.
+      }).filter((d) => d.saldo > EPS),
     ].sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime());
   }
 
@@ -520,8 +588,26 @@ export class PagosProveedorService {
         if (c.estado !== 'confirmado') throw new BadRequestException('Ese comprobante no está confirmado.');
         if (c.tipo === 'nota_credito') throw new BadRequestException('Una nota de crédito no se paga: descuenta deuda.');
         docProveedorId = c.proveedorId;
-        saldoDoc = money(c.total - c.pagado);
         etiqueta = `${c.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${c.letra} ${c.puntoVenta}-${c.numero ?? c.id}`;
+        /*
+         * ESTA es la guarda que de verdad impide pagar de más, y hasta ahora
+         * ignoraba las notas: con `total - pagado` se le podían aplicar los
+         * $200.000 enteros a una factura que una NC ya había bajado a $150.000.
+         * Arreglar solo la bandeja no alcanzaba — la bandeja es lo que se ofrece,
+         * esto es lo que se acepta.
+         */
+        const ajuste = await this.ajusteDe(tx, c.id);
+        saldoDoc = money(c.total + ajuste - c.pagado);
+        /*
+         * Una ND que ajusta una factura no se paga por su cuenta: su importe ya
+         * está sumado en el saldo de esa factura. Pagarla aparte sería pagar dos
+         * veces el mismo ajuste.
+         */
+        if (c.tipo === 'nota_debito' && c.refComprobanteId) {
+          throw new BadRequestException(
+            `${etiqueta} ajusta a otra factura: se paga dentro del saldo de esa factura, no por separado.`,
+          );
+        }
       }
 
       // El pago de Coca-Cola no puede pagar la factura de otro proveedor.

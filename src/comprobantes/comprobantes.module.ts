@@ -22,6 +22,14 @@ const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
+/** "Factura A 0115-00193307". La misma etiqueta en la tabla, el detalle y el error. */
+const ABREV_TIPO: Record<string, string> = {
+  orden_compra: 'OC', remito: 'Remito', factura: 'Factura', nota_credito: 'NC', nota_debito: 'ND',
+};
+const etiquetaDoc = (c: { tipo: string; letra?: string | null; puntoVenta?: string | null; numero?: number | null; id?: number }) =>
+  `${ABREV_TIPO[c.tipo] ?? c.tipo} ${c.letra ?? ''} ${c.puntoVenta ?? ''}-${String(c.numero ?? c.id ?? '').padStart(8, '0')}`
+    .replace(/\s+/g, ' ').trim();
+
 /** Para que los mensajes de error se lean como los diría una persona. */
 const NOMBRE_TIPO: Record<(typeof TIPOS)[number], string> = {
   orden_compra: 'la orden de compra',
@@ -165,6 +173,60 @@ export class ComprobantesService {
   }
 
   /**
+   * LAS NOTAS QUE AJUSTAN CADA FACTURA, en una consulta para todas.
+   * ============================================================================
+   * Una nota de crédito o de débito casi nunca vive sola: nace de UNA factura —
+   * la mercadería que se devolvió de esa entrega, el flete que se olvidaron de
+   * cobrar en ese remito. `refComprobanteId` guarda de cuál.
+   *
+   * Sin esto, la NC solo restaba de la deuda TOTAL del proveedor y la factura
+   * seguía ofreciendo su importe entero para pagar: el que paga factura por
+   * factura le pagaba de más, aunque la cuenta del proveedor cerrara bien.
+   *
+   * Signo: la **ND suma** (el proveedor cobra más por esa factura) y la
+   * **NC resta**. Devuelve un Map por el id de la FACTURA referenciada.
+   */
+  private async ajustesDe(idsFactura: number[]) {
+    const porFactura = new Map<number, { ajuste: number; notas: any[] }>();
+    if (!idsFactura.length) return porFactura;
+
+    const notas = await this.db.select({
+      id: comprobantes.id,
+      tipo: comprobantes.tipo,
+      letra: comprobantes.letra,
+      puntoVenta: comprobantes.puntoVenta,
+      numero: comprobantes.numero,
+      fecha: comprobantes.fecha,
+      total: comprobantes.total,
+      observaciones: comprobantes.observaciones,
+      refComprobanteId: comprobantes.refComprobanteId,
+    }).from(comprobantes).where(and(
+      inArray(comprobantes.refComprobanteId, idsFactura),
+      inArray(comprobantes.tipo, ['nota_credito', 'nota_debito']),
+      eq(comprobantes.estado, 'confirmado'),
+    )).orderBy(comprobantes.id);
+
+    for (const n of notas) {
+      const ref = n.refComprobanteId!;
+      const acc = porFactura.get(ref) ?? { ajuste: 0, notas: [] };
+      const signo = n.tipo === 'nota_debito' ? 1 : -1;
+      acc.ajuste = r2(acc.ajuste + signo * n.total);
+      acc.notas.push({ ...n, signo });
+      porFactura.set(ref, acc);
+    }
+    return porFactura;
+  }
+
+  /**
+   * El saldo de VERDAD de un comprobante: lo que dice el papel, más lo que sus
+   * notas de débito le agregaron, menos lo que sus notas de crédito le
+   * descontaron, menos lo que ya se pagó.
+   */
+  private saldoReal(c: { total: number; pagado: number }, ajuste = 0) {
+    return r2(c.total + ajuste - c.pagado);
+  }
+
+  /**
    * De dónde salió la plata de estos comprobantes, en UNA consulta para todos.
    *
    * Es lo que hace identificable en la tabla que una factura se pagó con plata
@@ -221,10 +283,11 @@ export class ComprobantesService {
      * cada vez que se abre la pantalla.
      */
     const ids = rows.map((c) => c.id);
-    const [items, pagos, percs] = await Promise.all([
+    const [items, pagos, percs, ajustes] = await Promise.all([
       this.db.select().from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, ids)),
       this.pagosDe(ids),
       this.db.select().from(comprobantePercepciones).where(inArray(comprobantePercepciones.comprobanteId, ids)),
+      this.ajustesDe(ids),
     ]);
     const itemsPorId = new Map<number, any[]>();
     for (const it of items) {
@@ -239,13 +302,41 @@ export class ComprobantesService {
       percsPorId.set(p.comprobanteId, arr);
     }
 
-    return rows.map((c) => ({
-      ...c,
-      items: itemsPorId.get(c.id) ?? [],
-      percepciones: percsPorId.get(c.id) ?? [],
-      pagos: pagos.get(c.id) ?? [],
-      saldo: Math.round((c.total - c.pagado) * 100) / 100,
-    }));
+    /*
+     * La etiqueta de la factura que ajusta cada nota, para que la tabla pueda
+     * decir "NC de la Factura A 0115-193307" sin pedir el detalle.
+     *
+     * Se piden las referenciadas que NO están en el resultado: con el filtro
+     * puesto en "notas de crédito", la factura de la que salen no viene en
+     * `rows` y la etiqueta quedaba vacía justo donde más se necesita.
+     */
+    const etiquetas = new Map<number, string>(rows.map((c) => [c.id, etiquetaDoc(c)]));
+    const refsFaltantes = [...new Set(
+      rows.map((c) => c.refComprobanteId).filter((x): x is number => !!x && !etiquetas.has(x)),
+    )];
+    if (refsFaltantes.length) {
+      const refs = await this.db.select({
+        id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra,
+        puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero,
+      }).from(comprobantes).where(inArray(comprobantes.id, refsFaltantes));
+      for (const r of refs) etiquetas.set(r.id, etiquetaDoc(r));
+    }
+
+    return rows.map((c) => {
+      const aj = ajustes.get(c.id);
+      return {
+        ...c,
+        items: itemsPorId.get(c.id) ?? [],
+        percepciones: percsPorId.get(c.id) ?? [],
+        pagos: pagos.get(c.id) ?? [],
+        // Lo que sus notas le sumaron o restaron, y cuáles fueron.
+        ajuste: aj?.ajuste ?? 0,
+        notas: aj?.notas ?? [],
+        // Si ESTA fila es una nota: a qué factura pertenece.
+        refEtiqueta: c.refComprobanteId ? (etiquetas.get(c.refComprobanteId) ?? '') : '',
+        saldo: this.saldoReal(c, aj?.ajuste ?? 0),
+      };
+    });
   }
 
   /**
@@ -271,13 +362,64 @@ export class ComprobantesService {
         .where(eq(facturaLecturas.comprobanteId, id))
         .orderBy(facturaArchivos.id),
     ]);
+
+    /* Las dos puntas del vínculo con las notas: si es una FACTURA, cuáles la
+     * ajustan; si es una NOTA, de qué factura salió. El detalle tiene que poder
+     * explicar el total sin que nadie cruce dos pantallas. */
+    const ajustes = await this.ajustesDe([id]);
+    const aj = ajustes.get(id);
+    let ref: any = null;
+    if (c.refComprobanteId) {
+      const [r] = await this.db.select().from(comprobantes)
+        .where(eq(comprobantes.id, c.refComprobanteId)).limit(1);
+      if (r) ref = { id: r.id, etiqueta: etiquetaDoc(r), fecha: r.fecha, total: r.total };
+    }
+
     return {
       ...conItems,
       percepciones,
       papeles,
       pagos: pagos.get(id) ?? [],
-      saldo: Math.round((c.total - c.pagado) * 100) / 100,
+      ajuste: aj?.ajuste ?? 0,
+      notas: aj?.notas ?? [],
+      ref,
+      refEtiqueta: ref?.etiqueta ?? '',
+      saldo: this.saldoReal(c, aj?.ajuste ?? 0),
     };
+  }
+
+  /**
+   * LAS FACTURAS QUE UNA NOTA PUEDE AJUSTAR.
+   * ============================================================================
+   * Alimenta el selector del paso 3 al cargar una NC o una ND. Solo facturas
+   * confirmadas del MISMO proveedor: una nota no puede ajustar la factura de
+   * otro, ni un remito (que no genera deuda), ni otra nota.
+   *
+   * Cada una viene con su saldo REAL —descontando lo pagado y lo que ya le
+   * ajustaron otras notas— porque es el número contra el que el usuario decide.
+   */
+  async referenciables(proveedorId: number) {
+    const facturas = await this.db.select().from(comprobantes).where(and(
+      eq(comprobantes.proveedorId, proveedorId),
+      eq(comprobantes.tipo, 'factura'),
+      eq(comprobantes.estado, 'confirmado'),
+    )).orderBy(desc(comprobantes.fecha), desc(comprobantes.id));
+    if (!facturas.length) return [];
+
+    const ajustes = await this.ajustesDe(facturas.map((f) => f.id));
+    return facturas.map((f) => {
+      const aj = ajustes.get(f.id);
+      return {
+        id: f.id,
+        etiqueta: etiquetaDoc(f),
+        fecha: f.fecha,
+        total: f.total,
+        pagado: f.pagado,
+        ajuste: aj?.ajuste ?? 0,
+        notas: (aj?.notas ?? []).length,
+        saldo: this.saldoReal(f, aj?.ajuste ?? 0),
+      };
+    });
   }
 
   async create(dto: CreateComprobanteDto) {
@@ -369,6 +511,39 @@ export class ComprobantesService {
     const egresaStock = estado !== 'anulado' && !!dto.recepcion && dto.tipo === 'nota_credito';
     if ((ingresaStock || egresaStock) && !dto.sucursalId) {
       throw new BadRequestException('Indicá la sucursal de recepción.');
+    }
+
+    /**
+     * LA FACTURA QUE LA NOTA AJUSTA.
+     * ==========================================================================
+     * Una NC o ND nace de UNA factura: la mercadería que se devolvió de esa
+     * entrega, el flete que no se cobró en ese remito. Atarla es lo que hace que
+     * el saldo de esa factura diga la verdad — sin la referencia, la NC restaba
+     * de la deuda total del proveedor y la factura seguía ofreciendo su importe
+     * entero para pagar.
+     *
+     * Se valida acá y no en el DTO porque son reglas de datos, no de forma: el
+     * proveedor tiene que ser el mismo, tiene que ser una factura (un remito no
+     * genera deuda y una nota no se ajusta con otra nota) y tiene que estar
+     * confirmada.
+     */
+    const esNota = dto.tipo === 'nota_credito' || dto.tipo === 'nota_debito';
+    if (dto.refComprobanteId != null) {
+      if (!esNota) {
+        throw new BadRequestException('Solo una nota de crédito o de débito ajusta a otro comprobante.');
+      }
+      const [ref] = await this.db.select().from(comprobantes)
+        .where(eq(comprobantes.id, dto.refComprobanteId)).limit(1);
+      if (!ref) throw new BadRequestException('La factura que se quiere ajustar no existe.');
+      if (ref.proveedorId !== prov.id) {
+        throw new BadRequestException(`Esa factura no es de ${prov.nombre}: una nota no puede ajustar la factura de otro proveedor.`);
+      }
+      if (ref.tipo !== 'factura') {
+        throw new BadRequestException(`Una nota solo ajusta una factura, y ${etiquetaDoc(ref)} no lo es.`);
+      }
+      if (ref.estado !== 'confirmado') {
+        throw new BadRequestException(`${etiquetaDoc(ref)} está ${ref.estado}: no se le pueden aplicar notas.`);
+      }
     }
 
     /**
@@ -603,8 +778,32 @@ export class ComprobantesService {
       if (c.tipo === 'factura' || c.tipo === 'nota_debito') { deuda += c.total; pagado += c.pagado; }
       else if (c.tipo === 'nota_credito') deuda -= c.total;
     }
-    const r2 = (n: number) => Math.round(n * 100) / 100;
-    return { proveedorId, saldo: r2(deuda - pagado), deuda: r2(deuda), pagado: r2(pagado), comprobantes: cs };
+    /*
+     * El TOTAL del proveedor no cambia por atar las notas a su factura —una NC
+     * resta de la deuda igual, referenciada o no—, así que este número siguió
+     * estando bien todo este tiempo. Lo que cambia es la ATRIBUCIÓN: cada
+     * comprobante viene con su ajuste y su saldo real, que es lo que estaba mal
+     * cuando se pagaba factura por factura.
+     */
+    const ajustes = await this.ajustesDe(cs.map((c) => c.id));
+    const etiquetas = new Map(cs.map((c) => [c.id, etiquetaDoc(c)]));
+    const conAjuste = cs.map((c) => {
+      const aj = ajustes.get(c.id);
+      return {
+        ...c,
+        ajuste: aj?.ajuste ?? 0,
+        notas: aj?.notas ?? [],
+        refEtiqueta: c.refComprobanteId ? (etiquetas.get(c.refComprobanteId) ?? '') : '',
+        saldo: this.saldoReal(c, aj?.ajuste ?? 0),
+      };
+    });
+    return {
+      proveedorId,
+      saldo: r2(deuda - pagado),
+      deuda: r2(deuda),
+      pagado: r2(pagado),
+      comprobantes: conAjuste,
+    };
   }
 }
 
@@ -620,6 +819,12 @@ export class ComprobantesController {
   @Get('cuenta/:proveedorId')
   cuenta(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
     return this.svc.cuenta(proveedorId);
+  }
+
+  /** Las facturas que una NC/ND de este proveedor puede ajustar, con su saldo. */
+  @Get('referenciables/:proveedorId')
+  referenciables(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
+    return this.svc.referenciables(proveedorId);
   }
 
   @Get(':id')
