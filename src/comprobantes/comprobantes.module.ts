@@ -12,6 +12,10 @@ import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas,
   productoProveedores, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
+/* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
+ * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
+ * y este módulo ya importa de `pagos`: exportarla desde acá cerraba el ciclo. */
+import { etiquetaDoc } from '../common/documentos';
 import { normalizarPuntoVenta } from '../facturas/facturas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
@@ -21,14 +25,6 @@ import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'] as const;
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
-
-/** "Factura A 0115-00193307". La misma etiqueta en la tabla, el detalle y el error. */
-const ABREV_TIPO: Record<string, string> = {
-  orden_compra: 'OC', remito: 'Remito', factura: 'Factura', nota_credito: 'NC', nota_debito: 'ND',
-};
-const etiquetaDoc = (c: { tipo: string; letra?: string | null; puntoVenta?: string | null; numero?: number | null; id?: number }) =>
-  `${ABREV_TIPO[c.tipo] ?? c.tipo} ${c.letra ?? ''} ${c.puntoVenta ?? ''}-${String(c.numero ?? c.id ?? '').padStart(8, '0')}`
-    .replace(/\s+/g, ' ').trim();
 
 /** Para que los mensajes de error se lean como los diría una persona. */
 const NOMBRE_TIPO: Record<(typeof TIPOS)[number], string> = {

@@ -30,10 +30,12 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
+  IsArray, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
+  MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import {
   cajaMovimientos, cajaSesiones, comprobantes, gastos, proveedorImputaciones,
   proveedorPagos, proveedores, sucursales, usuarios,
@@ -47,10 +49,20 @@ const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito'
 
 /* --------------------------------- DTOs --------------------------------- */
 
+/**
+ * Una fecha en formato 'AAAA-MM-DD' y nada más.
+ *
+ * No es cosmético: los filtros del listado hacían `new Date(q.desde).toISOString()`
+ * sobre lo que llegara, y `new Date('abc').toISOString()` **tira una excepción**
+ * (`RangeError: Invalid time value`) que salía como un 500. Validar el formato
+ * acá convierte ese 500 en el 400 que corresponde.
+ */
+const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
+
 export class ImputacionDto {
   @IsOptional() @IsInt() gastoId?: number;
   @IsOptional() @IsInt() comprobanteId?: number;
-  @IsNumber() importe!: number;
+  @IsNumber() @Min(0.01, { message: 'El importe a aplicar tiene que ser mayor a 0.' }) importe!: number;
 }
 
 export class CrearPagoDto {
@@ -61,16 +73,16 @@ export class CrearPagoDto {
    * viene, se infiere de la imputación o de las marcas del proveedor.
    */
   @IsOptional() @IsIn(['mercaderia', 'gastos']) destino?: 'mercaderia' | 'gastos';
-  @IsNumber() importe!: number;
+  @IsNumber() @Min(0.01, { message: 'El importe del pago tiene que ser mayor a 0.' }) importe!: number;
   @IsOptional() @IsIn(MEDIOS as unknown as string[]) medio?: string;
-  @IsOptional() @IsString() fecha?: string;
-  @IsOptional() @IsString() concepto?: string;
-  @IsOptional() @IsString() referencia?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
+  @IsOptional() @IsString() @MaxLength(300) concepto?: string;
+  @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsInt() sucursalId?: number;
   /** Turno del que sale el efectivo: genera el egreso en esa caja. */
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsOptional() @IsString() observaciones?: string;
+  @IsOptional() @IsString() @MaxLength(1000) observaciones?: string;
   /** Imputación en el mismo acto (pagar una factura que ya está cargada). */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionDto)
   imputaciones?: ImputacionDto[];
@@ -80,6 +92,33 @@ export class ImputarDto {
   @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionDto)
   imputaciones!: ImputacionDto[];
   @IsOptional() @IsInt() usuarioId?: number;
+}
+
+/**
+ * Filtros del listado. Antes era `@Query() q: any`, y con eso el `whitelist` del
+ * ValidationPipe global no filtraba nada: cualquier campo entraba al servicio.
+ * Los números llegan como texto en la query string, de ahí los `IsNumberString`
+ * en vez de `IsInt` — el servicio ya los pasa por `Number()`.
+ */
+export class ListarPagosDto {
+  @IsOptional() @Matches(/^\d+$/) proveedorId?: string;
+  @IsOptional() @Matches(/^\d+$/) sucursalId?: string;
+  @IsOptional() @Matches(/^\d+$/) cajaSesionId?: string;
+  @IsOptional() @IsIn(['mercaderia', 'gastos']) destino?: string;
+  @IsOptional() @IsIn(['activo', 'anulado']) estado?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'El desde va como AAAA-MM-DD.' }) desde?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'El hasta va como AAAA-MM-DD.' }) hasta?: string;
+  @IsOptional() @IsBooleanString() sinAplicar?: string;
+  @IsOptional() @Matches(/^\d+$/) limit?: string;
+}
+
+export class AnularPagoDto {
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+export class CambiarDestinoDto {
+  @IsIn(['mercaderia', 'gastos'], { message: 'Destino inválido: mercadería o gastos.' })
+  destino!: 'mercaderia' | 'gastos';
 }
 
 /* ------------------------------- Servicio ------------------------------- */
@@ -186,7 +225,10 @@ export class PagosProveedorService {
     if (q.cajaSesionId) conds.push(eq(proveedorPagos.cajaSesionId, Number(q.cajaSesionId)));
     if (q.destino) conds.push(eq(proveedorPagos.destino, q.destino));
     if (q.estado) conds.push(eq(proveedorPagos.estado, q.estado));
-    if (q.desde) conds.push(sql`${proveedorPagos.fecha} >= ${new Date(q.desde).toISOString()}`);
+    /* Las dos puntas se arman en hora LOCAL. El `desde` usaba la fecha pelada,
+     * que JavaScript interpreta como medianoche UTC: en UTC−3 eso arrancaba a
+     * las 21:00 del día anterior y el filtro se comía tres horas de más. */
+    if (q.desde) conds.push(sql`${proveedorPagos.fecha} >= ${new Date(`${String(q.desde).slice(0, 10)}T00:00:00`).toISOString()}`);
     if (q.hasta) conds.push(sql`${proveedorPagos.fecha} <= ${new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`).toISOString()}`);
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
@@ -238,7 +280,7 @@ export class PagosProveedorService {
     for (const f of filas) {
       const etiqueta = f.gastoId
         ? `Gasto #${f.gastoId}${f.gastoNumero ? ` · ${f.gastoNumero}` : ''}`
-        : `${f.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${f.letra ?? ''} ${f.puntoVenta ?? ''}-${f.numero ?? f.comprobanteId}`.trim();
+        : etiquetaDoc({ tipo: f.tipo!, letra: f.letra, puntoVenta: f.puntoVenta, numero: f.numero, id: f.comprobanteId! });
       const arr = porId.get(f.pagoId) ?? [];
       arr.push({ etiqueta, importe: f.importe });
       porId.set(f.pagoId, arr);
@@ -263,6 +305,7 @@ export class PagosProveedorService {
       gastoDescripcion: gastos.descripcion,
       gastoNumero: gastos.numero,
       comprobanteTipo: comprobantes.tipo,
+      comprobanteLetra: comprobantes.letra,
       comprobantePv: comprobantes.puntoVenta,
       comprobanteNumero: comprobantes.numero,
     }).from(proveedorImputaciones)
@@ -277,9 +320,16 @@ export class PagosProveedorService {
       fecha: f.fecha,
       tipo: f.gastoId ? 'gasto' : 'comprobante',
       docId: f.gastoId ?? f.comprobanteId,
+      // Acá se veía `nota_debito 0001-123`: el valor crudo del enum, en pantalla.
       etiqueta: f.gastoId
         ? `Gasto #${f.gastoId}${f.gastoNumero ? ` · ${f.gastoNumero}` : ''}${f.gastoDescripcion ? ` · ${f.gastoDescripcion}` : ''}`
-        : `${f.comprobanteTipo ?? 'comprobante'} ${f.comprobantePv ?? ''}-${f.comprobanteNumero ?? f.comprobanteId}`,
+        : etiquetaDoc({
+          tipo: f.comprobanteTipo ?? 'comprobante',
+          letra: f.comprobanteLetra,
+          puntoVenta: f.comprobantePv,
+          numero: f.comprobanteNumero,
+          id: f.comprobanteId!,
+        }),
     }));
   }
 
@@ -375,7 +425,7 @@ export class PagosProveedorService {
           docId: c.id,
           fecha: c.fecha,
           vencimiento: c.vencimientoPago,
-          etiqueta: `${c.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${c.letra} ${c.puntoVenta}-${c.numero ?? c.id}`,
+          etiqueta: etiquetaDoc(c),
           detalle: c.observaciones,
           total: c.total,
           pagado: c.pagado,
@@ -501,8 +551,18 @@ export class PagosProveedorService {
        * un pago registrado sin su egreso descuadraría la caja de esa noche.
        */
       if (medio === 'efectivo' && dto.cajaSesionId) {
+        /*
+         * EL TURNO SE LEE CON CANDADO, y no es por el saldo: es contra el CIERRE.
+         *
+         * Sin candado, un cierre de caja simultáneo sumaba el arqueo, este egreso
+         * entraba después, y el turno quedaba cerrado con un egreso que
+         * `sistemaEfectivo` no contaba. La diferencia del arqueo quedaba mal por
+         * ese importe y **congelada en la fila**, así que no se detectaba más.
+         * Con el candado, uno de los dos espera: o el cierre cuenta el egreso, o
+         * el pago se rechaza porque el turno ya cerró. Las dos son correctas.
+         */
         const [sesion] = await tx.select().from(cajaSesiones)
-          .where(eq(cajaSesiones.id, Number(dto.cajaSesionId))).limit(1);
+          .where(eq(cajaSesiones.id, Number(dto.cajaSesionId))).limit(1).for('update');
         if (!sesion) throw new BadRequestException('Turno de caja inexistente.');
         if (sesion.estado !== 'abierta') {
           throw new BadRequestException('Ese turno de caja está cerrado: no se le pueden cargar egresos.');
@@ -646,8 +706,20 @@ export class PagosProveedorService {
         if (!c) throw new BadRequestException('Comprobante inexistente.');
         if (c.estado !== 'confirmado') throw new BadRequestException('Ese comprobante no está confirmado.');
         if (c.tipo === 'nota_credito') throw new BadRequestException('Una nota de crédito no se paga: descuenta deuda.');
+        /*
+         * Solo la factura y la ND generan deuda. Antes solo se rechazaba la NC,
+         * así que una orden de compra o un remito se podían imputar por API
+         * directa y salían etiquetados como "Factura" — la pantalla no los
+         * ofrece (`documentosPendientes` filtra por tipo), pero lo que se acepta
+         * no puede depender de lo que se ofrece.
+         */
+        if (c.tipo !== 'factura' && c.tipo !== 'nota_debito') {
+          throw new BadRequestException(
+            `Un documento de tipo ${ABREV_TIPO[c.tipo] ?? c.tipo} no genera deuda: solo se pagan facturas y notas de débito.`,
+          );
+        }
         docProveedorId = c.proveedorId;
-        etiqueta = `${c.tipo === 'nota_debito' ? 'ND' : 'Factura'} ${c.letra} ${c.puntoVenta}-${c.numero ?? c.id}`;
+        etiqueta = etiquetaDoc(c);
         /*
          * ESTA es la guarda que de verdad impide pagar de más, y hasta ahora
          * ignoraba las notas: con `total - pagado` se le podían aplicar los
@@ -727,8 +799,10 @@ export class PagosProveedorService {
 
       if (pago && !pago.proveedorId) {
         if (pago.cajaMovimientoId) {
+          // Con candado, igual que al crear: el cierre no puede colarse entre el
+          // chequeo de "sigue abierta" y el borrado del movimiento.
           const [sesion] = await tx.select().from(cajaSesiones)
-            .where(eq(cajaSesiones.id, pago.cajaSesionId!)).limit(1);
+            .where(eq(cajaSesiones.id, pago.cajaSesionId!)).limit(1).for('update');
           if (sesion && sesion.estado !== 'abierta') {
             throw new BadRequestException(
               'Ese pago salió de un turno de caja ya cerrado: quitarlo rompería el arqueo. Registrá el reintegro como ingreso de caja del turno actual.',
@@ -754,17 +828,21 @@ export class PagosProveedorService {
    * revés). Solo mientras el pago no tenga NADA aplicado — con imputaciones,
    * el destino ya se materializó en documentos y moverlo mentiría.
    */
-  async cambiarDestino(id: number, destino: string) {
-    if (destino !== 'mercaderia' && destino !== 'gastos') {
-      throw new BadRequestException('Destino inválido: mercadería o gastos.');
-    }
-    const [p] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, id)).limit(1);
-    if (!p) throw new NotFoundException('Pago inexistente.');
-    if (p.estado !== 'activo') throw new BadRequestException('El pago está anulado.');
-    if (p.aplicado > EPS) {
-      throw new BadRequestException('El pago ya tiene documentos aplicados: quitá las aplicaciones antes de moverlo de bandeja.');
-    }
-    await this.db.update(proveedorPagos).set({ destino }).where(eq(proveedorPagos.id, id));
+  async cambiarDestino(id: number, destino: 'mercaderia' | 'gastos') {
+    // El destino ya viene validado por el DTO del controlador.
+    await this.db.transaction(async (tx) => {
+      /* Con candado y adentro de la transacción, como las otras tres: leído
+       * afuera, una imputación que entraba en el medio dejaba el pago movido de
+       * bandeja DESPUÉS de haberse materializado en un documento del otro mundo. */
+      const [p] = await tx.select().from(proveedorPagos)
+        .where(eq(proveedorPagos.id, id)).limit(1).for('update');
+      if (!p) throw new NotFoundException('Pago inexistente.');
+      if (p.estado !== 'activo') throw new BadRequestException('El pago está anulado.');
+      if (p.aplicado > EPS) {
+        throw new BadRequestException('El pago ya tiene documentos aplicados: quitá las aplicaciones antes de moverlo de bandeja.');
+      }
+      await tx.update(proveedorPagos).set({ destino }).where(eq(proveedorPagos.id, id));
+    });
     return this.get(id);
   }
 
@@ -792,8 +870,9 @@ export class PagosProveedorService {
       }
 
       if (p.cajaMovimientoId) {
+        // Con candado: ver `crear`. El cierre y este borrado se pelean la misma fila.
         const [sesion] = await tx.select().from(cajaSesiones)
-          .where(eq(cajaSesiones.id, p.cajaSesionId!)).limit(1);
+          .where(eq(cajaSesiones.id, p.cajaSesionId!)).limit(1).for('update');
         if (sesion && sesion.estado !== 'abierta') {
           throw new BadRequestException(
             'Ese pago salió de un turno de caja ya cerrado: anularlo rompería el arqueo. Registrá el reintegro como ingreso de caja del turno actual.',
@@ -871,18 +950,18 @@ export class PagosProveedorController {
     return this.svc.desimputar(id);
   }
 
-  @Get() list(@Query() q: any) { return this.svc.list(q ?? {}); }
+  @Get() list(@Query() q: ListarPagosDto) { return this.svc.list(q ?? {}); }
   @Post() crear(@Body() dto: CrearPagoDto) { return this.svc.crear(dto); }
 
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Post(':id/imputar') imputar(@Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto) {
     return this.svc.imputar(id, dto);
   }
-  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.anular(id, body?.motivo);
+  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPagoDto) {
+    return this.svc.anular(id, dto?.motivo);
   }
-  @Patch(':id/destino') destino(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.cambiarDestino(id, body?.destino);
+  @Patch(':id/destino') destino(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarDestinoDto) {
+    return this.svc.cambiarDestino(id, dto.destino);
   }
 }
 

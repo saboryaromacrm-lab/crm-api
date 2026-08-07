@@ -39,7 +39,9 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { createHash } from 'crypto';
-import { IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
+import {
+  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested,
+} from 'class-validator';
 import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -178,17 +180,51 @@ export function interpretarQr(texto: string): QrFactura | null {
  * ==========================================================================*/
 
 const MIMES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
-/** Por archivo, ya decodificado. Una foto comprimida a webp pesa ~200 KB. */
-const MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Por archivo, ya decodificado.
+ *
+ * Tiene que quedar POR DEBAJO del límite del body de `main.ts` (4 MB), o el tope
+ * no se alcanza nunca y el mensaje de error promete algo que no pasa: la request
+ * muere antes con un 413 pelado. En base64 los bytes crecen un 33%, así que
+ * 2,5 MB de archivo son ~3,4 MB de JSON — el margen que queda es para el resto
+ * del cuerpo. La pantalla comprime a ~200 KB, así que esto es solo el techo.
+ */
+const MAX_BYTES = Math.floor(2.5 * 1024 * 1024);
+/** Páginas por factura. Una factura larga tiene 3 o 4 hojas, no 200. */
+const MAX_PAGINAS = 20;
+
+/**
+ * FIRMAS DE ARCHIVO — los primeros bytes de verdad.
+ *
+ * El mime que llega en el prefijo de la data URL lo escribe el cliente: decir
+ * `data:image/png;base64,` y mandar cualquier otra cosa es gratis. Como el
+ * archivo después se sirve CON ese mime, creerle es alojar contenido arbitrario
+ * en el dominio del sistema. Estas firmas son el contraste contra los bytes.
+ */
+const FIRMAS: Array<{ mime: string; test: (b: Buffer) => boolean }> = [
+  { mime: 'image/jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { mime: 'image/png', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  // WebP es un contenedor RIFF: "RIFF" .... "WEBP".
+  { mime: 'image/webp', test: (b) => b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP' },
+  { mime: 'application/pdf', test: (b) => b.subarray(0, 5).toString('ascii') === '%PDF-' },
+];
+
+/** Qué es el archivo según sus bytes, o null si no es ninguno de los admitidos. */
+const mimeReal = (b: Buffer) => (b.length < 12 ? null : FIRMAS.find((f) => f.test(b))?.mime ?? null);
+
+/** Para el `filename` de la respuesta: sin comillas, saltos ni rutas. */
+const nombreSeguro = (n: string) => (n || 'factura').replace(/[^\w.\- ]+/g, '_').slice(0, 100);
 
 class ArchivoDto {
-  @IsOptional() @IsString() nombre?: string;
+  @IsOptional() @IsString() @MaxLength(160) nombre?: string;
   /** data URL completa: `data:image/webp;base64,…` */
   @IsString() data!: string;
 }
 
 class SubirLecturaDto {
-  @IsArray() @ValidateNested({ each: true }) @Type(() => ArchivoDto) archivos!: ArchivoDto[];
+  @IsArray() @ArrayMaxSize(MAX_PAGINAS) @ValidateNested({ each: true }) @Type(() => ArchivoDto)
+  archivos!: ArchivoDto[];
   /** Texto crudo del QR, leído en el navegador. Si no vino, se carga a mano. */
   @IsOptional() @IsString() qr?: string;
   @IsOptional() @IsInt() sucursalId?: number;
@@ -205,8 +241,10 @@ class PatchLecturaDto {
   @IsOptional() @IsString() puntoVenta?: string;
   @IsOptional() @IsInt() numero?: number;
   @IsOptional() @IsString() fecha?: string;
-  @IsOptional() @IsNumber() total?: number;
-  @IsOptional() @IsString() observaciones?: string;
+  /* El total del papel es la prueba de que los renglones cierran: en negativo no
+   * prueba nada, y con 0 el semáforo ya avisa que no se puede validar. */
+  @IsOptional() @IsNumber() @Min(0, { message: 'El total del papel no puede ser negativo.' }) total?: number;
+  @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
 }
 
 class DescartarDto {
@@ -241,15 +279,34 @@ export class FacturasService {
   private decodificar(a: ArchivoDto) {
     const m = /^data:([^;]+);base64,(.+)$/.exec(String(a?.data ?? ''));
     if (!m) throw new BadRequestException('El archivo tiene que llegar como data URL en base64.');
-    const [, mime, b64] = m;
-    if (!MIMES.includes(mime)) {
-      throw new BadRequestException(`Formato no admitido (${mime}). Se aceptan fotos JPG/PNG/WebP y PDF.`);
+    const [, declarado, b64] = m;
+    if (!MIMES.includes(declarado)) {
+      throw new BadRequestException(`Formato no admitido (${declarado}). Se aceptan fotos JPG/PNG/WebP y PDF.`);
     }
-    const bytes = Math.floor((b64.length * 3) / 4);
-    if (bytes > MAX_BYTES) {
-      throw new BadRequestException(`El archivo pesa ${Math.round(bytes / 1024 / 1024)} MB y el máximo es ${MAX_BYTES / 1024 / 1024} MB.`);
+
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length > MAX_BYTES) {
+      const mb = (n: number) => (n / 1024 / 1024).toFixed(1).replace('.', ',');
+      throw new BadRequestException(`El archivo pesa ${mb(buf.length)} MB y el máximo es ${mb(MAX_BYTES)} MB.`);
     }
-    return { nombre: String(a?.nombre ?? '').slice(0, 160), mime, data: b64 };
+
+    /*
+     * EL MIME SALE DE LOS BYTES, no de lo que dijo el cliente.
+     *
+     * Se guarda `real`, no `declarado`. Si no coinciden se rechaza en vez de
+     * corregir en silencio: un archivo cuyo contenido no es lo que dice ser no
+     * es un error de tipeo, y el papel de una factura no llega mal rotulado por
+     * accidente desde nuestra propia pantalla.
+     */
+    const real = mimeReal(buf);
+    if (!real) {
+      throw new BadRequestException('Ese archivo no es una foto JPG/PNG/WebP ni un PDF: no se pudo reconocer el contenido.');
+    }
+    if (real !== declarado) {
+      throw new BadRequestException(`El archivo dice ser ${declarado} pero su contenido es ${real}.`);
+    }
+
+    return { nombre: nombreSeguro(String(a?.nombre ?? '')), mime: real, data: b64 };
   }
 
   /**
@@ -327,6 +384,15 @@ export class FacturasService {
       .from(facturaLecturas).where(eq(facturaLecturas.id, lecturaId)).limit(1);
     if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
     if (l.estado !== 'pendiente') throw new BadRequestException('Esa factura ya se procesó.');
+
+    /* Tope de páginas: sin esto la tabla crece sin techo agregando de a una, y el
+     * límite del body no lo frena porque cada request es chica. */
+    const [n] = await this.db.select({ n: sql<number>`count(*)` })
+      .from(facturaArchivos).where(eq(facturaArchivos.lecturaId, lecturaId));
+    if (Number(n?.n) >= MAX_PAGINAS) {
+      throw new BadRequestException(`Esa factura ya tiene ${MAX_PAGINAS} páginas: si son más, cargala como dos.`);
+    }
+
     const a = this.decodificar(dto);
     await this.db.insert(facturaArchivos).values({ lecturaId, ...a });
     return this.get(lecturaId);
@@ -420,7 +486,8 @@ export class FacturasService {
       usuarioNombre: f.usuarioNombre ?? '',
       paginas: Number(f.paginas) || 0,
       duplicadoDe: f.dupComprobante ?? null,
-      mismoArchivo: f.dupLectura ?? null,
+      /* `dupLectura` NO viaja como campo propio: nadie lo leía. Lo que sí se usa
+       * es el amarillo que sale de él, acá abajo. */
       ...this.semaforo(f.l, { comprobanteId: f.dupComprobante, otraLectura: f.dupLectura }),
     }));
   }
@@ -436,25 +503,32 @@ export class FacturasService {
     const [l] = await this.db.select().from(facturaLecturas).where(eq(facturaLecturas.id, id)).limit(1);
     if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
 
-    /* Los bytes NUNCA viajan en el detalle: solo la lista de páginas, y cada
-     * una se pide por su URL cuando alguien la mira. */
-    const archivos = await this.db.select({
-      id: facturaArchivos.id, nombre: facturaArchivos.nombre, mime: facturaArchivos.mime,
-    }).from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id));
+    /* Las tres consultas que siguen no dependen entre sí, así que van juntas: en
+     * serie eran tres viajes a la base, y `subir` termina llamando acá.
+     *
+     * Los bytes NUNCA viajan en el detalle: solo la lista de páginas, y cada una
+     * se pide por su URL cuando alguien la mira. */
+    const [archivos, provs, dups] = await Promise.all([
+      this.db.select({
+        id: facturaArchivos.id, nombre: facturaArchivos.nombre, mime: facturaArchivos.mime,
+      }).from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id)),
 
-    const [prov] = l.proveedorId
-      ? await this.db.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
-      : [null as any];
+      l.proveedorId
+        ? this.db.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
+        : Promise.resolve([] as Array<{ nombre: string }>),
 
-    const [dup] = l.proveedorId && l.numero && l.tipo
-      ? await this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
-        eq(comprobantes.proveedorId, l.proveedorId),
-        eq(comprobantes.tipo, l.tipo),
-        eq(comprobantes.puntoVenta, l.puntoVenta),
-        eq(comprobantes.numero, l.numero),
-        ne(comprobantes.estado, 'anulado'),
-      )).limit(1)
-      : [null as any];
+      l.proveedorId && l.numero && l.tipo
+        ? this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
+          eq(comprobantes.proveedorId, l.proveedorId),
+          eq(comprobantes.tipo, l.tipo),
+          eq(comprobantes.puntoVenta, l.puntoVenta),
+          eq(comprobantes.numero, l.numero),
+          ne(comprobantes.estado, 'anulado'),
+        )).limit(1)
+        : Promise.resolve([] as Array<{ id: number }>),
+    ]);
+    const prov = provs[0];
+    const dup = dups[0];
 
     return {
       ...l,
@@ -470,6 +544,15 @@ export class FacturasService {
     const [a] = await this.db.select().from(facturaArchivos).where(eq(facturaArchivos.id, id)).limit(1);
     if (!a) throw new NotFoundException('Ese archivo no existe.');
     res.setHeader('Content-Type', a.mime);
+    /*
+     * `nosniff` corta el olfateo de contenido: sin él, un navegador puede decidir
+     * que el archivo "en realidad" es otra cosa y tratarlo como tal, y ahí un
+     * mime verificado al subir deja de servir de nada. Y `inline` con nombre
+     * explícito para que se vea al lado del formulario (es lo que se quiere) pero
+     * con un nombre saneado, no el que vino en el pedido.
+     */
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `inline; filename="${nombreSeguro(a.nombre)}"`);
     res.setHeader('Cache-Control', 'private, max-age=86400');
     res.end(Buffer.from(a.data, 'base64'));
   }

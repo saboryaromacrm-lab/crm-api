@@ -124,7 +124,24 @@ export class CobranzasService {
 
   /** Saldo real de cada venta, leído dentro de la transacción. */
   private async saldosEnTx(tx: any, ventaIds: number[]) {
-    const docs = await tx.select().from(ventas).where(inArray(ventas.id, ventaIds));
+    /*
+     * CON CANDADO, y es lo que hace confiable a la validación de más abajo.
+     *
+     * Postgres en READ COMMITTED no hace esperar a un `select` pelado: lee la
+     * última versión confirmada. Dos cobranzas simultáneas sobre la misma venta
+     * leían las dos el mismo saldo, las dos pasaban el "debe $X y estás imputando
+     * $Y", y las dos entraban — la venta terminaba cobrada de más. Es la misma
+     * carrera que tenía Pagos (ver Decisiones de diseño en /info).
+     *
+     * El agregado de imputaciones no se puede bloquear (es una suma), pero al
+     * bloquear la fila de la VENTA se serializa cualquier par de transacciones
+     * que toquen esa venta, y con eso la suma que se lee ya es estable.
+     *
+     * Si dos cobranzas toman las mismas dos ventas en orden distinto, Postgres
+     * detecta el abrazo y aborta una con error — ruidoso, no silencioso, que es
+     * lo que se quiere.
+     */
+    const docs = await tx.select().from(ventas).where(inArray(ventas.id, ventaIds)).for('update');
     const imput = await tx
       .select({
         ventaId: cobranzaImputaciones.ventaId,

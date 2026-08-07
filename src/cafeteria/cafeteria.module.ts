@@ -38,6 +38,7 @@ import {
   IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, gte, inArray, lte, ne, sql } from 'drizzle-orm';
+import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   enviosCafeteria, envioCafeteriaItems, gastos, presentaciones, productoProveedores,
@@ -49,12 +50,8 @@ import { costoNetoEntry, formatoActivo } from '../inventario/pricing';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
-/** Mismo parseo local que Gastos: 'AAAA-MM-DD' pelado se correría un día (UTC−3). */
-function fechaLocal(v?: string | null) {
-  if (!v) return null;
-  const s = String(v).trim();
-  return new Date(/^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00` : s);
-}
+/* `fechaLocal` se importa de `common/documentos`: era la misma función que en
+ * Gastos, copiada. 'AAAA-MM-DD' pelado se correría un día para atrás (UTC−3). */
 
 class EnvioItemDto {
   @IsInt() productoId!: number;

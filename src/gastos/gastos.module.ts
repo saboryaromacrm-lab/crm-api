@@ -25,6 +25,7 @@ import {
   IsIn, IsInt, IsNumber, IsOptional, IsString,
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm';
+import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   gastoAdjuntos, gastoCategorias, gastos, gastosRecurrentes, proveedores, sucursales, usuarios,
@@ -33,17 +34,13 @@ import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
-/**
- * Fecha que llega del formulario. Un `<input type="date">` manda 'AAAA-MM-DD'
- * pelado, y `new Date('2026-08-05')` lo interpreta como MEDIANOCHE UTC: en
- * Argentina (UTC-3) eso es el 4 a las 21:00, así que el gasto que el usuario
- * fechó el 5 aparecía listado el 4. Con la hora explícita se parsea local.
+/*
+ * `fechaLocal` vive en `common/documentos`. Está compartida con Cafetería —eran
+ * dos copias idénticas— porque es la trampa del `<input type="date">`: manda
+ * 'AAAA-MM-DD' pelado, `new Date('2026-08-05')` lo lee como MEDIANOCHE UTC, y en
+ * UTC−3 eso es el 4 a las 21:00, así que el gasto fechado el 5 se listaba el 4.
+ * En dos copias, arreglar una no arreglaba la otra.
  */
-function fechaLocal(v?: string | null) {
-  if (!v) return null;
-  const s = String(v).trim();
-  return new Date(/^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00` : s);
-}
 
 /** Meses que cubre cada frecuencia: define cuándo un gasto fijo vuelve a tocar. */
 const MESES_FRECUENCIA: Record<string, number> = {

@@ -179,23 +179,47 @@ export class CajaService {
     return c;
   }
 
+  /**
+   * Cerrar el turno: se cuenta el efectivo y el arqueo queda firmado.
+   *
+   * TODO ADENTRO DE UNA TRANSACCIÓN Y CON LA SESIÓN BLOQUEADA. El cierre son
+   * tres pasos —leer que está abierta, sumar el arqueo, marcarla cerrada— y
+   * entre el segundo y el tercero entraba plata: un pago a proveedor desde esta
+   * caja, o un movimiento manual. Ese egreso quedaba adentro de un turno cerrado
+   * pero **fuera de `sistemaEfectivo`**, así que la diferencia del arqueo nacía
+   * mal y quedaba congelada en la fila: nadie se enteraba después.
+   *
+   * Las dos puertas que insertan movimientos (`movimiento` acá y `crear` de
+   * pagos) ahora leen la sesión con el mismo candado, así que mientras el cierre
+   * cuenta, ninguna puede confirmar: o entran antes y el arqueo las cuenta, o
+   * esperan y se rechazan porque el turno ya cerró.
+   *
+   * `arqueo` sigue leyendo por fuera de la transacción a propósito: no necesita
+   * el mismo snapshot, le alcanza con que nadie pueda confirmar un movimiento
+   * nuevo mientras el candado está tomado.
+   */
   async cerrar(id: number, dto: CerrarCajaDto) {
-    const sesion = await this.get(id);
-    if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
-
-    const a = await this.arqueo(id);
     const declarado = money(dto.declaradoEfectivo);
 
-    const [c] = await this.db.update(cajaSesiones).set({
-      cierre: new Date(),
-      declaradoEfectivo: declarado,
-      sistemaEfectivo: a.esperadoEfectivo,
-      diferencia: money(declarado - a.esperadoEfectivo),
-      totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
-      estado: 'cerrada',
-      observaciones: dto.observaciones ?? sesion.observaciones,
-    }).where(eq(cajaSesiones.id, id)).returning();
-    return c;
+    return this.db.transaction(async (tx) => {
+      const [sesion] = await tx.select().from(cajaSesiones)
+        .where(eq(cajaSesiones.id, id)).limit(1).for('update');
+      if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+
+      const a = await this.arqueo(id);
+
+      const [c] = await tx.update(cajaSesiones).set({
+        cierre: new Date(),
+        declaradoEfectivo: declarado,
+        sistemaEfectivo: a.esperadoEfectivo,
+        diferencia: money(declarado - a.esperadoEfectivo),
+        totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
+        estado: 'cerrada',
+        observaciones: dto.observaciones ?? sesion.observaciones,
+      }).where(eq(cajaSesiones.id, id)).returning();
+      return c;
+    });
   }
 
   /**
@@ -222,16 +246,24 @@ export class CajaService {
   }
 
   async movimiento(id: number, dto: MovimientoCajaDto) {
-    const sesion = await this.get(id);
-    if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe debe ser mayor a 0.');
     if (!dto.motivo?.trim()) throw new BadRequestException('Indicá el motivo del movimiento.');
 
-    const [m] = await this.db.insert(cajaMovimientos).values({
-      cajaSesionId: id, tipo: dto.tipo, importe, motivo: dto.motivo.trim(), usuarioId: dto.usuarioId ?? null,
-    }).returning();
-    return m;
+    return this.db.transaction(async (tx) => {
+      /* Con candado y en la misma transacción que el insert: si el cierre está
+       * corriendo, este movimiento espera y se rechaza en vez de entrar a un
+       * turno cuyo arqueo ya se calculó sin él. Ver `cerrar`. */
+      const [sesion] = await tx.select().from(cajaSesiones)
+        .where(eq(cajaSesiones.id, id)).limit(1).for('update');
+      if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
+
+      const [m] = await tx.insert(cajaMovimientos).values({
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo: dto.motivo!.trim(), usuarioId: dto.usuarioId ?? null,
+      }).returning();
+      return m;
+    });
   }
 
   /**

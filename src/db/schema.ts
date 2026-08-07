@@ -856,6 +856,16 @@ export const comprobantes = pgTable('comprobantes', {
   uqNumero: uniqueIndex('uq_comprobantes_numero')
     .on(t.proveedorId, t.tipo, t.puntoVenta, t.numero)
     .where(sql`${t.numero} is not null`),
+  /**
+   * "¿Qué notas ajustan a esta factura?" se pregunta MUCHO: una vez por cada
+   * imputación (para saber el saldo real antes de aceptar un pago) y otra por
+   * cada apertura de la bandeja de pagos. Sin índice cada una era un scan de la
+   * tabla entera, en el camino de pagar. Parcial porque la enorme mayoría de los
+   * comprobantes no referencia a nadie.
+   */
+  ixRef: index('ix_comprobantes_ref')
+    .on(t.refComprobanteId)
+    .where(sql`${t.refComprobanteId} is not null`),
 }));
 
 /**
