@@ -10,8 +10,8 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
 import { CatalogosModule } from '../catalogos/catalogos.module';
 import {
-  categorias, etiquetas, marcas, presentaciones, productoEtiquetas, productoProveedores,
-  productos, proveedores, stock, subcategorias,
+  categorias, etiquetas, marcas, presentaciones, productoEtiquetas, productoListas,
+  productoProveedores, productos, proveedores, stock, subcategorias,
 } from '../db/schema';
 import {
   costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila,
@@ -57,6 +57,17 @@ class UpsertProductoDto {
   @IsOptional() @IsInt() proveedorId?: number;
   /** Costo de lista de ese proveedor, si ya se conoce (opcional). */
   @IsOptional() @IsNumber() costoInicial?: number;
+}
+
+/**
+ * IMPORTACIÓN MASIVA. El plan llega armado desde el navegador, que ya parseó
+ * los archivos y mostró la vista previa: acá se valida contra la base y se
+ * escribe. Las marcas y los rubros viajan por NOMBRE porque el que importa no
+ * conoce los ids — el servidor reusa el que existe o lo crea.
+ */
+class ImportarDto {
+  @IsInt() proveedorId!: number;
+  @IsArray() items!: any[];
 }
 
 @Injectable()
@@ -360,6 +371,212 @@ export class ProductosService {
     return this.get(p.id);
   }
 
+  /* ============================ IMPORTACIÓN MASIVA ============================ *
+   * Un catálogo entero (un proveedor, cientos de productos) en UNA transacción:
+   * o entra todo o no entra nada. Sin esto, un choque de código en el producto
+   * 60 dejaba 59 a medias y el segundo intento duplicaba.
+   *
+   * El PLAN llega armado desde el navegador (que ya mostró la vista previa):
+   * acá se valida contra la base, se resuelven marcas y rubros por NOMBRE
+   * —creando los que falten— y se escribe. Es IDEMPOTENTE por código interno:
+   * lo que ya existe se saltea y se informa, nunca se sobreescribe (actualizar
+   * costos es trabajo de la factura, no de una importación).
+   */
+  async importar(dto: ImportarDto) {
+    const items = dto.items || [];
+    if (!items.length) throw new BadRequestException('No hay nada para importar.');
+
+    const [prov] = await this.db.select().from(proveedores)
+      .where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
+    if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
+
+    const listasActivas = new Set((await this.listas.listasActivas()).map((l: any) => l.id));
+
+    /* ---- Qué NO se puede crear: se descarta antes de abrir la transacción ---- */
+    const codigosPropios = items.map((x) => (x.producto?.codigoPropio ?? '').trim()).filter(Boolean);
+    const yaEnBase = codigosPropios.length
+      ? await this.db.select({ codigoPropio: productos.codigoPropio, nombre: productos.nombre })
+        .from(productos).where(inArray(productos.codigoPropio, codigosPropios))
+      : [];
+    const existentes = new Map(yaEnBase.map((p) => [p.codigoPropio, p.nombre]));
+
+    // Todos los códigos de barras que ya usa el sistema (producto, presentación
+    // o formato de venta): uno no puede identificar dos cosas distintas.
+    const [barrasProd, barrasPres, barrasFmt] = await Promise.all([
+      this.db.select({ c: productos.codigoBarras, d: productos.dun, p: productos.codigoPropio }).from(productos),
+      this.db.select({ c: presentaciones.codigoBarras }).from(presentaciones),
+      this.db.select({ c: productoListas.codigoBarras }).from(productoListas),
+    ]);
+    const barrasUsadas = new Set([
+      ...barrasProd.flatMap((x) => [x.c, x.d]),
+      ...barrasPres.map((x) => x.c),
+      ...barrasFmt.map((x) => x.c),
+    ].filter(Boolean));
+
+    const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
+    const aCrear: any[] = [];
+    const vistosCodigo = new Set<string>();
+    const vistosBarras = new Set<string>();
+
+    for (const it of items) {
+      const p = it.producto || {};
+      const codigo = (p.codigoPropio ?? '').trim();
+      const nombre = (p.nombre ?? '').trim();
+      if (!nombre) { saltados.push({ codigo, nombre, motivo: 'sin nombre' }); continue; }
+      if (!codigo) { saltados.push({ codigo, nombre, motivo: 'sin código interno' }); continue; }
+      if (existentes.has(codigo)) {
+        saltados.push({ codigo, nombre, motivo: `ya existe como "${existentes.get(codigo)}"` });
+        continue;
+      }
+      if (vistosCodigo.has(codigo)) { saltados.push({ codigo, nombre, motivo: 'código repetido en el archivo' }); continue; }
+      if (!ALICUOTAS_IVA.includes(Number(p.iva))) {
+        saltados.push({ codigo, nombre, motivo: `IVA inválido (${p.iva}%)` });
+        continue;
+      }
+      // Los códigos de barras del producto y de sus presentaciones, juntos.
+      const barras = [p.codigoBarras, ...(it.presentaciones || []).map((x: any) => x.codigoBarras)]
+        .map((c) => (c ?? '').trim()).filter(Boolean);
+      const choca = barras.find((c) => barrasUsadas.has(c) || vistosBarras.has(c));
+      if (choca) { saltados.push({ codigo, nombre, motivo: `el código de barras ${choca} ya está en uso` }); continue; }
+
+      vistosCodigo.add(codigo);
+      barras.forEach((c) => vistosBarras.add(c));
+      aCrear.push(it);
+    }
+
+    if (!aCrear.length) return { ok: true, creados: 0, saltados, marcasCreadas: [], rubrosCreados: [] };
+
+    /* ---- Marcas y rubros por nombre: se reusa lo que hay, se crea lo que falta ---- */
+    const marcasCreadas: string[] = [];
+    const rubrosCreados: string[] = [];
+    const ids: number[] = [];
+
+    await this.db.transaction(async (tx) => {
+      const clave = (s: string) => s.trim().toLowerCase();
+      const marcaPorNombre = new Map(
+        (await tx.select().from(marcas)).map((m: any) => [clave(m.nombre), m.id]),
+      );
+      const catPorNombre = new Map(
+        (await tx.select().from(categorias)).map((c: any) => [clave(c.nombre), c.id]),
+      );
+      const subPorNombre = new Map(
+        (await tx.select().from(subcategorias)).map((s: any) => [clave(s.nombre), s.id]),
+      );
+
+      const idMarca = async (nombre?: string) => {
+        const n = (nombre ?? '').trim();
+        if (!n) return null;
+        if (marcaPorNombre.has(clave(n))) return marcaPorNombre.get(clave(n))!;
+        const [m] = await tx.insert(marcas).values({ nombre: n }).returning();
+        marcaPorNombre.set(clave(n), m.id);
+        marcasCreadas.push(n);
+        return m.id;
+      };
+      const idCategoria = async (nombre?: string) => {
+        const n = (nombre ?? '').trim() || 'Alimentos';
+        if (catPorNombre.has(clave(n))) return catPorNombre.get(clave(n))!;
+        const [c] = await tx.insert(categorias).values({ nombre: n }).returning();
+        catPorNombre.set(clave(n), c.id);
+        rubrosCreados.push(n);
+        return c.id;
+      };
+      const idSub = async (nombre: string | undefined, categoriaId: number) => {
+        const n = (nombre ?? '').trim();
+        if (!n) return null;
+        if (subPorNombre.has(clave(n))) return subPorNombre.get(clave(n))!;
+        const [s] = await tx.insert(subcategorias).values({ nombre: n, categoriaId }).returning();
+        subPorNombre.set(clave(n), s.id);
+        rubrosCreados.push(n);
+        return s.id;
+      };
+
+      for (const it of aCrear) {
+        const p = it.producto;
+        const categoriaId = await idCategoria(p.categoriaNombre);
+        const [creado] = await tx.insert(productos).values({
+          nombre: p.nombre.trim(),
+          descripcion: (p.descripcion ?? '').trim(),
+          codigoPropio: p.codigoPropio.trim(),
+          codigoBarras: (p.codigoBarras ?? '').trim(),
+          dun: '',
+          unidadesPorBulto: Math.max(1, Number(p.unidadesPorBulto) || 1),
+          marcaId: await idMarca(p.marcaNombre),
+          categoriaId,
+          subcategoriaId: await idSub(p.subcategoriaNombre, categoriaId),
+          iva: Number(p.iva),
+          tipo: p.esGranel ? 'granel' : 'entero',
+          publicado: !!p.publicado,
+          idExterno: String(p.idExterno ?? '').trim(),
+        }).returning();
+        ids.push(creado.id);
+
+        const f = it.formatoCompra || {};
+        await tx.insert(productoProveedores).values({
+          productoId: creado.id,
+          proveedorId: prov.id,
+          cantidad: Number(f.cantidad) > 0 ? Number(f.cantidad) : 1,
+          costo: Number(f.costo) || 0,
+          descuento: Number(f.descuento) || 0,
+          descuento2: Number(f.descuento2) || 0,
+          descuento3: Number(f.descuento3) || 0,
+          descuento4: Number(f.descuento4) || 0,
+          flete: Number(f.flete) || 0,
+          modoCosto: f.modoCosto === 'final' ? 'final' : 'lista',
+          costoFinal: Number(f.costoFinal) || 0,
+          usarParaPrecio: true, // es el único formato del producto recién creado
+          codigoProveedor: (f.codigoProveedor ?? '').trim(),
+        });
+
+        // Las presentaciones son del granel: en un producto entero no existen.
+        const pres = (it.presentaciones || []).filter((x: any) => Number(x.tamKg) > 0);
+        if (p.esGranel && pres.length) {
+          await tx.insert(presentaciones).values(pres.map((x: any) => ({
+            productoId: creado.id,
+            tamKg: Number(x.tamKg),
+            recargo: Number(x.recargo) || 0,
+            codigoBarras: (x.codigoBarras ?? '').trim(),
+          })));
+        }
+
+        /*
+         * El formato de venta se escribe con ESTE tx, no con `setFormato`: ese
+         * abre su propia transacción y las filas quedarían fuera del "todo o
+         * nada" (y podrían bloquearse entre sí). Los formatos importados no
+         * llevan código de barras propio —los códigos viven en el producto y en
+         * sus presentaciones—, así que no hay nada más que validar acá.
+         */
+        const filas = (it.listas || [])
+          .filter((l: any) => listasActivas.has(Number(l.listaId)))
+          .filter((l: any) => (l.modoPrecio === 'precio' ? Number(l.precioFijo) > 0 : true));
+        const vistas = new Set<number>();
+        const filasUnicas = filas.filter((l: any) => {
+          const id = Number(l.listaId);
+          if (vistas.has(id)) return false;
+          vistas.add(id);
+          return true;
+        });
+        if (filasUnicas.length) {
+          await tx.insert(productoListas).values(filasUnicas.map((l: any) => ({
+            productoId: creado.id,
+            listaId: Number(l.listaId),
+            modoPrecio: (l.modoPrecio === 'precio' ? 'precio' : 'markup') as 'markup' | 'precio',
+            markup: Number(l.markup) || 0,
+            precioFijo: Number(l.precioFijo) || 0,
+            unidades: Math.max(1, Number(l.unidades) || 1),
+            codigoBarras: '',
+            unidadesMinimas: Math.max(0, Number(l.unidadesMinimas) || 0),
+          })));
+        }
+      }
+    });
+
+    // El primer precio de cada producto queda en la evolución: un solo snapshot
+    // para todos, no uno por producto (son cientos).
+    if (ids.length) await this.evolucion.snapshot(ids, 'inicial');
+
+    return { ok: true, creados: ids.length, saltados, marcasCreadas, rubrosCreados };
+  }
+
   async update(id: number, dto: UpsertProductoDto) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -531,6 +748,8 @@ export class ProductosController {
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
   @Post() create(@Body() dto: UpsertProductoDto) { return this.svc.create(dto); }
+  /** Catálogo completo de un proveedor, en una sola transacción. */
+  @Post('importar') importar(@Body() dto: ImportarDto) { return this.svc.importar(dto); }
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
     return this.svc.update(id, dto);
   }
