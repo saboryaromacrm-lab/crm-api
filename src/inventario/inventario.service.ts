@@ -4,7 +4,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
-  comprobantes, comprobanteItems,
+  comprobantes, comprobanteItems, facturaLecturas,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
@@ -1165,7 +1165,7 @@ export class InventarioService {
 
   async bootstrap() {
     const [suc, prov, usr, prods, pres, provCostos, formatos, listasCat, stk, transfs, incs,
-      ms, cs, ss, es, pes, rolesCat] = await Promise.all([
+      ms, cs, ss, es, pes, rolesCat, pendientesLectura] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select().from(usuarios),
@@ -1183,6 +1183,8 @@ export class InventarioService {
       this.db.select().from(etiquetas),
       this.db.select().from(productoEtiquetas),
       this.db.select().from(roles),
+      this.db.select({ n: sql<number>`count(*)` }).from(facturaLecturas)
+        .where(eq(facturaLecturas.estado, 'pendiente')),
     ]);
     const cfgVentas = await this.cfg.get('ventas');
     const redondeo = cfgVentas.redondeoPrecio;
@@ -1274,6 +1276,14 @@ export class InventarioService {
       catalogos: { marcas: ms, categorias: cs, subcategorias: ss, etiquetas: es },
       sucursales: suc, proveedores: prov, usuarios: this.usuariosPublicos(usr, rolesCat), productos: productosFull,
       stock: stk, transferencias: transfs, incidencias: incs,
+      /*
+       * Cuántas facturas de papel están esperando que alguien las cargue. Viaja
+       * solo el NÚMERO —para el globito del menú—: la bandeja en sí la pide su
+       * panel, con sus filtros. Sin este aviso nadie se entera de que hay
+       * facturas subidas, y el papel se queda en la bandeja como se quedaba en
+       * el cajón.
+       */
+      lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
       // El frontend replica el cálculo de precios: necesita el mismo redondeo
       // para no mostrar un número distinto al de la API.
       configVentas: cfgVentas,

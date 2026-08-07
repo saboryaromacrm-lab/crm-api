@@ -4,6 +4,7 @@ import { DbModule } from './db/db.module';
 import { HealthController } from './health.controller';
 import { InventarioModule } from './inventario/inventario.module';
 import { ComprobantesModule } from './comprobantes/comprobantes.module';
+import { FacturasModule } from './facturas/facturas.module';
 import { ProductosModule } from './productos/productos.module';
 import { CatalogosModule } from './catalogos/catalogos.module';
 import { ProveedoresModule } from './proveedores/proveedores.module';
@@ -31,6 +32,7 @@ import { ChatModule } from './chat/chat.module';
     DbModule,
     InventarioModule,
     ComprobantesModule,
+    FacturasModule,
     ProductosModule,
     CatalogosModule,
     ProveedoresModule,

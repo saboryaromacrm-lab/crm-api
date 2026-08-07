@@ -9,9 +9,10 @@ import {
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  comprobantes, comprobanteItems, comprobantePercepciones, productoProveedores, proveedores,
-  proveedorImputaciones, proveedorPagos, sucursales, usuarios,
+  comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas,
+  productoProveedores, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
+import { normalizarPuntoVenta } from '../facturas/facturas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { PreciosModule, PreciosService } from '../precios/precios.module';
@@ -20,6 +21,15 @@ import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'] as const;
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** Para que los mensajes de error se lean como los diría una persona. */
+const NOMBRE_TIPO: Record<(typeof TIPOS)[number], string> = {
+  orden_compra: 'la orden de compra',
+  remito: 'el remito',
+  factura: 'la factura',
+  nota_credito: 'la nota de crédito',
+  nota_debito: 'la nota de débito',
+};
 
 /** Una percepción del pie de la factura (RG 5329, IIBB…). */
 class PercepcionDto {
@@ -102,6 +112,14 @@ class CreateComprobanteDto {
   @IsOptional() @IsInt() refComprobanteId?: number;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** El CAE del papel. Viene del QR, no se tipea. */
+  @IsOptional() @IsString() cae?: string;
+  /**
+   * La factura de la bandeja que este comprobante viene a cerrar. Se marca
+   * `cargada` en la MISMA transacción: si el comprobante no queda, la factura
+   * tampoco se da por procesada.
+   */
+  @IsOptional() @IsInt() lecturaId?: number;
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() fechaCarga?: string;
   @IsOptional() @IsString() vencimientoPago?: string;
@@ -239,14 +257,24 @@ export class ComprobantesService {
   async get(id: number) {
     const [c] = await this.db.select().from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
     if (!c) throw new NotFoundException('Comprobante inexistente.');
-    const [conItems, pagos, percepciones] = await Promise.all([
+    const [conItems, pagos, percepciones, papeles] = await Promise.all([
       this.withItems(c),
       this.pagosDe([id]),
       this.db.select().from(comprobantePercepciones).where(eq(comprobantePercepciones.comprobanteId, id)),
+      /* El papel del que salió esta factura, si entró por la bandeja o si
+       * alguien lo engachó después. Es lo que se mira cuando el total no cierra
+       * seis meses más tarde. Solo los metadatos: los bytes se piden por URL. */
+      this.db.select({
+        id: facturaArchivos.id, nombre: facturaArchivos.nombre, mime: facturaArchivos.mime,
+      }).from(facturaArchivos)
+        .innerJoin(facturaLecturas, eq(facturaLecturas.id, facturaArchivos.lecturaId))
+        .where(eq(facturaLecturas.comprobanteId, id))
+        .orderBy(facturaArchivos.id),
     ]);
     return {
       ...conItems,
       percepciones,
+      papeles,
       pagos: pagos.get(id) ?? [],
       saldo: Math.round((c.total - c.pagado) * 100) / 100,
     };
@@ -325,12 +353,46 @@ export class ComprobantesService {
 
     const total = subtotalNeto + ivaTotal + percepcionesTotal;
     const estado = dto.estado ?? 'confirmado';
+    // El papel imprime cinco dígitos y el sistema usa cuatro: normalizar acá es
+    // lo que hace que el único de la base cruce las dos formas de cargarlo.
+    const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? '0001');
     const ingresaStock = estado !== 'anulado' && !!dto.recepcion && (dto.tipo === 'remito' || dto.tipo === 'factura');
-    if (ingresaStock && !dto.sucursalId) throw new BadRequestException('Indicá la sucursal de recepción.');
+    /**
+     * UNA NOTA DE CRÉDITO CON RECEPCIÓN **SACA** MERCADERÍA.
+     *
+     * Faltaba: la NC ya descontaba la deuda pero la mercadería devuelta quedaba
+     * en stock. No se puede hacer automático por tipo, porque una NC no siempre
+     * es una devolución: también ajusta un precio mal facturado o compensa un
+     * bulto roto que igual te quedaste. Por eso lo decide `recepcion`, que acá
+     * significa "esta NC devuelve mercadería".
+     */
+    const egresaStock = estado !== 'anulado' && !!dto.recepcion && dto.tipo === 'nota_credito';
+    if ((ingresaStock || egresaStock) && !dto.sucursalId) {
+      throw new BadRequestException('Indicá la sucursal de recepción.');
+    }
+
+    /**
+     * El mismo comprobante no se carga dos veces. El índice único de la base es
+     * la garantía real (dos pestañas en paralelo se pasan por arriba de este
+     * chequeo), pero sin esto el usuario veía un error de Postgres en crudo.
+     */
+    if (dto.numero) {
+      const [ya] = await this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
+        eq(comprobantes.proveedorId, prov.id),
+        eq(comprobantes.tipo, dto.tipo),
+        eq(comprobantes.puntoVenta, puntoVenta),
+        eq(comprobantes.numero, dto.numero),
+      )).limit(1);
+      if (ya) {
+        throw new BadRequestException(
+          `${prov.nombre} ya tiene cargada ${NOMBRE_TIPO[dto.tipo]} ${puntoVenta}-${dto.numero} (comprobante #${ya.id}).`,
+        );
+      }
+    }
 
     const id = await this.db.transaction(async (tx) => {
       const [c] = await tx.insert(comprobantes).values({
-        tipo: dto.tipo, letra: dto.letra ?? 'A', puntoVenta: dto.puntoVenta ?? '0001', numero: dto.numero ?? null,
+        tipo: dto.tipo, letra: dto.letra ?? 'A', puntoVenta, numero: dto.numero ?? null,
         fecha: dto.fecha ? new Date(dto.fecha) : undefined,
         fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga) : undefined, proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
         estado, condicionPago: dto.condicionPago ?? 'cuenta_corriente',
@@ -338,6 +400,7 @@ export class ComprobantesService {
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
         subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
+        cae: String(dto.cae ?? '').slice(0, 32),
         refComprobanteId: dto.refComprobanteId ?? null, observaciones: dto.observaciones ?? '', usuarioId: dto.usuarioId ?? null,
       }).returning();
 
@@ -357,6 +420,17 @@ export class ComprobantesService {
         await this.inv.ingresarStockItems(tx, {
           sucursalId: dto.sucursalId, proveedorId: prov.id, proveedorNombre: prov.nombre, usuarioId: dto.usuarioId,
           descripcion: `Recepción ${dto.tipo} ${c.puntoVenta}-${c.numero ?? c.id}`, items: dto.items,
+        });
+      }
+
+      /* La devolución al proveedor: sale del stock disponible. Si no hay
+       * cantidad suficiente el helper corta la transacción — mejor que dejar
+       * stock negativo por una NC cargada con el número de bultos equivocado. */
+      if (egresaStock) {
+        await this.inv.egresarStockItems(tx, {
+          sucursalId: dto.sucursalId, usuarioId: dto.usuarioId, tipoMovimiento: 'devolucion',
+          descripcion: `Devolución a ${prov.nombre} · NC ${c.puntoVenta}-${c.numero ?? c.id}`,
+          items: dto.items,
         });
       }
 
@@ -420,6 +494,18 @@ export class ComprobantesService {
           comprobanteId: c.id,
         }, tx);
       }
+
+      /**
+       * Y se cierra la factura de la bandeja, en la MISMA transacción: si el
+       * comprobante no llega a quedar, el papel sigue esperando. Es un UPDATE de
+       * una línea y por eso va acá y no invocando al módulo de facturas — traer
+       * un módulo entero para esto ataba dos servicios sin necesidad.
+       */
+      if (dto.lecturaId) {
+        await tx.update(facturaLecturas)
+          .set({ estado: 'cargada', comprobanteId: c.id })
+          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')));
+      }
       return c.id;
     });
     // La evolución de precios se registra DESPUÉS del commit: dentro de la
@@ -465,7 +551,7 @@ export class ComprobantesService {
           importe: contado,
           medio: dto.pagoContado?.medio,
           fecha: dto.fecha,
-          concepto: `${dto.tipo} ${dto.letra ?? 'A'} ${dto.puntoVenta ?? ''}-${dto.numero ?? id}`.trim(),
+          concepto: `${dto.tipo} ${dto.letra ?? 'A'} ${puntoVenta}-${dto.numero ?? id}`.trim(),
           referencia: dto.pagoContado?.referencia,
           sucursalId: dto.sucursalId,
           cajaSesionId: dto.pagoContado?.cajaSesionId,

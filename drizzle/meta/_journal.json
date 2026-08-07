@@ -288,6 +288,13 @@
       "when": 1786200000000,
       "tag": "0040_bonificacion_percepciones",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1786290000000,
+      "tag": "0041_facturas_por_procesar",
+      "breakpoints": true
     }
   ]
 }

@@ -53,6 +53,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'compras.productos', nombre: 'Productos' },
       { clave: 'compras.catalogos', nombre: 'Catálogos' },
       { clave: 'compras.proveedores', nombre: 'Proveedores' },
+      { clave: 'compras.lecturas', nombre: 'Facturas por procesar (bandeja de papeles subidos)' },
       { clave: 'compras.facturacion', nombre: 'Facturación' },
       { clave: 'compras.pagos', nombre: 'Pagos en sucursal (plata a cuenta de proveedores)' },
       { clave: 'compras.historial', nombre: 'Historial' },

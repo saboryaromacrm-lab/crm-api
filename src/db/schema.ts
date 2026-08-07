@@ -791,6 +791,13 @@ export const comprobantes = pgTable('comprobantes', {
   letra: letraComprobanteEnum('letra').notNull().default('A'),
   puntoVenta: text('punto_venta').notNull().default('0001'),
   numero: integer('numero'),
+  /**
+   * CAE — el número con el que ARCA autorizó la factura del proveedor. NO se
+   * tipea: sale del QR del papel (RG 4892), que es la única parte de la factura
+   * que se puede leer sin interpretar la imagen. Guardarlo permite después
+   * cruzar lo cargado contra "Mis Comprobantes" y encontrar facturas perdidas.
+   */
+  cae: text('cae').notNull().default(''),
   // Dos fechas distintas y las dos importan: `fecha` es la que trae el papel
   // del proveedor (define el período fiscal) y `fechaCarga` es cuándo se
   // registró en el sistema (dice cuándo entró de verdad a la operación).
@@ -833,7 +840,23 @@ export const comprobantes = pgTable('comprobantes', {
   refComprobanteId: integer('ref_comprobante_id'),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-});
+}, (t) => ({
+  /**
+   * EL MISMO COMPROBANTE NO SE CARGA DOS VECES.
+   *
+   * Faltaba: `ventas` y `cobranzas` ya lo tenían y compras no. Con carga manual
+   * no molestaba porque el que cargaba se acordaba; con facturas que entran
+   * desde una bandeja de papeles subidos, el duplicado deja de ser improbable y
+   * pasa a ser cuestión de tiempo — y entra dos veces al stock y a la deuda.
+   *
+   * Va en la BASE y no solo en el servicio: dos pestañas en paralelo se pasan
+   * por arriba de cualquier chequeo previo. Solo aplica con número cargado (una
+   * orden de compra interna puede no tenerlo).
+   */
+  uqNumero: uniqueIndex('uq_comprobantes_numero')
+    .on(t.proveedorId, t.tipo, t.puntoVenta, t.numero)
+    .where(sql`${t.numero} is not null`),
+}));
 
 /**
  * PERCEPCIONES — los impuestos que el proveedor cobra por adelantado.
@@ -886,6 +909,99 @@ export const comprobanteItems = pgTable('comprobante_items', {
   iva: doublePrecision('iva').notNull().default(21),
   subtotal: doublePrecision('subtotal').notNull().default(0),
 });
+
+/* ----------------------------------------------------------------------------
+ * FACTURAS POR PROCESAR — la bandeja de papeles subidos
+ * --------------------------------------------------------------------------*/
+
+/**
+ * `pendiente` está esperando que alguien la revise · `cargada` se convirtió en
+ * un comprobante (o se enganchó a uno que ya estaba cargado a mano) ·
+ * `descartada` no correspondía (duplicada, ilegible, no era nuestra).
+ */
+export const estadoLecturaEnum = pgEnum('estado_lectura', ['pendiente', 'cargada', 'descartada']);
+
+/**
+ * UNA FACTURA SUBIDA, TODAVÍA NO CARGADA.
+ * ============================================================================
+ * Separa dos momentos que hoy son uno solo y no tienen por qué serlo: **recibir
+ * el papel** (la cajera saca la foto cuando llega el camión) y **cargar la
+ * factura** (el admin la procesa el viernes). Ese desacople es el que ahorra
+ * tiempo de verdad; leer el QR es la yapa.
+ *
+ * NO es un comprobante en borrador, y no puede serlo: `comprobante_items`
+ * exige `producto_id` y `comprobantes` exige `proveedor_id`, así que una
+ * factura recién subida —con renglones que todavía no se reconocieron, o de un
+ * CUIT que no está en el padrón— literalmente no se podría guardar ahí. El
+ * comprobante se crea al confirmar, ya `confirmado`, por el camino que ya
+ * funciona.
+ *
+ * El encabezado NO se adivina: sale del **QR de la RG 4892**, que es un JSON
+ * dentro del papel. Eso da CUIT, tipo, punto de venta, número, fecha, total y
+ * CAE con exactitud, sin interpretar la imagen. El `total` de ahí es el número
+ * contra el que después se valida que los renglones cierren.
+ */
+export const facturaLecturas = pgTable('factura_lecturas', {
+  id: serial('id').primaryKey(),
+  estado: estadoLecturaEnum('estado').notNull().default('pendiente'),
+  /** Si el QR se pudo leer. En false, todo el encabezado se carga a mano. */
+  leido: boolean('leido').notNull().default(false),
+
+  /* --- Lo que salió del QR (exacto, no interpretado) --- */
+  cuit: text('cuit').notNull().default(''),                 // emisor
+  tipo: tipoComprobanteEnum('tipo'),
+  letra: letraComprobanteEnum('letra'),
+  puntoVenta: text('punto_venta').notNull().default(''),
+  numero: integer('numero'),
+  fecha: timestamp('fecha', { withTimezone: true }),
+  total: doublePrecision('total').notNull().default(0),
+  cae: text('cae').notNull().default(''),
+  moneda: text('moneda').notNull().default(''),
+  /**
+   * El CUIT al que la factura está dirigida. Se guarda para poder avisar
+   * "esta factura no es nuestra": pasa cuando el proveedor factura a otra razón
+   * social del mismo dueño, y cargarla mete crédito fiscal que no corresponde.
+   */
+  cuitReceptor: text('cuit_receptor').notNull().default(''),
+
+  /* --- Resuelto por el sistema o corregido a mano --- */
+  proveedorId: integer('proveedor_id').references(() => proveedores.id, { onDelete: 'set null' }),
+  /** La sucursal que recibió la mercadería. NO está en el papel: se pregunta. */
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  /** Quién subió el papel (no necesariamente quién lo carga después). */
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** Con qué comprobante se cerró. Es el vínculo papel ↔ factura cargada. */
+  comprobanteId: integer('comprobante_id').references(() => comprobantes.id, { onDelete: 'set null' }),
+  observaciones: text('observaciones').notNull().default(''),
+  /** sha256 del contenido: la misma foto subida dos veces se detecta al toque. */
+  hash: text('hash').notNull().default(''),
+  subidoEn: timestamp('subido_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixEstado: index('ix_factura_lecturas_estado').on(t.estado),
+  // Para buscar si ya existe un comprobante con este número de este proveedor.
+  ixNumero: index('ix_factura_lecturas_numero').on(t.proveedorId, t.numero),
+  ixHash: index('ix_factura_lecturas_hash').on(t.hash),
+}));
+
+/**
+ * El papel en sí. En tabla aparte —igual que `gasto_adjuntos` y `web_imagenes`—
+ * para que el listado de la bandeja, que se pide entero y seguido, no arrastre
+ * nunca los bytes.
+ *
+ * Es 1:N a propósito: una factura de tres páginas es UNA lectura con tres
+ * fotos, no tres facturas.
+ */
+export const facturaArchivos = pgTable('factura_archivos', {
+  id: serial('id').primaryKey(),
+  lecturaId: integer('lectura_id').notNull().references(() => facturaLecturas.id, { onDelete: 'cascade' }),
+  nombre: text('nombre').notNull().default(''),
+  mime: text('mime').notNull().default('image/webp'),
+  /** Base64 SIN el prefijo data-URL. */
+  data: text('data').notNull(),
+  subidoEn: timestamp('subido_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixLectura: index('ix_factura_archivos_lectura').on(t.lecturaId),
+}));
 
 /* ============================================================================
  * VENTAS
@@ -1623,7 +1739,7 @@ export const schema = {
   modalidadesVenta, listasVenta, productoListas, clienteListas, reglasMarca,
   ofertas, ofertaAlcances, ofertaComponentes, precioHistorial,
   productoProveedorCostos, stock, movimientos, transferencias, transferenciaItems, transferenciaHist,
-  incidencias, comprobantes, comprobanteItems,
+  incidencias, comprobantes, comprobanteItems, facturaLecturas, facturaArchivos,
   clientes, cajaSesiones, cajaMovimientos, cajaControles, ventas, ventaItems, ventaExtras, ventaPagos,
   cobranzas, cobranzaPagos, cobranzaImputaciones, presupuestos, presupuestoItems, configuracion,
   webImagenes, webEventos,
