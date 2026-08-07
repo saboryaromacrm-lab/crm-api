@@ -24,13 +24,26 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { IsInt, IsOptional, IsString, MaxLength } from 'class-validator';
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { chatLecturas, chatMensajes, sucursales, usuarios } from '../db/schema';
 
 const LIMITE_BOOTSTRAP = 400;
 const LIMITE_POLL = 100;
 const EN_LINEA_MS = 15000;
+/**
+ * El chat es CONVERSACIÓN, no archivo: a las 24 horas el mensaje se va. Dos
+ * capas, y las dos hacen falta:
+ *  - las consultas FILTRAN por este corte, así el límite es exacto en todo
+ *    momento (sin esto se verían mensajes de 25 h entre purga y purga);
+ *  - la purga BORRA de verdad, así la tabla no crece (sin esto la base junta
+ *    conversaciones para siempre).
+ * Lo que hay que decidir en un documento (un dato de cuenta, un pedido) va al
+ * documento, no al chat.
+ */
+const RETENCION_MS = 24 * 60 * 60 * 1000;
+/** Cada cuánto, como mucho, se ejecuta el DELETE (el poll pega cada 4 s). */
+const PURGA_CADA_MS = 10 * 60 * 1000;
 
 class EnviarMensajeDto {
   @IsInt() sucursalId!: number;
@@ -54,9 +67,33 @@ export class ChatService {
 
   /** Latido de presencia: usuarioId → { visto, sucursalId }. En memoria, a propósito. */
   private vistos = new Map<number, { visto: number; sucursalId: number }>();
+  /** Cuándo corrió el último DELETE. En memoria: si la API reinicia, se purga de nuevo. */
+  private ultimaPurga = 0;
 
   private latido(sucursalId: number, usuarioId: number) {
     if (usuarioId > 0) this.vistos.set(usuarioId, { visto: Date.now(), sucursalId });
+  }
+
+  /** El corte de retención: nada anterior a esto existe para el chat. */
+  private corte() {
+    return new Date(Date.now() - RETENCION_MS);
+  }
+
+  /**
+   * Borra lo que pasó las 24 horas. Se dispara desde las consultas (no hay
+   * scheduler en la API y no hace falta uno: si nadie usa el chat, tampoco
+   * crece). Va sin `await` — es mantenimiento interno y no tiene por qué
+   * sumarle latencia al poll del cajero.
+   */
+  private purgarSiToca() {
+    const ahora = Date.now();
+    // El throttle se reclama ANTES del DELETE: si no, dos polls simultáneos
+    // (tres cajeros pollean cada 4 s) lanzarían el mismo borrado en paralelo.
+    if (ahora - this.ultimaPurga < PURGA_CADA_MS) return;
+    this.ultimaPurga = ahora;
+    this.db.delete(chatMensajes)
+      .where(lt(chatMensajes.fecha, this.corte()))
+      .catch(() => { this.ultimaPurga = 0; }); // falló: que reintente el próximo
   }
 
   /** Quiénes están en línea en esta sucursal (pollearon hace < 15 s), con nombre. */
@@ -89,10 +126,15 @@ export class ChatService {
       .leftJoin(usuarios, eq(usuarios.id, chatMensajes.usuarioId));
   }
 
-  /** Lo VISIBLE para este usuario: el canal del local + los privados donde es una punta. */
+  /**
+   * Lo VISIBLE para este usuario: el canal del local + los privados donde es
+   * una punta, y siempre DENTRO de la retención — el corte se aplica en la
+   * consulta, no depende de que la purga haya corrido.
+   */
   private visiblesPara(sucursalId: number, usuarioId: number) {
     return and(
       eq(chatMensajes.sucursalId, sucursalId),
+      gte(chatMensajes.fecha, this.corte()),
       or(
         isNull(chatMensajes.paraUsuarioId),
         eq(chatMensajes.paraUsuarioId, usuarioId),
@@ -109,6 +151,7 @@ export class ChatService {
   async bootstrap(sucursalId: number, usuarioId: number) {
     if (!(await this.habilitada(sucursalId))) return { habilitado: false };
     this.latido(sucursalId, usuarioId);
+    this.purgarSiToca();
     const ultimos = await this.baseMensajes()
       .where(this.visiblesPara(sucursalId, usuarioId))
       .orderBy(desc(chatMensajes.id))
@@ -123,12 +166,16 @@ export class ChatService {
       mensajes: ultimos.reverse(),
       lecturas,
       enLinea: await this.enLinea(sucursalId),
+      // El cliente descarta con el MISMO criterio: una sola fuente de verdad
+      // para la retención, y el panel no muestra lo que la API ya no tiene.
+      retencionHoras: RETENCION_MS / 3600000,
     };
   }
 
   /** El tick del poller: lo nuevo visible para MÍ + la foto de presencia. */
   async nuevos(sucursalId: number, usuarioId: number, desde: number) {
     this.latido(sucursalId, usuarioId);
+    this.purgarSiToca();
     const mensajes = await this.baseMensajes()
       .where(and(this.visiblesPara(sucursalId, usuarioId), gt(chatMensajes.id, desde)))
       .orderBy(asc(chatMensajes.id))
@@ -168,6 +215,10 @@ export class ChatService {
    * Upsert de la marca de lectura de UNA conversación, solo hacia ADELANTE:
    * dos pestañas del mismo usuario pueden marcar en desorden y la más vieja
    * no debe pisar a la nueva.
+   *
+   * La marca sobrevive a la purga a propósito: es una MARCA DE AGUA (un id),
+   * no una referencia — el mensaje puede ya no existir y el número sigue
+   * sirviendo, porque los ids solo crecen.
    */
   async marcarLeido(dto: MarcarLeidoDto) {
     await this.db.insert(chatLecturas)
