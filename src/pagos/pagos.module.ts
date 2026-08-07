@@ -459,6 +459,18 @@ export class PagosProveedorService {
       if (!prov) throw new BadRequestException('Proveedor inválido.');
       proveedorId = prov.id;
     }
+    /* El pago queda firmado con un usuario, y esa firma es lo que se mira en el
+     * arqueo cuando falta plata: tiene que ser alguien que exista y esté activo.
+     * No prueba QUIÉN pidió la operación —eso lo declara el cliente hasta que
+     * haya sesión autenticada—, pero cierra la puerta a firmar con un id
+     * cualquiera o con uno dado de baja. */
+    if (dto.usuarioId) {
+      const [u] = await this.db.select({ id: usuarios.id, activo: usuarios.activo })
+        .from(usuarios).where(eq(usuarios.id, Number(dto.usuarioId))).limit(1);
+      if (!u) throw new BadRequestException('El usuario que registra el pago no existe.');
+      if (!u.activo) throw new BadRequestException('Ese usuario está dado de baja: no puede registrar pagos.');
+    }
+
     // Un pago que va a quedar a cuenta necesita saber DE QUIÉN es esa cuenta.
     if (!proveedorId && !dto.imputaciones?.length) {
       throw new BadRequestException(
@@ -495,6 +507,27 @@ export class PagosProveedorService {
         if (sesion.estado !== 'abierta') {
           throw new BadRequestException('Ese turno de caja está cerrado: no se le pueden cargar egresos.');
         }
+        /*
+         * LA SUCURSAL DEL PAGO ES LA DEL TURNO, no la que dice el pedido.
+         *
+         * Antes era `sucursalId ?? sesion.sucursalId`: si el pedido mandaba otra
+         * sucursal, ganaba la del pedido y el egreso quedaba registrado en el
+         * arqueo de un turno de una sucursal, con el pago diciendo que fue de
+         * otra. Con eso se le podía cargar un egreso al cajón de cualquier
+         * sucursal con turno abierto. Ahora manda el turno y la discrepancia se
+         * rechaza en vez de resolverse sola.
+         *
+         * FALTA la mitad de esto y no se puede cerrar acá: que el turno sea el
+         * de QUIEN pide. Eso necesita sesión autenticada del lado del servidor
+         * (hoy `usuarioId` lo declara el cliente), y es parte del bloqueante de
+         * autenticación del deploy.
+         */
+        if (sucursalId != null && sucursalId !== sesion.sucursalId) {
+          throw new BadRequestException(
+            'Ese turno de caja es de otra sucursal: el egreso sale del cajón donde está abierto el turno.',
+          );
+        }
+        sucursalId = sesion.sucursalId;
         const nombreProv = prov?.nombre ?? '';
         const [mov] = await tx.insert(cajaMovimientos).values({
           cajaSesionId: sesion.id,
@@ -505,7 +538,6 @@ export class PagosProveedorService {
         }).returning();
         cajaMovimientoId = mov.id;
         cajaSesionId = sesion.id;
-        sucursalId = sucursalId ?? sesion.sucursalId;
       }
 
       const [pago] = await tx.insert(proveedorPagos).values({
@@ -536,8 +568,26 @@ export class PagosProveedorService {
   /**
    * Aplica un pago a uno o varios documentos. Cada imputación se valida contra
    * el saldo VIVO del pago y del documento (recalculados después de cada una),
-   * así aplicar tres cosas de una no puede pasarse del total por redondeo ni
-   * por dos pedidos simultáneos.
+   * así aplicar tres cosas de una no puede pasarse del total por redondeo.
+   *
+   * DOS PEDIDOS SIMULTÁNEOS: hacen falta los `FOR UPDATE` de abajo.
+   * ------------------------------------------------------------------------
+   * Antes esta guarda se podía pasar dos veces y el comentario afirmaba lo
+   * contrario, que es peor que no decir nada: nadie lo revisa. Con el nivel de
+   * aislamiento de Postgres por defecto (READ COMMITTED) un `select` pelado
+   * **no espera** a la transacción de al lado — lee la última versión
+   * confirmada. Dos `imputar` simultáneos del mismo pago leían los dos
+   * `aplicado = 0`, los dos pasaban la validación, y las dos imputaciones
+   * entraban: la tabla de imputaciones y los totales quedaban en desacuerdo,
+   * que es exactamente el invariante que este módulo declara como su corazón.
+   * Un doble click en una conexión lenta alcanza.
+   *
+   * `.for('update')` bloquea la fila hasta el fin de la transacción, así el
+   * segundo pedido espera y recién entonces lee el saldo ya actualizado.
+   *
+   * ORDEN DE BLOQUEO: primero el pago, después el documento. Siempre igual, en
+   * las tres funciones que bloquean (`aplicar`, `desimputar`, `anular`): dos
+   * caminos que tomen los mismos dos candados en orden distinto se abrazan.
    */
   private async aplicar(tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number) {
     for (const item of items) {
@@ -546,7 +596,10 @@ export class PagosProveedorService {
       if (!item.gastoId && !item.comprobanteId) throw new BadRequestException('Indicá a qué documento se aplica.');
       if (item.gastoId && item.comprobanteId) throw new BadRequestException('Una imputación va a un solo documento.');
 
-      const [pago] = await tx.select().from(proveedorPagos).where(eq(proveedorPagos.id, pagoId)).limit(1);
+      // Candado 1 de 2 (ver el comentario del método). Sin esto el saldo que se
+      // valida abajo puede ser el de hace un instante.
+      const [pago] = await tx.select().from(proveedorPagos)
+        .where(eq(proveedorPagos.id, pagoId)).limit(1).for('update');
       if (!pago) throw new NotFoundException('Pago inexistente.');
       if (pago.estado !== 'activo') throw new BadRequestException('El pago está anulado.');
       const saldoPago = money(pago.importe - pago.aplicado);
@@ -575,15 +628,21 @@ export class PagosProveedorService {
       let saldoDoc: number;
       let etiqueta: string;
 
+      /* Candado 2 de 2: el documento. El candado del pago solo evita que se
+       * pase el MISMO pago dos veces; sin este, dos pagos distintos aplicados a
+       * la vez a la misma factura leen los dos el mismo `pagado` y la
+       * sobre-pagan entre ambos. */
       if (item.gastoId) {
-        const [g] = await tx.select().from(gastos).where(eq(gastos.id, item.gastoId)).limit(1);
+        const [g] = await tx.select().from(gastos)
+          .where(eq(gastos.id, item.gastoId)).limit(1).for('update');
         if (!g) throw new BadRequestException('Gasto inexistente.');
         if (g.estado === 'anulado') throw new BadRequestException('Ese gasto está anulado.');
         docProveedorId = g.proveedorId;
         saldoDoc = money(g.total - g.pagado);
         etiqueta = `gasto #${g.id}`;
       } else {
-        const [c] = await tx.select().from(comprobantes).where(eq(comprobantes.id, item.comprobanteId!)).limit(1);
+        const [c] = await tx.select().from(comprobantes)
+          .where(eq(comprobantes.id, item.comprobanteId!)).limit(1).for('update');
         if (!c) throw new BadRequestException('Comprobante inexistente.');
         if (c.estado !== 'confirmado') throw new BadRequestException('Ese comprobante no está confirmado.');
         if (c.tipo === 'nota_credito') throw new BadRequestException('Una nota de crédito no se paga: descuenta deuda.');
@@ -660,7 +719,11 @@ export class PagosProveedorService {
       const [imp] = await tx.select().from(proveedorImputaciones)
         .where(eq(proveedorImputaciones.id, imputacionId)).limit(1);
       if (!imp) throw new NotFoundException('Imputación inexistente.');
-      const [pago] = await tx.select().from(proveedorPagos).where(eq(proveedorPagos.id, imp.pagoId)).limit(1);
+      // Mismo candado que en `aplicar`: dos desaplicaciones simultáneas del
+      // mismo pago recalculaban las dos sobre el estado viejo y una de las dos
+      // sobrevivía en `aplicado`.
+      const [pago] = await tx.select().from(proveedorPagos)
+        .where(eq(proveedorPagos.id, imp.pagoId)).limit(1).for('update');
 
       if (pago && !pago.proveedorId) {
         if (pago.cajaMovimientoId) {
@@ -714,14 +777,20 @@ export class PagosProveedorService {
    *     actual, dejando rastro de las dos operaciones.
    */
   async anular(id: number, motivo?: string) {
-    const [p] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, id)).limit(1);
-    if (!p) throw new NotFoundException('Pago inexistente.');
-    if (p.estado === 'anulado') throw new BadRequestException('Ese pago ya está anulado.');
-    if (p.aplicado > EPS) {
-      throw new BadRequestException('El pago está aplicado a un documento: desaplicalo antes de anularlo.');
-    }
-
     await this.db.transaction(async (tx) => {
+      /* El chequeo de `aplicado` va DENTRO de la transacción y con candado.
+       * Leído afuera, una imputación que entraba en el medio dejaba el pago
+       * anulado CON imputaciones vivas — exactamente lo que el primer candado
+       * dice evitar, y encima el `pagado` del comprobante seguía contando un
+       * pago anulado porque el recálculo no se vuelve a correr acá. */
+      const [p] = await tx.select().from(proveedorPagos)
+        .where(eq(proveedorPagos.id, id)).limit(1).for('update');
+      if (!p) throw new NotFoundException('Pago inexistente.');
+      if (p.estado === 'anulado') throw new BadRequestException('Ese pago ya está anulado.');
+      if (p.aplicado > EPS) {
+        throw new BadRequestException('El pago está aplicado a un documento: desaplicalo antes de anularlo.');
+      }
+
       if (p.cajaMovimientoId) {
         const [sesion] = await tx.select().from(cajaSesiones)
           .where(eq(cajaSesiones.id, p.cajaSesionId!)).limit(1);

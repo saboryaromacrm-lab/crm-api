@@ -533,9 +533,43 @@ export class FacturasService {
     const [l] = await this.db.select().from(facturaLecturas).where(eq(facturaLecturas.id, id)).limit(1);
     if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
     if (l.estado === 'cargada') throw new BadRequestException('Esa factura ya está enganchada a un comprobante.');
-    const [c] = await this.db.select({ id: comprobantes.id }).from(comprobantes)
-      .where(eq(comprobantes.id, dto.comprobanteId)).limit(1);
+    const [c] = await this.db.select({
+      id: comprobantes.id, proveedorId: comprobantes.proveedorId, tipo: comprobantes.tipo,
+      puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero,
+    }).from(comprobantes).where(eq(comprobantes.id, dto.comprobanteId)).limit(1);
     if (!c) throw new NotFoundException('Ese comprobante no existe.');
+
+    /*
+     * TIENE QUE SER DEL MISMO PROVEEDOR.
+     *
+     * Sin este control se podía enganchar el papel de un proveedor al
+     * comprobante de otro, y el daño era doble: la lectura salía de la bandeja
+     * marcada como `cargada` SIN haberse cargado nunca (la factura simplemente
+     * desaparecía del trabajo pendiente), y el botón "Ver la factura" del
+     * comprobante ajeno mostraba el papel equivocado — es decir, el respaldo de
+     * un comprobante pasaba a ser la factura de otra empresa.
+     */
+    if (l.proveedorId && c.proveedorId !== l.proveedorId) {
+      throw new BadRequestException(
+        'Ese comprobante es de otro proveedor: el papel se engancha al comprobante del proveedor que lo emitió.',
+      );
+    }
+    if (!l.proveedorId) {
+      throw new BadRequestException(
+        'Primero decí de qué proveedor es el papel: sin eso no se puede verificar que el comprobante sea el correcto.',
+      );
+    }
+
+    /* El número no bloquea —el papel puede ser la segunda hoja de una factura
+     * cargada con otro número de por medio, o el número puede estar mal
+     * tipeado— pero queda anotado: es la pista para cuando algo no cuadre. */
+    const distinto = l.numero && c.numero && l.numero !== c.numero;
+    if (distinto) {
+      await this.db.update(facturaLecturas).set({
+        observaciones: `${l.observaciones} · Vinculada al ${c.tipo} ${c.puntoVenta}-${c.numero} con número distinto al del papel (${l.numero}).`.trim(),
+      }).where(eq(facturaLecturas.id, id));
+    }
+
     await this.db.update(facturaLecturas)
       .set({ estado: 'cargada', comprobanteId: c.id })
       .where(eq(facturaLecturas.id, id));
