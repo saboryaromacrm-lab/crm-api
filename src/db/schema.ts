@@ -803,8 +803,25 @@ export const comprobantes = pgTable('comprobantes', {
   vencimientoPago: timestamp('vencimiento_pago', { withTimezone: true }),
   // Si el comprobante ingresa mercadería (remito o factura con recepción) suma stock.
   recepcion: boolean('recepcion').notNull().default(false),
+  /**
+   * EL PIE DE LA FACTURA, en el orden en que lo lee el papel:
+   *   subtotal de los ítems  (con los descuentos de cada renglón ya aplicados)
+   *   − bonificación general (el descuento de pie: "Bonif. 21,38 %")
+   *   = subtotalNeto         ← la base gravada
+   *   + ivaTotal             (se calcula sobre el neto YA bonificado)
+   *   + percepcionesTotal    (RG 5329, IIBB…, cada una en `comprobante_percepciones`)
+   *   = total                ← lo que hay que pagarle al proveedor
+   *
+   * La bonificación se guarda como PORCENTAJE y como IMPORTE: el porcentaje es
+   * lo que dice el papel, pero el importe manda — el proveedor redondea a su
+   * manera y el total tiene que coincidir al centavo con la factura.
+   */
+  bonificacion: doublePrecision('bonificacion').notNull().default(0),
+  bonificacionImporte: doublePrecision('bonificacion_importe').notNull().default(0),
   subtotalNeto: doublePrecision('subtotal_neto').notNull().default(0),
   ivaTotal: doublePrecision('iva_total').notNull().default(0),
+  /** Suma de las percepciones. NO es IVA: es pago a cuenta de otro impuesto. */
+  percepcionesTotal: doublePrecision('percepciones_total').notNull().default(0),
   total: doublePrecision('total').notNull().default(0),
   /**
    * Cuánto de este comprobante ya se le pagó al proveedor. Suma de las
@@ -816,6 +833,46 @@ export const comprobantes = pgTable('comprobantes', {
   refComprobanteId: integer('ref_comprobante_id'),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+
+/**
+ * PERCEPCIONES — los impuestos que el proveedor cobra por adelantado.
+ * ============================================================================
+ * No son IVA: son pago a cuenta de OTRO impuesto (IVA RG 5329, Ingresos
+ * Brutos, Ganancias), y al cierre hay que declarar cada una por separado. Por
+ * eso van con nombre y alícuota propios y no sumadas en un "otros".
+ *
+ * Se configuran POR PROVEEDOR —cada uno cobra las suyas, algunos varias— y al
+ * cargar la factura se ofrecen tildadas o no: el mismo proveedor a veces las
+ * trae y a veces no, así que el papel siempre manda.
+ */
+export const basePercepcionEnum = pgEnum('base_percepcion', ['neto', 'total']);
+
+export const proveedorPercepciones = pgTable('proveedor_percepciones', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  /** Como figura en la factura: "Perc. IVA RG 5329", "Perc. IIBB Formosa". */
+  nombre: text('nombre').notNull(),
+  alicuota: doublePrecision('alicuota').notNull().default(0),
+  /** Sobre qué se calcula: el neto gravado (lo habitual) o el total con IVA. */
+  base: basePercepcionEnum('base').notNull().default('neto'),
+  activa: boolean('activa').notNull().default(true),
+}, (t) => ({
+  ixProveedor: index('ix_proveedor_percepciones').on(t.proveedorId),
+}));
+
+/**
+ * Las percepciones de UN comprobante, con su nombre y alícuota COPIADOS: si
+ * mañana cambia la alícuota del proveedor, la factura del año pasado tiene que
+ * seguir explicando su propio total.
+ */
+export const comprobantePercepciones = pgTable('comprobante_percepciones', {
+  id: serial('id').primaryKey(),
+  comprobanteId: integer('comprobante_id').notNull().references(() => comprobantes.id, { onDelete: 'cascade' }),
+  nombre: text('nombre').notNull(),
+  alicuota: doublePrecision('alicuota').notNull().default(0),
+  base: basePercepcionEnum('base').notNull().default('neto'),
+  importe: doublePrecision('importe').notNull().default(0),
 });
 
 export const comprobanteItems = pgTable('comprobante_items', {

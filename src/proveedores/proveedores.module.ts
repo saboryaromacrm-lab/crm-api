@@ -1,11 +1,11 @@
 import {
-  Body, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
-  Param, ParseIntPipe, Patch, Post, Query,
+  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
 import { and, eq } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { proveedores } from '../db/schema';
+import { proveedorPercepciones, proveedores } from '../db/schema';
 
 class UpsertProveedorDto {
   @IsString() nombre!: string;
@@ -78,6 +78,46 @@ export class ProveedoresService {
     await this.db.delete(proveedores).where(eq(proveedores.id, id));
     return { ok: true };
   }
+
+  /* ---------------------------- PERCEPCIONES ---------------------------- *
+   * Las que ESTE proveedor suele cobrar. Se configuran una vez acá y después
+   * la carga de la factura las ofrece con un tilde: el mismo proveedor a veces
+   * las trae y a veces no, así que nunca se aplican solas.
+   */
+  percepciones(proveedorId: number) {
+    return this.db.select().from(proveedorPercepciones)
+      .where(eq(proveedorPercepciones.proveedorId, proveedorId))
+      .orderBy(proveedorPercepciones.id);
+  }
+
+  /**
+   * Reemplaza la lista completa (el formulario manda todas las filas juntas).
+   * Se borra y se reinserta: las percepciones YA APLICADAS a un comprobante
+   * tienen su propia copia con nombre y alícuota, así que tocar esta lista no
+   * altera ninguna factura vieja.
+   */
+  async setPercepciones(proveedorId: number, filas: any[]) {
+    await this.get(proveedorId);
+    const validas = (filas || [])
+      .filter((f) => (f?.nombre ?? '').trim())
+      .map((f) => ({
+        proveedorId,
+        nombre: String(f.nombre).trim(),
+        alicuota: Number(f.alicuota) || 0,
+        base: (f.base === 'total' ? 'total' : 'neto') as 'neto' | 'total',
+        activa: f.activa !== false,
+      }));
+    for (const f of validas) {
+      if (f.alicuota < 0 || f.alicuota > 100) {
+        throw new BadRequestException(`La alícuota de "${f.nombre}" tiene que estar entre 0 y 100.`);
+      }
+    }
+    await this.db.transaction(async (tx) => {
+      await tx.delete(proveedorPercepciones).where(eq(proveedorPercepciones.proveedorId, proveedorId));
+      if (validas.length) await tx.insert(proveedorPercepciones).values(validas);
+    });
+    return this.percepciones(proveedorId);
+  }
 }
 
 @Controller('proveedores')
@@ -85,6 +125,12 @@ export class ProveedoresController {
   constructor(private readonly svc: ProveedoresService) {}
 
   @Get() list(@Query('tipo') tipo?: string) { return this.svc.list(tipo); }
+  @Get(':id/percepciones') percepciones(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.percepciones(id);
+  }
+  @Put(':id/percepciones') setPercepciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.svc.setPercepciones(id, body?.percepciones ?? body);
+  }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto) { return this.svc.update(id, dto); }

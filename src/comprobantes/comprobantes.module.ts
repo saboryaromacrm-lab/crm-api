@@ -9,7 +9,7 @@ import {
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  comprobantes, comprobanteItems, productoProveedores, proveedores,
+  comprobantes, comprobanteItems, comprobantePercepciones, productoProveedores, proveedores,
   proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -18,6 +18,17 @@ import { PreciosModule, PreciosService } from '../precios/precios.module';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
 const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'] as const;
+
+const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** Una percepción del pie de la factura (RG 5329, IIBB…). */
+class PercepcionDto {
+  @IsString() nombre!: string;
+  @IsOptional() @IsNumber() alicuota?: number;
+  @IsOptional() @IsIn(['neto', 'total']) base?: 'neto' | 'total';
+  /** El del papel. Si no viene, se calcula con la alícuota. */
+  @IsOptional() @IsNumber() importe?: number;
+}
 
 class ComprobanteItemDto {
   @IsInt() productoId!: number;
@@ -82,6 +93,12 @@ class CreateComprobanteDto {
   @IsOptional() @IsIn(['borrador', 'confirmado', 'anulado']) estado?: 'borrador' | 'confirmado' | 'anulado';
   @IsOptional() @IsIn(['contado', 'cuenta_corriente']) condicionPago?: 'contado' | 'cuenta_corriente';
   @IsOptional() @IsBoolean() recepcion?: boolean;
+  /** El descuento de PIE ("Bonif. 21,38 %"), aparte de los de cada renglón. */
+  @IsOptional() @IsNumber() bonificacion?: number;
+  /** Su importe tal como lo imprime la factura; si viene, gana sobre el %. */
+  @IsOptional() @IsNumber() bonificacionImporte?: number;
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => PercepcionDto)
+  percepciones?: PercepcionDto[];
   @IsOptional() @IsInt() refComprobanteId?: number;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -186,9 +203,10 @@ export class ComprobantesService {
      * cada vez que se abre la pantalla.
      */
     const ids = rows.map((c) => c.id);
-    const [items, pagos] = await Promise.all([
+    const [items, pagos, percs] = await Promise.all([
       this.db.select().from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, ids)),
       this.pagosDe(ids),
+      this.db.select().from(comprobantePercepciones).where(inArray(comprobantePercepciones.comprobanteId, ids)),
     ]);
     const itemsPorId = new Map<number, any[]>();
     for (const it of items) {
@@ -196,10 +214,17 @@ export class ComprobantesService {
       arr.push(it);
       itemsPorId.set(it.comprobanteId, arr);
     }
+    const percsPorId = new Map<number, any[]>();
+    for (const p of percs) {
+      const arr = percsPorId.get(p.comprobanteId) ?? [];
+      arr.push(p);
+      percsPorId.set(p.comprobanteId, arr);
+    }
 
     return rows.map((c) => ({
       ...c,
       items: itemsPorId.get(c.id) ?? [],
+      percepciones: percsPorId.get(c.id) ?? [],
       pagos: pagos.get(c.id) ?? [],
       saldo: Math.round((c.total - c.pagado) * 100) / 100,
     }));
@@ -214,9 +239,14 @@ export class ComprobantesService {
   async get(id: number) {
     const [c] = await this.db.select().from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
     if (!c) throw new NotFoundException('Comprobante inexistente.');
-    const [conItems, pagos] = await Promise.all([this.withItems(c), this.pagosDe([id])]);
+    const [conItems, pagos, percepciones] = await Promise.all([
+      this.withItems(c),
+      this.pagosDe([id]),
+      this.db.select().from(comprobantePercepciones).where(eq(comprobantePercepciones.comprobanteId, id)),
+    ]);
     return {
       ...conItems,
+      percepciones,
       pagos: pagos.get(id) ?? [],
       saldo: Math.round((c.total - c.pagado) * 100) / 100,
     };
@@ -232,20 +262,68 @@ export class ComprobantesService {
     const discrimina = prov.condicionIva === 'responsable_inscripto';
     const ivaDefault = discrimina ? 21 : 0;
 
-    // Totales
-    let subtotalNeto = 0;
-    let ivaTotal = 0;
+    /* ------------------------- EL PIE DE LA FACTURA -------------------------
+     * En el mismo orden en que lo lee el papel: los renglones dan el bruto, la
+     * bonificación general lo baja, el IVA se calcula sobre el neto YA
+     * bonificado (si se calculara antes, el IVA quedaría más alto que el de la
+     * factura) y las percepciones se suman al final — no son IVA, son pago a
+     * cuenta de otro impuesto.
+     */
+    let bruto = 0;
     const items = dto.items.map((it) => {
       const cantidad = Number(it.cantidad) || 0;
       const costo = Number(it.costoUnitario) || 0;
       const desc = Number(it.descuento) || 0;
       const ivaP = it.iva != null ? Number(it.iva) : ivaDefault;
       const neto = cantidad * costo * (1 - desc / 100);
-      subtotalNeto += neto;
-      ivaTotal += neto * ivaP / 100;
+      bruto += neto;
       return { ...it, iva: ivaP, subtotal: neto };
     });
-    const total = subtotalNeto + ivaTotal;
+
+    // La bonificación llega como % o como importe: el IMPORTE manda cuando
+    // viene, porque el proveedor redondea a su manera y el total tiene que dar
+    // igual al del papel, al centavo.
+    const bonifPct = Number(dto.bonificacion) || 0;
+    if (bonifPct < 0 || bonifPct >= 100) {
+      if (bonifPct !== 0) throw new BadRequestException('La bonificación tiene que estar entre 0 y 100%.');
+    }
+    let bonificacionImporte = dto.bonificacionImporte != null
+      ? Number(dto.bonificacionImporte) || 0
+      : r2(bruto * bonifPct / 100);
+    if (bonificacionImporte > bruto + 0.009) {
+      throw new BadRequestException('La bonificación no puede ser mayor que el subtotal de los ítems.');
+    }
+    if (bonificacionImporte < 0) bonificacionImporte = 0;
+    // El factor real, para repartir la bonificación entre los renglones y que
+    // el libro de IVA cierre con el neto gravado de cada alícuota.
+    const factorBonif = bruto > 0 ? 1 - bonificacionImporte / bruto : 1;
+
+    let subtotalNeto = 0;
+    let ivaTotal = 0;
+    for (const it of items) {
+      const neto = it.subtotal * factorBonif;
+      it.subtotal = neto;
+      subtotalNeto += neto;
+      ivaTotal += neto * it.iva / 100;
+    }
+
+    // Percepciones: cada una con su nombre y alícuota copiados del proveedor,
+    // porque la factura del año pasado tiene que seguir explicando su total.
+    const conIva = subtotalNeto + ivaTotal;
+    const percepciones = (dto.percepciones ?? [])
+      .filter((p) => (p?.nombre ?? '').trim())
+      .map((p) => {
+        const base = p.base === 'total' ? 'total' : 'neto';
+        const alicuota = Number(p.alicuota) || 0;
+        const calculado = (base === 'total' ? conIva : subtotalNeto) * alicuota / 100;
+        // El importe del papel gana: el proveedor puede redondear distinto.
+        const importe = p.importe != null ? Number(p.importe) || 0 : r2(calculado);
+        return { nombre: String(p.nombre).trim(), alicuota, base: base as 'neto' | 'total', importe };
+      })
+      .filter((p) => p.importe > 0.009);
+    const percepcionesTotal = percepciones.reduce((a, p) => a + p.importe, 0);
+
+    const total = subtotalNeto + ivaTotal + percepcionesTotal;
     const estado = dto.estado ?? 'confirmado';
     const ingresaStock = estado !== 'anulado' && !!dto.recepcion && (dto.tipo === 'remito' || dto.tipo === 'factura');
     if (ingresaStock && !dto.sucursalId) throw new BadRequestException('Indicá la sucursal de recepción.');
@@ -257,7 +335,9 @@ export class ComprobantesService {
         fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga) : undefined, proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
         estado, condicionPago: dto.condicionPago ?? 'cuenta_corriente',
         vencimientoPago: dto.vencimientoPago ? new Date(dto.vencimientoPago) : null,
-        recepcion: !!dto.recepcion, subtotalNeto, ivaTotal, total,
+        recepcion: !!dto.recepcion,
+        bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
+        subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
         refComprobanteId: dto.refComprobanteId ?? null, observaciones: dto.observaciones ?? '', usuarioId: dto.usuarioId ?? null,
       }).returning();
 
@@ -266,6 +346,12 @@ export class ComprobantesService {
         cantidad: Number(it.cantidad) || 0, costoUnitario: Number(it.costoUnitario) || 0,
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
       })));
+
+      if (percepciones.length) {
+        await tx.insert(comprobantePercepciones).values(
+          percepciones.map((p) => ({ comprobanteId: c.id, ...p })),
+        );
+      }
 
       if (ingresaStock) {
         await this.inv.ingresarStockItems(tx, {
