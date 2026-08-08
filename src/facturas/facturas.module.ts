@@ -46,8 +46,11 @@ import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  comprobantes, configuracion, facturaArchivos, facturaLecturas, proveedores, sucursales, usuarios,
+  comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
+  proveedores, sucursales, usuarios,
 } from '../db/schema';
+import { clave, extraerLineasPdf, pegarNumeros } from './extraccion';
+import { RECETAS } from './recetas';
 
 /* ============================================================================
  * EL QR DE LA FACTURA (RG 4892)
@@ -107,6 +110,8 @@ export type QrFactura = {
 };
 
 const soloDigitos = (v: any) => String(v ?? '').replace(/\D/g, '');
+
+const r2 = (n: number) => Math.round(n * 100) / 100;
 
 /**
  * PUNTO DE VENTA, SIEMPRE IGUAL — cuatro dígitos.
@@ -661,6 +666,156 @@ export class FacturasService {
     return this.get(id);
   }
 
+  /* ====================================================================
+   * LECTURA DE RENGLONES desde el PDF digital
+   * ====================================================================
+   * La etapa que estaba EN ESPERA, resuelta para el caso barato: si el papel
+   * es un PDF con capa de texto (factura electrónica mandada por mail), los
+   * renglones se LEEN — no se interpretan — y acá se convierten en una
+   * propuesta para el alta. Todo local: el archivo ya vive en la base y no
+   * sale del sistema. Las fotos siguen siendo la etapa de visión (ficha en
+   * /info), que ahora solo tiene sentido para ellas.
+   */
+
+  /**
+   * ¿Qué producto del catálogo es "AVENA INSTANT FWP CUM10x400g"?
+   *
+   * Puntaje por tokens del NOMBRE DEL PRODUCTO (que está limpio) buscados en la
+   * descripción del papel (que viene rota: "AJ O GRANULADO"). Por eso se compara
+   * con `clave()` — sin espacios — y no palabra por palabra: los espacios del
+   * PDF no son confiables. Un token cuenta si aparece entero o por su prefijo
+   * (INSTANTANEA se encuentra en INSTANT). Empate en el puntaje = no se elige:
+   * mejor un renglón sin producto que un producto equivocado.
+   */
+  private matchearProducto(
+    descripcion: string,
+    catalogo: Array<{ id: number; nombre: string; iva: number; porBulto: number }>,
+  ) {
+    const desc = clave(descripcion);
+    if (!desc) return null;
+    let mejor: (typeof catalogo)[number] | null = null;
+    let mejorScore = 0;
+    let empate = false;
+    for (const p of catalogo) {
+      const toks = String(p.nombre).split(/\s+/).map(clave).filter((t) => t.length >= 3);
+      if (!toks.length) continue;
+      let hits = 0;
+      for (const t of toks) {
+        if (desc.includes(t) || (t.length > 4 && desc.includes(t.slice(0, 4)))) hits++;
+      }
+      const score = hits / toks.length;
+      if (score > mejorScore) { mejor = p; mejorScore = score; empate = false; }
+      else if (score === mejorScore && mejor && score > 0 && p.id !== mejor.id) empate = true;
+    }
+    if (!mejor || mejorScore < 0.6 || empate) return null;
+    return { ...mejor, confianza: r2(mejorScore * 100) / 100 };
+  }
+
+  /**
+   * La propuesta de carga: renglones + pie + encabezado, leídos del PDF de la
+   * lectura y matcheados contra el catálogo del proveedor. NO escribe nada —
+   * es una lectura que el alta usa para precargar, y la persona confirma.
+   */
+  async renglonesPdf(id: number) {
+    const [l] = await this.db.select().from(facturaLecturas).where(eq(facturaLecturas.id, id)).limit(1);
+    if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
+
+    const archivos = await this.db.select().from(facturaArchivos)
+      .where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id));
+    const pdf = archivos.find((a) => a.mime === 'application/pdf');
+    if (!pdf) {
+      throw new BadRequestException(
+        'Este papel no es un PDF: la lectura de renglones por ahora funciona solo con PDFs digitales. Las fotos se cargan a mano (leerlas automáticamente es la etapa de visión, en espera).',
+      );
+    }
+
+    const lineas = await extraerLineasPdf(Buffer.from(pdf.data, 'base64'));
+    const totalFrags = lineas.reduce((a, x) => a + x.frags.length, 0);
+    const texto = lineas.map((x) => `[p${x.pagina}] ${pegarNumeros(x.texto)}`).join('\n');
+    if (totalFrags < 15) {
+      return {
+        receta: null, cierra: false, encabezado: null, renglones: [], pie: null, texto,
+        avisos: ['El PDF no tiene capa de texto: es un escaneo o una foto convertida. Para estos el camino es la carga a mano (o el modelo de visión, cuando se decida).'],
+      };
+    }
+
+    // La receta se elige por CUIT del emisor: del QR si se leyó, del padrón si no.
+    let cuit = soloDigitos(l.cuit);
+    if (!cuit && l.proveedorId) {
+      const [p] = await this.db.select({ cuit: proveedores.cuit }).from(proveedores)
+        .where(eq(proveedores.id, l.proveedorId)).limit(1);
+      cuit = soloDigitos(p?.cuit);
+    }
+    const receta = cuit ? RECETAS[cuit] : undefined;
+    if (!receta) {
+      return {
+        receta: null, cierra: false, encabezado: null, renglones: [], pie: null, texto,
+        avisos: [`Todavía no hay receta de lectura para este proveedor${cuit ? ` (CUIT ${cuit})` : ''}. El texto del PDF se extrajo igual — con una factura real se arma la receta.`],
+      };
+    }
+
+    const leida = receta.leer(lineas);
+    const avisos = [...leida.avisos];
+
+    /* El encabezado del papel, mapeado al vocabulario del sistema. */
+    const mapeo = leida.encabezado.tipoArca != null ? TIPOS_ARCA[leida.encabezado.tipoArca] : undefined;
+    const encabezado = {
+      tipo: mapeo?.tipo ?? null,
+      letra: mapeo?.letra ?? null,
+      puntoVenta: leida.encabezado.puntoVenta ? normalizarPuntoVenta(leida.encabezado.puntoVenta) : null,
+      numero: leida.encabezado.numero,
+      fecha: leida.encabezado.fecha,
+      cae: leida.encabezado.cae,
+      vencimiento: leida.encabezado.vencimiento,
+    };
+
+    /* Matcheo contra el catálogo DEL PROVEEDOR: ahí están los nombres limpios. */
+    const catalogo = l.proveedorId
+      ? await this.db.select({
+        id: productos.id, nombre: productos.nombre, iva: productos.iva,
+        porBulto: productoProveedores.cantidad,
+      }).from(productoProveedores)
+        .innerJoin(productos, eq(productos.id, productoProveedores.productoId))
+        .where(eq(productoProveedores.proveedorId, l.proveedorId))
+      : [];
+    if (!catalogo.length) avisos.push('La lectura no tiene proveedor asignado (o el proveedor no tiene catálogo): los renglones van sin producto.');
+
+    const ivaFactura = leida.pie.ivaAlicuota ?? 21;
+    const renglones = leida.renglones.map((ren) => {
+      const m = this.matchearProducto(ren.descripcion, catalogo);
+      /*
+       * El costo del bulto se deriva DEL IMPORTE, no del precio impreso:
+       * importe = cantidad × costoBulto × (1 − dto). Despejado así, la suma
+       * del alta cierra con el papel aunque el catálogo tenga otro precio.
+       */
+      const costoBulto = ren.cantidad > 0 && ren.dto < 100
+        ? r2(ren.importe / (ren.cantidad * (1 - ren.dto / 100)))
+        : null;
+      return {
+        ...ren,
+        iva: ivaFactura,
+        costoBulto,
+        productoId: m?.id ?? null,
+        productoNombre: m?.nombre ?? null,
+        porBulto: m?.porBulto ?? null,
+        confianza: m?.confianza ?? null,
+      };
+    });
+    const sinProducto = renglones.filter((x) => !x.productoId).length;
+    if (sinProducto) {
+      avisos.push(`${sinProducto} ${sinProducto === 1 ? 'renglón' : 'renglones'} sin producto reconocido: se agregan a mano (pueden ser artículos nuevos del proveedor).`);
+    }
+
+    /* El checksum de siempre: el total reconstruido contra el de la lectura. */
+    const cierra = Number(l.total) > 0 && leida.pie.total != null
+      && Math.abs(leida.pie.total - Number(l.total)) <= 0.05;
+    if (Number(l.total) > 0 && leida.pie.total != null && !cierra) {
+      avisos.push(`El total leído del PDF (${leida.pie.total.toFixed(2)}) no coincide con el total de la lectura (${Number(l.total).toFixed(2)}).`);
+    }
+
+    return { receta: receta.nombre, cierra, encabezado, renglones, pie: leida.pie, avisos, texto };
+  }
+
   /** Los papeles de un comprobante ya cargado, para el botón "Ver la factura". */
   async archivosDeComprobante(comprobanteId: number) {
     const lecturas = await this.db.select({ id: facturaLecturas.id }).from(facturaLecturas)
@@ -702,6 +857,11 @@ export class FacturasController {
 
   @Get('lecturas/:id') get(@Param('id', ParseIntPipe) id: number) {
     return this.svc.get(id);
+  }
+
+  /** La propuesta de carga leída del PDF: renglones + pie + encabezado. Solo lee. */
+  @Get('lecturas/:id/renglones') renglonesPdf(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.renglonesPdf(id);
   }
 
   @Post('lecturas') subir(@Body() dto: SubirLecturaDto) {
