@@ -773,8 +773,23 @@ export const incidencias = pgTable('incidencias', {
 });
 
 /* ---------------- Facturación / comprobantes de compra ---------------- */
+/**
+ * Tipos de comprobante de COMPRA.
+ *
+ * `liquidacion` es el único NO FISCAL de la lista, y existe por un caso real:
+ * hay proveedores que entregan mitad facturado y mitad sin factura. Esa segunda
+ * mitad **entró al depósito y hay que pagarla**, así que tiene que estar en el
+ * sistema o el stock y la deuda quedan mintiendo — pero NO lleva IVA, no tiene
+ * CAE y no puede aparecer en nada fiscal.
+ *
+ * Por qué un tipo propio y no una factura con letra X ni un flag `fiscal:false`:
+ * lo que importa es qué pasa cuando alguien se olvida. Con un tipo aparte, toda
+ * consulta que pide "facturas" la excluye sola y hay que **optar por incluirla**;
+ * con una letra o un flag, todo la incluye por defecto y hay que acordarse de
+ * sacarla — y ese olvido infla el IVA computado, que es el lado caro del error.
+ */
 export const tipoComprobanteEnum = pgEnum('tipo_comprobante', [
-  'orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito',
+  'orden_compra', 'remito', 'factura', 'liquidacion', 'nota_credito', 'nota_debito',
 ]);
 export const letraComprobanteEnum = pgEnum('letra_comprobante', ['A', 'B', 'C', 'X']);
 export const estadoComprobanteEnum = pgEnum('estado_comprobante', ['borrador', 'confirmado', 'anulado']);

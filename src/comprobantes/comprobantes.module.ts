@@ -22,7 +22,7 @@ import { InventarioService } from '../inventario/inventario.service';
 import { PreciosModule, PreciosService } from '../precios/precios.module';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
-const TIPOS = ['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'] as const;
+const TIPOS = ['orden_compra', 'remito', 'factura', 'liquidacion', 'nota_credito', 'nota_debito'] as const;
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -31,9 +31,31 @@ const NOMBRE_TIPO: Record<(typeof TIPOS)[number], string> = {
   orden_compra: 'la orden de compra',
   remito: 'el remito',
   factura: 'la factura',
+  liquidacion: 'la liquidación',
   nota_credito: 'la nota de crédito',
   nota_debito: 'la nota de débito',
 };
+
+/*
+ * QUÉ HACE CADA TIPO — las tres preguntas que definen el circuito.
+ * ============================================================================
+ *                  ¿mueve stock?   ¿genera deuda?   ¿es fiscal?
+ *   orden_compra         no              no             no
+ *   remito          sí (recepción)       no             no
+ *   factura         sí (recepción)       sí             SÍ
+ *   liquidacion     sí (recepción)       sí             no      ← la mitad negra
+ *   nota_credito    sí (devolución)   resta            SÍ
+ *   nota_debito          no            suma            SÍ
+ *
+ * LA LIQUIDACIÓN aparece en las tres listas de "genera deuda" y "mueve stock" y
+ * en NINGUNA de las fiscales. Las listas son explícitas a propósito —se leen y
+ * se auditan— pero eso significa que **un tipo nuevo hay que agregarlo en todas**
+ * o se cuela un documento que mueve mercadería y no aparece en lo que se debe.
+ * Están todas marcadas con el comentario "LISTA DE TIPOS" para poder encontrarlas.
+ */
+
+/** Un comprobante no fiscal no discrimina IVA ni lleva percepciones. */
+const esFiscal = (tipo: string) => tipo !== 'liquidacion';
 
 /** Una percepción del pie de la factura (RG 5329, IIBB…). */
 class PercepcionDto {
@@ -464,19 +486,31 @@ export class ComprobantesService {
     // el libro de IVA cierre con el neto gravado de cada alícuota.
     const factorBonif = bruto > 0 ? 1 - bonificacionImporte / bruto : 1;
 
+    /*
+     * EN UNA LIQUIDACIÓN EL IVA ES CERO, y se fuerza acá y no en la pantalla.
+     *
+     * No es cosmético: si el renglón guardara su 21%, el importe existiría en la
+     * base y cualquier suma futura de IVA de compras lo levantaría como crédito
+     * fiscal de una factura que no existe. El precio de la mitad no facturada ya
+     * viene sin IVA — es la razón por la que es más barata.
+     */
+    const fiscal = esFiscal(dto.tipo);
     let subtotalNeto = 0;
     let ivaTotal = 0;
     for (const it of items) {
       const neto = it.subtotal * factorBonif;
       it.subtotal = neto;
       subtotalNeto += neto;
+      if (!fiscal) it.iva = 0;
       ivaTotal += neto * it.iva / 100;
     }
 
     // Percepciones: cada una con su nombre y alícuota copiados del proveedor,
     // porque la factura del año pasado tiene que seguir explicando su total.
     const conIva = subtotalNeto + ivaTotal;
-    const percepciones = (dto.percepciones ?? [])
+    // Las percepciones son pago a cuenta de un impuesto: en un comprobante que
+    // no existe para ARCA no hay nada a cuenta de qué. Se descartan.
+    const percepciones = (fiscal ? (dto.percepciones ?? []) : [])
       .filter((p) => (p?.nombre ?? '').trim())
       .map((p) => {
         const base = p.base === 'total' ? 'total' : 'neto';
@@ -494,7 +528,10 @@ export class ComprobantesService {
     // El papel imprime cinco dígitos y el sistema usa cuatro: normalizar acá es
     // lo que hace que el único de la base cruce las dos formas de cargarlo.
     const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? '0001');
-    const ingresaStock = estado !== 'anulado' && !!dto.recepcion && (dto.tipo === 'remito' || dto.tipo === 'factura');
+    // LISTA DE TIPOS · mueve stock hacia adentro. La liquidación va acá: la
+    // mercadería de la mitad no facturada entró al depósito igual que la otra.
+    const ingresaStock = estado !== 'anulado' && !!dto.recepcion
+      && (dto.tipo === 'remito' || dto.tipo === 'factura' || dto.tipo === 'liquidacion');
     /**
      * UNA NOTA DE CRÉDITO CON RECEPCIÓN **SACA** MERCADERÍA.
      *
@@ -563,7 +600,13 @@ export class ComprobantesService {
 
     const id = await this.db.transaction(async (tx) => {
       const [c] = await tx.insert(comprobantes).values({
-        tipo: dto.tipo, letra: dto.letra ?? 'A', puntoVenta, numero: dto.numero ?? null,
+        tipo: dto.tipo,
+        /* La liquidación es SIEMPRE letra X y no se deja elegir: la A significa
+         * "discrimina IVA" y este comprobante no discrimina nada. Con letra A la
+         * etiqueta decía "Liquidación A", que promete algo que no hay. */
+        letra: fiscal ? (dto.letra ?? 'A') : 'X',
+        puntoVenta,
+        numero: dto.numero ?? null,
         fecha: dto.fecha ? new Date(dto.fecha) : undefined,
         fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga) : undefined, proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
         estado, condicionPago: dto.condicionPago ?? 'cuenta_corriente',
@@ -703,7 +746,10 @@ export class ComprobantesService {
      * Solo los documentos que GENERAN deuda se pagan. Una nota de crédito
      * resta deuda: pagarla no significa nada.
      */
-    const generaDeuda = estado === 'confirmado' && (dto.tipo === 'factura' || dto.tipo === 'nota_debito');
+    // LISTA DE TIPOS · genera deuda. La liquidación va acá: al proveedor se le
+    // debe la mitad no facturada igual que la facturada, y se le paga junto.
+    const generaDeuda = estado === 'confirmado'
+      && (dto.tipo === 'factura' || dto.tipo === 'liquidacion' || dto.tipo === 'nota_debito');
     if (generaDeuda) {
       // Primero los pagos que ya existían: es plata que ya salió del cajón y
       // la factura viene a explicarla.
@@ -771,8 +817,11 @@ export class ComprobantesService {
       // Antes solo contaba la cta. cte.: una factura al contado sin pago
       // registrado desaparecía del saldo aunque no se hubiera pagado nunca.
       // Ahora la deuda la define el documento y la cancela el pago.
-      if (c.tipo === 'factura' || c.tipo === 'nota_debito') { deuda += c.total; pagado += c.pagado; }
-      else if (c.tipo === 'nota_credito') deuda -= c.total;
+      // LISTA DE TIPOS · suman a la cuenta corriente. La liquidación también:
+      // la plata que se le paga al proveedor es UNA, facturada o no.
+      if (c.tipo === 'factura' || c.tipo === 'liquidacion' || c.tipo === 'nota_debito') {
+        deuda += c.total; pagado += c.pagado;
+      } else if (c.tipo === 'nota_credito') deuda -= c.total;
     }
     /*
      * El TOTAL del proveedor no cambia por atar las notas a su factura —una NC

@@ -18,6 +18,9 @@ export const ABREV_TIPO: Record<string, string> = {
   orden_compra: 'OC',
   remito: 'Remito',
   factura: 'Factura',
+  /* La abreviatura NO se acorta a "Liq.": este documento no es fiscal y en la
+   * pantalla tiene que cantarlo. Ahorrar cuatro letras acá no vale nada. */
+  liquidacion: 'Liquidación',
   nota_credito: 'NC',
   nota_debito: 'ND',
 };

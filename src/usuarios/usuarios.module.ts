@@ -60,6 +60,14 @@ export const CATALOGO_PERMISOS = [
     ],
     acciones: [
       { clave: 'facturas', nombre: 'Cargar comprobantes de compra' },
+      /*
+       * Permiso APARTE del de facturas, y a propósito. La liquidación es la
+       * mitad que el proveedor entrega sin factura: es un documento no fiscal y
+       * quién lo ve es decisión del dueño, no una consecuencia de poder cargar
+       * compras. Arranca solo para admin y superadmin — aflojarlo después es
+       * fácil, apretarlo una vez que todos lo vieron no.
+       */
+      { clave: 'liquidaciones', nombre: 'Cargar y ver liquidaciones (la mitad sin factura)' },
       { clave: 'precios', nombre: 'Precios, márgenes y actualizaciones' },
       { clave: 'etiquetas', nombre: 'Imprimir etiquetas' },
     ],

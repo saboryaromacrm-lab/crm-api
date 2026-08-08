@@ -235,8 +235,10 @@ class SubirLecturaDto {
 class PatchLecturaDto {
   @IsOptional() @IsInt() proveedorId?: number;
   @IsOptional() @IsInt() sucursalId?: number;
-  @IsOptional() @IsIn(['orden_compra', 'remito', 'factura', 'nota_credito', 'nota_debito'])
-  tipo?: 'orden_compra' | 'remito' | 'factura' | 'nota_credito' | 'nota_debito';
+  /* `liquidacion` entra acá porque el papel de la mitad no facturada también se
+   * puede subir a la bandeja y clasificar a mano — no trae QR, obviamente. */
+  @IsOptional() @IsIn(['orden_compra', 'remito', 'factura', 'liquidacion', 'nota_credito', 'nota_debito'])
+  tipo?: 'orden_compra' | 'remito' | 'factura' | 'liquidacion' | 'nota_credito' | 'nota_debito';
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
   @IsOptional() @IsString() puntoVenta?: string;
   @IsOptional() @IsInt() numero?: number;

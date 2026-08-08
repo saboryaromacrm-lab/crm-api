@@ -1,0 +1,16 @@
+-- LIQUIDACIÓN: el comprobante NO FISCAL de la mitad sin factura.
+--
+-- Hay proveedores que entregan mitad facturado y mitad sin factura. Esa segunda
+-- mitad entró al depósito y hay que pagarla, así que tiene que estar cargada o
+-- el stock y la cuenta corriente del proveedor quedan mintiendo. Pero no lleva
+-- IVA, no tiene CAE y no puede aparecer en nada fiscal.
+--
+-- Va como tipo propio y no como una factura con letra X: así toda consulta que
+-- pide "facturas" la excluye sola, y hay que optar por incluirla. Al revés, un
+-- olvido infla el IVA computado.
+--
+-- `ADD VALUE` puede correr dentro de la transacción de la migración porque acá
+-- solo se AGREGA el valor; usarlo en la misma transacción sería el problema.
+-- Se inserta después de 'factura' para que el orden del enum siga el del
+-- circuito (lo usan los ORDER BY que ordenan por tipo).
+ALTER TYPE "tipo_comprobante" ADD VALUE IF NOT EXISTS 'liquidacion' AFTER 'factura';

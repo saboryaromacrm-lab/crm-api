@@ -382,7 +382,9 @@ export class PagosProveedorService {
       destino === 'gastos' ? [] : this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
-        inArray(comprobantes.tipo, ['factura', 'nota_debito']),
+        // LISTA DE TIPOS · documentos pagables. La liquidación (la mitad sin
+        // factura) se paga como cualquier otra deuda del proveedor.
+        inArray(comprobantes.tipo, ['factura', 'liquidacion', 'nota_debito']),
         // La ND que ajusta una factura vive dentro del saldo de esa factura.
         or(ne(comprobantes.tipo, 'nota_debito'), isNull(comprobantes.refComprobanteId)),
       )).orderBy(comprobantes.fecha),
@@ -447,7 +449,9 @@ export class PagosProveedorService {
   async cuenta(proveedorId: number) {
     const [comp, gast, pag] = await Promise.all([
       this.db.select({
-        deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
+        // LISTA DE TIPOS · la cuenta corriente del proveedor, incluida la
+        // liquidación: se le debe igual, y se le paga en el mismo acto.
+        deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
       }).from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -713,9 +717,11 @@ export class PagosProveedorService {
          * ofrece (`documentosPendientes` filtra por tipo), pero lo que se acepta
          * no puede depender de lo que se ofrece.
          */
-        if (c.tipo !== 'factura' && c.tipo !== 'nota_debito') {
+        // LISTA DE TIPOS · lo que se ACEPTA imputar (lo que se ofrece está en
+        // `documentosPendientes`; las dos tienen que decir lo mismo).
+        if (c.tipo !== 'factura' && c.tipo !== 'liquidacion' && c.tipo !== 'nota_debito') {
           throw new BadRequestException(
-            `Un documento de tipo ${ABREV_TIPO[c.tipo] ?? c.tipo} no genera deuda: solo se pagan facturas y notas de débito.`,
+            `Un documento de tipo ${ABREV_TIPO[c.tipo] ?? c.tipo} no genera deuda: solo se pagan facturas, liquidaciones y notas de débito.`,
           );
         }
         docProveedorId = c.proveedorId;
