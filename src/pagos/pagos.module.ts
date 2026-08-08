@@ -820,6 +820,27 @@ export class PagosProveedorService {
           .where(eq(proveedorPagos.id, pago.id));
       }
 
+      /*
+       * CANDADO 2 DE 2: el documento. Faltaba, y el comentario de `aplicar`
+       * afirmaba que las tres funciones bloqueaban las dos filas — peor que no
+       * decir nada, porque nadie lo revisa.
+       *
+       * Sin este candado, un `desimputar` y un `imputar` simultáneos sobre la
+       * MISMA factura recalculan los dos su `pagado` desde el estado viejo y el
+       * último pisa al otro: la factura queda con menos pagado del que recibió,
+       * vuelve a la bandeja de pendientes y se paga dos veces.
+       *
+       * Mismo orden que en `aplicar` (pago → documento) para no abrazarse.
+       */
+      if (imp.gastoId) {
+        await tx.select({ id: gastos.id }).from(gastos)
+          .where(eq(gastos.id, imp.gastoId)).limit(1).for('update');
+      }
+      if (imp.comprobanteId) {
+        await tx.select({ id: comprobantes.id }).from(comprobantes)
+          .where(eq(comprobantes.id, imp.comprobanteId)).limit(1).for('update');
+      }
+
       await tx.delete(proveedorImputaciones).where(eq(proveedorImputaciones.id, imputacionId));
       await this.recalcularPago(tx, imp.pagoId);
       if (imp.gastoId) await this.recalcularGasto(tx, imp.gastoId);

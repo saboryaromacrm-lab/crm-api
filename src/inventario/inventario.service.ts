@@ -12,6 +12,17 @@ import { ListasService } from '../listas/listas.module';
 import { costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila } from './pricing';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
+/**
+ * Abreviaturas cortas para el código del libro de Operaciones, donde la columna
+ * es angosta. `Liq` tiene que ser distinguible de `FC` de un vistazo: es el
+ * único de los tres que no es fiscal.
+ */
+const ABREV_LIBRO: Record<string, string> = {
+  remito: 'REM',
+  liquidacion: 'Liq',
+  factura: 'FC',
+};
+
 const TIPOS_MOV: Record<string, { label: string; dir: number }> = {
   compra: { label: 'Compra', dir: 1 },
   fraccionamiento: { label: 'Fraccionamiento', dir: 0 },
@@ -1081,7 +1092,11 @@ export class InventarioService {
 
     for (const c of comps) {
       filas.push({
-        id: `c${c.id}`, tipo: 'compra_recibida', codigo: `${c.tipo === 'remito' ? 'REM' : 'FC'} ${c.puntoVenta}-${String(c.numero ?? 0).padStart(8, '0')}`,
+        /* LISTA DE TIPOS · la etiqueta del libro de Operaciones. Antes era
+         * `remito ? 'REM' : 'FC'`, así que una LIQUIDACIÓN aparecía como "FC",
+         * idéntica a una factura de compra — y todo el diseño del tipo no fiscal
+         * se apoya en que se distinga en cualquier pantalla donde aparezca. */
+        id: `c${c.id}`, tipo: 'compra_recibida', codigo: `${ABREV_LIBRO[c.tipo] ?? 'FC'} ${c.puntoVenta}-${String(c.numero ?? 0).padStart(8, '0')}`,
         fecha: c.fecha, fechaCarga: c.fechaCarga, concepto: 'Recepción de compra',
         monto: c.subtotalNeto, observaciones: c.observaciones,
         usuario: nomUsr.get(c.usuarioId as number) ?? '', refComprobanteId: c.id,

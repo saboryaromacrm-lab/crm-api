@@ -614,7 +614,13 @@ export class ComprobantesService {
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
         subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
-        cae: String(dto.cae ?? '').slice(0, 32),
+        /* Un comprobante no fiscal NO GUARDA CAE. Se podía cargar el papel de una
+         * factura A real (con su CAE y su IVA) eligiendo tipo liquidación: la
+         * API forzaba IVA 0 y letra X pero se guardaba el CAE igual, y quedaba un
+         * no fiscal con número de autorización de ARCA. Aparte de perder el
+         * crédito fiscal de esa factura, deja lista la trampa para cualquier
+         * chequeo futuro del estilo "tiene CAE ⇒ es fiscal". */
+        cae: fiscal ? String(dto.cae ?? '').slice(0, 32) : '',
         refComprobanteId: dto.refComprobanteId ?? null, observaciones: dto.observaciones ?? '', usuarioId: dto.usuarioId ?? null,
       }).returning();
 
