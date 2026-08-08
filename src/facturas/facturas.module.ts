@@ -47,7 +47,7 @@ import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
-  proveedores, sucursales, usuarios,
+  proveedorArticulos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { clave, extraerLineasPdf, pegarNumeros } from './extraccion';
 import { RECETAS } from './recetas';
@@ -774,15 +774,73 @@ export class FacturasService {
       ? await this.db.select({
         id: productos.id, nombre: productos.nombre, iva: productos.iva,
         porBulto: productoProveedores.cantidad,
+        codigoProveedor: productoProveedores.codigoProveedor,
       }).from(productoProveedores)
         .innerJoin(productos, eq(productos.id, productoProveedores.productoId))
         .where(eq(productoProveedores.proveedorId, l.proveedorId))
       : [];
     if (!catalogo.length) avisos.push('La lectura no tiene proveedor asignado (o el proveedor no tiene catálogo): los renglones van sin producto.');
 
+    /*
+     * TRES NIVELES para reconocer el producto, del más confiable al menos:
+     *
+     *   1. `aprendido` — el mapeo (proveedor, código del papel) → producto que
+     *      quedó guardado la última vez que una persona CONFIRMÓ una factura.
+     *   2. `catalogo` — el código de proveedor cargado en el formato de compra.
+     *      Vino del sistema viejo y tiene corrimientos (la factura real dice
+     *      10206 donde el catálogo dice 10200), por eso no alcanza solo.
+     *   3. `parecido` — similitud de nombres. Solo para el arranque en frío:
+     *      en cuanto la factura se guarda, el renglón pasa al nivel 1.
+     */
+    const aprendidos = l.proveedorId
+      ? await this.db.select({
+        codigo: proveedorArticulos.codigo, productoId: proveedorArticulos.productoId,
+        nombre: productos.nombre, iva: productos.iva,
+      }).from(proveedorArticulos)
+        .innerJoin(productos, eq(productos.id, proveedorArticulos.productoId))
+        .where(eq(proveedorArticulos.proveedorId, l.proveedorId))
+      : [];
+    const porAprendido = new Map(aprendidos.map((a) => [a.codigo, a]));
+    const porCatalogo = new Map<string, (typeof catalogo)[number]>();
+    for (const p of catalogo) {
+      const cod = String(p.codigoProveedor || '').trim();
+      if (cod && !porCatalogo.has(cod)) porCatalogo.set(cod, p);
+    }
+
     const ivaFactura = leida.pie.ivaAlicuota ?? 21;
     const renglones = leida.renglones.map((ren) => {
-      const m = this.matchearProducto(ren.descripcion, catalogo);
+      let productoId: number | null = null;
+      let productoNombre: string | null = null;
+      let porBulto: number | null = null;
+      let confianza: number | null = null;
+      let fuente: 'aprendido' | 'catalogo' | 'parecido' | null = null;
+
+      const ap = porAprendido.get(ren.codigo);
+      const cat = porCatalogo.get(ren.codigo);
+      if (ap) {
+        productoId = ap.productoId;
+        productoNombre = ap.nombre;
+        // El formato de compra, si existe, aporta el tamaño del bulto.
+        porBulto = catalogo.find((c) => c.id === ap.productoId)?.porBulto ?? null;
+        confianza = 1;
+        fuente = 'aprendido';
+      } else if (cat) {
+        productoId = cat.id;
+        productoNombre = cat.nombre;
+        porBulto = cat.porBulto;
+        confianza = 1;
+        fuente = 'catalogo';
+      } else {
+        const m = this.matchearProducto(ren.descripcion, catalogo);
+        if (m) {
+          productoId = m.id;
+          productoNombre = m.nombre;
+          porBulto = m.porBulto;
+          confianza = m.confianza;
+          fuente = 'parecido';
+        }
+      }
+
       /*
        * El costo del bulto se deriva DEL IMPORTE, no del precio impreso:
        * importe = cantidad × costoBulto × (1 − dto). Despejado así, la suma
@@ -791,15 +849,7 @@ export class FacturasService {
       const costoBulto = ren.cantidad > 0 && ren.dto < 100
         ? r2(ren.importe / (ren.cantidad * (1 - ren.dto / 100)))
         : null;
-      return {
-        ...ren,
-        iva: ivaFactura,
-        costoBulto,
-        productoId: m?.id ?? null,
-        productoNombre: m?.nombre ?? null,
-        porBulto: m?.porBulto ?? null,
-        confianza: m?.confianza ?? null,
-      };
+      return { ...ren, iva: ivaFactura, costoBulto, productoId, productoNombre, porBulto, confianza, fuente };
     });
     const sinProducto = renglones.filter((x) => !x.productoId).length;
     if (sinProducto) {

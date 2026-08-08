@@ -329,6 +329,32 @@ export const productoProveedores = pgTable('producto_proveedores', {
   ixProveedor: index('ix_producto_proveedores_proveedor').on(t.proveedorId),
 }));
 
+/**
+ * MAPEO APRENDIDO: el código del artículo EN LA FACTURA del proveedor → nuestro
+ * producto. Es lo que hace que la lectura del PDF reconozca "33800 SALMON NAT
+ * TROZOS" la segunda vez: la primera lo asocia el admin a mano en el alta, y al
+ * GUARDAR el comprobante el sistema lo recuerda. Si se cancela, no se aprende.
+ *
+ * NO es lo mismo que `productoProveedores.codigoProveedor`: aquel es dato
+ * curado del catálogo, y en la práctica vino del sistema viejo con corrimientos
+ * (la factura real dice 10206 donde el catálogo dice 10200 para el mismo
+ * artículo). Este se aprende de facturas CONFIRMADAS por una persona, y por eso
+ * resuelve PRIMERO. Un mapeo mal aprendido se corrige solo: en la próxima
+ * factura el admin cambia el producto del renglón y el guardado lo pisa.
+ */
+export const proveedorArticulos = pgTable('proveedor_articulos', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  /** El código tal como lo imprime la factura. */
+  codigo: text('codigo').notNull(),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /** La última descripción vista en el papel, para poder auditar el mapeo. */
+  descripcion: text('descripcion').notNull().default(''),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  uqCodigo: uniqueIndex('uq_proveedor_articulo').on(t.proveedorId, t.codigo),
+}));
+
 /** De dónde salió un cambio de costo. Define cómo se lee la auditoría. */
 export const origenCostoEnum = pgEnum('origen_costo', [
   'alta', 'manual', 'masiva', 'recepcion', 'reversion',

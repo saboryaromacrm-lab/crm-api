@@ -4,12 +4,13 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
+  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength,
+  ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas,
+  comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
   productoProveedores, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
 /* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
@@ -73,6 +74,15 @@ class ComprobanteItemDto {
   @IsOptional() @IsNumber() costoUnitario?: number;
   @IsOptional() @IsNumber() descuento?: number;
   @IsOptional() @IsNumber() iva?: number;
+  /**
+   * El código del artículo COMO LO IMPRIME LA FACTURA del proveedor, cuando el
+   * renglón vino de la lectura del PDF. No se guarda en el ítem: alimenta el
+   * mapeo aprendido (proveedor, código) → producto, que es lo que hace que la
+   * próxima factura reconozca el artículo sola.
+   */
+  @IsOptional() @IsString() @MaxLength(40) codigoProveedor?: string;
+  /** La descripción del papel, para poder auditar el mapeo después. */
+  @IsOptional() @IsString() @MaxLength(200) descripcionPapel?: string;
 }
 
 /**
@@ -629,6 +639,36 @@ export class ComprobantesService {
         cantidad: Number(it.cantidad) || 0, costoUnitario: Number(it.costoUnitario) || 0,
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
       })));
+
+      /*
+       * APRENDER EL MAPEO DE ARTÍCULOS. Si el renglón vino de la lectura del
+       * PDF trae el código con el que el proveedor lo imprime: acá — recién al
+       * GUARDAR, o sea con una persona confirmando la factura entera — se
+       * recuerda (proveedor, código) → producto. La próxima factura del mismo
+       * proveedor reconoce el artículo sin similitudes de nombre.
+       *
+       * Es upsert: si el mapeo existía y el admin eligió otro producto en este
+       * alta, la elección nueva PISA la vieja. Un mapeo mal aprendido se
+       * corrige solo en la factura siguiente.
+       */
+      for (const it of dto.items) {
+        const codigo = String(it.codigoProveedor ?? '').trim();
+        if (!codigo) continue;
+        await tx.insert(proveedorArticulos).values({
+          proveedorId: prov.id,
+          codigo,
+          productoId: it.productoId,
+          descripcion: String(it.descripcionPapel ?? '').trim().slice(0, 200),
+          actualizadoEn: new Date(),
+        }).onConflictDoUpdate({
+          target: [proveedorArticulos.proveedorId, proveedorArticulos.codigo],
+          set: {
+            productoId: it.productoId,
+            descripcion: String(it.descripcionPapel ?? '').trim().slice(0, 200),
+            actualizadoEn: new Date(),
+          },
+        });
+      }
 
       if (percepciones.length) {
         await tx.insert(comprobantePercepciones).values(
