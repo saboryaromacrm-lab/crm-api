@@ -44,8 +44,8 @@ import { and, asc, desc, eq, gt, gte, inArray, lte, ne, sql } from 'drizzle-orm'
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  enviosCafeteria, envioCafeteriaItems, gastos, presentaciones, productoProveedores,
-  productos, sucursales, usuarios,
+  enviosCafeteria, envioCafeteriaItems, gastos, pedidoCafeteriaItems, pedidosCafeteria,
+  presentaciones, productoProveedores, productos, sucursales, usuarios,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
@@ -65,6 +65,8 @@ class CrearEnvioDto {
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** El pedido que este envío viene a cumplir: lo cierra en el mismo acto. */
+  @IsOptional() @IsInt() pedidoId?: number;
   @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => EnvioItemDto)
   items!: EnvioItemDto[];
 }
@@ -83,6 +85,24 @@ class EditarEnvioDto {
 }
 
 class AnularEnvioDto {
+  @IsString() @MaxLength(300) motivo!: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class PedidoItemDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() presentacionId?: number;
+  @IsNumber() cantidad!: number;
+}
+
+class CrearPedidoDto {
+  @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+  @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => PedidoItemDto)
+  items!: PedidoItemDto[];
+}
+
+class AnularPedidoDto {
   @IsString() @MaxLength(300) motivo!: string;
   @IsOptional() @IsInt() usuarioId?: number;
 }
@@ -165,6 +185,24 @@ export class CafeteriaService {
         || (await tx.select().from(sucursales).where(eq(sucursales.tipo, 'distribuidora')).limit(1))[0]?.id;
       if (!sucId) throw new BadRequestException('No hay sucursal de origen.');
 
+      /*
+       * Si viene a cumplir un pedido, el pedido se CIERRA acá, con reclamo
+       * atómico: dos personas convirtiendo el mismo pedido a la vez generarían
+       * dos envíos por la misma demanda — solo una gana el UPDATE condicional.
+       */
+      if (o.pedidoId) {
+        const cerrado = await tx.update(pedidosCafeteria)
+          .set({ estado: 'enviado', actualizadoEn: new Date() })
+          .where(and(
+            eq(pedidosCafeteria.id, o.pedidoId),
+            inArray(pedidosCafeteria.estado, ['pendiente', 'armando']),
+          ))
+          .returning({ id: pedidosCafeteria.id });
+        if (!cerrado.length) {
+          throw new BadRequestException('Ese pedido ya se convirtió en envío (o está anulado) — actualizá la pantalla.');
+        }
+      }
+
       const val = await this.valuarItems(tx, items);
       const { filas, total } = this.armarFilas(items, val, (_c, hoy) => hoy);
 
@@ -173,6 +211,7 @@ export class CafeteriaService {
         usuarioId: o.usuarioId ?? null, estado: 'enviado', totalCosto: total,
         observaciones: (o.observaciones ?? '').trim(),
         version: 1, actualizadoEn: new Date(),
+        pedidoId: o.pedidoId ?? null,
       }).returning();
       const codigo = `CAF${String(envio.id).padStart(4, '0')}`;
       await tx.update(enviosCafeteria).set({ codigo }).where(eq(enviosCafeteria.id, envio.id));
@@ -339,16 +378,141 @@ export class CafeteriaService {
       estado: enviosCafeteria.estado, totalCosto: enviosCafeteria.totalCosto,
       observaciones: enviosCafeteria.observaciones, motivoAnulacion: enviosCafeteria.motivoAnulacion,
       version: enviosCafeteria.version, actualizadoEn: enviosCafeteria.actualizadoEn,
+      pedidoId: enviosCafeteria.pedidoId, pedidoCodigo: pedidosCafeteria.codigo,
       sucursalNombre: sucursales.nombre, usuarioNombre: usuarios.nombre,
     }).from(enviosCafeteria)
       .leftJoin(sucursales, eq(sucursales.id, enviosCafeteria.sucursalId))
       .leftJoin(usuarios, eq(usuarios.id, enviosCafeteria.usuarioId))
+      .leftJoin(pedidosCafeteria, eq(pedidosCafeteria.id, enviosCafeteria.pedidoId))
       .where(eq(enviosCafeteria.id, id)).limit(1);
     if (!envio) throw new NotFoundException('Envío inexistente.');
     const items = await this.db.select().from(envioCafeteriaItems)
       .where(eq(envioCafeteriaItems.envioId, id))
       .orderBy(envioCafeteriaItems.id);
     return { ...envio, items: items.map((it) => this.conKg(it)) };
+  }
+
+  /* ==================================================================== *
+   * PEDIDOS DE LA CAFETERÍA — la demanda, separada del envío
+   * ==================================================================== *
+   * Los arma el usuario del rol Cafetería (su única pantalla del CRM) contra
+   * el catálogo completo con disponibilidad. NO tocan stock ni costo: la
+   * realidad entra con el envío, que se crea desde el pedido y lo cierra.
+   */
+
+  async crearPedido(o: CrearPedidoDto) {
+    const items = (o.items || []).filter((it) => Number(it.cantidad) > 0);
+    if (!items.length) throw new BadRequestException('Agregá al menos un renglón con cantidad.');
+
+    const id = await this.db.transaction(async (tx) => {
+      // valuarItems valida producto/presentación y da los nombres; el costo
+      // que calcula acá NO se guarda — el pedido es demanda, no plata.
+      const val = await this.valuarItems(tx, items);
+      const filas = items.map((it) => {
+        const { prod, pres } = val.get(`${it.productoId}-${it.presentacionId ?? 0}`)!;
+        const esGranel = prod.tipo === 'granel' && !pres;
+        const tam = pres ? (pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`) : '';
+        return {
+          productoId: prod.id,
+          presentacionId: pres?.id ?? null,
+          cantidad: Number(it.cantidad),
+          nombre: pres ? `${prod.nombre} · ${tam}` : prod.nombre,
+          unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
+        };
+      });
+
+      const [pedido] = await tx.insert(pedidosCafeteria).values({
+        codigo: '', usuarioId: o.usuarioId ?? null,
+        observaciones: (o.observaciones ?? '').trim(), actualizadoEn: new Date(),
+      }).returning();
+      const codigo = `PCAF${String(pedido.id).padStart(4, '0')}`;
+      await tx.update(pedidosCafeteria).set({ codigo }).where(eq(pedidosCafeteria.id, pedido.id));
+      await tx.insert(pedidoCafeteriaItems).values(filas.map((f) => ({ ...f, pedidoId: pedido.id })));
+      return pedido.id;
+    });
+    return this.getPedido(id);
+  }
+
+  async listPedidos(q: { estado?: string; limit?: number } = {}) {
+    const conds: any[] = [];
+    if (q.estado && ['pendiente', 'armando', 'enviado', 'anulado'].includes(q.estado)) {
+      conds.push(eq(pedidosCafeteria.estado, q.estado as any));
+    }
+    const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 300);
+    const rows = await this.db.select({
+      id: pedidosCafeteria.id, codigo: pedidosCafeteria.codigo, fecha: pedidosCafeteria.fecha,
+      estado: pedidosCafeteria.estado, observaciones: pedidosCafeteria.observaciones,
+      usuarioNombre: usuarios.nombre,
+      // El envío que lo cumplió, si ya se convirtió.
+      envioId: enviosCafeteria.id, envioCodigo: enviosCafeteria.codigo,
+    }).from(pedidosCafeteria)
+      .leftJoin(usuarios, eq(usuarios.id, pedidosCafeteria.usuarioId))
+      .leftJoin(enviosCafeteria, eq(enviosCafeteria.pedidoId, pedidosCafeteria.id))
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(pedidosCafeteria.id))
+      .limit(limit);
+
+    const cuenta = await this.db.select({
+      pedidoId: pedidoCafeteriaItems.pedidoId,
+      renglones: sql<number>`count(*)`,
+    }).from(pedidoCafeteriaItems)
+      .where(inArray(pedidoCafeteriaItems.pedidoId, rows.length ? rows.map((r) => r.id) : [-1]))
+      .groupBy(pedidoCafeteriaItems.pedidoId);
+    const porPedido = new Map(cuenta.map((c) => [c.pedidoId, Number(c.renglones)]));
+    return rows.map((r) => ({ ...r, renglones: porPedido.get(r.id) ?? 0 }));
+  }
+
+  async getPedido(id: number) {
+    const [pedido] = await this.db.select({
+      id: pedidosCafeteria.id, codigo: pedidosCafeteria.codigo, fecha: pedidosCafeteria.fecha,
+      estado: pedidosCafeteria.estado, observaciones: pedidosCafeteria.observaciones,
+      motivoAnulacion: pedidosCafeteria.motivoAnulacion, actualizadoEn: pedidosCafeteria.actualizadoEn,
+      usuarioId: pedidosCafeteria.usuarioId, usuarioNombre: usuarios.nombre,
+      envioId: enviosCafeteria.id, envioCodigo: enviosCafeteria.codigo,
+    }).from(pedidosCafeteria)
+      .leftJoin(usuarios, eq(usuarios.id, pedidosCafeteria.usuarioId))
+      .leftJoin(enviosCafeteria, eq(enviosCafeteria.pedidoId, pedidosCafeteria.id))
+      .where(eq(pedidosCafeteria.id, id)).limit(1);
+    if (!pedido) throw new NotFoundException('Pedido inexistente.');
+    const items = await this.db.select().from(pedidoCafeteriaItems)
+      .where(eq(pedidoCafeteriaItems.pedidoId, id))
+      .orderBy(pedidoCafeteriaItems.id);
+    return { ...pedido, items };
+  }
+
+  /** El contador del badge y del aviso del admin: qué demanda espera. */
+  async pedidosPendientes() {
+    const rows = await this.db.select({
+      estado: pedidosCafeteria.estado,
+      n: sql<number>`count(*)::int`,
+    }).from(pedidosCafeteria)
+      .where(inArray(pedidosCafeteria.estado, ['pendiente', 'armando']))
+      .groupBy(pedidosCafeteria.estado);
+    const de = (e: string) => Number(rows.find((r) => r.estado === e)?.n) || 0;
+    return { pendientes: de('pendiente'), armando: de('armando') };
+  }
+
+  /** pendiente → armando: "lo estoy preparando". Reclamo atómico. */
+  async tomarPedido(id: number) {
+    const gano = await this.db.update(pedidosCafeteria)
+      .set({ estado: 'armando', actualizadoEn: new Date() })
+      .where(and(eq(pedidosCafeteria.id, id), eq(pedidosCafeteria.estado, 'pendiente')))
+      .returning({ id: pedidosCafeteria.id });
+    if (!gano.length) throw new BadRequestException('El pedido cambió de estado — actualizá la pantalla.');
+    return this.getPedido(id);
+  }
+
+  async anularPedido(id: number, o: AnularPedidoDto) {
+    if (!o.motivo?.trim()) throw new BadRequestException('Escribí por qué se anula.');
+    const gano = await this.db.update(pedidosCafeteria)
+      .set({ estado: 'anulado', motivoAnulacion: o.motivo.trim(), actualizadoEn: new Date() })
+      .where(and(
+        eq(pedidosCafeteria.id, id),
+        inArray(pedidosCafeteria.estado, ['pendiente', 'armando']),
+      ))
+      .returning({ id: pedidosCafeteria.id });
+    if (!gano.length) throw new BadRequestException('Ese pedido ya se envió (o ya estaba anulado): no se anula.');
+    return this.getPedido(id);
   }
 
   /**
@@ -507,6 +671,33 @@ export class CafeteriaController {
   /** El endpoint de coffit: todo lo que cambió desde el cursor. */
   @Get('sync') sync(@Query('desde') desde?: string) {
     return this.svc.sync(desde);
+  }
+
+  /* ---- Pedidos de la cafetería (la demanda) ---- */
+
+  @Get('pedidos') listPedidos(@Query('estado') estado?: string, @Query('limit') limit?: string) {
+    return this.svc.listPedidos({ estado, limit: limit ? Number(limit) : undefined });
+  }
+
+  /** El poller del aviso del admin: un count, nada más. */
+  @Get('pedidos-pendientes') pedidosPendientes() {
+    return this.svc.pedidosPendientes();
+  }
+
+  @Get('pedidos/:id') getPedido(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.getPedido(id);
+  }
+
+  @Post('pedidos') crearPedido(@Body() dto: CrearPedidoDto) {
+    return this.svc.crearPedido(dto);
+  }
+
+  @Post('pedidos/:id/tomar') tomarPedido(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.tomarPedido(id);
+  }
+
+  @Post('pedidos/:id/anular') anularPedido(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPedidoDto) {
+    return this.svc.anularPedido(id, dto);
   }
 
   @Get('envios/:id') get(@Param('id', ParseIntPipe) id: number) {

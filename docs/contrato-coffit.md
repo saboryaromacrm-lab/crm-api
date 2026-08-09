@@ -45,6 +45,7 @@ cambio. Sin `desde` devuelve todo el historial (máximo 200 por llamada).
       "motivoAnulacion": "",
       "version": 2,
       "actualizadoEn": "2026-08-09T06:01:10.456Z",
+      "pedidoId": 3,
       "items": [
         {
           "id": 15,
@@ -114,6 +115,15 @@ Congelado al enviar, en pesos, **por la unidad del `modo`** ($/kg, $/paquete o
 $/unidad). Es el costo de reposición del café, para que coffit calcule su
 margen. El precio de venta del café lo decide coffit — no copiar la lista de
 la distribuidora.
+
+### El origen del envío: `pedidoId`
+
+La cafetería puede armar su **pedido** en el CRM (rol Cafetería, con el catálogo
+completo a la vista). Cuando la distribuidora lo convierte en envío, el envío
+viaja con `pedidoId` (null = envío espontáneo, sin pedido detrás). Es
+**informativo**: le permite a coffit cruzar "esto que llegó responde a aquello
+que se pidió". El detalle que vale es siempre el del ENVÍO — puede diferir de
+lo pedido (faltantes, reemplazos).
 
 ## Versiones: cómo reaccionar a ediciones y anulaciones
 

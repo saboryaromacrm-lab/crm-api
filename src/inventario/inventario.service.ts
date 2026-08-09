@@ -4,7 +4,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
-  comprobantes, comprobanteItems, facturaLecturas,
+  comprobantes, comprobanteItems, facturaLecturas, pedidosCafeteria,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
@@ -1180,7 +1180,7 @@ export class InventarioService {
 
   async bootstrap() {
     const [suc, prov, usr, prods, pres, provCostos, formatos, listasCat, stk, transfs, incs,
-      ms, cs, ss, es, pes, rolesCat, pendientesLectura] = await Promise.all([
+      ms, cs, ss, es, pes, rolesCat, pendientesLectura, pendientesPedidoCafe] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select().from(usuarios),
@@ -1200,6 +1200,9 @@ export class InventarioService {
       this.db.select().from(roles),
       this.db.select({ n: sql<number>`count(*)` }).from(facturaLecturas)
         .where(eq(facturaLecturas.estado, 'pendiente')),
+      // La demanda del café que espera: alimenta el globito de Almacén › Cafetería.
+      this.db.select({ n: sql<number>`count(*)` }).from(pedidosCafeteria)
+        .where(inArray(pedidosCafeteria.estado, ['pendiente', 'armando'])),
     ]);
     const cfgVentas = await this.cfg.get('ventas');
     const redondeo = cfgVentas.redondeoPrecio;
@@ -1299,6 +1302,8 @@ export class InventarioService {
        * el cajón.
        */
       lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
+      /** Pedidos del café sin resolver (pendiente + armando): el globito de Cafetería. */
+      pedidosCafeteriaPendientes: Number(pendientesPedidoCafe?.[0]?.n) || 0,
       // El frontend replica el cálculo de precios: necesita el mismo redondeo
       // para no mostrar un número distinto al de la API.
       configVentas: cfgVentas,

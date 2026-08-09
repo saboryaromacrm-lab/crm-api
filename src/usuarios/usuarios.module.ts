@@ -105,6 +105,12 @@ export const CATALOGO_PERMISOS = [
       { clave: 'almacen.operaciones', nombre: 'Operaciones' },
       { clave: 'almacen.incidencias', nombre: 'Incidencias' },
       { clave: 'almacen.cafeteria', nombre: 'Cafetería (envíos a coffit)' },
+      /*
+       * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
+       * única sección del rol Cafetería — sin ninguna otra clave, ese usuario
+       * no ve nada más del CRM (sin sección = módulo invisible).
+       */
+      { clave: 'almacen.cafeteria-pedidos', nombre: 'Pedido a la distribuidora (pantalla de la cafetería)' },
     ],
     acciones: [
       { clave: 'pedidos', nombre: 'Pedir y recibir mercadería' },

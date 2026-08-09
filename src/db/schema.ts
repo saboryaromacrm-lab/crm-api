@@ -1591,6 +1591,45 @@ export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['enviado', 'anul
  */
 export const modoEnvioCafeEnum = pgEnum('modo_envio_cafe', ['granel', 'paquete', 'unidad']);
 
+/**
+ * EL PEDIDO DE LA CAFETERÍA — la demanda, no el envío.
+ *
+ * Lo arma el usuario del rol Cafetería desde SU pantalla (el CRM con una sola
+ * sección visible): elige del catálogo completo con disponibilidad a la vista.
+ * NO toca stock ni congela costo — es un pedido, la vieja lección: la realidad
+ * entra recién con el ENVÍO, que se crea desde el pedido y lo cierra.
+ *
+ *   pendiente ──tomar──► armando ──convertir en envío──► enviado
+ *        └──────────────anular (con motivo)──────────────► anulado
+ */
+export const estadoPedidoCafeEnum = pgEnum('estado_pedido_cafe', ['pendiente', 'armando', 'enviado', 'anulado']);
+
+export const pedidosCafeteria = pgTable('pedidos_cafeteria', {
+  id: serial('id').primaryKey(),
+  codigo: text('codigo').notNull().default(''),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /** Quién lo pidió (el usuario del rol Cafetería). */
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  estado: estadoPedidoCafeEnum('estado').notNull().default('pendiente'),
+  observaciones: text('observaciones').notNull().default(''),
+  motivoAnulacion: text('motivo_anulacion').notNull().default(''),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  // El badge y el aviso del admin preguntan esto en cada poll.
+  ixEstado: index('ix_pedidos_cafe_estado').on(t.estado),
+}));
+
+export const pedidoCafeteriaItems = pgTable('pedido_cafeteria_items', {
+  id: serial('id').primaryKey(),
+  pedidoId: integer('pedido_id').notNull().references(() => pedidosCafeteria.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'restrict' }),
+  cantidad: doublePrecision('cantidad').notNull().default(0),
+  /* Snapshot para que el pedido histórico siga siendo legible tal como se pidió. */
+  nombre: text('nombre').notNull().default(''),
+  unidad: text('unidad').notNull().default(''),
+});
+
 export const enviosCafeteria = pgTable('envios_cafeteria', {
   id: serial('id').primaryKey(),
   codigo: text('codigo').notNull().default(''),
@@ -1611,6 +1650,13 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
    */
   version: integer('version').notNull().default(1),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * El pedido que este envío vino a cumplir (null = envío espontáneo). Una
+   * sola dirección a propósito: el envío conoce su origen y el pedido se
+   * resuelve por consulta — dos punteros cruzados terminan en desacuerdo.
+   * Viaja en el sync: coffit puede cruzar su pedido con lo que llegó.
+   */
+  pedidoId: integer('pedido_id'),
 }, (t) => ({
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
   // La consulta de sincronización de coffit entra por acá.
