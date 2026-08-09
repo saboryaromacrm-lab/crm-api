@@ -1558,31 +1558,55 @@ export const gastos = pgTable('gastos', {
  * coffit tiene que decir lo mismo dentro de seis meses aunque el producto se
  * renombre, y el código de barras es la clave del mapeo del lado coffit.
  */
-export const tipoEnvioCafeEnum = pgEnum('tipo_envio_cafe', ['envio', 'devolucion']);
-/** Qué hace la cafetería con esto: reventa tal cual, o insumo de receta. Le importa a coffit. */
-export const destinoEnvioCafeEnum = pgEnum('destino_envio_cafe', ['venta', 'uso']);
-/**
- * Ciclo de vida, con el stock acompañando: pedido (demanda, sin stock) →
- * transito (disponible → en_transito, costo congelado) → recibido (egresa del
- * CRM). La devolución nace 'recibido'. Anular deshace lo de su etapa.
+/*
+ * Sin `tipo_envio_cafe` ni `destino_envio_cafe` desde el 9/8/2026: no hay
+ * devoluciones (coffit recibe y punto: una corrección es EDITAR el envío), y el
+ * destino de cada renglón (venta/uso) es una decisión DE COFFIT — el CRM la
+ * pedía, la guardaba y jamás la leía. La clasificación vive donde vive el stock.
  */
-export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['pedido', 'transito', 'recibido', 'anulado']);
+/**
+ * Ciclo de vida en DOS estados: el envío nace 'enviado' (egresa stock y congela
+ * costo en el mismo acto — con el envío ya se da por hecho que coffit lo
+ * recibió) y solo puede pasar a 'anulado' (reversión completa). Las etapas
+ * pedido/transito/recibido se colapsaron el 9/8/2026: eran teatro de un viaje
+ * que en la práctica es cruzar la calle, y cada etapa era un lugar más donde
+ * el estado del CRM y el de coffit podían divergir.
+ */
+export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['enviado', 'anulado']);
+/**
+ * En qué unidad habla `cantidad`, EXPLÍCITO. Antes se deducía de si
+ * `presentacionId` venía en null — la ambigüedad exacta que puede convertir 10
+ * paquetes de 500 g en 10 kg del lado de coffit.
+ *   granel  → cantidad en KG (tamKg = 1)
+ *   paquete → cantidad en PAQUETES de la presentación (tamKg = kg por paquete)
+ *   unidad  → cantidad en UNIDADES de producto entero (tamKg = 0: no aplica)
+ */
+export const modoEnvioCafeEnum = pgEnum('modo_envio_cafe', ['granel', 'paquete', 'unidad']);
 
 export const enviosCafeteria = pgTable('envios_cafeteria', {
   id: serial('id').primaryKey(),
   codigo: text('codigo').notNull().default(''),
-  tipo: tipoEnvioCafeEnum('tipo').notNull().default('envio'),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
-  /** De qué sucursal sale la mercadería (o adónde vuelve en la devolución). */
+  /** De qué sucursal sale la mercadería. */
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-  estado: estadoEnvioCafeEnum('estado').notNull().default('pedido'),
+  estado: estadoEnvioCafeEnum('estado').notNull().default('enviado'),
   /** Suma de renglones a costo — lo que este envío le "cuesta" a la cafetería. */
   totalCosto: doublePrecision('total_costo').notNull().default(0),
   observaciones: text('observaciones').notNull().default(''),
   motivoAnulacion: text('motivo_anulacion').notNull().default(''),
+  /**
+   * EL PULSO PARA COFFIT. Un envío enviado se puede EDITAR (y anular), así que
+   * coffit necesita saber que algo cambió después de haberlo ingresado:
+   * `version` sube en cada cambio y `actualizadoEn` es el cursor de
+   * sincronización (GET /cafeteria/sync?desde=… devuelve lo tocado desde ahí).
+   */
+  version: integer('version').notNull().default(1),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
+  // La consulta de sincronización de coffit entra por acá.
+  ixActualizado: index('ix_envios_cafe_actualizado').on(t.actualizadoEn),
 }));
 
 /* ============================================================================
@@ -1622,13 +1646,27 @@ export const chatLecturas = pgTable('chat_lecturas', {
 export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
   id: serial('id').primaryKey(),
   envioId: integer('envio_id').notNull().references(() => enviosCafeteria.id, { onDelete: 'cascade' }),
+  /**
+   * productoId + presentacionId son LA CLAVE ESTABLE para coffit: seriales
+   * inmutables. Coffit matchea a mano una vez (su almacén "Sabor y Aroma") y el
+   * mapeo no se rompe aunque acá se recodifique o renombre el producto —
+   * códigos y nombre viajan solo como legibles.
+   */
   productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'restrict' }),
-  destino: destinoEnvioCafeEnum('destino').notNull().default('venta'),
+  /** En qué unidad habla `cantidad` (ver el enum): la trampa del 20× cerrada. */
+  modo: modoEnvioCafeEnum('modo').notNull().default('unidad'),
   cantidad: doublePrecision('cantidad').notNull().default(0),
-  /** Costo unitario CONGELADO al confirmar ($/kg del granel, $/paquete de la presentación). */
+  /** Kg por unidad de cantidad (granel: 1, paquete: tamKg de la presentación, unidad: 0). */
+  tamKg: doublePrecision('tam_kg').notNull().default(0),
+  /**
+   * Costo unitario CONGELADO al enviar ($/kg, $/paquete o $/unidad). Editar el
+   * envío NO re-valúa los renglones que ya estaban: solo un renglón nuevo entra
+   * al costo del día. Re-valuar sería cambiar retroactivamente cuánto costó la
+   * cafetería en un período ya mirado.
+   */
   costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
-  /* Snapshot para el remito y el mapeo en coffit. */
+  /* Snapshot para el remito y para que la pantalla de matcheo en coffit sea legible. */
   nombre: text('nombre').notNull().default(''),
   unidad: text('unidad').notNull().default(''),
   codigoBarras: text('codigo_barras').notNull().default(''),
