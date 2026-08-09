@@ -383,7 +383,13 @@ export class VentasService {
         ?? efectivas[efectivas.length - 1] ?? null;
       const markupBase = filaBase?.markupEf ?? 0;
 
-      items.push({
+      /*
+       * El "solo para fraccionar" (la Pimienta de Jamaica que llega 1 kg y se
+       * fracciona entera en paquetes) NO viaja suelto al POS: no está a la
+       * venta por kg. Sus paquetes, abajo, van normal. Esto es solo lo que se
+       * OFRECE — el candado que vale está en la venta (validarSoloFraccionar).
+       */
+      if (!p.soloFraccionar) items.push({
         key: `p${p.id}`,
         productoId: p.id,
         presentacionId: null,
@@ -697,6 +703,25 @@ export class VentasService {
 
   /* ------------------------------ Escritura ------------------------------ */
 
+  /**
+   * "SOLO PARA FRACCIONAR": el granel marcado así no se vende suelto — existe
+   * únicamente para convertirse en paquetes (la Pimienta de Jamaica llega 1 kg
+   * y se fracciona entera). El POS ya no lo ofrece suelto; este es el candado
+   * de verdad, porque lo que se acepta no puede depender de lo que se ofrece.
+   * Sus presentaciones se venden normal (llevan presentacionId).
+   */
+  private async validarSoloFraccionar(items: Array<{ productoId: number; presentacionId?: number | null }>) {
+    const sueltos = [...new Set((items ?? []).filter((it) => !it.presentacionId).map((it) => it.productoId))];
+    if (!sueltos.length) return;
+    const [prohibido] = await this.db.select({ nombre: productos.nombre }).from(productos)
+      .where(and(inArray(productos.id, sueltos), eq(productos.soloFraccionar, true))).limit(1);
+    if (prohibido) {
+      throw new BadRequestException(
+        `${prohibido.nombre} no se vende suelto: es solo para fraccionar. Vendé sus paquetes.`,
+      );
+    }
+  }
+
   async create(dto: CreateVentaDto) {
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.consumidorFinal();
@@ -704,6 +729,10 @@ export class VentasService {
 
     const esBorrador = dto.estado === 'borrador';
     if (!esBorrador && !dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
+
+    // También en el borrador: un ticket que nunca va a poder confirmarse no
+    // tiene por qué poder armarse.
+    await this.validarSoloFraccionar(dto.items ?? []);
 
     const tot = this.calcularTotales(dto.items ?? [], dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
@@ -856,6 +885,9 @@ export class VentasService {
   async confirmar(id: number, dto: ConfirmarVentaDto) {
     const borrador = await this.exigirBorrador(id);
     if (!borrador.items.length) throw new BadRequestException('El ticket está vacío.');
+    // El borrador pudo nacer antes de que el producto se marcara "solo para
+    // fraccionar": se re-valida acá, que es donde el stock de verdad sale.
+    await this.validarSoloFraccionar(borrador.items);
 
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(borrador.clienteId);

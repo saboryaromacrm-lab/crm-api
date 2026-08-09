@@ -193,6 +193,14 @@ export const productos = pgTable('productos', {
 
   iva: doublePrecision('iva').notNull().default(21),
   tipo: tipoProductoEnum('tipo').notNull().default('entero'),
+  /**
+   * El "SOLO STOCK" del sistema viejo: granel que NO se vende suelto — existe
+   * únicamente para fraccionarse. La Pimienta de Jamaica llega 1 kg y se
+   * fracciona entera en 20 paquetes de 50 g: el POS no tiene que poder vender
+   * "0,5 kg de pimienta suelta", solo sus paquetes. El candado vive en la
+   * venta (API) y el POS ni la ofrece suelta.
+   */
+  soloFraccionar: boolean('solo_fraccionar').notNull().default(false),
   stockMin: doublePrecision('stock_min').notNull().default(0),
   /**
    * Redondeo de góndola propio. NULL = hereda el de configuración, que es lo

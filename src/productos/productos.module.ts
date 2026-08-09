@@ -44,6 +44,13 @@ class UpsertProductoDto {
   @IsOptional() @IsBoolean() publicado?: boolean;
   @IsOptional() @IsString() idExterno?: string;
 
+  /**
+   * Granel que NO se vende suelto: existe solo para fraccionarse (el "SOLO
+   * STOCK" del sistema viejo). El POS no lo ofrece suelto y la venta lo
+   * rechaza; sus presentaciones se venden normal.
+   */
+  @IsOptional() @IsBoolean() soloFraccionar?: boolean;
+
   /** Solo en el alta: después el tipo no se cambia (hay stock atado a él). */
   @IsOptional() @IsBoolean() esGranel?: boolean;
 
@@ -315,6 +322,7 @@ export class ProductosService {
       // `undefined` = no lo mandaron (queda como estaba); `null` = heredar.
       redondeo: dto.redondeo === undefined ? (previo?.redondeo ?? null) : dto.redondeo,
       publicado: dto.publicado ?? previo?.publicado ?? false,
+      soloFraccionar: dto.soloFraccionar ?? previo?.soloFraccionar ?? false,
       idExterno: (dto.idExterno ?? previo?.idExterno ?? '').trim(),
     };
   }
@@ -335,6 +343,9 @@ export class ProductosService {
   }
 
   async create(dto: UpsertProductoDto) {
+    if (dto.soloFraccionar && !dto.esGranel) {
+      throw new BadRequestException('"Solo para fraccionar" es para productos a granel.');
+    }
     this.validarIva(dto.iva);
     await this.validarClasificacion(dto);
     await this.validarCodigos(dto);
@@ -581,6 +592,12 @@ export class ProductosService {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
 
+    // "Solo para fraccionar" es un candado sobre la venta SUELTA: en un
+    // producto entero no significa nada y aceptarlo sería guardar ruido.
+    if (dto.soloFraccionar && p.tipo !== 'granel') {
+      throw new BadRequestException('"Solo para fraccionar" es para productos a granel.');
+    }
+
     this.validarIva(dto.iva);
     await this.validarClasificacion(dto);
     await this.validarCodigos(dto, id);
@@ -617,6 +634,7 @@ export class ProductosService {
     if (p.tipo !== 'granel') throw new BadRequestException('Solo los productos a granel tienen presentaciones.');
 
     const valid = (items || []).filter((x) => Number(x.tamKg) > 0).map((x) => ({
+      id: Number(x.id) || null,
       productoId: id,
       tamKg: Number(x.tamKg),
       recargo: Number(x.recargo) || 0,
@@ -646,9 +664,46 @@ export class ProductosService {
       if (otra) throw new BadRequestException('Ese código ya lo usa la presentación de otro producto.');
     }
 
+    /*
+     * ACTUALIZA POR ID, no borra-y-reinserta. No es estilo: `stock` cascadea
+     * por `presentacion_id`, así que el reemplazo total borraba EL STOCK de
+     * todos los fraccionados en cada guardado de la pestaña — aunque no se
+     * hubiera sacado ninguna. (La misma lección que `setFormatosCompra` con su
+     * historial de costos.) Solo se borra lo que el usuario sacó de la lista,
+     * y sacar una presentación CON STOCK se rechaza: ese stock son paquetes
+     * reales en el depósito, no un renglón de configuración.
+     */
     await this.db.transaction(async (tx) => {
-      await tx.delete(presentaciones).where(eq(presentaciones.productoId, id));
-      if (valid.length) await tx.insert(presentaciones).values(valid);
+      const actuales = await tx.select().from(presentaciones)
+        .where(eq(presentaciones.productoId, id));
+      const vigentes = new Set(valid.map((v) => v.id).filter(Boolean));
+
+      for (const vieja of actuales) {
+        if (vigentes.has(vieja.id)) continue;
+        const [conStock] = await tx.select({ id: stock.id }).from(stock)
+          .where(and(eq(stock.presentacionId, vieja.id), gt(stock.cantidad, 1e-9)))
+          .limit(1);
+        if (conStock) {
+          const tam = vieja.tamKg < 1 ? `${Math.round(vieja.tamKg * 1000)} g` : `${vieja.tamKg} kg`;
+          throw new BadRequestException(
+            `La presentación de ${tam} tiene paquetes en stock: no se puede borrar. Vendé o ajustá ese stock primero.`,
+          );
+        }
+        await tx.delete(presentaciones).where(eq(presentaciones.id, vieja.id));
+      }
+
+      const porId = new Map(actuales.map((a: any) => [a.id, a]));
+      for (const v of valid) {
+        if (v.id && porId.has(v.id)) {
+          await tx.update(presentaciones)
+            .set({ tamKg: v.tamKg, recargo: v.recargo, codigoBarras: v.codigoBarras })
+            .where(eq(presentaciones.id, v.id));
+        } else {
+          await tx.insert(presentaciones).values({
+            productoId: id, tamKg: v.tamKg, recargo: v.recargo, codigoBarras: v.codigoBarras,
+          });
+        }
+      }
     });
     return this.get(id);
   }
