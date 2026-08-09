@@ -344,6 +344,13 @@
       "when": 1786740000000,
       "tag": "0048_pedidos_cafeteria",
       "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1786820000000,
+      "tag": "0049_pedido_cafe_solo_del_cafe",
+      "breakpoints": true
     }
   ]
 }

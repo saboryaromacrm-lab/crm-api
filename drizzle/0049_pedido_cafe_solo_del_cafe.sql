@@ -1,0 +1,23 @@
+-- "Pedido a la distribuidora" es la pantalla DEL CAFÉ, y de nadie más.
+--
+-- La 0048 le sumó la sección `almacen.cafeteria-pedidos` a admin y superadmin,
+-- por el reflejo de siempre (sección nueva → dársela al admin, como
+-- `compras.lecturas` en la 0041). Acá ese reflejo está mal: esa pantalla es la
+-- cafetería pidiéndole mercadería a la distribuidora. Verla en el menú de
+-- Almacén invita a que administración cargue un pedido que nadie pidió, y
+-- confunde de qué lado del mostrador nace cada cosa.
+--
+-- Administración no pierde nada: para mandar mercadería sin pedido detrás está
+-- "+ Nuevo envío" en Almacén › Cafetería (el envío nace con `pedido_id` en
+-- null), y la bandeja de pedidos con Tomar, Convertir y Anular sigue ahí con
+-- `almacen.cafeteria`.
+--
+-- La clave NO se saca del catálogo de Gerencia › Usuarios y roles: es la que
+-- arma el rol Cafetería, y el editor muestra el catálogo completo aunque quien
+-- edita no tenga la sección. Solo deja de venir otorgada.
+--
+-- `<> 'cafeteria'` en lugar de nombrar admin y superadmin: la limpieza vale para
+-- cualquier rol que la haya heredado. Corre una sola vez — si mañana el dueño
+-- decide dársela a otro rol desde la pantalla, nadie se la vuelve a quitar.
+UPDATE "roles" SET "permisos" = "permisos" - 'almacen.cafeteria-pedidos'
+WHERE "clave" <> 'cafeteria' AND ("permisos" ? 'almacen.cafeteria-pedidos');
