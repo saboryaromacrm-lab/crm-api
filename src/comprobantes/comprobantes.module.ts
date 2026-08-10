@@ -7,11 +7,11 @@ import {
   ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength,
   ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
-  productoProveedores, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
+  productoProveedores, productos, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
 /* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
  * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
@@ -450,10 +450,30 @@ export class ComprobantesService {
     });
   }
 
+  /**
+   * Lo que ya no se trae NO entra por una factura de compra. Vale para
+   * discontinuado y archivado: si el producto volvió, la decisión es
+   * reactivarlo (un clic, conserva precios e historial), no cargarlo como si
+   * nunca se hubiera dado de baja — así el estado no miente.
+   */
+  private async validarProductosComprables(items: Array<{ productoId: number }>) {
+    const ids = [...new Set((items ?? []).map((it) => it.productoId).filter(Boolean))];
+    if (!ids.length) return;
+    const dados = await this.db.select({ nombre: productos.nombre, estado: productos.estado })
+      .from(productos).where(and(inArray(productos.id, ids), ne(productos.estado, 'activo')));
+    if (dados.length) {
+      const nombres = dados.map((d) => `${d.nombre} (${d.estado})`).join(', ');
+      throw new BadRequestException(
+        `Estos productos ya no se compran: ${nombres}. Si volvés a traerlos, reactivalos en Compras › Productos y cargá la factura de nuevo.`,
+      );
+    }
+  }
+
   async create(dto: CreateComprobanteDto) {
     const [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
     if (!dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
+    await this.validarProductosComprables(dto.items);
 
     // Un proveedor monotributista o exento NO discrimina IVA: asumir 21% inflaría
     // el total del comprobante y ensuciaría el libro de IVA compras.

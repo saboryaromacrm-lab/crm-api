@@ -125,6 +125,10 @@ export class CafeteriaService {
       if (out.has(clave)) continue;
       const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
+      // Archivado = fuera de catálogo: no se pide ni se manda al café.
+      if (prod.estado === 'archivado') {
+        throw new BadRequestException(`${prod.nombre} está archivado: ya no se maneja. Reactivalo si volvió a entrar.`);
+      }
       let pres: any = null;
       if (it.presentacionId) {
         [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);

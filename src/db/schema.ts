@@ -27,6 +27,24 @@ import { sql } from 'drizzle-orm';
 export const tipoProductoEnum = pgEnum('tipo_producto', ['granel', 'entero']);
 /** Cómo se carga el costo de un formato de compra. Ver `producto_proveedores`. */
 export const modoCostoEnum = pgEnum('modo_costo', ['lista', 'final']);
+/**
+ * CICLO DE VIDA DEL PRODUCTO. "No lo traigo más" y "no lo vendo más" son dos
+ * decisiones distintas que pasan en momentos distintos, y confundirlas cuesta
+ * plata: apagar todo de golpe deja sin vender lo que queda en góndola, y no
+ * apagar nada ensucia las compras para siempre.
+ *
+ *   activo         se compra y se vende, todo normal
+ *   discontinuado  NO se compra más (el proveedor lo bajó o se decidió no
+ *                  reponer) pero SE SIGUE VENDIENDO hasta agotar el stock
+ *   archivado      fuera de catálogo: no se compra ni se vende
+ *
+ * El camino natural es activo → discontinuado → (se agota) → archivado, y
+ * volver es un clic: reactivar conserva TODO (códigos, historial de precios,
+ * presentaciones, formatos de compra, cuántas veces venció).
+ */
+export const estadoProductoEnum = pgEnum('estado_producto', [
+  'activo', 'discontinuado', 'archivado',
+]);
 export const tipoSucursalEnum = pgEnum('tipo_sucursal', ['distribuidora', 'express']);
 export const estadoStockEnum = pgEnum('estado_stock', [
   'disponible', 'comprometido', 'retenido', 'defectuoso', 'vencido',
@@ -194,6 +212,19 @@ export const productos = pgTable('productos', {
 
   iva: doublePrecision('iva').notNull().default(21),
   tipo: tipoProductoEnum('tipo').notNull().default('entero'),
+
+  /* Ciclo de vida ------------------------------------------------------ *
+   * Ver `estadoProductoEnum`. El producto NO se borra: se da de baja y se
+   * puede reactivar — es el principio del sistema ("lo que está en uso se
+   * desactiva, no se borra"), que hasta la 0051 cumplían las marcas, las
+   * listas y las ofertas pero no el producto, que es el que más historia
+   * acumula. Eliminar de verdad queda solo para el que no tiene NINGUNA
+   * huella (un duplicado del importador, un alta con el dedo). */
+  estado: estadoProductoEnum('estado').notNull().default('activo'),
+  /** Cuándo pasó al estado actual: da el "discontinuado hace 8 meses". */
+  estadoDesde: timestamp('estado_desde', { withTimezone: true }),
+  /** Por qué se dio de baja. Lo lee quien decide si vale la pena reactivarlo. */
+  motivoBaja: text('motivo_baja').notNull().default(''),
   /**
    * El "SOLO STOCK" del sistema viejo: granel que NO se vende suelto — existe
    * únicamente para fraccionarse. La Pimienta de Jamaica llega 1 kg y se
@@ -685,7 +716,13 @@ export const clienteListas = pgTable('cliente_listas', {
 /* ---------------- Stock (Producto × Sucursal × Presentación × Estado) ---------------- */
 export const stock = pgTable('stock', {
   id: serial('id').primaryKey(),
-  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /**
+   * `restrict`, no cascade (0051): borrar un producto NO puede hacer
+   * desaparecer existencias en silencio. El borrado real limpia antes las
+   * filas en CERO (que no son información) y si queda cantidad, el candado
+   * explícito del servicio corta con un mensaje entendible.
+   */
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'cascade' }),
   estado: estadoStockEnum('estado').notNull().default('disponible'),
@@ -761,7 +798,8 @@ export const transferencias = pgTable('transferencias', {
 export const transferenciaItems = pgTable('transferencia_items', {
   id: serial('id').primaryKey(),
   transferenciaId: integer('transferencia_id').notNull().references(() => transferencias.id, { onDelete: 'cascade' }),
-  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /** `restrict` (0051): un remito viejo no puede quedar mutilado en silencio. */
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
   cantidad: doublePrecision('cantidad').notNull().default(0),
   /**
@@ -804,7 +842,8 @@ export const incidencias = pgTable('incidencias', {
   estado: estadoIncidenciaEnum('estado').notNull().default('pendiente'),
   responsableId: integer('responsable_id').references(() => usuarios.id, { onDelete: 'set null' }),
   motivo: text('motivo').notNull().default(''),
-  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /** `restrict` (0051): la incidencia es historia — no se borra por arrastre. */
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
   cantidad: doublePrecision('cantidad').notNull().default(0),

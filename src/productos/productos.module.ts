@@ -2,7 +2,7 @@ import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
 } from '@nestjs/common';
-import { IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength } from 'class-validator';
 import { and, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -10,8 +10,10 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
 import { CatalogosModule } from '../catalogos/catalogos.module';
 import {
-  categorias, etiquetas, marcas, presentaciones, productoEtiquetas, productoListas,
-  productoProveedores, productos, proveedores, stock, subcategorias,
+  categorias, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, marcas, movimientos,
+  pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
+  productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
+  transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import {
   costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila,
@@ -22,6 +24,23 @@ import {
  * de 21 no da error y descalabra todos los precios del producto en silencio.
  */
 const ALICUOTAS_IVA = [0, 2.5, 5, 10.5, 21, 27];
+
+/** Ver `estadoProductoEnum`: activo → discontinuado → archivado, y vuelta. */
+const ESTADOS_PRODUCTO = ['activo', 'discontinuado', 'archivado'] as const;
+
+/**
+ * Estados de stock que representan mercadería VIVA: la que todavía se puede
+ * vender o está por moverse. Lo vencido y lo defectuoso no están acá — ya
+ * salieron de circulación, y exigir que estén en cero para archivar dejaría
+ * productos imposibles de archivar para siempre.
+ */
+const ESTADOS_STOCK_VIVO = ['disponible', 'comprometido', 'retenido', 'en_transito'] as const;
+
+class CambiarEstadoDto {
+  @IsIn(ESTADOS_PRODUCTO as unknown as string[]) estado!: 'activo' | 'discontinuado' | 'archivado';
+  /** Por qué se da de baja. Lo lee quien decide si vale reactivarlo. */
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
 
 class UpsertProductoDto {
   @IsString() nombre!: string;
@@ -406,10 +425,18 @@ export class ProductosService {
     /* ---- Qué NO se puede crear: se descarta antes de abrir la transacción ---- */
     const codigosPropios = items.map((x) => (x.producto?.codigoPropio ?? '').trim()).filter(Boolean);
     const yaEnBase = codigosPropios.length
-      ? await this.db.select({ codigoPropio: productos.codigoPropio, nombre: productos.nombre })
-        .from(productos).where(inArray(productos.codigoPropio, codigosPropios))
+      ? await this.db.select({
+        codigoPropio: productos.codigoPropio, nombre: productos.nombre, estado: productos.estado,
+      }).from(productos).where(inArray(productos.codigoPropio, codigosPropios))
       : [];
-    const existentes = new Map(yaEnBase.map((p) => [p.codigoPropio, p.nombre]));
+    /* El importador nunca pisa lo que ya existe: lo saltea. Eso también evita
+     * que un archivado REVIVA en silencio porque volvió a aparecer en el CSV —
+     * pero el motivo tiene que decir que está dado de baja, si no el usuario
+     * cree que ya está disponible y en realidad hay que reactivarlo. */
+    const existentes = new Map(yaEnBase.map((p) => [
+      p.codigoPropio,
+      p.estado === 'activo' ? p.nombre : `${p.nombre} — ${p.estado}, hay que reactivarlo`,
+    ]));
 
     // Todos los códigos de barras que ya usa el sistema (producto, presentación
     // o formato de venta): uno no puede identificar dos cosas distintas.
@@ -607,11 +634,124 @@ export class ProductosService {
     return this.get(id);
   }
 
+  /* ==================== CICLO DE VIDA ====================
+   *
+   * El producto NO se borra: se da de baja y se puede reactivar. Eliminar de
+   * verdad queda SOLO para el que no dejó ninguna huella (un duplicado del
+   * importador, un alta con el dedo) — y cuando no se puede, el mensaje dice
+   * cuál es la huella y qué hacer en su lugar.
+   */
+
+  /**
+   * Todo lo que ata al producto a la historia del negocio. Cada entrada dice
+   * cómo se llama en la pantalla, así el mensaje de error es entendible sin
+   * saber nada de tablas.
+   */
+  private async huellas(id: number) {
+    const cuenta = async (tabla: any, columna: any) => {
+      const [r] = await this.db.select({ n: sql<number>`count(*)::int` })
+        .from(tabla).where(eq(columna, id));
+      return Number(r?.n) || 0;
+    };
+    const [ventas, compras, presup, movs, transf, incid, vencs, enviosCafe, pedidosCafe] = await Promise.all([
+      cuenta(ventaItems, ventaItems.productoId),
+      cuenta(comprobanteItems, comprobanteItems.productoId),
+      cuenta(presupuestoItems, presupuestoItems.productoId),
+      cuenta(movimientos, movimientos.productoId),
+      cuenta(transferenciaItems, transferenciaItems.productoId),
+      cuenta(incidencias, incidencias.productoId),
+      cuenta(vencimientos, vencimientos.productoId),
+      cuenta(envioCafeteriaItems, envioCafeteriaItems.productoId),
+      cuenta(pedidoCafeteriaItems, pedidoCafeteriaItems.productoId),
+    ]);
+    const lista: string[] = [];
+    if (ventas) lista.push(`${ventas} venta(s)`);
+    if (compras) lista.push(`${compras} renglón(es) de compra`);
+    if (presup) lista.push(`${presup} presupuesto(s)`);
+    if (transf) lista.push(`${transf} transferencia(s)`);
+    if (incid) lista.push(`${incid} incidencia(s)`);
+    if (vencs) lista.push(`${vencs} registro(s) de vencimiento`);
+    if (enviosCafe) lista.push(`${enviosCafe} envío(s) a la cafetería`);
+    if (pedidosCafe) lista.push(`${pedidosCafe} pedido(s) de la cafetería`);
+    if (movs) lista.push(`${movs} movimiento(s) de stock`);
+    return lista;
+  }
+
+  /**
+   * Cambia el estado del ciclo de vida. Los candados que importan:
+   *   · Archivar exige que no quede stock (lo que hay en góndola no se puede
+   *     vender si el producto está archivado: sería plata muerta). Se avisa
+   *     dónde está para liquidarlo o darlo de baja por merma antes.
+   *   · Archivar una madre de fraccionados exige que sus paquetes tampoco
+   *     tengan stock — mismo criterio que borrar una presentación con stock.
+   */
+  async cambiarEstado(id: number, dto: CambiarEstadoDto) {
+    const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
+    if (!p) throw new NotFoundException('Producto inexistente.');
+    const estado = dto.estado;
+    if (p.estado === estado) return this.get(id);
+
+    if (estado === 'archivado') {
+      /* Solo la mercadería VIVA frena el archivado: lo vencido y lo defectuoso
+       * ya está fuera de circulación (nadie lo va a vender) y bloquear por eso
+       * dejaría productos imposibles de archivar para siempre. Lo comprometido
+       * y lo que viaja SÍ frenan: se van a mover.
+       * Sin filtro de presentación a propósito: el stock de los fraccionados
+       * cuenta igual — archivar la madre y dejar sus paquetes sin poder
+       * venderse es el mismo problema, visto desde el otro lado. */
+      const filas = await this.db.select({
+        cantidad: stock.cantidad, sucursalId: stock.sucursalId, presentacionId: stock.presentacionId,
+      }).from(stock).where(and(
+        eq(stock.productoId, id),
+        gt(stock.cantidad, 1e-9),
+        inArray(stock.estado, [...ESTADOS_STOCK_VIVO]),
+      ));
+      if (filas.length) {
+        const sucs = await this.db.select().from(sucursales);
+        const detalle = filas.slice(0, 4).map((f) => {
+          const suc = sucs.find((s) => s.id === f.sucursalId)?.nombre ?? `sucursal ${f.sucursalId}`;
+          return `${f.cantidad} en ${suc}${f.presentacionId ? ' (fraccionado)' : ''}`;
+        }).join(', ');
+        throw new BadRequestException(
+          `Todavía queda stock: ${detalle}. Archivado no se puede vender — liquidalo primero (una oferta) o dalo de baja por merma. Mientras tanto podés dejarlo "discontinuado": deja de comprarse pero se sigue vendiendo hasta agotar.`,
+        );
+      }
+    }
+
+    const [out] = await this.db.update(productos).set({
+      estado,
+      estadoDesde: new Date(),
+      motivoBaja: estado === 'activo' ? '' : (dto.motivo ?? '').trim(),
+    }).where(eq(productos.id, id)).returning();
+    return { ...(await this.get(out.id)) };
+  }
+
   async remove(id: number) {
+    const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
+    if (!p) throw new NotFoundException('Producto inexistente.');
+
     const conStock = await this.db.select().from(stock)
       .where(and(eq(stock.productoId, id), gt(stock.cantidad, 1e-9))).limit(1);
-    if (conStock[0]) throw new BadRequestException('No se puede eliminar: el producto tiene stock.');
-    await this.db.delete(productos).where(eq(productos.id, id));
+    if (conStock[0]) {
+      throw new BadRequestException(
+        'No se puede eliminar: el producto tiene stock. Si ya no se trae más, dalo de baja (se sigue vendiendo hasta agotar) en lugar de borrarlo.',
+      );
+    }
+
+    const huellas = await this.huellas(id);
+    if (huellas.length) {
+      throw new BadRequestException(
+        `No se puede eliminar: el producto ya tiene historia (${huellas.join(', ')}). Borrarlo dejaría documentos viejos incompletos. Dalo de baja: deja de aparecer y se puede reactivar cuando vuelvas a traerlo, conservando precios e historial.`,
+      );
+    }
+
+    /* Sin huella: se puede borrar de verdad. Las filas de stock en CERO se
+     * limpian primero — no son información y la FK es `restrict` desde la
+     * 0051 (antes un cascade se llevaba existencias en silencio). */
+    await this.db.transaction(async (tx) => {
+      await tx.delete(stock).where(eq(stock.productoId, id));
+      await tx.delete(productos).where(eq(productos.id, id));
+    });
     return { ok: true };
   }
 
@@ -809,6 +949,12 @@ export class ProductosController {
     return this.svc.update(id, dto);
   }
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
+
+  /** Dar de baja (discontinuado / archivado) y reactivar: el mismo endpoint. */
+  @Post(':id/estado')
+  cambiarEstado(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarEstadoDto) {
+    return this.svc.cambiarEstado(id, dto);
+  }
 
   @Put(':id/presentaciones')
   setPresentaciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {

@@ -22,7 +22,7 @@ import {
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
 import type { Response } from 'express';
-import { and, eq, gte, isNull } from 'drizzle-orm';
+import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
@@ -114,7 +114,12 @@ export class TiendaService {
     const suc = await this.sucursalTienda();
     const desdeReingreso = new Date(Date.now() - DIAS_REINGRESO * 86400000);
     const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web] = await Promise.all([
-      this.db.select().from(productos).orderBy(productos.nombre),
+      /* El sitio no publica ARCHIVADOS, tengan precio mayorista o no: el estado
+       * corta antes que el criterio de publicación. El discontinuado se sigue
+       * ofreciendo mientras tenga stock — el `webStockMin` ya lo saca de la web
+       * cuando conviene guardar lo último para el mostrador. */
+      this.db.select().from(productos)
+        .where(ne(productos.estado, 'archivado')).orderBy(productos.nombre),
       this.db.select().from(productoProveedores),
       this.db.select().from(productoListas),
       this.db.select().from(productoEtiquetas),

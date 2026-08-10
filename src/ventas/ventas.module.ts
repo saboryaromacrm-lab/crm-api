@@ -24,7 +24,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, lte, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, marcas,
@@ -295,7 +295,11 @@ export class VentasService {
    */
   async catalogo(sucursalId: number) {
     const [prods, provs, formatos, cat, press, existencias, sucs, cfg, ms, cs, etiqs, ofs, etiqCat, provCat] = await Promise.all([
-      this.db.select().from(productos).orderBy(productos.nombre),
+      /* Sin los ARCHIVADOS: fuera de catálogo es fuera de la caja. El
+       * DISCONTINUADO sí viaja — dejó de comprarse, pero lo que hay en góndola
+       * se vende hasta agotar (para eso son dos estados y no un interruptor). */
+      this.db.select().from(productos)
+        .where(ne(productos.estado, 'archivado')).orderBy(productos.nombre),
       this.db.select().from(productoProveedores),
       this.db.select().from(productoListas),
       this.listas.catalogo(),
@@ -722,6 +726,25 @@ export class VentasService {
     }
   }
 
+  /**
+   * ARCHIVADO no se vende. El DISCONTINUADO sí: dejó de comprarse pero lo que
+   * queda en góndola se termina de vender — es la razón de que sean dos estados
+   * y no un interruptor. El candado va acá y no solo en el catálogo del POS,
+   * porque el catálogo se cachea al abrir la caja: un producto archivado en el
+   * medio del turno seguiría estando en la pantalla del cajero.
+   */
+  private async validarEstadoVendible(items: Array<{ productoId: number }>) {
+    const ids = [...new Set((items ?? []).map((it) => it.productoId))];
+    if (!ids.length) return;
+    const [archivado] = await this.db.select({ nombre: productos.nombre }).from(productos)
+      .where(and(inArray(productos.id, ids), eq(productos.estado, 'archivado'))).limit(1);
+    if (archivado) {
+      throw new BadRequestException(
+        `${archivado.nombre} está archivado: ya no se vende. Si volvió a entrar, reactivalo en Compras › Productos.`,
+      );
+    }
+  }
+
   async create(dto: CreateVentaDto) {
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.consumidorFinal();
@@ -733,6 +756,7 @@ export class VentasService {
     // También en el borrador: un ticket que nunca va a poder confirmarse no
     // tiene por qué poder armarse.
     await this.validarSoloFraccionar(dto.items ?? []);
+    await this.validarEstadoVendible(dto.items ?? []);
 
     const tot = this.calcularTotales(dto.items ?? [], dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
@@ -886,8 +910,9 @@ export class VentasService {
     const borrador = await this.exigirBorrador(id);
     if (!borrador.items.length) throw new BadRequestException('El ticket está vacío.');
     // El borrador pudo nacer antes de que el producto se marcara "solo para
-    // fraccionar": se re-valida acá, que es donde el stock de verdad sale.
+    // fraccionar" o se archivara: se re-valida acá, que es donde el stock sale.
     await this.validarSoloFraccionar(borrador.items);
+    await this.validarEstadoVendible(borrador.items);
 
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(borrador.clienteId);

@@ -103,6 +103,11 @@ export class VencimientosService {
       if (out.has(clave)) continue;
       const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
+      /* Archivado no se controla: si no se vende, no tiene sentido vigilar su
+       * fecha. El DISCONTINUADO sí — es justo el que hay que sacar a tiempo. */
+      if (prod.estado === 'archivado') {
+        throw new BadRequestException(`${prod.nombre} está archivado: ya no se vende, así que no hay nada que vigilar.`);
+      }
       let pres: any = null;
       if (it.presentacionId) {
         [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
