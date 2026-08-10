@@ -226,7 +226,17 @@ export class TiendaService {
        * queda se prioriza para fraccionar / venta minorista y el sitio pasa a
        * "Sin stock". 0 = se vende online hasta la última unidad.
        */
-      const disponibleWeb = stockDisp - (p.webStockMin || 0) > 1e-9;
+      /*
+       * Lo que el sitio PUEDE vender de este producto: el disponible menos el
+       * piso reservado para el mostrador. Viaja como número (no solo el sí/no)
+       * para que el carrito pueda topear la cantidad y avisar "es todo lo que
+       * hay" en vez de dejar pedir 50 kg de algo que tiene 3.
+       *
+       * Es el único dato de stock que el sitio conoce, y solo se muestra al
+       * llegar al tope: no es un cartel de "quedan pocos".
+       */
+      const disponibleParaWeb = Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
+      const disponibleWeb = disponibleParaWeb > 1e-9;
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];
 
       // Una promo por producto: la de mayor beneficio entre las que alcanzan (misma regla que el POS).
@@ -265,6 +275,8 @@ export class TiendaService {
         /** Mínimo de compra PROPIO del producto (0 = sin mínimo). */
         unidadesMinimas: filaTienda.unidadesMinimas || 0,
         enStock: disponibleWeb,
+        /** Cuánto puede vender el sitio (ya descontado el piso del mostrador). */
+        disponible: disponibleParaWeb,
         // La imagen subida en el módulo Web manda; la URL externa es el plan B.
         imagenUrl: urlImagen('producto', p.id) || p.imagenUrl || '',
         destacado: !!p.destacado,
