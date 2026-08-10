@@ -126,12 +126,16 @@ export const EMPRESA_DEFAULTS = {
  * rollo80 (recomendado: más texto por línea) · rollo58 (posnet/portátil) ·
  * a4 · carta. Global a propósito: la impresora FÍSICA la elige cada puesto
  * en el diálogo del navegador (o su predeterminada con Chrome kiosco).
+ *
+ * Las ETIQUETAS del fraccionado son la excepción de tamaño: van a la impresora
+ * térmica de etiquetas, en su medida (etiqueta50x30 y compañía) y sin membrete.
  */
 export const IMPRESION_DEFAULTS = {
   ticketPos: 'rollo80' as string,
   presupuesto: 'a4' as string,
   hojaArmado: 'a4' as string,
   listaPreparacion: 'a4' as string,
+  etiquetaFraccionado: 'etiqueta50x30' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
   leyendaNoFiscal: true as boolean,
