@@ -317,6 +317,25 @@ export class InventarioService {
   }
 
   /**
+   * COSTO CONGELADO DE UNA PÉRDIDA.
+   *
+   * Toda baja por pérdida (merma, vencido, defectuoso) guarda el costo del día
+   * en el movimiento: el reporte en pesos de marzo no puede cambiar en julio
+   * porque subió el catálogo. Vive acá porque hay DOS puertas que dan de baja
+   * mercadería —el movimiento manual y la resolución de una incidencia— y con
+   * el cálculo repetido una de las dos quedaba en cero (la de incidencias
+   * quedó, y su pérdida figuraba en $0 en el reporte de Vencimientos).
+   */
+  private async costoDePerdida(tx: any, prod: any, presId: number | null) {
+    const provs = await tx.select().from(productoProveedores)
+      .where(eq(productoProveedores.productoId, prod.id));
+    const cnKg = costoNetoEntry(formatoActivo(provs as any[]) as any, prod.iva);
+    if (!presId) return cnKg;
+    const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presId)).limit(1);
+    return cnKg * (Number(pres?.tamKg) || 1);
+  }
+
+  /**
    * El cuerpo del movimiento simple SIN abrir transacción: un documento que
    * necesita la baja DENTRO de la suya (procesar un vencimiento genera la baja
    * real y marca el registro en el mismo acto) la llama con su tx — o todo
@@ -342,20 +361,8 @@ export class InventarioService {
     if (o.tipo === 'vencido') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'vencido' }, c); estadoHacia = 'vencido'; }
     else if (o.tipo === 'defectuoso') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
 
-    /* Las bajas por PÉRDIDA congelan su costo unitario: el reporte en pesos de
-     * hoy no puede cambiar el mes que viene porque subió el catálogo. */
-    let costoUnitario = 0;
-    if (o.tipo === 'merma' || o.tipo === 'vencido' || o.tipo === 'defectuoso') {
-      const provs = await tx.select().from(productoProveedores)
-        .where(eq(productoProveedores.productoId, prod.id));
-      const cnKg = costoNetoEntry(formatoActivo(provs as any[]) as any, prod.iva);
-      if (presId) {
-        const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presId)).limit(1);
-        costoUnitario = cnKg * (Number(pres?.tamKg) || 1);
-      } else {
-        costoUnitario = cnKg;
-      }
-    }
+    const esPerdida = o.tipo === 'merma' || o.tipo === 'vencido' || o.tipo === 'defectuoso';
+    const costoUnitario = esPerdida ? await this.costoDePerdida(tx, prod, presId) : 0;
 
     const m = await this.mov(tx, {
       tipo: o.tipo, productoId: prod.id, sucursalId: sucId, presentacionId: presId, signo, cantidad: c,
@@ -1058,9 +1065,19 @@ export class InventarioService {
       else if (resolucion === 'defectuoso') { tipoMov = 'defectuoso'; await this.addDelta(tx, { productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
       else throw new BadRequestException('Resolución inválida.');
       await tx.update(incidencias).set({ estado: 'resuelta', resolucion, fechaResolucion: new Date(), activa: false }).where(eq(incidencias.id, id));
+      /*
+       * La baja por incidencia es una pérdida como cualquier otra: congela su
+       * costo (si no, figuraba en $0 en el reporte de pérdidas de Vencimientos,
+       * que lista los movimientos de estos tres tipos) y dice DE DÓNDE vino en
+       * el `motivo` — la pantalla de Mermas muestra ese campo, y sin él la fila
+       * aparecía como una merma anónima aunque el vínculo estuviera guardado.
+       */
+      const esPerdida = resolucion !== 'liberar';
       await this.mov(tx, {
         tipo: tipoMov, productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId,
         signo: resolucion === 'liberar' ? 0 : -1, cantidad: c, unidad: inc.unidad, estadoDesde: 'comprometido', estadoHacia,
+        costoUnitario: esPerdida ? await this.costoDePerdida(tx, prod, inc.presentacionId) : 0,
+        motivo: `Incidencia ${inc.codigo} · ${inc.tipo}`,
         refIncidenciaId: inc.id, descripcion: `${inc.codigo} resuelta: ${resolucion === 'liberar' ? 'liberado a disponible' : 'baja por ' + resolucion}`,
       });
       return { ok: true };
