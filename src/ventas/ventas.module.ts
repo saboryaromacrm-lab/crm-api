@@ -1329,8 +1329,19 @@ export class VentasController {
     @Query('limit') limit?: string,
   ) {
     const num = (v?: string) => (v ? Number(v) : undefined);
+    /* Los enums se validan ACÁ: un `?estado=abc` llegaba a Postgres como valor
+     * de enum inválido y salía un 500 donde corresponde un 400 (misma lección
+     * que el `?desde=abc` de los pagos). */
+    const uno = (v: string | undefined, validos: readonly string[], campo: string) => {
+      if (!v) return undefined;
+      if (!validos.includes(v)) throw new BadRequestException(`${campo} inválido: ${v}`);
+      return v;
+    };
     return this.svc.listado({
-      desde, hasta, estado, medioPago, origen, q,
+      desde, hasta, q,
+      estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
+      medioPago: uno(medioPago, MEDIOS, 'Medio de pago'),
+      origen: uno(origen, ['pos', 'presupuesto'], 'Origen'),
       sucursalId: num(sucursalId), usuarioId: num(usuarioId),
       clienteId: num(clienteId), cajaSesionId: num(cajaSesionId),
       conOferta: conOferta === 'true',
