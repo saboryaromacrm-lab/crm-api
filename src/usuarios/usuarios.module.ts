@@ -77,6 +77,7 @@ export const CATALOGO_PERMISOS = [
     modulo: 'ventas',
     secciones: [
       { clave: 'ventas.pos', nombre: 'Punto de venta' },
+      { clave: 'ventas.listado', nombre: 'Ventas (listado de tickets del POS)' },
       { clave: 'ventas.ordenes', nombre: 'Órdenes web (bandeja de pedidos del sitio)' },
       { clave: 'ventas.presupuestos', nombre: 'Presupuestos' },
       { clave: 'ventas.clientes', nombre: 'Clientes' },

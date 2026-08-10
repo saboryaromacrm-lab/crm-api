@@ -24,7 +24,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, inArray, lte, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, marcas,
@@ -46,6 +46,16 @@ const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito'
 
 /** Redondeo monetario a 2 decimales (evita el arrastre de flotantes). */
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/* ---------------- Días de un filtro de fechas ----------------
+ *
+ * `new Date('2026-08-10')` es medianoche UTC = 21:00 del 9 en Argentina: un
+ * filtro "de hoy a hoy" se comía las ventas de la mañana y sumaba las de
+ * anoche. Con la hora explícita el string se interpreta en la zona del server,
+ * que es la del negocio. Misma trampa que en los vencimientos de pago.
+ */
+const desdeDia = (s?: string) => (s ? new Date(`${s}T00:00:00`) : null);
+const hastaDia = (s?: string) => (s ? new Date(`${s}T23:59:59.999`) : null);
 
 /**
  * Tipo de comprobante que corresponde emitir. Depende de NUESTRA condición
@@ -142,6 +152,19 @@ class DelegarVentaDto {
   @IsInt() usuarioId!: number;
 }
 
+/**
+ * Filtros del listado de ventas. Van por query string (es una LECTURA: se
+ * comparte por link y se recarga), así que llegan como texto y se normalizan
+ * en el controlador.
+ */
+type ListadoVentasQ = {
+  desde?: string; hasta?: string;
+  sucursalId?: number; usuarioId?: number; clienteId?: number; cajaSesionId?: number;
+  estado?: string; medioPago?: string; origen?: string;
+  conOferta?: boolean; q?: string;
+  offset?: number; limit?: number;
+};
+
 @Injectable()
 export class VentasService {
   constructor(
@@ -184,8 +207,8 @@ export class VentasService {
     if (q.clienteId) conds.push(eq(ventas.clienteId, Number(q.clienteId)));
     if (q.sucursalId) conds.push(eq(ventas.sucursalId, Number(q.sucursalId)));
     if (q.estado) conds.push(eq(ventas.estado, q.estado as any));
-    if (q.desde) conds.push(gte(ventas.fecha, new Date(q.desde)));
-    if (q.hasta) conds.push(lte(ventas.fecha, new Date(q.hasta)));
+    const d = desdeDia(q.desde); if (d) conds.push(gte(ventas.fecha, d));
+    const h = hastaDia(q.hasta); if (h) conds.push(lte(ventas.fecha, h));
 
     // Límite por defecto: el listado nunca trae la tabla entera.
     const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 500);
@@ -212,6 +235,173 @@ export class VentasService {
     });
   }
 
+  /**
+   * EL LISTADO DE VENTAS — la pregunta "¿qué se vendió?" con todos sus cortes.
+   *
+   * Tres cosas lo separan de `list()`, que es el primitivo que usan el POS y la
+   * ficha del cliente:
+   *
+   *   1. PAGINADO DE VERDAD (`offset` + `total`): la tabla de ventas crece para
+   *      siempre y una pantalla no puede depender de un `limit` que corta en
+   *      silencio.
+   *   2. Viene RESUELTA: nombres de cliente, cajero y sucursal, medios de pago,
+   *      renglones y lo que descontó cada promo. Sin eso la pantalla tendría
+   *      que pedir una consulta por fila.
+   *   3. TOTALES DEL FILTRO ENTERO, no de la página: "vendí $X hoy" tiene que
+   *      sumar las 300 ventas del día, no las 25 que se están viendo. Y suman
+   *      SOLO las no anuladas — una anulada figura en la lista (hay que poder
+   *      auditarla) pero no es plata que entró.
+   *
+   * El BORRADOR no es una venta: si no se pide un estado puntual, queda afuera
+   * (los tickets abiertos viven en el Punto de venta, que es donde se retoman).
+   */
+  private condicionesListado(q: ListadoVentasQ) {
+    const conds: any[] = [];
+    if (q.sucursalId) conds.push(eq(ventas.sucursalId, Number(q.sucursalId)));
+    if (q.usuarioId) conds.push(eq(ventas.usuarioId, Number(q.usuarioId)));
+    if (q.clienteId) conds.push(eq(ventas.clienteId, Number(q.clienteId)));
+    if (q.cajaSesionId) conds.push(eq(ventas.cajaSesionId, Number(q.cajaSesionId)));
+    if (q.estado) conds.push(eq(ventas.estado, q.estado as any));
+    else conds.push(ne(ventas.estado, 'borrador'));
+    const d = desdeDia(q.desde); if (d) conds.push(gte(ventas.fecha, d));
+    const h = hastaDia(q.hasta); if (h) conds.push(lte(ventas.fecha, h));
+    /* Origen: la venta de mostrador nace sin presupuesto detrás. La que viene
+     * de un pedido (mayorista cotizado o del sitio web) tiene `presupuestoId`,
+     * y NO la hizo el cajero en la caja. */
+    if (q.origen === 'pos') conds.push(sql`${ventas.presupuestoId} is null`);
+    if (q.origen === 'presupuesto') conds.push(sql`${ventas.presupuestoId} is not null`);
+    if (q.medioPago) {
+      conds.push(sql`exists (select 1 from venta_pagos vp where vp.venta_id = ${ventas.id} and vp.medio = ${q.medioPago})`);
+    }
+    if (q.conOferta) {
+      conds.push(sql`exists (select 1 from venta_items vi where vi.venta_id = ${ventas.id} and vi.oferta_id is not null)`);
+    }
+    if (q.q) {
+      // Un número de ticket o un pedazo del nombre del cliente: lo que uno
+      // tiene a mano cuando alguien vuelve con una bolsa y un papel.
+      const t = q.q.trim();
+      const digitos = t.replace(/\D/g, '');
+      const ors: any[] = [ilike(clientes.nombre, `%${t}%`)];
+      if (digitos) ors.push(eq(ventas.numero, Number(digitos)));
+      conds.push(or(...ors));
+    }
+    return conds;
+  }
+
+  async listado(q: ListadoVentasQ) {
+    const conds = this.condicionesListado(q);
+    const donde = and(...conds);
+    const limit = Math.min(Math.max(Number(q.limit) || 25, 1), 200);
+    const offset = Math.max(Number(q.offset) || 0, 0);
+    const vivas = and(...conds, ne(ventas.estado, 'anulada'));
+
+    const [filas, [tot], porMedio, [ofe]] = await Promise.all([
+      this.db.select({
+        v: ventas,
+        clienteNombre: clientes.nombre,
+        sucursalNombre: sucursales.nombre,
+        cajeroNombre: usuarios.nombre,
+      }).from(ventas)
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
+        .leftJoin(usuarios, eq(usuarios.id, ventas.usuarioId))
+        .where(donde)
+        .orderBy(desc(ventas.fecha), desc(ventas.id))
+        .limit(limit).offset(offset),
+
+      this.db.select({
+        registros: sql<number>`count(*)::int`,
+        anuladas: sql<number>`count(*) filter (where ${ventas.estado} = 'anulada')::int`,
+        tickets: sql<number>`count(*) filter (where ${ventas.estado} <> 'anulada')::int`,
+        plata: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        neto: sql<number>`coalesce(sum(${ventas.subtotalNeto}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        iva: sql<number>`coalesce(sum(${ventas.ivaTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        descuentos: sql<number>`coalesce(sum(${ventas.descuentoTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        plataAnulada: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} = 'anulada'), 0)`,
+      }).from(ventas)
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .where(donde),
+
+      this.db.select({
+        medio: ventaPagos.medio,
+        importe: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)`,
+      }).from(ventaPagos)
+        .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .where(vivas)
+        .groupBy(ventaPagos.medio),
+
+      this.db.select({
+        plata: sql<number>`coalesce(sum(${ventaItems.ofertaDescuento}), 0)`,
+        ventas: sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventaItems.ofertaId} is not null)::int`,
+      }).from(ventaItems)
+        .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .where(vivas),
+    ]);
+
+    const ids = filas.map((f) => f.v.id);
+    const [pagos, agg, imput] = ids.length
+      ? await Promise.all([
+        this.db.select().from(ventaPagos).where(inArray(ventaPagos.ventaId, ids)),
+        this.db.select({
+          ventaId: ventaItems.ventaId,
+          renglones: sql<number>`count(*)::int`,
+          unidades: sql<number>`coalesce(sum(${ventaItems.cantidad}), 0)`,
+          ofertaDescuento: sql<number>`coalesce(sum(${ventaItems.ofertaDescuento}), 0)`,
+          // Los nombres CONGELADOS al vender: el ticket viejo dice qué promo se
+          // le aplicó aunque hoy esa oferta ya no exista.
+          ofertas: sql<string[]>`array_remove(array_agg(distinct nullif(${ventaItems.oferta}, '')), null)`,
+          listas: sql<string[]>`array_remove(array_agg(distinct nullif(${ventaItems.lista}, '')), null)`,
+        }).from(ventaItems).where(inArray(ventaItems.ventaId, ids)).groupBy(ventaItems.ventaId),
+        this.imputadoPorVenta(ids),
+      ])
+      : [[], [], new Map<number, number>()];
+
+    const registros = Number(tot?.registros) || 0;
+    const tickets = Number(tot?.tickets) || 0;
+    const plata = money(Number(tot?.plata));
+    return {
+      filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre }) => {
+        const a = agg.find((x: any) => x.ventaId === v.id);
+        const cobrado = imput.get(v.id) ?? 0;
+        return {
+          ...v,
+          clienteNombre,
+          sucursalNombre: sucursalNombre ?? '—',
+          cajeroNombre: cajeroNombre ?? '—',
+          cobrado,
+          saldo: money(v.total - cobrado),
+          medios: pagos.filter((p: any) => p.ventaId === v.id).map((p: any) => ({ medio: p.medio, importe: p.importe })),
+          renglones: Number(a?.renglones) || 0,
+          unidades: money(Number(a?.unidades)),
+          ofertaDescuento: money(Number(a?.ofertaDescuento)),
+          ofertas: a?.ofertas ?? [],
+          listas: a?.listas ?? [],
+          /** De mostrador o nacida de un pedido: la pantalla lo distingue. */
+          origen: v.presupuestoId ? 'presupuesto' : 'pos',
+        };
+      }),
+      // `total` es de lo que MATCHEA (incluidas las anuladas): es el universo
+      // que el paginado recorre.
+      total: registros,
+      paginado: { offset, limit },
+      totales: {
+        registros,
+        tickets,
+        anuladas: Number(tot?.anuladas) || 0,
+        plata,
+        neto: money(Number(tot?.neto)),
+        iva: money(Number(tot?.iva)),
+        descuentos: money(Number(tot?.descuentos)),
+        plataAnulada: money(Number(tot?.plataAnulada)),
+        promedio: tickets ? money(plata / tickets) : 0,
+        ofertas: { plata: money(Number(ofe?.plata)), ventas: Number(ofe?.ventas) || 0 },
+        porMedio: porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) })),
+      },
+    };
+  }
+
   async get(id: number) {
     const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
     if (!v) throw new NotFoundException('Venta inexistente.');
@@ -222,7 +412,61 @@ export class VentasService {
       this.imputadoPorVenta([id]),
     ]);
     const cobrado = imput.get(id) ?? 0;
-    return { ...v, items, extras, pagos, cobrado, saldo: money(v.total - cobrado) };
+
+    /*
+     * Los NOMBRES, que hasta acá no venían: el ticket se reimprime desde el
+     * listado y desde el POS, y sin esto salía "#12" en lugar del producto y
+     * sin el nombre del cliente. El nombre del producto NO está congelado en el
+     * renglón (a diferencia de la lista y la oferta), así que se resuelve al
+     * leer: si alguien renombró el producto, el ticket reimpreso dice el nombre
+     * de hoy — que es el que el cliente reconoce en la góndola.
+     */
+    const prodIds = [...new Set(items.map((i) => i.productoId))];
+    const presIds = [...new Set(items.map((i) => i.presentacionId).filter(Boolean) as number[])];
+    const prods = new Map<number, { nombre: string; tipo: string }>();
+    const tamDe = new Map<number, number>();
+    if (prodIds.length) {
+      const filas = await this.db.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo })
+        .from(productos).where(inArray(productos.id, prodIds));
+      for (const p of filas) prods.set(p.id, { nombre: p.nombre, tipo: p.tipo });
+    }
+    if (presIds.length) {
+      const filas = await this.db.select({ id: presentaciones.id, tamKg: presentaciones.tamKg })
+        .from(presentaciones).where(inArray(presentaciones.id, presIds));
+      for (const p of filas) tamDe.set(p.id, p.tamKg);
+    }
+    const [cli] = await this.db.select({ nombre: clientes.nombre })
+      .from(clientes).where(eq(clientes.id, v.clienteId)).limit(1);
+    const [suc] = v.sucursalId
+      ? await this.db.select({ nombre: sucursales.nombre })
+        .from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
+      : [];
+    const [usr] = v.usuarioId
+      ? await this.db.select({ nombre: usuarios.nombre })
+        .from(usuarios).where(eq(usuarios.id, v.usuarioId)).limit(1)
+      : [];
+    const tam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
+
+    return {
+      ...v,
+      clienteNombre: cli?.nombre ?? '—',
+      sucursalNombre: suc?.nombre ?? '—',
+      cajeroNombre: usr?.nombre ?? '—',
+      items: items.map((it) => {
+        const p = prods.get(it.productoId);
+        const kg = it.presentacionId ? tamDe.get(it.presentacionId) : undefined;
+        const base = p?.nombre ?? `#${it.productoId}`;
+        return {
+          ...it,
+          nombre: kg !== undefined ? `${base} · ${tam(kg)}` : base,
+          unidad: kg !== undefined ? 'paq.' : (p?.tipo === 'granel' ? 'kg' : 'u.'),
+        };
+      }),
+      extras,
+      pagos,
+      cobrado,
+      saldo: money(v.total - cobrado),
+    };
   }
 
   /**
@@ -1066,6 +1310,33 @@ export class VentasController {
 
   @Get('cuenta/:clienteId')
   cuenta(@Param('clienteId', ParseIntPipe) clienteId: number) { return this.svc.cuenta(clienteId); }
+
+  /** El listado de la pantalla Ventas: filtros + paginado + totales del filtro. */
+  @Get('listado')
+  listado(
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
+    @Query('sucursalId') sucursalId?: string,
+    @Query('usuarioId') usuarioId?: string,
+    @Query('clienteId') clienteId?: string,
+    @Query('cajaSesionId') cajaSesionId?: string,
+    @Query('estado') estado?: string,
+    @Query('medioPago') medioPago?: string,
+    @Query('origen') origen?: string,
+    @Query('conOferta') conOferta?: string,
+    @Query('q') q?: string,
+    @Query('offset') offset?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const num = (v?: string) => (v ? Number(v) : undefined);
+    return this.svc.listado({
+      desde, hasta, estado, medioPago, origen, q,
+      sucursalId: num(sucursalId), usuarioId: num(usuarioId),
+      clienteId: num(clienteId), cajaSesionId: num(cajaSesionId),
+      conOferta: conOferta === 'true',
+      offset: num(offset), limit: num(limit),
+    });
+  }
 
   @Get()
   list(
