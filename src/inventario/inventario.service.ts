@@ -4,7 +4,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
-  comprobantes, comprobanteItems, facturaLecturas, pedidosCafeteria,
+  comprobantes, comprobanteItems, facturaLecturas, pedidosCafeteria, vencimientos,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
@@ -280,33 +280,58 @@ export class InventarioService {
 
   /** Movimiento simple: devolución (+), ajuste (±), merma/vencido/defectuoso (−). */
   async opSimple(o: any) {
-    return this.db.transaction(async (tx) => {
-      const prod = await this.getProducto(tx, o.productoId);
-      if (!prod) throw new BadRequestException('Producto inválido.');
-      const meta = TIPOS_MOV[o.tipo];
-      if (!meta) throw new BadRequestException('Tipo inválido.');
-      const presId = o.presId || null;
-      const sucId = o.sucursalId;
-      const c = Number(o.cantidad);
-      if (!(c > 0)) throw new BadRequestException('Ingresá una cantidad mayor a 0.');
-      let signo = meta.dir;
-      if (signo === 0) signo = Number(o.signo) === 1 ? 1 : -1;
-      if (signo < 0) {
-        const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
-        if (c > disp + 1e-9) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`);
+    return this.db.transaction(async (tx) => this.opSimpleTx(tx, o));
+  }
+
+  /**
+   * El cuerpo del movimiento simple SIN abrir transacción: un documento que
+   * necesita la baja DENTRO de la suya (procesar un vencimiento genera la baja
+   * real y marca el registro en el mismo acto) la llama con su tx — o todo
+   * pasa, o no pasó nada.
+   */
+  async opSimpleTx(tx: any, o: any) {
+    const prod = await this.getProducto(tx, o.productoId);
+    if (!prod) throw new BadRequestException('Producto inválido.');
+    const meta = TIPOS_MOV[o.tipo];
+    if (!meta) throw new BadRequestException('Tipo inválido.');
+    const presId = o.presId || null;
+    const sucId = o.sucursalId;
+    const c = Number(o.cantidad);
+    if (!(c > 0)) throw new BadRequestException('Ingresá una cantidad mayor a 0.');
+    let signo = meta.dir;
+    if (signo === 0) signo = Number(o.signo) === 1 ? 1 : -1;
+    if (signo < 0) {
+      const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
+      if (c > disp + 1e-9) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`);
+    }
+    await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, signo * c);
+    let estadoHacia: EstadoStock | null = signo > 0 ? 'disponible' : null;
+    if (o.tipo === 'vencido') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'vencido' }, c); estadoHacia = 'vencido'; }
+    else if (o.tipo === 'defectuoso') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
+
+    /* Las bajas por PÉRDIDA congelan su costo unitario: el reporte en pesos de
+     * hoy no puede cambiar el mes que viene porque subió el catálogo. */
+    let costoUnitario = 0;
+    if (o.tipo === 'merma' || o.tipo === 'vencido' || o.tipo === 'defectuoso') {
+      const provs = await tx.select().from(productoProveedores)
+        .where(eq(productoProveedores.productoId, prod.id));
+      const cnKg = costoNetoEntry(formatoActivo(provs as any[]) as any, prod.iva);
+      if (presId) {
+        const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presId)).limit(1);
+        costoUnitario = cnKg * (Number(pres?.tamKg) || 1);
+      } else {
+        costoUnitario = cnKg;
       }
-      await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, signo * c);
-      let estadoHacia: EstadoStock | null = signo > 0 ? 'disponible' : null;
-      if (o.tipo === 'vencido') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'vencido' }, c); estadoHacia = 'vencido'; }
-      else if (o.tipo === 'defectuoso') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
-      const m = await this.mov(tx, {
-        tipo: o.tipo, productoId: prod.id, sucursalId: sucId, presentacionId: presId, signo, cantidad: c,
-        unidad: this.unidadDe(prod.tipo, presId), estadoDesde: signo < 0 ? 'disponible' : null, estadoHacia,
-        usuarioId: o.usuarioId ?? null, motivo: o.motivo || '',
-        descripcion: `${meta.label} ${signo > 0 ? '+' : '−'}${this.fmtCant(prod.tipo, presId, c)}${o.motivo ? ' · ' + o.motivo : ''}`,
-      });
-      return { ok: true, movimiento: m };
+    }
+
+    const m = await this.mov(tx, {
+      tipo: o.tipo, productoId: prod.id, sucursalId: sucId, presentacionId: presId, signo, cantidad: c,
+      unidad: this.unidadDe(prod.tipo, presId), estadoDesde: signo < 0 ? 'disponible' : null, estadoHacia,
+      costoUnitario,
+      usuarioId: o.usuarioId ?? null, motivo: o.motivo || '',
+      descripcion: `${meta.label} ${signo > 0 ? '+' : '−'}${this.fmtCant(prod.tipo, presId, c)}${o.motivo ? ' · ' + o.motivo : ''}`,
     });
+    return { ok: true, movimiento: m };
   }
 
   /**
@@ -1180,7 +1205,8 @@ export class InventarioService {
 
   async bootstrap() {
     const [suc, prov, usr, prods, pres, provCostos, formatos, listasCat, stk, transfs, incs,
-      ms, cs, ss, es, pes, rolesCat, pendientesLectura, pendientesPedidoCafe] = await Promise.all([
+      ms, cs, ss, es, pes, rolesCat, pendientesLectura, pendientesPedidoCafe,
+      urgentesVenc] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select().from(usuarios),
@@ -1203,6 +1229,11 @@ export class InventarioService {
       // La demanda del café que espera: alimenta el globito de Almacén › Cafetería.
       this.db.select({ n: sql<number>`count(*)` }).from(pedidosCafeteria)
         .where(inArray(pedidosCafeteria.estado, ['pendiente', 'armando'])),
+      // Lo que apura del vigía de fechas: vencido sin procesar + vence en ≤7
+      // días. El día se compara contra ARGENTINA, no contra el reloj UTC del
+      // server (a la noche UTC ya es mañana y adelantaría los vencidos).
+      this.db.select({ n: sql<number>`count(*)` }).from(vencimientos)
+        .where(sql`(${vencimientos.procesado} = false AND ${vencimientos.fechaVencimiento} - (now() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date <= 7)`),
     ]);
     const cfgVentas = await this.cfg.get('ventas');
     const redondeo = cfgVentas.redondeoPrecio;
@@ -1304,6 +1335,7 @@ export class InventarioService {
       lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
       /** Pedidos del café sin resolver (pendiente + armando): el globito de Cafetería. */
       pedidosCafeteriaPendientes: Number(pendientesPedidoCafe?.[0]?.n) || 0,
+      vencimientosUrgentes: Number(urgentesVenc?.[0]?.n) || 0,
       // El frontend replica el cálculo de precios: necesita el mismo redondeo
       // para no mostrar un número distinto al de la API.
       configVentas: cfgVentas,

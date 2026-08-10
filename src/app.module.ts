@@ -24,6 +24,7 @@ import { WebModule } from './web/web.module';
 import { GastosModule } from './gastos/gastos.module';
 import { PagosModule } from './pagos/pagos.module';
 import { CafeteriaModule } from './cafeteria/cafeteria.module';
+import { VencimientosModule } from './vencimientos/vencimientos.module';
 import { ChatModule } from './chat/chat.module';
 
 @Module({
@@ -54,6 +55,7 @@ import { ChatModule } from './chat/chat.module';
     PagosModule,
     GastosModule,
     CafeteriaModule,
+    VencimientosModule,
     ChatModule,
   ],
   controllers: [HealthController],

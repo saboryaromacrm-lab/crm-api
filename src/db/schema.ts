@@ -19,6 +19,7 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  date,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -708,6 +709,13 @@ export const movimientos = pgTable('movimientos', {
   estadoHacia: estadoStockEnum('estado_hacia'),
   sucursalDestinoId: integer('sucursal_destino_id').references(() => sucursales.id, { onDelete: 'set null' }),
   vencimiento: timestamp('vencimiento', { withTimezone: true }),
+  /**
+   * Costo unitario CONGELADO al momento del movimiento (0 = no valuado).
+   * Solo lo llenan las bajas por pérdida (merma / vencido / defectuoso): son
+   * las que un reporte suma en pesos, y valuarlas al costo del día en que se
+   * mira cambiaría retroactivamente un período ya cerrado.
+   */
+  costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
   proveedorNombre: text('proveedor_nombre').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   refTransferenciaId: integer('ref_transferencia_id'),
@@ -1858,6 +1866,71 @@ export const gastoAdjuntos = pgTable('gasto_adjuntos', {
   subidoEn: timestamp('subido_en', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixGasto: index('ix_gasto_adjuntos_gasto').on(t.gastoId),
+}));
+
+/* ============================================================================
+ * VENCIMIENTOS — la lista de control de fechas, SIN lote
+ * ============================================================================
+ * El registro NO es stock: es un vigía. "De este producto hay 6 unidades que
+ * vencen el 15/9 en Express 2" — el sistema avisa a tiempo (7/15/30 días) para
+ * promocionar o reubicar antes de tirar. La realidad del stock entra recién
+ * cuando algo VENCIÓ y se procesa: ahí se genera la baja real (movimiento tipo
+ * 'vencido') por las unidades que no se salvaron. Es la versión sin lote de los
+ * vencimientos que se quitaron del modelo original (aquéllos eran por lote).
+ *
+ * El costo viaja CONGELADO al registrar (lección de cafetería): la pérdida de
+ * marzo no puede cambiar en julio porque subió el catálogo.
+ */
+
+/** El control como acto: quién caminó qué sucursal y cuánto anotó. */
+export const vencimientoSesiones = pgTable('vencimiento_sesiones', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  totalItems: integer('total_items').notNull().default(0),
+  totalUnidades: doublePrecision('total_unidades').notNull().default(0),
+}, (t) => ({
+  ixFecha: index('ix_venc_sesiones_fecha').on(t.fecha),
+}));
+
+export const vencimientos = pgTable('vencimientos', {
+  id: serial('id').primaryKey(),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'restrict' }),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  sesionId: integer('sesion_id').references(() => vencimientoSesiones.id, { onDelete: 'set null' }),
+  /**
+   * DATE pelado, sin zona horaria: es la fecha impresa en el paquete, no un
+   * instante. Los "días para vencer" se calculan SIEMPRE contra el día de
+   * Argentina (now() AT TIME ZONE), nunca contra CURRENT_DATE del server en
+   * UTC — a la noche ya es "mañana" en UTC y adelantaría los vencidos.
+   */
+  fechaVencimiento: date('fecha_vencimiento').notNull(),
+  cantidad: doublePrecision('cantidad').notNull().default(0),
+  /** Congelado al registrar, con el costo real del formato activo de ese día. */
+  costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
+  /* Snapshot para listar y exportar sin joins (patrón pedidos de cafetería). */
+  nombre: text('nombre').notNull().default(''),
+  unidad: text('unidad').notNull().default(''),
+  codigoBarras: text('codigo_barras').notNull().default(''),
+  observaciones: text('observaciones').notNull().default(''),
+  /* El cierre del ciclo: venció → se procesa. Cuántas se salvaron vendiéndose
+   * y cuántas se perdieron; la pérdida REAL es costo × (cantidad − vendidas). */
+  unidadesVendidas: doublePrecision('unidades_vendidas').notNull().default(0),
+  procesado: boolean('procesado').notNull().default(false),
+  procesadoEn: timestamp('procesado_en', { withTimezone: true }),
+  /** La baja real generada al procesar (movimiento 'vencido'), si se generó. */
+  mermaMovimientoId: integer('merma_movimiento_id'),
+  /** La oferta REAL armada desde este registro (Ventas › Ofertas, aplica en caja). */
+  ofertaId: integer('oferta_id').references(() => ofertas.id, { onDelete: 'set null' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixFechaVenc: index('ix_vencimientos_fecha').on(t.fechaVencimiento),
+  ixSucursal: index('ix_vencimientos_sucursal').on(t.sucursalId),
+  ixProducto: index('ix_vencimientos_producto').on(t.productoId),
+  ixProcesado: index('ix_vencimientos_procesado').on(t.procesado),
 }));
 
 /* ---------------- Configuración (clave → JSON) ---------------- */

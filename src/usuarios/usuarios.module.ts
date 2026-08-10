@@ -104,6 +104,11 @@ export const CATALOGO_PERMISOS = [
       { clave: 'almacen.transferencias', nombre: 'Transferencias' },
       { clave: 'almacen.operaciones', nombre: 'Operaciones' },
       { clave: 'almacen.incidencias', nombre: 'Incidencias' },
+      /*
+       * El vigía de fechas: control por sucursal, alertas 7/15/30, procesar
+       * vencidos (pérdida real + baja de stock), ofertas por vencer y mermas.
+       */
+      { clave: 'almacen.vencimientos', nombre: 'Vencimientos (control de fechas)' },
       { clave: 'almacen.cafeteria', nombre: 'Cafetería (envíos a coffit)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
