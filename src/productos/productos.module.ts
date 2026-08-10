@@ -3,7 +3,7 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
 } from '@nestjs/common';
 import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength } from 'class-validator';
-import { and, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasModule, ListasService } from '../listas/listas.module';
@@ -39,6 +39,11 @@ const ESTADOS_STOCK_VIVO = ['disponible', 'comprometido', 'retenido', 'en_transi
 class CambiarEstadoDto {
   @IsIn(ESTADOS_PRODUCTO as unknown as string[]) estado!: 'activo' | 'discontinuado' | 'archivado';
   /** Por qué se da de baja. Lo lee quien decide si vale reactivarlo. */
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+class ArchivarLoteDto {
+  @IsArray() ids!: number[];
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
 }
 
@@ -726,6 +731,86 @@ export class ProductosService {
     return { ...(await this.get(out.id)) };
   }
 
+  /**
+   * LOS DISCONTINUADOS QUE YA SE AGOTARON: candidatos a archivar.
+   *
+   * Es una SUGERENCIA, no un automatismo, y la diferencia importa. Archivar en
+   * el acto en que se vende la última unidad rompería cosas reales: el catálogo
+   * del POS se carga al abrir la caja, así que un cajero con el ticket ya
+   * armado vería "está archivado" sobre algo que tenía en pantalla; y una
+   * devolución o la anulación de ese mismo ticket devuelve el stock. Por eso
+   * decide una persona (y el camino de vuelta sí es automático:
+   * `despertarArchivado` en el inventario).
+   *
+   * Los tres filtros, cada uno por una razón:
+   *   · sin stock VIVO en NINGUNA sucursal — incluido `en_transito`: lo que
+   *     está arriba de un camión todavía va a llegar a algún lado;
+   *   · sin movimientos en los últimos `DIAS_GRACIA` días — recién agotado, una
+   *     devolución es probable y sugerir archivarlo el mismo día es ruido;
+   *   · discontinuado, obviamente: el activo no se toca.
+   */
+  async sugerenciasArchivado() {
+    const DIAS_GRACIA = 30;
+    const corte = new Date();
+    corte.setDate(corte.getDate() - DIAS_GRACIA);
+
+    const filas = await this.db.select({
+      id: productos.id,
+      nombre: productos.nombre,
+      codigoPropio: productos.codigoPropio,
+      motivoBaja: productos.motivoBaja,
+      estadoDesde: productos.estadoDesde,
+      ultimoMovimiento: sql<string | null>`(
+        select max(m.fecha) from movimientos m where m.producto_id = ${productos.id}
+      )`,
+    }).from(productos)
+      .where(and(
+        eq(productos.estado, 'discontinuado'),
+        // Sin una sola unidad viva, en ninguna sucursal ni presentación.
+        sql`not exists (
+          select 1 from stock s
+           where s.producto_id = ${productos.id}
+             and s.cantidad > 1e-9
+             and s.estado in ('disponible', 'comprometido', 'retenido', 'en_transito')
+        )`,
+        // Quieto hace rato: sin movimientos recientes (o sin ninguno nunca).
+        sql`not exists (
+          select 1 from movimientos m
+           where m.producto_id = ${productos.id} and m.fecha >= ${corte}
+        )`,
+      ))
+      .orderBy(asc(productos.nombre));
+
+    return { diasGracia: DIAS_GRACIA, productos: filas };
+  }
+
+  /**
+   * Archiva varios de una. Cada uno se revalida con `cambiarEstado` (el estado
+   * pudo cambiar entre que se mostró la sugerencia y el clic: una devolución lo
+   * despertó, alguien lo reactivó). Lo que no se pudo, se informa — nunca se
+   * archiva a medias en silencio.
+   */
+  async archivarLote(ids: number[], motivo?: string) {
+    const limpios = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!limpios.length) throw new BadRequestException('No hay productos para archivar.');
+    const archivados: string[] = [];
+    const omitidos: { nombre: string; razon: string }[] = [];
+    for (const id of limpios) {
+      const [p] = await this.db.select({ nombre: productos.nombre }).from(productos)
+        .where(eq(productos.id, id)).limit(1);
+      try {
+        await this.cambiarEstado(id, {
+          estado: 'archivado',
+          motivo: (motivo ?? '').trim() || 'Discontinuado y sin stock',
+        } as CambiarEstadoDto);
+        archivados.push(p?.nombre ?? String(id));
+      } catch (e: any) {
+        omitidos.push({ nombre: p?.nombre ?? String(id), razon: e?.message ?? 'no se pudo' });
+      }
+    }
+    return { archivados, omitidos };
+  }
+
   async remove(id: number) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -954,6 +1039,12 @@ export class ProductosController {
   @Post(':id/estado')
   cambiarEstado(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarEstadoDto) {
     return this.svc.cambiarEstado(id, dto);
+  }
+
+  /* Los discontinuados que ya se agotaron: sugerencia, no automatismo. */
+  @Get('sugerencias/archivado') sugerenciasArchivado() { return this.svc.sugerenciasArchivado(); }
+  @Post('archivar-lote') archivarLote(@Body() dto: ArchivarLoteDto) {
+    return this.svc.archivarLote(dto.ids, dto.motivo);
   }
 
   @Put(':id/presentaciones')

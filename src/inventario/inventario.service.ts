@@ -96,6 +96,39 @@ export class InventarioService {
   private async addDelta(tx: any, c: Coord, delta: number) {
     const e = await this.getOrCreate(tx, c);
     await tx.execute(sql`UPDATE stock SET cantidad = cantidad + ${delta} WHERE id = ${e.id}`);
+    if (delta > 0 && c.estado === 'disponible') await this.despertarArchivado(tx, c.productoId);
+  }
+
+  /**
+   * ENTRÓ MERCADERÍA DE UN PRODUCTO ARCHIVADO → vuelve a discontinuado.
+   *
+   * "Archivado con stock" es un estado imposible: mercadería que existe y que
+   * el sistema no deja vender. Pasa de verdad — una devolución del cliente, la
+   * anulación de un ticket, un ajuste de inventario — y por eso se resuelve
+   * solo. La asimetría es deliberada:
+   *
+   *   · ARCHIVAR cierra puertas → lo decide una persona (por eso hay
+   *     sugerencia y no automatismo: ver `sugerenciasArchivado`).
+   *   · DES-ARCHIVAR abre puertas → lo hace el sistema, porque lo contrario
+   *     es dejar plata inmovilizada esperando que alguien se acuerde.
+   *
+   * Vuelve a `discontinuado` y no a `activo`: que reaparezca una unidad no
+   * significa que se haya vuelto a comprar. Sigue sin entrar a las compras
+   * hasta que alguien lo reactive de verdad.
+   *
+   * Va en `addDelta` a propósito: es el ÚNICO lugar por donde pasa todo
+   * aumento de stock (compra, devolución, ajuste, reingreso por anulación,
+   * recepción de transferencia, fraccionamiento), así que ningún camino nuevo
+   * se lo puede olvidar. El UPDATE es condicional: si no estaba archivado no
+   * toca nada, y no hay carrera posible.
+   */
+  private async despertarArchivado(tx: any, productoId: number) {
+    await tx.execute(sql`
+      UPDATE productos
+         SET estado = 'discontinuado',
+             estado_desde = now(),
+             motivo_baja = 'Volvió a haber stock (devolución, anulación o ajuste): se reabrió para poder venderlo'
+       WHERE id = ${productoId} AND estado = 'archivado'`);
   }
   private async cant(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
     const e = await this.getEntry(tx, { productoId, sucursalId, presentacionId, estado });
