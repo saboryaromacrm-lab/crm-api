@@ -31,8 +31,23 @@ async function bootstrap() {
   app.enableCors({ origin: origins, credentials: true });
 
   const port = Number(config.get('PORT') ?? 3001);
-  await app.listen(port);
+  /*
+   * EN QUÉ INTERFAZ ESCUCHA, y por qué es una variable y no una constante.
+   *
+   * En el VPS tiene que ser `127.0.0.1`: nginx es la única puerta, y si se
+   * puede llegar a Node directo (IP:3001) el `X-Forwarded-For` de arriba se
+   * puede falsificar y encima se saltea el TLS.
+   *
+   * Pero NO puede estar hardcodeado, porque en la red del local la API la
+   * consumen otras máquinas: la sync de coffit (la cafetería) y las cajas.
+   * Con `127.0.0.1` fijo, eso dejaría de andar en desarrollo.
+   *
+   * Default `0.0.0.0` = lo de siempre; el `.env` del servidor lo baja a
+   * localhost. Ver deploy/DEPLOY.md.
+   */
+  const host = (config.get<string>('HOST') ?? '0.0.0.0').trim();
+  await app.listen(port, host);
   // eslint-disable-next-line no-console
-  console.log(`CRM API escuchando en http://localhost:${port}/api`);
+  console.log(`CRM API escuchando en http://${host}:${port}/api`);
 }
 bootstrap();

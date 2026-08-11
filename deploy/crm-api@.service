@@ -1,0 +1,57 @@
+# UNIDAD PLANTILLA: una sola definición para las dos etapas.
+#
+#   sudo systemctl enable --now crm-api@prod
+#   sudo systemctl enable --now crm-api@dev
+#
+# El `%i` de systemd se reemplaza por lo que va después del @ (prod | dev), y de
+# ahí salen la carpeta, el .env y el nombre en el log. Una unidad por etapa
+# duplicada terminaría con una de las dos vieja.
+#
+# Instalación:
+#   sudo cp crm-api@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+
+[Unit]
+Description=CRM API Sabor y Aroma — etapa %i
+Documentation=https://github.com/saboryaromacrm-lab/crm-api/blob/main/deploy/DEPLOY.md
+# `network-online` y no `network`: sin esto el servicio puede arrancar antes de
+# que haya red y morir al no poder conectarse a Postgres.
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=crm
+Group=crm
+WorkingDirectory=/srv/crm/%i/crm-api
+EnvironmentFile=/srv/crm/%i/crm-api/.env
+ExecStart=/usr/bin/node dist/main.js
+
+# Si se cae, vuelve. `RestartSec` evita el bucle apretado cuando la causa es
+# que Postgres todavía no está.
+Restart=always
+RestartSec=3
+
+# Al log del sistema: `journalctl -u crm-api@prod -f`
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crm-api-%i
+
+# --- Endurecimiento -------------------------------------------------------
+# La API NO escribe en disco: los archivos de facturas se guardan en la base
+# (factura_archivos.data, base64). Así que puede correr sin permiso de
+# escritura en ninguna parte, y si algún día se agrega una subida a disco esto
+# va a fallar RUIDOSAMENTE en vez de dejar archivos sueltos por el servidor.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Solo TCP/Unix: no hay razón para que la API abra otra familia de sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
