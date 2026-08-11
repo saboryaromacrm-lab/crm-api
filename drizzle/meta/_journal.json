@@ -386,6 +386,20 @@
       "when": 1787080000000,
       "tag": "0054_oferta_alcanza_paquete",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1787180000000,
+      "tag": "0055_pedido_borrador",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1787180100000,
+      "tag": "0056_un_borrador_por_ruta",
+      "breakpoints": true
     }
   ]
 }

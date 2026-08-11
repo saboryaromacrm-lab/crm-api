@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Put, Query } from '@nestjs/common';
 import { InventarioService } from './inventario.service';
 
 @Controller('stock')
@@ -95,6 +95,34 @@ export class TransferenciasController {
   @Post()
   crear(@Body() body: any) {
     return this.inv.crearTransferencia(body);
+  }
+
+  /*
+   * EL BORRADOR: el pedido que se arma durante el día (0055). `POST borrador`
+   * abre o retoma el de esa ruta, `PUT` guarda la lista completa (lo llama el
+   * guardado automático), `enviar` lo convierte en demanda y `DELETE` lo
+   * descarta. Uno por ruta, no por cajero.
+   */
+  @Post('borrador')
+  borrador(@Body() body: any) {
+    return this.inv.borradorTransferencia({
+      origenId: Number(body?.origenId), destinoId: Number(body?.destinoId), usuarioId: body?.usuarioId,
+    });
+  }
+
+  @Put(':id/borrador')
+  guardarBorrador(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.guardarBorrador(id, body ?? {});
+  }
+
+  @Post(':id/enviar')
+  enviarBorrador(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.inv.enviarBorrador(id, { usuarioId: body?.usuarioId });
+  }
+
+  @Delete(':id/borrador')
+  descartarBorrador(@Param('id', ParseIntPipe) id: number) {
+    return this.inv.descartarBorrador(id);
   }
 
   @Post(':id/avanzar')

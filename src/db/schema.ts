@@ -56,7 +56,7 @@ export const estadoStockEnum = pgEnum('estado_stock', [
   'en_transito',
 ]);
 export const estadoTransferEnum = pgEnum('estado_transferencia', [
-  'pendiente', 'preparada', 'transito', 'recibida', 'cancelada',
+  'borrador', 'pendiente', 'preparada', 'transito', 'recibida', 'cancelada',
 ]);
 export const estadoIncidenciaEnum = pgEnum('estado_incidencia', [
   'pendiente', 'revision', 'resuelta',
@@ -819,6 +819,10 @@ export const movimientos = pgTable('movimientos', {
  * la recibe contando lo que llegó.
  *
  * El stock acompaña los estados:
+ *   borrador    el que pide lo está ARMANDO (0055): no toca stock y el origen
+ *               no lo ve — nadie prepara algo que se sigue escribiendo. Hay
+ *               uno solo por ruta (índice parcial, 0056) porque el pedido es
+ *               del LOCAL: el cajero que entra sigue la lista del anterior
  *   pendiente   documento de demanda: NO toca stock
  *   preparada   el origen la armó: disponible → comprometido (reserva)
  *   transito    salió: comprometido → en_transito (sigue siendo del origen)
@@ -828,6 +832,7 @@ export const movimientos = pgTable('movimientos', {
  */
 export const transferencias = pgTable('transferencias', {
   id: serial('id').primaryKey(),
+  /** Serie TR: se asigna al ENVIAR. Un borrador no tiene código todavía. */
   codigo: text('codigo').notNull().default(''),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   origenId: integer('origen_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),

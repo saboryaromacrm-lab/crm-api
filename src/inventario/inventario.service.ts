@@ -726,6 +726,158 @@ export class InventarioService {
     });
   }
 
+  /* ------------------- El pedido que se arma de a poco ------------------- */
+  /*
+   * EL BORRADOR (0055). El cajero atiende clientes; el pedido lo arma entre
+   * uno y otro. Así que el pedido tiene que vivir en la base desde el primer
+   * renglón, no en la pantalla: cerrar el modal, cambiar de máquina o irse a
+   * casa no puede costar el trabajo del día.
+   *
+   * Es UNO POR RUTA (origen → destino), no por cajero: el pedido es del LOCAL.
+   * Ver el comentario de la 0056 — dos borradores por ruta terminan en
+   * mercadería duplicada en el depósito.
+   *
+   * Mientras es borrador NO toca stock y el origen NO lo ve. La serie TR se
+   * asigna al enviarlo.
+   */
+
+  /** El borrador de esa ruta, o uno nuevo. Idempotente: llamarlo dos veces da el mismo. */
+  async borradorTransferencia(o: { origenId: number; destinoId: number; usuarioId?: number }) {
+    return this.db.transaction(async (tx) => {
+      const [origen] = await tx.select().from(sucursales).where(eq(sucursales.id, o.origenId)).limit(1);
+      const [destino] = await tx.select().from(sucursales).where(eq(sucursales.id, o.destinoId)).limit(1);
+      if (!origen || !destino || origen.id === destino.id) throw new BadRequestException('Elegí origen y destino distintos.');
+
+      const buscar = async () => {
+        const [t] = await tx.select().from(transferencias).where(and(
+          eq(transferencias.origenId, origen.id),
+          eq(transferencias.destinoId, destino.id),
+          eq(transferencias.estado, 'borrador'),
+        )).limit(1);
+        return t;
+      };
+
+      let t = await buscar();
+      if (!t) {
+        try {
+          [t] = await tx.insert(transferencias).values({
+            codigo: '', origenId: origen.id, destinoId: destino.id,
+            usuarioId: o.usuarioId ?? null, estado: 'borrador', observaciones: '',
+          }).returning();
+        } catch (e: any) {
+          // Dos cajeros abrieron el pedido en el mismo segundo: el índice único
+          // parcial (0056) dejó pasar a uno solo. El que perdió se queda con el
+          // borrador del otro, que es exactamente lo que se quiere.
+          if (!/transfer_borrador_unico/.test(e?.message ?? '')) throw e;
+          t = await buscar();
+          if (!t) throw e;
+        }
+      }
+      const items = await tx.select().from(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
+      return { ...t, items };
+    });
+  }
+
+  /**
+   * Guarda el borrador COMPLETO: la lista que manda el modal reemplaza la que
+   * había. Un solo endpoint en vez de agregar/editar/quitar renglón por
+   * renglón, porque es lo que el modal tiene en la mano y porque así el
+   * guardado automático es idempotente — se puede repetir sin duplicar nada.
+   *
+   * Los renglones en 0 se guardan igual: recién agregado y sin tipear todavía
+   * es un estado normal mientras se arma. Se limpian al enviar.
+   */
+  async guardarBorrador(id: number, o: { items?: any[]; observaciones?: string; usuarioId?: number }) {
+    return this.db.transaction(async (tx) => {
+      const t = await this.borradorVigente(tx, id);
+      const crudos = Array.isArray(o.items) ? o.items : [];
+      if (crudos.length > 300) throw new BadRequestException('Demasiados renglones en un pedido (máximo 300).');
+
+      const filas: any[] = [];
+      for (const it of crudos) {
+        const prodId = Number(it.productoId);
+        if (!Number.isInteger(prodId) || prodId <= 0) continue;
+        const prod = await this.getProducto(tx, prodId);
+        if (!prod) throw new BadRequestException('Hay un renglón con un producto que ya no existe.');
+        const cant = Number(it.cantidad);
+        if (!Number.isFinite(cant) || cant < 0) throw new BadRequestException('Cantidad inválida en un renglón.');
+        let presId: number | null = it.presId ? Number(it.presId) : null;
+        if (presId) {
+          // La presentación tiene que ser DE ESE producto: un id ajeno pediría
+          // "5 paquetes de 250 g" de algo que no los tiene.
+          const [pres] = await tx.select().from(presentaciones)
+            .where(and(eq(presentaciones.id, presId), eq(presentaciones.productoId, prodId))).limit(1);
+          if (!pres) throw new BadRequestException('Una presentación elegida no es de su producto.');
+        }
+        filas.push({
+          transferenciaId: t.id, productoId: prodId, presentacionId: presId,
+          cantidad: cant, cantidadPreparada: cant,
+        });
+      }
+
+      await tx.delete(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
+      if (filas.length) await tx.insert(transferenciaItems).values(filas);
+      const patch: any = {};
+      if (o.observaciones != null) patch.observaciones = String(o.observaciones).trim();
+      // Queda quién lo tocó ÚLTIMO: el borrador pasa de mano en mano entre turnos.
+      if (o.usuarioId != null) patch.usuarioId = o.usuarioId;
+      if (Object.keys(patch).length) await tx.update(transferencias).set(patch).where(eq(transferencias.id, t.id));
+      return { ok: true, renglones: filas.length };
+    });
+  }
+
+  /**
+   * Manda el pedido: borrador → pendiente. Recién acá se asigna el código y el
+   * origen lo ve en su bandeja. Los renglones en 0 se van (son los que se
+   * agregaron y nunca se completaron).
+   */
+  async enviarBorrador(id: number, o: { usuarioId?: number } = {}) {
+    return this.db.transaction(async (tx) => {
+      const t = await this.borradorVigente(tx, id);
+      const items = await tx.select().from(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
+      const vacios = items.filter((it: any) => !(it.cantidad > 1e-9));
+      if (items.length - vacios.length === 0) {
+        throw new BadRequestException('El pedido no tiene ningún renglón con cantidad.');
+      }
+      for (const it of vacios) await tx.delete(transferenciaItems).where(eq(transferenciaItems.id, it.id));
+
+      const codigo = 'TR' + String(t.id).padStart(4, '0');
+      // Reclamo atómico: dos "Enviar" simultáneos mandarían el pedido dos veces.
+      const gano = await tx.update(transferencias)
+        .set({ estado: 'pendiente', codigo, fecha: new Date(), usuarioId: o.usuarioId ?? t.usuarioId })
+        .where(and(eq(transferencias.id, t.id), eq(transferencias.estado, 'borrador')))
+        .returning({ id: transferencias.id });
+      if (!gano.length) throw new BadRequestException('El pedido ya se había enviado — actualizá la pantalla.');
+      await tx.insert(transferenciaHist).values({ transferenciaId: t.id, estado: 'pendiente', usuarioId: o.usuarioId ?? null });
+      return { ok: true, id: t.id, codigo, renglones: items.length - vacios.length };
+    });
+  }
+
+  /**
+   * Descarta el borrador. Se BORRA, no se cancela: nunca fue un documento —
+   * no tuvo código, no tocó stock y nadie lo vio. Dejarlo como "cancelada"
+   * llenaría el historial de pedidos que jamás existieron.
+   */
+  async descartarBorrador(id: number) {
+    return this.db.transaction(async (tx) => {
+      const t = await this.borradorVigente(tx, id);
+      await tx.delete(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
+      await tx.delete(transferenciaHist).where(eq(transferenciaHist.transferenciaId, t.id));
+      await tx.delete(transferencias).where(eq(transferencias.id, t.id));
+      return { ok: true };
+    });
+  }
+
+  /** Guarda común de los tres de arriba: existe y TODAVÍA es borrador. */
+  private async borradorVigente(tx: any, id: number) {
+    const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
+    if (!t) throw new NotFoundException('Pedido inexistente.');
+    if (t.estado !== 'borrador') {
+      throw new BadRequestException('Este pedido ya se envió: no se edita como borrador.');
+    }
+    return t;
+  }
+
   /* ------------------- Preparación en dos listas ------------------- */
 
   /**
@@ -920,7 +1072,10 @@ export class InventarioService {
       }
 
       let siguiente: 'preparada' | 'transito';
-      if (t.estado === 'pendiente') siguiente = 'preparada';
+      // Un borrador no es demanda todavía: el origen ni lo ve. Tiene que
+      // enviarlo el que lo está armando.
+      if (t.estado === 'borrador') throw new BadRequestException('Este pedido todavía se está armando: el que lo pide tiene que enviarlo.');
+      else if (t.estado === 'pendiente') siguiente = 'preparada';
       else if (t.estado === 'preparada') siguiente = 'transito';
       else if (t.estado === 'transito') throw new BadRequestException('Está en tránsito: se cierra desde "Recibir", contando lo que llegó.');
       else throw new BadRequestException('La transferencia ya está en su estado final.');
@@ -1061,6 +1216,8 @@ export class InventarioService {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
+      // El borrador no se cancela: se descarta y se borra (nunca fue documento).
+      if (t.estado === 'borrador') throw new BadRequestException('Este pedido todavía se está armando: se descarta, no se cancela.');
       if (t.estado !== 'pendiente' && t.estado !== 'preparada') throw new BadRequestException('Solo se cancelan transferencias pendientes o preparadas.');
       // Reclamo atómico: si en el medio la prepararon o despacharon, no se
       // puede cancelar con la foto vieja.
