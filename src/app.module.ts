@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { DbModule } from './db/db.module';
+import { AuthModule } from './auth/auth.module';
 import { HealthController } from './health.controller';
 import { InventarioModule } from './inventario/inventario.module';
 import { ComprobantesModule } from './comprobantes/comprobantes.module';
@@ -31,6 +32,9 @@ import { ChatModule } from './chat/chat.module';
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     DbModule,
+    // Antes que todo lo demás: registra el guard global, que es la puerta de
+    // los 224 endpoints. Cerrado por defecto; lo público se marca a mano.
+    AuthModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,

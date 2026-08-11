@@ -132,6 +132,44 @@ export const usuarios = pgTable('usuarios', {
   activo: boolean('activo').notNull().default(true),
 });
 
+/**
+ * SESIONES — lo que convierte el login en una credencial verificable (0057).
+ *
+ * Antes el login devolvía el usuario y ahí terminaba: cada request siguiente
+ * era anónima. Con esto, el guard global resuelve en cada llamada QUIÉN llama,
+ * con qué rol y **desde qué sucursal**.
+ *
+ * Tres cosas que se ganan por estar en la base y no en un JWT firmado:
+ * se puede cortar una sesión antes de que venza (empleado que se va, tablet
+ * perdida), los permisos se leen frescos en cada request, y la sucursal vive
+ * del lado del servidor — el candado del cajero a su sucursal deja de poder
+ * abrirse cambiando un número en la request.
+ *
+ * `tokenHash`: se guarda el sha256, nunca el token. Un token en claro en la
+ * base es una credencial usable con solo tener el backup. No hace falta scrypt
+ * porque el token son 32 bytes de aleatorio, no una contraseña adivinable.
+ */
+export const sesiones = pgTable('sesiones', {
+  id: serial('id').primaryKey(),
+  tokenHash: text('token_hash').notNull(),
+  usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
+  /** El contexto de trabajo de TODA la sesión, no un parámetro de cada pantalla. */
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
+  ultimoUso: timestamp('ultimo_uso', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * Vence por INACTIVIDAD y se corre hacia adelante con el uso: un vencimiento
+   * absoluto corto deja al cajero afuera en mitad del turno, y uno largo deja
+   * la caja abierta toda la noche en una máquina compartida.
+   */
+  expiraEn: timestamp('expira_en', { withTimezone: true }).notNull(),
+  userAgent: text('user_agent').notNull().default(''),
+}, (t) => ({
+  ixToken: uniqueIndex('ix_sesiones_token').on(t.tokenHash),
+  ixUsuario: index('ix_sesiones_usuario').on(t.usuarioId),
+  ixExpira: index('ix_sesiones_expira').on(t.expiraEn),
+}));
+
 /* ==================================================================== *
  * CATÁLOGOS DEL PRODUCTO — marca, categoría › subcategoría, etiquetas
  * ==================================================================== *
@@ -2046,7 +2084,7 @@ export const configuracion = pgTable('configuracion', {
 
 /** Todas las tablas para pasar al cliente de Drizzle. */
 export const schema = {
-  sucursales, proveedores, roles, usuarios, productos, presentaciones, productoProveedores,
+  sucursales, proveedores, roles, usuarios, sesiones, productos, presentaciones, productoProveedores,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   modalidadesVenta, listasVenta, productoListas, clienteListas, reglasMarca,
   ofertas, ofertaAlcances, ofertaComponentes, precioHistorial,

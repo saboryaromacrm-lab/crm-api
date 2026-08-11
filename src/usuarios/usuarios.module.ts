@@ -13,13 +13,15 @@
  * nuevas, y `verificarPassword` queda listo para el login real.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable,
+  BadRequestException, Body, Controller, Delete, Get, Headers, Inject, Injectable,
   Module, NotFoundException, Param, ParseIntPipe, Patch, Post, UnauthorizedException,
 } from '@nestjs/common';
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { and, eq, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
+import { SesionesService } from '../auth/sesiones.service';
+import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 
 /* ---------------- Catálogo de permisos (fuente de verdad) ---------------- */
 /**
@@ -229,7 +231,10 @@ function publico(u: any, r: any) {
 
 @Injectable()
 export class UsuariosService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly sesiones: SesionesService,
+  ) {}
 
   /* ---------------- Roles ---------------- */
 
@@ -324,18 +329,72 @@ export class UsuariosService {
    * Los mensajes distinguen el caso "sin contraseña definida" del "contraseña
    * incorrecta": el primero se arregla pidiéndosela al superadmin, no reintentando.
    */
-  async login(o: any) {
-    const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, Number(o?.usuarioId))).limit(1);
+  async login(o: any, userAgent = '') {
+    /*
+     * Los ids se validan ANTES de consultar. `Number(undefined)` da NaN, y una
+     * consulta con NaN no devuelve "no encontrado": explota en Postgres y sale
+     * un 500. Entrar sin elegir la sucursal es un error del que entra, no una
+     * falla del servidor — y el 500 encima no le dice qué le falta.
+     */
+    const usuarioId = Number(o?.usuarioId);
+    const sucursalId = Number(o?.sucursalId);
+    if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+      throw new UnauthorizedException('Elegí un usuario válido.');
+    }
+    if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
+      throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
+    }
+    const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, usuarioId)).limit(1);
     if (!u) throw new UnauthorizedException('Elegí un usuario válido.');
     if (!u.activo) throw new UnauthorizedException('Ese usuario está desactivado — hablá con el superadmin.');
     if (!u.passwordHash) throw new UnauthorizedException(`${u.nombre} no tiene contraseña definida — el superadmin se la asigna desde Gerencia.`);
     if (!verificarPassword(String(o?.password ?? ''), u.passwordHash)) {
       throw new UnauthorizedException('Contraseña incorrecta.');
     }
-    const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, Number(o?.sucursalId))).limit(1);
+    const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     if (!suc) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
     const [r] = await this.db.select().from(roles).where(eq(roles.id, u.rolId)).limit(1);
-    return { ok: true, usuario: publico(u, r), sucursal: { id: suc.id, nombre: suc.nombre } };
+
+    /*
+     * ACÁ NACE LA CREDENCIAL. Antes esto devolvía el usuario y terminaba: el
+     * frontend lo guardaba y la API no volvía a preguntar nada nunca más. El
+     * token es lo que hace que el resto de las 224 llamadas puedan verificarse.
+     *
+     * La SUCURSAL se guarda con la sesión, no viaja en cada request: es el
+     * contexto de trabajo de todo el turno, y del lado del servidor deja de
+     * poder cambiarse editando un número.
+     */
+    const token = await this.sesiones.crear(u.id, suc.id, userAgent);
+    // Barrido oportunista de las vencidas: pasa una vez por login, que es
+    // exactamente la frecuencia que este sistema necesita. Un cron para esto
+    // sería una pieza más que mantener.
+    await this.sesiones.limpiarVencidas();
+
+    return {
+      ok: true,
+      token,
+      usuario: publico(u, r),
+      sucursal: { id: suc.id, nombre: suc.nombre },
+    };
+  }
+
+  /**
+   * Lo mínimo para poder ELEGIR en la pantalla de login, y nada más.
+   *
+   * Es público por necesidad —todavía no hay sesión— así que devuelve lo justo:
+   * `GET /usuarios` completo expondría los permisos de cada rol y quién es
+   * superadmin a cualquiera que abra la URL.
+   */
+  async opcionesLogin() {
+    const [us, ss] = await Promise.all([
+      this.db.select({ id: usuarios.id, nombre: usuarios.nombre, passwordHash: usuarios.passwordHash })
+        .from(usuarios).where(eq(usuarios.activo, true)).orderBy(usuarios.nombre),
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).orderBy(sucursales.id),
+    ]);
+    return {
+      usuarios: us.map((u) => ({ id: u.id, nombre: u.nombre, tienePassword: !!u.passwordHash })),
+      sucursales: ss,
+    };
   }
 
   /** Nunca puede quedar el sistema sin UN superadmin activo: sería quedarse afuera. */
@@ -378,11 +437,28 @@ export class UsuariosService {
       patch.passwordHash = hashPassword(pw);
     }
     if (Object.keys(patch).length) await this.db.update(usuarios).set(patch).where(eq(usuarios.id, id));
+
+    /*
+     * Cambiar la contraseña o desactivar a alguien tiene que ECHARLO de donde
+     * ya está. Si no, la contraseña nueva no sirve para nada en el único caso
+     * en que se cambia con urgencia: la sesión abierta en la sucursal seguiría
+     * andando con la vieja.
+     */
+    if (patch.passwordHash || patch.activo === false) {
+      await this.sesiones.cerrarTodasDe(id);
+    }
     return { ok: true };
   }
 }
 
+/*
+ * Quién puede tocar usuarios y roles: `gerencia.usuarios`, la misma clave que
+ * gatea la pantalla. Repartir permisos es la operación que permite darse a uno
+ * mismo cualquier otro permiso, así que es la que más tiene que estar cerrada:
+ * sin esto, un cajero podía hacerse superadmin con una sola llamada.
+ */
 @Controller('roles')
+@Permiso('gerencia.usuarios')
 export class RolesController {
   constructor(private readonly svc: UsuariosService) {}
   @Get() list() { return this.svc.listRoles(); }
@@ -393,6 +469,7 @@ export class RolesController {
 }
 
 @Controller('usuarios')
+@Permiso('gerencia.usuarios')
 export class UsuariosController {
   constructor(private readonly svc: UsuariosService) {}
   @Get() list() { return this.svc.listUsuarios(); }
@@ -402,8 +479,42 @@ export class UsuariosController {
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly svc: UsuariosService) {}
-  @Post('login') login(@Body() body: any) { return this.svc.login(body ?? {}); }
+  constructor(
+    private readonly svc: UsuariosService,
+    private readonly sesiones: SesionesService,
+  ) {}
+
+  /** Lo justo para poder elegir usuario y sucursal en el login. */
+  @Publico()
+  @Get('opciones') opciones() { return this.svc.opcionesLogin(); }
+
+  @Publico()
+  @Post('login') login(@Body() body: any, @Headers('user-agent') ua?: string) {
+    return this.svc.login(body ?? {}, ua ?? '');
+  }
+
+  /**
+   * QUIÉN SOY, según el servidor.
+   *
+   * El frontend lo llama al arrancar: es lo que le dice si el token que tiene
+   * guardado todavía vale, y de paso le trae los permisos y la sucursal
+   * FRESCOS. Antes de esto, la sesión del localStorage podía tener permisos de
+   * hace una semana y el sistema le creía.
+   */
+  @Get('yo') yo(@Auth() sesion: Sesion) {
+    return {
+      usuario: {
+        id: sesion.usuarioId, nombre: sesion.nombre, rolId: sesion.rolId,
+        rolClave: sesion.rolClave, permisos: sesion.permisos, activo: true,
+      },
+      sucursal: { id: sesion.sucursalId, nombre: sesion.sucursalNombre },
+    };
+  }
+
+  /** Cierra SOLO esta sesión: la tablet del local sigue trabajando. */
+  @Post('salir') salir(@Auth() sesion: Sesion) {
+    return this.sesiones.cerrar(sesion.sesionId);
+  }
 }
 
 @Module({

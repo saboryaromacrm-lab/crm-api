@@ -21,6 +21,7 @@ import {
   NotFoundException, Param, ParseIntPipe, Post, Res, UseGuards,
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
+import { Publico } from '../auth/auth.decoradores';
 import type { Response } from 'express';
 import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -482,6 +483,7 @@ export class TiendaService {
  * el resto de la API no se limita: el CRM le pega todo el día desde la red local.
  */
 @Controller('tienda')
+@Publico()
 @UseGuards(TiendaRateLimitGuard)
 export class TiendaController {
   constructor(private readonly svc: TiendaService) {}
