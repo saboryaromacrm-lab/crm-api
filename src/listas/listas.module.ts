@@ -407,6 +407,33 @@ export class ListasService {
       }
     }
 
+    /*
+     * EL CÓDIGO DE LA FILA ES EL DE LA CAJA.
+     *
+     * El artículo ya tiene el suyo: el del producto, o el de la etiqueta si es un
+     * paquete fraccionado. Un código propio en una fila que vende **de a 1** sería
+     * un SEGUNDO código para exactamente la misma cosa, y el escáner de la caja
+     * se quedaría sin desempate — el mismo problema que el único de la base evita
+     * entre tablas.
+     *
+     * Se exige solo en lo que NACE O CAMBIA: quedó una fila heredada del sistema
+     * viejo así (Maiz Frito, "54564" con unidades 1) y rechazarla dejaría ese
+     * producto sin poder guardar ni un cambio de markup. Se avisa en pantalla.
+     *
+     * No se le pide EAN-13, a diferencia del código de la presentación: la caja
+     * suele venir con un DUN-14, que tiene 14 dígitos y es igual de legítimo.
+     */
+    const previas = await this.db.select().from(productoListas)
+      .where(this.ambito(productoId, presentacionId));
+    const codigoPrevio = new Map(previas.map((f: any) => [f.listaId, f.codigoBarras || '']));
+    for (const r of rows) {
+      if (!r.codigoBarras || r.unidades > 1) continue;
+      if (codigoPrevio.get(r.listaId) === r.codigoBarras) continue;   // no lo tocó
+      throw new BadRequestException(
+        'Un formato que vende de a 1 no lleva código propio: sería un segundo código para el mismo artículo. Poné cuántas unidades trae la caja, o dejá el código vacío.',
+      );
+    }
+
     // Los códigos de formato compiten con TODOS los demás códigos del sistema:
     // si la caja responde al mismo código que otra cosa, el escáner de la caja
     // queda sin desempate. Dos consultas chicas, no una por fila.
