@@ -26,6 +26,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "drizzle-orm": "^0.36.4",
+    "helmet": "^8.3.0",
     "pdfjs-dist": "^6.2.108",
     "pg": "^8.13.1",
     "reflect-metadata": "^0.2.2",

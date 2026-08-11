@@ -3,11 +3,25 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { json } from 'express';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const config = app.get(ConfigService);
+
+  /*
+   * Cabeceras de seguridad. La API devuelve JSON y, en un endpoint, el binario
+   * de una imagen de la tienda — no sirve HTML, así que el CSP de helmet no
+   * tiene nada que proteger acá y sí puede molestar (la página la sirve nginx
+   * con su propia configuración). Lo que sí importa de esta lista:
+   *   - `noSniff`: sin él, un navegador puede decidir que una imagen subida es
+   *     HTML y ejecutarla. Ya estaba puesto a mano en el módulo de facturas;
+   *     ahora vale para toda la API.
+   *   - `frameguard`: que nadie meta la API en un iframe.
+   *   - se apaga el `X-Powered-By` de Express, que anuncia con qué está hecho.
+   */
+  app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 
   // El logo de la empresa viaja como data-URL en la configuración: el body
   // default de 100kb no le alcanza a una imagen.

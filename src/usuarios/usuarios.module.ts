@@ -14,13 +14,14 @@
  */
 import {
   BadRequestException, Body, Controller, Delete, Get, Headers, Inject, Injectable,
-  Module, NotFoundException, Param, ParseIntPipe, Patch, Post, UnauthorizedException,
+  Module, NotFoundException, Param, ParseIntPipe, Patch, Post, Req, UnauthorizedException,
 } from '@nestjs/common';
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { and, eq, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
 import { SesionesService } from '../auth/sesiones.service';
+import { FrenoLogin } from '../auth/freno-login';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 
 /* ---------------- Catálogo de permisos (fuente de verdad) ---------------- */
@@ -234,6 +235,7 @@ export class UsuariosService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly sesiones: SesionesService,
+    private readonly freno: FrenoLogin,
   ) {}
 
   /* ---------------- Roles ---------------- */
@@ -329,7 +331,7 @@ export class UsuariosService {
    * Los mensajes distinguen el caso "sin contraseña definida" del "contraseña
    * incorrecta": el primero se arregla pidiéndosela al superadmin, no reintentando.
    */
-  async login(o: any, userAgent = '') {
+  async login(o: any, userAgent = '', ip = '') {
     /*
      * Los ids se validan ANTES de consultar. `Number(undefined)` da NaN, y una
      * consulta con NaN no devuelve "no encontrado": explota en Postgres y sale
@@ -344,13 +346,24 @@ export class UsuariosService {
     if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
       throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
     }
+    // El freno va ANTES de mirar la contraseña: es lo que evita que se puedan
+    // probar las 10.000 claves de 4 dígitos.
+    this.freno.revisar(usuarioId, ip);
+
     const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, usuarioId)).limit(1);
-    if (!u) throw new UnauthorizedException('Elegí un usuario válido.');
+    if (!u) {
+      // Cuenta como fallo: si no, probar ids inexistentes sería gratis y serviría
+      // para averiguar qué ids existen.
+      this.freno.fallo(usuarioId, ip);
+      throw new UnauthorizedException('Elegí un usuario válido.');
+    }
     if (!u.activo) throw new UnauthorizedException('Ese usuario está desactivado — hablá con el superadmin.');
     if (!u.passwordHash) throw new UnauthorizedException(`${u.nombre} no tiene contraseña definida — el superadmin se la asigna desde Gerencia.`);
     if (!verificarPassword(String(o?.password ?? ''), u.passwordHash)) {
+      this.freno.fallo(usuarioId, ip);
       throw new UnauthorizedException('Contraseña incorrecta.');
     }
+    this.freno.exito(usuarioId);
     const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     if (!suc) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
     const [r] = await this.db.select().from(roles).where(eq(roles.id, u.rolId)).limit(1);
@@ -489,8 +502,12 @@ export class AuthController {
   @Get('opciones') opciones() { return this.svc.opcionesLogin(); }
 
   @Publico()
-  @Post('login') login(@Body() body: any, @Headers('user-agent') ua?: string) {
-    return this.svc.login(body ?? {}, ua ?? '');
+  @Post('login') login(@Body() body: any, @Req() req: any, @Headers('user-agent') ua?: string) {
+    // `req.ip` es la IP real gracias al `trust proxy` de main.ts. Vale mientras
+    // Node escuche SOLO en localhost detrás de nginx (HOST=127.0.0.1): si se
+    // puede llegar a Node directo, ese encabezado se puede falsificar y el
+    // freno por IP se esquiva. Está en el checklist de deploy/DEPLOY.md.
+    return this.svc.login(body ?? {}, ua ?? '', req?.ip ?? '');
   }
 
   /**

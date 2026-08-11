@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { AuthGuard } from './auth.guard';
+import { FrenoLogin } from './freno-login';
 import { SesionesService } from './sesiones.service';
 
 /**
@@ -15,8 +16,9 @@ import { SesionesService } from './sesiones.service';
 @Module({
   providers: [
     SesionesService,
+    FrenoLogin,
     { provide: APP_GUARD, useClass: AuthGuard },
   ],
-  exports: [SesionesService],
+  exports: [SesionesService, FrenoLogin],
 })
 export class AuthModule {}
