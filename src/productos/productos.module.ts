@@ -1,6 +1,6 @@
 import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
+  NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength } from 'class-validator';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
@@ -18,6 +18,7 @@ import {
 import {
   costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila,
 } from '../inventario/pricing';
+import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
 
 /**
  * Alícuotas legales de IVA. Es una lista cerrada a propósito: tipear 2.1 en vez
@@ -313,6 +314,67 @@ export class ProductosService {
     if (!ALICUOTAS_IVA.includes(iva)) {
       throw new BadRequestException(`Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_IVA.join(', ')}%.`);
     }
+  }
+
+  /**
+   * TODOS los códigos que ya identifican algo, en un solo Set.
+   *
+   * Son TRES tablas y no una: el producto (su EAN, su código propio y el DUN
+   * del bulto), la presentación fraccionada y el FORMATO DE VENTA (el EAN de la
+   * caja). Las tres se escanean en la misma caja, así que un código repetido
+   * entre ellas es una ambigüedad — y el único de la base no puede verlo porque
+   * es por tabla.
+   */
+  private async codigosEnUso(): Promise<Set<string>> {
+    const [prods, press, formatos] = await Promise.all([
+      this.db.select({
+        barras: productos.codigoBarras, propio: productos.codigoPropio, dun: productos.dun,
+      }).from(productos),
+      this.db.select({ codigo: presentaciones.codigoBarras }).from(presentaciones),
+      this.db.select({ codigo: productoListas.codigoBarras }).from(productoListas),
+    ]);
+    const set = new Set<string>();
+    for (const p of prods) for (const c of [p.barras, p.propio, p.dun]) if (c) set.add(c);
+    for (const p of press) if (p.codigo) set.add(p.codigo);
+    for (const f of formatos) if (f.codigo) set.add(f.codigo);
+    return set;
+  }
+
+  /** Prefijo de la serie interna, salteando el que usa la balanza. */
+  private async prefijoInterno() {
+    let balanza = '20';
+    try {
+      const cfg: any = await this.cfg.get('ventas');
+      balanza = String(cfg?.balanzaPrefijo || '20');
+    } catch { /* sin config, el default de la balanza es 20 */ }
+    return PREFIJOS_INTERNOS.find((p) => p !== balanza) ?? PREFIJOS_INTERNOS[0];
+  }
+
+  /**
+   * Un EAN-13 propio LIBRE, para el botón "Generar" de la presentación.
+   *
+   * Sigue la secuencia de la serie (el mayor emitido + 1) en vez de sortear un
+   * número: así los códigos internos quedan legibles y ordenados por antigüedad.
+   * Igual se comprueba contra todos los códigos en uso antes de devolverlo — la
+   * secuencia se puede haber saltado a mano, y dos altas al mismo tiempo pueden
+   * pedir el mismo número (el único de la base es la última palabra).
+   */
+  async siguienteEan13(excluir: string[] = []) {
+    const prefijo = await this.prefijoInterno();
+    const usados = await this.codigosEnUso();
+    // Los que ya están en la pantalla y todavía no se guardaron: sin esto,
+    // agregar tres presentaciones de una daba el mismo código tres veces.
+    for (const c of excluir) if (c) usados.add(String(c).trim());
+    let ultima = 0;
+    for (const c of usados) {
+      const sec = secuenciaDe(c, prefijo);
+      if (sec != null && sec > ultima) ultima = sec;
+    }
+    for (let i = 1; i <= 1000; i += 1) {
+      const codigo = armarEan13(prefijo, ultima + i);
+      if (!usados.has(codigo)) return { codigo, prefijo };
+    }
+    throw new BadRequestException('No encontré un código libre en la serie interna. Avisá: hay que ampliar el prefijo.');
   }
 
   /**
@@ -866,6 +928,40 @@ export class ProductosService {
       codigoBarras: (x.codigoBarras ?? '').trim(),
     }));
 
+    /*
+     * EL CÓDIGO NUEVO TIENE QUE SER UN EAN-13 DE VERDAD.
+     *
+     * Se exige solo en los códigos que NACEN O CAMBIAN acá. Los que ya estaban
+     * pasan intactos aunque no cumplan: en la base hay 71 heredados del sistema
+     * viejo (13 con el verificador mal y 58 que no llegan a 13 dígitos), y
+     * rechazarlos dejaría esas presentaciones sin poder guardar ni un cambio de
+     * recargo. Se arreglan de a uno, con el botón Generar, cuando toque.
+     *
+     * Vaciar el código SÍ se permite: es un acto deliberado para sacar uno malo.
+     * Lo que no se permite es que una presentación NUEVA nazca sin código —
+     * sería un paquete que la caja no puede escanear.
+     */
+    const previas = await this.db.select().from(presentaciones).where(eq(presentaciones.productoId, id));
+    const codigoPrevio = new Map(previas.map((p: any) => [p.id, p.codigoBarras || '']));
+    const comoDice = (tamKg: number) => (tamKg < 1 ? `${Math.round(tamKg * 1000)} g` : `${tamKg} kg`);
+    for (const v of valid) {
+      const antes = v.id ? (codigoPrevio.get(v.id) ?? '') : null;
+      if (antes === v.codigoBarras) continue;  // no lo tocó: no se juzga
+      if (!v.codigoBarras) {
+        if (antes === null) {
+          throw new BadRequestException(
+            `La presentación de ${comoDice(v.tamKg)} necesita un código de barras: es el que la caja escanea en el paquete. Con el botón "Generar" sale uno propio.`,
+          );
+        }
+        continue;  // se lo saca a propósito
+      }
+      if (!esEan13(v.codigoBarras)) {
+        throw new BadRequestException(
+          `El código "${v.codigoBarras}" de la presentación de ${comoDice(v.tamKg)} no es un EAN-13 válido: son 13 dígitos y el último es el verificador. Copiá el del fabricante o usá "Generar".`,
+        );
+      }
+    }
+
     // Mismo criterio que en el producto: un código no puede identificar dos
     // cosas. Se valida contra las otras presentaciones y contra los productos.
     const codigos = valid.map((v) => v.codigoBarras).filter(Boolean);
@@ -882,11 +978,33 @@ export class ProductosService {
         )).limit(1);
       if (ajeno) throw new BadRequestException(`Ese código ya lo usa el producto "${ajeno.nombre}".`);
 
-      const [otra] = await this.db.select({ id: presentaciones.id })
+      const [otra] = await this.db.select({ id: presentaciones.id, tamKg: presentaciones.tamKg, nombre: productos.nombre })
         .from(presentaciones)
+        .innerJoin(productos, eq(productos.id, presentaciones.productoId))
         .where(and(ne(presentaciones.productoId, id), inArray(presentaciones.codigoBarras, codigos)))
         .limit(1);
-      if (otra) throw new BadRequestException('Ese código ya lo usa la presentación de otro producto.');
+      if (otra) {
+        throw new BadRequestException(
+          `Ese código ya lo usa la presentación de ${comoDice(otra.tamKg)} de "${otra.nombre}".`,
+        );
+      }
+
+      /*
+       * La TERCERA puerta, que faltaba: el código del FORMATO DE VENTA (el EAN
+       * de la caja). El POS también busca por ahí, así que un código repetido
+       * entre un paquete fraccionado y una caja hace que escanear cargue
+       * cualquiera de los dos. El único de la base no lo ve: es por tabla.
+       */
+      const [formato] = await this.db.select({ nombre: productos.nombre, unidades: productoListas.unidades })
+        .from(productoListas)
+        .innerJoin(productos, eq(productos.id, productoListas.productoId))
+        .where(inArray(productoListas.codigoBarras, codigos))
+        .limit(1);
+      if (formato) {
+        throw new BadRequestException(
+          `Ese código ya lo usa el formato de venta de "${formato.nombre}" (×${formato.unidades}).`,
+        );
+      }
     }
 
     /*
@@ -1025,6 +1143,13 @@ export class ProductosController {
   @Get() list() { return this.svc.list(); }
   /** Antes de `:id`, si no "siguiente-codigo" entra como id y revienta. */
   @Get('siguiente-codigo') siguienteCodigo() { return this.svc.siguienteCodigo(); }
+  /**
+   * Un EAN-13 propio libre para el botón "Generar" de la presentación.
+   * `excluir` son los códigos que la pantalla tiene sin guardar todavía.
+   */
+  @Get('siguiente-ean') siguienteEan(@Query('excluir') excluir?: string) {
+    return this.svc.siguienteEan13(String(excluir || '').split(',').filter(Boolean));
+  }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
   @Post() create(@Body() dto: UpsertProductoDto) { return this.svc.create(dto); }
