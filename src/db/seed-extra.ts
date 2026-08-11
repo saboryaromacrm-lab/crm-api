@@ -103,7 +103,7 @@ async function main() {
     iva?: number; etiquetas?: number[];
     compra: { proveedorId: number; cantidad: number; costo: number; descuento?: number; descuento2?: number; flete?: number; codigo: string };
     venta: { mostrador: number; mayorista?: { markup: number; minimas?: number; unidades?: number; codigoBarras?: string }; ofertaMarkup?: number; ofertaFijo?: number };
-    presentaciones?: { tamKg: number; recargo: number }[];
+    presentaciones?: { tamKg: number; markup: number }[];
     stockDist: number; stockEx1?: number;
     fraccionar?: { tamKg: number; cant: number }[];
     bulto?: number;
@@ -114,52 +114,52 @@ async function main() {
     { nombre: 'Arroz Integral', tipo: 'granel', marcaId: mNorte.id, subId: subCereales.id, iva: 10.5, etiquetas: [etSinTacc.id],
       compra: { proveedorId: legum.id, cantidad: 1, costo: 1100, descuento: 5, flete: 3, codigo: 'LN-3301' },
       venta: { mostrador: 60, mayorista: { markup: 28, minimas: 10 } },
-      presentaciones: [{ tamKg: 1, recargo: 8 }, { tamKg: 0.5, recargo: 15 }],
+      presentaciones: [{ tamKg: 1, markup: 73 }, { tamKg: 0.5, markup: 84 }],
       stockDist: 60, fraccionar: [{ tamKg: 1, cant: 10 }, { tamKg: 0.5, cant: 10 }] },
     { nombre: 'Garbanzos', tipo: 'granel', marcaId: mNorte.id, subId: subLegumbres.id, iva: 10.5, etiquetas: [etSinTacc.id],
       compra: { proveedorId: legum.id, cantidad: 1, costo: 1600, descuento: 8, flete: 4, codigo: 'LN-2205' },
       venta: { mostrador: 55, mayorista: { markup: 25, minimas: 6 } },
-      presentaciones: [{ tamKg: 0.5, recargo: 12 }, { tamKg: 0.25, recargo: 20 }],
+      presentaciones: [{ tamKg: 0.5, markup: 74 }, { tamKg: 0.25, markup: 86 }],
       stockDist: 40, fraccionar: [{ tamKg: 0.5, cant: 10 }] },
     { nombre: 'Porotos Negros', tipo: 'granel', marcaId: mNorte.id, subId: subLegumbres.id, iva: 10.5, etiquetas: [etSinTacc.id],
       compra: { proveedorId: legum.id, cantidad: 1, costo: 1500, descuento: 5, flete: 4, codigo: 'LN-2210' },
       venta: { mostrador: 55 },
-      presentaciones: [{ tamKg: 0.5, recargo: 12 }],
+      presentaciones: [{ tamKg: 0.5, markup: 74 }],
       stockDist: 30 },
     { nombre: 'Quinoa', tipo: 'granel', marcaId: mCampoVivo.id, subId: subCereales.id, iva: 10.5, etiquetas: [etSinTacc.id, etOrganico.id],
       compra: { proveedorId: legum.id, cantidad: 1, costo: 5200, flete: 3, codigo: 'LN-3320' },
       venta: { mostrador: 70 },
-      presentaciones: [{ tamKg: 0.5, recargo: 10 }, { tamKg: 0.25, recargo: 18 }],
+      presentaciones: [{ tamKg: 0.5, markup: 87 }, { tamKg: 0.25, markup: 101 }],
       stockDist: 25 },
     { nombre: 'Mix Frutos Secos', tipo: 'granel', marcaId: mFrutosPais.id, subId: subFrutosSecos.id, iva: 21,
       compra: { proveedorId: frutosPais.id, cantidad: 1, costo: 7800, descuento: 5, flete: 2, codigo: 'FP-100' },
       venta: { mostrador: 65, mayorista: { markup: 30, minimas: 5 } },
-      presentaciones: [{ tamKg: 0.5, recargo: 10 }, { tamKg: 0.25, recargo: 16 }],
+      presentaciones: [{ tamKg: 0.5, markup: 82 }, { tamKg: 0.25, markup: 91 }],
       stockDist: 20, fraccionar: [{ tamKg: 0.25, cant: 12 }] },
     { nombre: 'Almendras', tipo: 'granel', marcaId: mFrutosPais.id, subId: subFrutosSecos.id, iva: 21,
       compra: { proveedorId: frutosPais.id, cantidad: 1, costo: 12500, descuento: 5, flete: 2, codigo: 'FP-110' },
       venta: { mostrador: 60 },
-      presentaciones: [{ tamKg: 0.25, recargo: 12 }, { tamKg: 0.1, recargo: 22 }],
+      presentaciones: [{ tamKg: 0.25, markup: 79 }, { tamKg: 0.1, markup: 95 }],
       stockDist: 15 },
     { nombre: 'Nueces Peladas', tipo: 'granel', marcaId: mFrutosPais.id, subId: subFrutosSecos.id, iva: 21,
       compra: { proveedorId: frutosPais.id, cantidad: 1, costo: 11000, flete: 2, codigo: 'FP-120' },
       venta: { mostrador: 60 },
-      presentaciones: [{ tamKg: 0.25, recargo: 12 }],
+      presentaciones: [{ tamKg: 0.25, markup: 79 }],
       stockDist: 12 },
     { nombre: 'Semillas de Chía', tipo: 'granel', marcaId: mNutriSol.id, subId: subSemillas.id, iva: 21, etiquetas: [etSinTacc.id, etOrganico.id],
       compra: { proveedorId: frutosPais.id, cantidad: 1, costo: 6000, flete: 3, codigo: 'FP-210' },
       venta: { mostrador: 65 },
-      presentaciones: [{ tamKg: 0.25, recargo: 10 }, { tamKg: 0.1, recargo: 20 }],
+      presentaciones: [{ tamKg: 0.25, markup: 82 }, { tamKg: 0.1, markup: 98 }],
       stockDist: 18 },
     { nombre: 'Azúcar Mascabo', tipo: 'granel', marcaId: mCampoVivo.id, subId: subEndulzantes.id, iva: 10.5,
       compra: { proveedorId: dietCentral.id, cantidad: 1, costo: 1900, descuento: 5, flete: 3, codigo: 'DC-501' },
       venta: { mostrador: 55, ofertaMarkup: 15 },
-      presentaciones: [{ tamKg: 1, recargo: 8 }, { tamKg: 0.5, recargo: 14 }],
+      presentaciones: [{ tamKg: 1, markup: 67 }, { tamKg: 0.5, markup: 77 }],
       stockDist: 50 },
     { nombre: 'Girasol Pelado', tipo: 'granel', marcaId: mNutriSol.id, subId: subSemillas.id, iva: 21, etiquetas: [etSinTacc.id],
       compra: { proveedorId: frutosPais.id, cantidad: 1, costo: 3800, descuento: 5, flete: 3, codigo: 'FP-220' },
       venta: { mostrador: 60 },
-      presentaciones: [{ tamKg: 0.25, recargo: 10 }],
+      presentaciones: [{ tamKg: 0.25, markup: 76 }],
       stockDist: 22 },
 
     /* ---------- Enteros ---------- */
@@ -225,7 +225,7 @@ async function main() {
     let presRows: any[] = [];
     if (d.presentaciones?.length) {
       presRows = await db.insert(presentaciones).values(
-        d.presentaciones.map((pr) => ({ productoId: p.id, tamKg: pr.tamKg, recargo: pr.recargo, codigoBarras: cbPres() })),
+        d.presentaciones.map((pr) => ({ productoId: p.id, tamKg: pr.tamKg, codigoBarras: cbPres() })),
       ).returning();
     }
 
@@ -245,6 +245,14 @@ async function main() {
     }
     if (d.venta.ofertaMarkup != null) filasVenta.push({ productoId: p.id, listaId: oferta.id, markup: d.venta.ofertaMarkup });
     if (d.venta.ofertaFijo != null) filasVenta.push({ productoId: p.id, listaId: oferta.id, modoPrecio: 'precio', precioFijo: d.venta.ofertaFijo });
+    /* Cada paquete con SU markup en el mostrador: el paquete se cotiza solo y su
+     * margen es más alto que el del kilo suelto (envase y mano de obra). */
+    for (const row of presRows) {
+      const def = d.presentaciones!.find((pr) => Math.abs(pr.tamKg - row.tamKg) < 1e-6)!;
+      filasVenta.push({
+        productoId: p.id, presentacionId: row.id, listaId: mostrador.id, markup: def.markup,
+      });
+    }
     await db.insert(productoListas).values(filasVenta);
 
     /* Stock por el motor real: valuado, con movimiento y trazable. */

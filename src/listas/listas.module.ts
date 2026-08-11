@@ -23,7 +23,7 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
 } from '@nestjs/common';
 import { IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
-import { and, asc, eq, inArray, ne, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   clienteListas, listasVenta, marcas, modalidadesVenta, presentaciones, productoListas, productos, reglasMarca, ventaItems,
@@ -32,6 +32,8 @@ import {
 /** Una fila del formato de venta, con la identidad de la lista ya pegada. */
 export interface FormatoVenta {
   listaId: number;
+  /** NULL = el producto suelto. Con id = el paquete fraccionado que se cotiza solo. */
+  presentacionId?: number | null;
   modoPrecio: 'markup' | 'precio';
   markup: number;
   precioFijo: number;
@@ -299,12 +301,11 @@ export class ListasService {
 
   /* ---------------------- Formato de venta del producto ---------------------- */
 
-  /** Las listas en las que ESTE producto se vende, con su markup propio. */
-  async formatoDe(productoId: number): Promise<(FormatoVenta & { productoId: number })[]> {
-    const filas = await this.db.select().from(productoListas)
-      .where(eq(productoListas.productoId, productoId));
-    return filas.map((f) => ({
+  /** De fila de la base a `FormatoVenta`. Una sola forma de mapear, tres lectores. */
+  private aFormato(f: any): FormatoVenta & { productoId: number } {
+    return {
       productoId: f.productoId,
+      presentacionId: f.presentacionId ?? null,
       listaId: f.listaId,
       modoPrecio: f.modoPrecio as any,
       markup: f.markup,
@@ -312,7 +313,25 @@ export class ListasService {
       unidades: f.unidades,
       codigoBarras: f.codigoBarras,
       unidadesMinimas: f.unidadesMinimas,
-    }));
+    };
+  }
+
+  /**
+   * El formato de venta de TODA la familia del producto: el suelto y el de cada
+   * uno de sus paquetes. Viene junto porque el armado del producto necesita las
+   * dos cosas en la misma pasada; cada fila dice de quién es en `presentacionId`.
+   */
+  async formatoDe(productoId: number): Promise<(FormatoVenta & { productoId: number })[]> {
+    const filas = await this.db.select().from(productoListas)
+      .where(eq(productoListas.productoId, productoId));
+    return filas.map((f) => this.aFormato(f));
+  }
+
+  /** El formato de venta de UN paquete fraccionado. */
+  async formatoDePresentacion(presentacionId: number): Promise<(FormatoVenta & { productoId: number })[]> {
+    const filas = await this.db.select().from(productoListas)
+      .where(eq(productoListas.presentacionId, presentacionId));
+    return filas.map((f) => this.aFormato(f));
   }
 
   /**
@@ -322,25 +341,42 @@ export class ListasService {
    */
   async formatoTodos(): Promise<(FormatoVenta & { productoId: number })[]> {
     const filas = await this.db.select().from(productoListas);
-    return filas.map((f) => ({
-      productoId: f.productoId,
-      listaId: f.listaId,
-      modoPrecio: f.modoPrecio as any,
-      markup: f.markup,
-      precioFijo: f.precioFijo,
-      unidades: f.unidades,
-      codigoBarras: f.codigoBarras,
-      unidadesMinimas: f.unidadesMinimas,
-    }));
+    return filas.map((f) => this.aFormato(f));
   }
 
   /**
-   * Reemplaza el formato de venta del producto. A diferencia del modelo viejo
-   * NO se filtra nada por "coincide con la lista": acá no hay herencia, la fila
-   * es el dato. Lo único que se descarta son las listas que no existen o están
-   * dadas de baja.
+   * Reemplaza el formato de venta del PRODUCTO SUELTO (la unidad, o el granel
+   * por kg). A diferencia del modelo viejo NO se filtra nada por "coincide con
+   * la lista": acá no hay herencia, la fila es el dato. Lo único que se descarta
+   * son las listas que no existen o están dadas de baja.
    */
   async setFormato(productoId: number, filas: any[]) {
+    return this.guardarFormato(productoId, null, filas);
+  }
+
+  /**
+   * Reemplaza el formato de venta de UN PAQUETE fraccionado. Mismo cuerpo que el
+   * del producto: el paquete se cotiza igual, solo cambia sobre qué costo.
+   */
+  async setFormatoPresentacion(presentacionId: number, filas: any[]) {
+    const [pr] = await this.db.select().from(presentaciones)
+      .where(eq(presentaciones.id, presentacionId)).limit(1);
+    if (!pr) throw new NotFoundException('Presentación inexistente.');
+    return this.guardarFormato(pr.productoId, presentacionId, filas);
+  }
+
+  /**
+   * Las filas de UN ámbito: el producto suelto (`presentacionId` null) o uno de
+   * sus paquetes. Existe porque las dos cosas viven en la misma tabla, y sin
+   * este filtro el guardado de la madre borraría el precio de todos sus hijos.
+   */
+  private ambito(productoId: number, presentacionId: number | null) {
+    return presentacionId == null
+      ? and(eq(productoListas.productoId, productoId), isNull(productoListas.presentacionId))
+      : eq(productoListas.presentacionId, presentacionId);
+  }
+
+  private async guardarFormato(productoId: number, presentacionId: number | null, filas: any[]) {
     const activas = await this.listasActivas();
     const validas = new Set(activas.map((l) => l.id));
 
@@ -348,6 +384,7 @@ export class ListasService {
     const rows = (filas || [])
       .map((f) => ({
         productoId,
+        presentacionId,
         listaId: Number(f.listaId),
         modoPrecio: (f.modoPrecio === 'precio' ? 'precio' : 'markup') as any,
         markup: Number(f.markup) || 0,
@@ -384,20 +421,27 @@ export class ListasService {
         )),
         this.db.select({ id: presentaciones.id }).from(presentaciones)
           .where(inArray(presentaciones.codigoBarras, codigos)),
-        this.db.select({ id: productoListas.id }).from(productoListas).where(and(
-          inArray(productoListas.codigoBarras, codigos), ne(productoListas.productoId, productoId),
-        )),
+        this.db.select({
+          id: productoListas.id, productoId: productoListas.productoId, presentacionId: productoListas.presentacionId,
+        }).from(productoListas).where(inArray(productoListas.codigoBarras, codigos)),
       ]);
-      if (enProductos.length || enPresentaciones.length || enFormatos.length) {
+      // Del choque con otros formatos se descuentan las filas de ESTE ámbito:
+      // son las que están por reemplazarse. Se filtra acá y no en el WHERE
+      // porque "no es mi ámbito" con un NULL adentro es más claro en JS.
+      const ajenos = enFormatos.filter((f) => f.productoId !== productoId
+        || (f.presentacionId ?? null) !== presentacionId);
+      if (enProductos.length || enPresentaciones.length || ajenos.length) {
         throw new BadRequestException('Un código de formato ya lo usa otro producto, presentación o formato.');
       }
     }
 
     await this.db.transaction(async (tx) => {
-      await tx.delete(productoListas).where(eq(productoListas.productoId, productoId));
+      await tx.delete(productoListas).where(this.ambito(productoId, presentacionId));
       if (rows.length) await tx.insert(productoListas).values(rows);
     });
-    return this.formatoDe(productoId);
+    return presentacionId == null
+      ? (await this.formatoDe(productoId)).filter((f) => !f.presentacionId)
+      : this.formatoDePresentacion(presentacionId);
   }
 }
 

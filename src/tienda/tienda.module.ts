@@ -208,7 +208,12 @@ export class TiendaService {
        * fallback a otra lista. Publicar = cargarle el precio mayorista;
        * sacarlo del sitio = quitárselo.
        */
-      const filaTienda = filas.find((f) => f.productoId === p.id && f.listaId === listaTienda.id);
+      /* La fila del producto SUELTO: el sitio todavía publica la madre, no sus
+       * paquetes (el stock que mira ya es el del granel). Sin el filtro de
+       * presentación podría tomar la fila de un paquete de 250 g y publicar ESE
+       * precio como si fuera el del kilo. */
+      const filaTienda = filas.find((f) => f.productoId === p.id
+        && f.presentacionId == null && f.listaId === listaTienda.id);
       if (!filaTienda) continue;
 
       const costoNeto = costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)), p.iva);

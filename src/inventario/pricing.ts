@@ -264,16 +264,15 @@ export function precioLista(costoNetoKg: number, markup: number, opts?: Opciones
 }
 
 /**
- * Precio NETO de una presentación fraccionada. `markupLista` es el markup de
- * la lista con la que se cotiza; la presentación solo aporta su `recargo`.
+ * COSTO neto de un paquete fraccionado: el del kilo por lo que consume.
+ *
+ * Es lo único que el paquete hereda de su madre. Con este costo, un paquete
+ * pasa por `precioVentaFila` igual que cualquier producto —markup o precio
+ * fijo, caja por N, redondeo de góndola— y el sistema no necesita un segundo
+ * camino para cotizarlo. Antes existía `precioPresentacion`, que multiplicaba el
+ * precio de la lista de la madre por un `recargo`: se borró junto con la columna
+ * (0053) porque era una forma paralela de decir cuánto vale un paquete.
  */
-export function precioPresentacion(
-  costoNetoKg: number,
-  pres: { tamKg: number; recargo: number },
-  markupLista = 0,
-  opts?: OpcionesPrecio,
-): number {
-  const porKg = (Number(costoNetoKg) || 0) * (1 + (Number(markupLista) || 0) / 100);
-  const neto = porKg * (Number(pres.tamKg) || 0) * (1 + (Number(pres.recargo) || 0) / 100);
-  return ajustarNeto(neto, opts);
+export function costoNetoPresentacion(costoNetoKg: number, tamKg: number): number {
+  return (Number(costoNetoKg) || 0) * (Number(tamKg) || 0);
 }

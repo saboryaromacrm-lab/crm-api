@@ -121,22 +121,26 @@ async function main() {
     { productoId: yerba.id, etiquetaId: etOrganico.id },
   ]);
 
-  /* ---- Presentaciones (granel): tamaño + % ganancia ---- */
+  /* ---- Presentaciones (granel): SOLO el tamaño ----
+   * La presentación define cuánto granel consume el paquete y nada más. El
+   * precio es del paquete y vive en su formato de venta, abajo. */
   const presHarina = await db.insert(presentaciones).values([
-    { productoId: harina.id, tamKg: 1, recargo: 8, codigoBarras: '7791234100012' },
-    { productoId: harina.id, tamKg: 0.5, recargo: 15, codigoBarras: '7791234100029' },
-    { productoId: harina.id, tamKg: 0.25, recargo: 25, codigoBarras: '7791234100036' },
+    { productoId: harina.id, tamKg: 1, codigoBarras: '7791234100012' },
+    { productoId: harina.id, tamKg: 0.5, codigoBarras: '7791234100029' },
+    { productoId: harina.id, tamKg: 0.25, codigoBarras: '7791234100036' },
+  ]).returning();
+  const presLentejas = await db.insert(presentaciones).values([
+    { productoId: lentejas.id, tamKg: 1, codigoBarras: '7791234100043' },
+    { productoId: lentejas.id, tamKg: 0.5 },
   ]).returning();
   await db.insert(presentaciones).values([
-    { productoId: lentejas.id, tamKg: 1, recargo: 8, codigoBarras: '7791234100043' },
-    { productoId: lentejas.id, tamKg: 0.5, recargo: 15 },
-  ]);
-  await db.insert(presentaciones).values([
-    { productoId: avena.id, tamKg: 1, recargo: 8, codigoBarras: '7791234100050' },
-    { productoId: avena.id, tamKg: 0.5, recargo: 15 },
+    { productoId: avena.id, tamKg: 1, codigoBarras: '7791234100050' },
+    { productoId: avena.id, tamKg: 0.5 },
   ]);
   const harina1kg = presHarina.find((p) => Math.abs(p.tamKg - 1) < 1e-6)!;
   const harina05 = presHarina.find((p) => Math.abs(p.tamKg - 0.5) < 1e-6)!;
+  const harina025 = presHarina.find((p) => Math.abs(p.tamKg - 0.25) < 1e-6)!;
+  const lentejas1kg = presLentejas.find((p) => Math.abs(p.tamKg - 1) < 1e-6)!;
 
   /* ---- FORMATOS DE COMPRA ----
    * Todos los importes son del BULTO. `usarParaPrecio` marca el único que
@@ -203,7 +207,24 @@ async function main() {
     { productoId: gaseosa.id, listaId: mayA.id, markup: 22, unidades: 6, codigoBarras: '27791234000057' },
     // Avena: solo mostrador.
     { productoId: avena.id, listaId: minGeneral.id, markup: 60 },
+
+    /* ---- Y EL FORMATO DE VENTA DE LOS PAQUETES ----
+     * El paquete se cotiza solo: su markup es propio y más alto que el del kilo
+     * suelto (envase y mano de obra), que es lo que antes intentaba decir el
+     * `recargo`. Ahora puede decir más: el de 250 g de harina va con PRECIO
+     * DEFINIDO ($900 el paquete) y el de 1 kg de lentejas se vende también por
+     * CAJA DE 12 con su propio código — dos cosas que un recargo no expresaba.
+     */
+    { productoId: harina.id, presentacionId: harina1kg.id, listaId: minGeneral.id, markup: 78 },
+    { productoId: harina.id, presentacionId: harina1kg.id, listaId: mayA.id, markup: 42, unidadesMinimas: 6 },
+    { productoId: harina.id, presentacionId: harina05.id, listaId: minGeneral.id, markup: 95 },
+    { productoId: harina.id, presentacionId: harina025.id, listaId: minGeneral.id, modoPrecio: 'precio', precioFijo: 900 },
+    { productoId: lentejas.id, presentacionId: lentejas1kg.id, listaId: minGeneral.id, markup: 70 },
+    { productoId: lentejas.id, presentacionId: lentejas1kg.id, listaId: mayA.id, markup: 38, unidades: 12, codigoBarras: '27791234100040' },
   ]);
+  /* El de 500 g de lentejas y los dos de avena quedan SIN formato de venta a
+   * propósito: es el caso "paquete sin precio" que el POS tiene que bloquear con
+   * el motivo y que el contador de Fraccionamiento tiene que contar. */
 
   /* La única regla GLOBAL: "12 unidades de ColaCo habilitan Mayorista". */
   await db.insert(reglasMarca).values({

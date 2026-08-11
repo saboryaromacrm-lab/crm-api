@@ -25,7 +25,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
@@ -58,7 +58,12 @@ export class HistorialPreciosService {
     const [prods, formatos, plistas, listas] = await Promise.all([
       this.db.select().from(productos).where(inArray(productos.id, productoIds)),
       this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, productoIds)),
-      this.db.select().from(productoListas).where(inArray(productoListas.productoId, productoIds)),
+      /* Las del producto SUELTO. La evolución de precios es por (producto,
+       * lista): si entraran las filas de los paquetes habría dos precios para la
+       * misma clave y el historial registraría cualquiera de los dos. El precio
+       * de los paquetes todavía no lleva historial — está anotado en /info. */
+      this.db.select().from(productoListas)
+        .where(and(inArray(productoListas.productoId, productoIds), isNull(productoListas.presentacionId))),
       this.db.select().from(listasVenta).where(eq(listasVenta.activa, true)),
     ]);
     const listasVivas = new Set(listas.map((l) => l.id));
@@ -249,12 +254,13 @@ class CambioMargenDto {
   @IsNumber() valor!: number;
 }
 
+/**
+ * Los `id` son filas de `producto_listas`. Tenía un `tipo` para elegir entre eso
+ * y `presentaciones.recargo`; desde la 0053 el paquete tiene su propia fila en
+ * la misma tabla, así que el segundo destino desapareció — y la masiva ganó de
+ * arriba la capacidad de mover el margen de los paquetes.
+ */
 class ActualizarMargenesDto {
-  /**
-   * `markup_lista` opera sobre `producto_listas` (el formato de venta por
-   * producto); `recargo_presentacion` sobre `presentaciones.recargo`.
-   */
-  @IsIn(['markup_lista', 'recargo_presentacion']) tipo!: 'markup_lista' | 'recargo_presentacion';
   @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => CambioMargenDto)
   cambios!: CambioMargenDto[];
   @IsOptional() @IsString() motivo?: string;
@@ -353,66 +359,50 @@ export class PreciosService {
   /* ------------------------------ Márgenes ------------------------------ */
 
   /**
-   * Masiva de márgenes con dos destinos:
+   * Masiva de márgenes sobre las filas de `producto_listas` — el formato de
+   * venta, sea del producto suelto o de un paquete fraccionado (desde la 0053
+   * viven en la misma tabla, así que una sola masiva mueve las dos cosas).
    *
-   * - `markup_lista`: el markup de las filas de `producto_listas` (el formato
-   *   de venta por producto). Las filas en modo **precio definido** se saltean:
-   *   su precio lo fijó una persona y un % masivo no debe pisarlo. Mueve la
-   *   góndola, así que registra evolución de precios (origen `formato_venta`).
-   *
-   * - `recargo_presentacion`: el recargo de fraccionamiento. No lleva
-   *   historial: es decisión propia y reversible a mano.
+   * Las filas en modo **precio definido** se saltean: ese precio lo fijó una
+   * persona y un % masivo no debe pisarlo. Mueve la góndola, así que registra
+   * evolución de precios (origen `formato_venta`).
    */
   async actualizarMargenes(dto: ActualizarMargenesDto) {
     const cambios = dto.cambios.filter((c) => Number.isInteger(c.id) && Number.isFinite(c.valor));
     if (!cambios.length) throw new BadRequestException('No hay cambios para aplicar.');
     if (cambios.length > 5000) throw new BadRequestException('Demasiadas filas en una sola actualización (máximo 5000).');
 
-    if (dto.tipo === 'markup_lista') {
-      const ids = [...new Set(cambios.map((c) => c.id))];
-      const actuales = await this.db.select().from(productoListas).where(inArray(productoListas.id, ids));
-      const porId = new Map(actuales.map((f) => [f.id, f]));
+    const ids = [...new Set(cambios.map((c) => c.id))];
+    const actuales = await this.db.select().from(productoListas).where(inArray(productoListas.id, ids));
+    const porId = new Map(actuales.map((f) => [f.id, f]));
 
-      // Solo filas reales, en modo markup y con un valor efectivamente distinto.
-      const finales = cambios
-        .map((c) => {
-          const a = porId.get(c.id);
-          if (!a || a.modoPrecio === 'precio') return null;
-          const nuevo = money(Math.max(0, c.valor));
-          return Math.abs(nuevo - a.markup) < 0.005 ? null : { id: c.id, valor: nuevo, productoId: a.productoId };
-        })
-        .filter(Boolean) as { id: number; valor: number; productoId: number }[];
-      if (!finales.length) return { ok: true, actualizados: 0 };
-
-      const valores = sql.join(
-        finales.map((f) => sql`(${f.id}::int, ${f.valor}::double precision)`),
-        sql`, `,
-      );
-      await this.db.execute(sql`
-        UPDATE producto_listas AS t
-        SET markup = v.valor
-        FROM (VALUES ${valores}) AS v(id, valor)
-        WHERE t.id = v.id
-      `);
-      await this.evolucion.snapshot(
-        [...new Set(finales.map((f) => f.productoId))],
-        'formato_venta',
-        { detalle: dto.motivo ?? 'Actualización masiva de márgenes', usuarioId: dto.usuarioId ?? null },
-      );
-      return { ok: true, actualizados: finales.length };
-    }
+    // Solo filas reales, en modo markup y con un valor efectivamente distinto.
+    const finales = cambios
+      .map((c) => {
+        const a = porId.get(c.id);
+        if (!a || a.modoPrecio === 'precio') return null;
+        const nuevo = money(Math.max(0, c.valor));
+        return Math.abs(nuevo - a.markup) < 0.005 ? null : { id: c.id, valor: nuevo, productoId: a.productoId };
+      })
+      .filter(Boolean) as { id: number; valor: number; productoId: number }[];
+    if (!finales.length) return { ok: true, actualizados: 0 };
 
     const valores = sql.join(
-      cambios.map((c) => sql`(${c.id}::int, ${money(Math.max(0, c.valor))}::double precision)`),
+      finales.map((f) => sql`(${f.id}::int, ${f.valor}::double precision)`),
       sql`, `,
     );
     await this.db.execute(sql`
-      UPDATE presentaciones AS t
-      SET recargo = v.valor
+      UPDATE producto_listas AS t
+      SET markup = v.valor
       FROM (VALUES ${valores}) AS v(id, valor)
       WHERE t.id = v.id
     `);
-    return { ok: true, actualizados: cambios.length };
+    await this.evolucion.snapshot(
+      [...new Set(finales.map((f) => f.productoId))],
+      'formato_venta',
+      { detalle: dto.motivo ?? 'Actualización masiva de márgenes', usuarioId: dto.usuarioId ?? null },
+    );
+    return { ok: true, actualizados: finales.length };
   }
 
   /* -------------------------- Proveedor activo -------------------------- */

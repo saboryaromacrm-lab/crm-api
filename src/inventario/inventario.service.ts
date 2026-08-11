@@ -9,7 +9,7 @@ import {
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
-import { costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila } from './pricing';
+import { costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioLista, precioVentaFila } from './pricing';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
 /**
@@ -159,10 +159,13 @@ export class InventarioService {
    */
   private async ctxPrecio(tx: any, productoId: number) {
     const [prod] = await tx.select().from(productos).where(eq(productos.id, productoId)).limit(1);
-    if (!prod) return { cn: 0, iva: 0, markup: 0, tieneLista: false, redondeo: 0 };
+    if (!prod) return { cn: 0, iva: 0, markup: 0, tieneLista: false, redondeo: 0, listaBaseId: null as number | null };
     const [provs, formato, cfg, listas] = await Promise.all([
       tx.select().from(productoProveedores).where(eq(productoProveedores.productoId, productoId)),
-      tx.select().from(productoListas).where(eq(productoListas.productoId, productoId)),
+      // Las del producto SUELTO. Sin el `isNull` entrarían las de sus paquetes y
+      // el granel podría cotizarse con el precio de una bolsa de 500 g.
+      tx.select().from(productoListas)
+        .where(and(eq(productoListas.productoId, productoId), isNull(productoListas.presentacionId))),
       this.cfg.get('ventas'),
       tx.select().from(listasVenta).where(eq(listasVenta.activa, true))
         .orderBy(asc(listasVenta.orden), asc(listasVenta.id)),
@@ -189,6 +192,8 @@ export class InventarioService {
       markup: pv && cn > 0 ? ((pv.netoUnitario / cn) - 1) * 100 : (fila?.markup ?? 0),
       tieneLista: !!fila,
       redondeo: cfg.redondeoPrecio,
+      /** La lista del piso, para cotizar un paquete con el mismo criterio. */
+      listaBaseId: (base?.id ?? null) as number | null,
     };
   }
 
@@ -197,12 +202,28 @@ export class InventarioService {
     return tieneLista ? precioLista(cn, markup, { iva, redondeo }) : cn;
   }
 
+  /**
+   * Precio de UN PAQUETE fraccionado, con SU formato de venta (0053).
+   *
+   * Se toma el de la lista base —el piso, lo mismo que muestran las pantallas— y
+   * si el paquete no tiene ninguna fila cargada NO se devuelve cero: se corta. Un
+   * cero acá sería una venta a precio cero, y el motivo aparecería recién en el
+   * arqueo de caja.
+   */
   private async precioPres(tx: any, presentacionId: number): Promise<number> {
     const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presentacionId)).limit(1);
-    if (!pres) return 0;
-    // El markup lo pone la lista; la presentación solo agrega su recargo.
-    const { cn, iva, markup, redondeo } = await this.ctxPrecio(tx, pres.productoId);
-    return precioPresentacion(cn, pres, markup, { iva, redondeo });
+    if (!pres) throw new BadRequestException('Presentación inexistente.');
+    const { cn, iva, redondeo, listaBaseId } = await this.ctxPrecio(tx, pres.productoId);
+    const suyas = await tx.select().from(productoListas)
+      .where(eq(productoListas.presentacionId, presentacionId));
+    if (!suyas.length) {
+      const tam = pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`;
+      throw new BadRequestException(
+        `El paquete de ${tam} no tiene formato de venta cargado, así que no tiene precio. Cargalo en su ficha (Compras › Productos → el fraccionado).`,
+      );
+    }
+    const fila = suyas.find((f: any) => f.listaId === listaBaseId) ?? suyas[suyas.length - 1];
+    return precioVentaFila(costoNetoPresentacion(cn, pres.tamKg), fila, { iva, redondeo }).netoUnitario;
   }
 
   /* ------------------------- Movimiento ------------------------- */
@@ -1311,15 +1332,20 @@ export class InventarioService {
       // El redondeo propio del producto pisa al de configuración; null = heredar.
       const opts = { iva: p.iva, redondeo: p.redondeo ?? redondeo };
 
-      // FORMATO DE VENTA: solo las listas que el producto tiene cargadas, cada
-      // una con su markup propio. Sin fila no hay precio en esa lista.
-      const listasProd = mias
+      /*
+       * FORMATO DE VENTA hecho precio. `presId` dice de quién son las filas: null
+       * = el producto suelto, un id = uno de sus paquetes, que desde la 0053 se
+       * cotiza solo. El armado es UNO para los dos: un paquete es la misma cosa
+       * con otro costo (el del kilo × su tamaño).
+       */
+      const armarFormato = (presId: number | null, costo: number) => mias
+        .filter((f) => ((f as any).presentacionId ?? null) === presId)
         .map((f) => {
           const l: any = activas.find((x: any) => x.id === f.listaId);
           if (!l) return null;
           // El MISMO helper que la ficha y el POS: markup o precio definido,
           // unidades por formato — una sola derivación en todo el sistema.
-          const pv = precioVentaFila(cn, f as any, opts);
+          const pv = precioVentaFila(costo, f as any, opts);
           return {
             id: f.id,          // fila de producto_listas: la llave de la masiva de márgenes
             listaId: f.listaId,
@@ -1343,14 +1369,9 @@ export class InventarioService {
         .filter(Boolean)
         .sort((a: any, b: any) => a.orden - b.orden) as any[];
 
-      // El precio de referencia de una presentación usa el piso; el POS
-      // recalcula con la lista que el ticket habilite. Con precio definido el
-      // markup no manda: se usa el equivalente derivado del neto.
-      const filaRefB = listasProd.find((l) => l.listaId === listaBase?.id)
-        ?? listasProd[listasProd.length - 1] ?? null;
-      const markupRef = filaRefB
-        ? (cn > 0 ? ((filaRefB.precio / cn) - 1) * 100 : filaRefB.markup)
-        : 0;
+      const listasProd = armarFormato(null, cn);
+      /** El piso: lo que se paga sin que el ticket habilite nada. */
+      const piso = (ls: any[]) => ls.find((l) => l.listaId === listaBase?.id) ?? ls[ls.length - 1] ?? null;
       const misEtq = etiquetasDe.get(p.id) ?? [];
       return {
         ...p,
@@ -1360,8 +1381,21 @@ export class InventarioService {
         etiquetas: misEtq,
         etiquetasNombres: misEtq.map((id) => nEtiqueta.get(id)).filter(Boolean),
         costoNeto: cn,
-        presentaciones: pres.filter((x) => x.productoId === p.id)
-          .map((pr) => ({ ...pr, precio: precioPresentacion(cn, pr, markupRef, opts) })),
+        /* Cada paquete con SU formato de venta. `precio` null = todavía no tiene
+         * ninguna lista cargada, que no es lo mismo que valer cero. */
+        presentaciones: pres.filter((x) => x.productoId === p.id).map((pr) => {
+          const costoPaquete = costoNetoPresentacion(cn, pr.tamKg);
+          const suyas = armarFormato(pr.id, costoPaquete);
+          const pisoPres = piso(suyas);
+          return {
+            ...pr,
+            costoNeto: costoPaquete,
+            listas: suyas,
+            sinFormato: suyas.length === 0,
+            precio: pisoPres ? pisoPres.precio : null,
+            precioFinal: pisoPres ? pisoPres.precioFinalUnitario : null,
+          };
+        }),
         // Cada formato con su cadena derivada. Mismo nombre que en
         // `/productos`: un producto tiene una sola forma, venga de donde venga.
         formatosCompra: pp.map((e) => ({ ...e, ...costosFormato(e, p.iva), costoNeto: costoNetoEntry(e, p.iva) })),

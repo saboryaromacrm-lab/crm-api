@@ -16,7 +16,8 @@ import {
   transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import {
-  costoNetoEntry, costosFormato, formatoActivo, precioLista, precioPresentacion, precioVentaFila,
+  costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioLista, precioVentaFila,
+  type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
 
@@ -156,6 +157,46 @@ export class ProductosService {
     const provsDe = idx(provs);
     const formatoDe = idx(formato);
     const etqsDe = idx(etqs);
+    /** Las filas de formato de venta de cada PAQUETE, aparte de las de su madre. */
+    const formatoPresDe = new Map<number, any[]>();
+    for (const f of formato) {
+      if (!f.presentacionId) continue;
+      const arr = formatoPresDe.get(f.presentacionId);
+      if (arr) arr.push(f); else formatoPresDe.set(f.presentacionId, [f]);
+    }
+
+    /**
+     * FORMATO DE VENTA hecho precio: las filas de algo que se vende, con la
+     * identidad de su lista y los tres precios ya derivados.
+     *
+     * Lo usan la madre y cada paquete sin distinción — un paquete es la misma
+     * cosa con otro costo (el del kilo × su tamaño). Que el armado sea uno es lo
+     * que evita que la madre y sus hijos deriven el precio de dos maneras.
+     */
+    const armarFormato = (filas: any[], costo: number, opts: OpcionesPrecio) => filas
+      .filter((f: any) => porListaId.has(f.listaId))
+      .map((f: any) => {
+        const l: any = porListaId.get(f.listaId);
+        const pv = precioVentaFila(costo, f, opts);
+        return {
+          listaId: f.listaId,
+          modalidadId: l.modalidadId, modalidad: l.modalidad,
+          numero: l.numero, nombre: l.nombre, etiqueta: l.etiqueta, orden: l.orden,
+          modoPrecio: f.modoPrecio,
+          markup: f.markup,
+          precioFijo: f.precioFijo,
+          unidades: f.unidades,
+          codigoBarras: f.codigoBarras,
+          unidadesMinimas: f.unidadesMinimas,
+          precio: pv.netoUnitario,
+          precioFinalUnitario: pv.finalUnitario,
+          precioFinalFormato: pv.finalFormato,
+        };
+      })
+      .sort((a: any, b: any) => a.orden - b.orden);
+
+    /** El piso: lo que se paga sin que el ticket habilite nada. */
+    const filaPiso = (listas: any[]) => listas.find((l) => l.listaId === base?.id) ?? listas[listas.length - 1] ?? null;
 
     return prods.map((prod) => {
       const mios = provsDe.get(prod.id) ?? [];
@@ -164,37 +205,10 @@ export class ProductosService {
       // El redondeo del producto pisa al de configuración; null = heredar.
       const opts = { iva: prod.iva, redondeo: prod.redondeo ?? cfg.redondeoPrecio };
 
-      // FORMATO DE VENTA: solo las listas en las que este producto se vende,
-      // cada una con SU markup. No hay herencia — lo que no está, no existe.
-      const listas = (formatoDe.get(prod.id) ?? [])
-        .filter((f: any) => porListaId.has(f.listaId))
-        .map((f: any) => {
-          const l: any = porListaId.get(f.listaId);
-          const pv = precioVentaFila(costoNeto, f, opts);
-          return {
-            listaId: f.listaId,
-            modalidadId: l.modalidadId, modalidad: l.modalidad,
-            numero: l.numero, nombre: l.nombre, etiqueta: l.etiqueta, orden: l.orden,
-            modoPrecio: f.modoPrecio,
-            markup: f.markup,
-            precioFijo: f.precioFijo,
-            unidades: f.unidades,
-            codigoBarras: f.codigoBarras,
-            unidadesMinimas: f.unidadesMinimas,
-            precio: pv.netoUnitario,
-            precioFinalUnitario: pv.finalUnitario,
-            precioFinalFormato: pv.finalFormato,
-          };
-        })
-        .sort((a: any, b: any) => a.orden - b.orden);
-
-      // Precio de referencia (presentaciones, valuaciones): el piso, o sea lo
-      // que vale sin que el ticket habilite nada. Con modo 'precio' el markup
-      // no manda, así que se deriva el EQUIVALENTE desde el neto unitario.
-      const filaRef = listas.find((l: any) => l.listaId === base?.id) ?? listas[listas.length - 1] ?? null;
-      const markupRef = filaRef
-        ? (costoNeto > 0 ? ((filaRef.precio / costoNeto) - 1) * 100 : filaRef.markup)
-        : 0;
+      // FORMATO DE VENTA del producto SUELTO: las filas sin presentación. Las de
+      // sus paquetes van con cada paquete — si entraran acá, la madre mostraría
+      // como propios los precios de sus hijos.
+      const listas = armarFormato((formatoDe.get(prod.id) ?? []).filter((f: any) => !f.presentacionId), costoNeto, opts);
 
       const misEtq = (etqsDe.get(prod.id) ?? []).map((e: any) => e.etiquetaId);
 
@@ -208,8 +222,25 @@ export class ProductosService {
         etiquetas: misEtq,
         etiquetasNombres: misEtq.map((id: number) => cats.etiqueta.get(id)).filter(Boolean),
         costoNeto,
-        presentaciones: (presDe.get(prod.id) ?? [])
-          .map((pr: any) => ({ ...pr, precio: precioPresentacion(costoNeto, pr, markupRef, opts) })),
+        /*
+         * Cada paquete con SU formato de venta y su costo derivado. `precio` es
+         * el del piso, y es NULL cuando el paquete todavía no tiene ninguna
+         * lista cargada: no es cero, es "no tiene precio" — el POS lo bloquea y
+         * la etiqueta avisa antes de imprimir. Un cero se vendería.
+         */
+        presentaciones: (presDe.get(prod.id) ?? []).map((pr: any) => {
+          const costoPaquete = costoNetoPresentacion(costoNeto, pr.tamKg);
+          const suyas = armarFormato(formatoPresDe.get(pr.id) ?? [], costoPaquete, opts);
+          const piso = filaPiso(suyas);
+          return {
+            ...pr,
+            costoNeto: costoPaquete,
+            listas: suyas,
+            sinFormato: suyas.length === 0,
+            precio: piso ? piso.precio : null,
+            precioFinal: piso ? piso.precioFinalUnitario : null,
+          };
+        }),
         // FORMATO DE COMPRA: cada uno con su cadena ya derivada (lista →
         // descuentos → flete → neto → IVA), para que la pantalla solo muestre.
         formatosCompra: mios.map((pv: any) => ({
@@ -632,17 +663,6 @@ export class ProductosService {
           codigoProveedor: (f.codigoProveedor ?? '').trim(),
         });
 
-        // Las presentaciones son del granel: en un producto entero no existen.
-        const pres = (it.presentaciones || []).filter((x: any) => Number(x.tamKg) > 0);
-        if (p.esGranel && pres.length) {
-          await tx.insert(presentaciones).values(pres.map((x: any) => ({
-            productoId: creado.id,
-            tamKg: Number(x.tamKg),
-            recargo: Number(x.recargo) || 0,
-            codigoBarras: (x.codigoBarras ?? '').trim(),
-          })));
-        }
-
         /*
          * El formato de venta se escribe con ESTE tx, no con `setFormato`: ese
          * abre su propia transacción y las filas quedarían fuera del "todo o
@@ -650,27 +670,53 @@ export class ProductosService {
          * llevan código de barras propio —los códigos viven en el producto y en
          * sus presentaciones—, así que no hay nada más que validar acá.
          */
-        const filas = (it.listas || [])
-          .filter((l: any) => listasActivas.has(Number(l.listaId)))
-          .filter((l: any) => (l.modoPrecio === 'precio' ? Number(l.precioFijo) > 0 : true));
-        const vistas = new Set<number>();
-        const filasUnicas = filas.filter((l: any) => {
-          const id = Number(l.listaId);
-          if (vistas.has(id)) return false;
-          vistas.add(id);
-          return true;
-        });
-        if (filasUnicas.length) {
-          await tx.insert(productoListas).values(filasUnicas.map((l: any) => ({
-            productoId: creado.id,
-            listaId: Number(l.listaId),
-            modoPrecio: (l.modoPrecio === 'precio' ? 'precio' : 'markup') as 'markup' | 'precio',
-            markup: Number(l.markup) || 0,
-            precioFijo: Number(l.precioFijo) || 0,
-            unidades: Math.max(1, Number(l.unidades) || 1),
-            codigoBarras: '',
-            unidadesMinimas: Math.max(0, Number(l.unidadesMinimas) || 0),
-          })));
+        const filasVenta = (crudas: any[], presId: number | null) => {
+          const vistas = new Set<number>();
+          return (crudas || [])
+            .filter((l: any) => listasActivas.has(Number(l.listaId)))
+            .filter((l: any) => (l.modoPrecio === 'precio' ? Number(l.precioFijo) > 0 : true))
+            .filter((l: any) => {
+              const id = Number(l.listaId);
+              if (vistas.has(id)) return false;
+              vistas.add(id);
+              return true;
+            })
+            .map((l: any) => ({
+              productoId: creado.id,
+              presentacionId: presId,
+              listaId: Number(l.listaId),
+              modoPrecio: (l.modoPrecio === 'precio' ? 'precio' : 'markup') as 'markup' | 'precio',
+              markup: Number(l.markup) || 0,
+              precioFijo: Number(l.precioFijo) || 0,
+              unidades: Math.max(1, Number(l.unidades) || 1),
+              codigoBarras: '',
+              unidadesMinimas: Math.max(0, Number(l.unidadesMinimas) || 0),
+            }));
+        };
+
+        const delProducto = filasVenta(it.listas, null);
+        if (delProducto.length) await tx.insert(productoListas).values(delProducto);
+
+        /*
+         * Las presentaciones son del granel: en un producto entero no existen.
+         * Cada una entra con SU formato de venta, que el archivo del sistema
+         * viejo ya trae — allá el markup era por presentación (el kilo al 48%, el
+         * de 250 g al 66%). Antes eso se traducía a un `recargo` sobre la madre;
+         * ahora el modelo es el mismo que el del sistema viejo y el markup del
+         * paquete entra tal cual. Se insertan de a una para usar el id que
+         * devuelve cada una, sin depender del orden del insert múltiple.
+         */
+        if (p.esGranel) {
+          for (const x of (it.presentaciones || [])) {
+            if (!(Number(x.tamKg) > 0)) continue;
+            const [row] = await tx.insert(presentaciones).values({
+              productoId: creado.id,
+              tamKg: Number(x.tamKg),
+              codigoBarras: (x.codigoBarras ?? '').trim(),
+            }).returning();
+            const suyas = filasVenta(x.listas, row.id);
+            if (suyas.length) await tx.insert(productoListas).values(suyas);
+          }
         }
       }
     });
@@ -924,7 +970,6 @@ export class ProductosService {
       id: Number(x.id) || null,
       productoId: id,
       tamKg: Number(x.tamKg),
-      recargo: Number(x.recargo) || 0,
       codigoBarras: (x.codigoBarras ?? '').trim(),
     }));
 
@@ -1039,11 +1084,11 @@ export class ProductosService {
       for (const v of valid) {
         if (v.id && porId.has(v.id)) {
           await tx.update(presentaciones)
-            .set({ tamKg: v.tamKg, recargo: v.recargo, codigoBarras: v.codigoBarras })
+            .set({ tamKg: v.tamKg, codigoBarras: v.codigoBarras })
             .where(eq(presentaciones.id, v.id));
         } else {
           await tx.insert(presentaciones).values({
-            productoId: id, tamKg: v.tamKg, recargo: v.recargo, codigoBarras: v.codigoBarras,
+            productoId: id, tamKg: v.tamKg, codigoBarras: v.codigoBarras,
           });
         }
       }
@@ -1134,6 +1179,25 @@ export class ProductosService {
     await this.evolucion.snapshot([id], 'formato_venta');
     return this.get(id);
   }
+
+  /**
+   * El formato de venta de UN PAQUETE fraccionado (0053).
+   *
+   * Devuelve el producto MADRE completo: el paquete no es una entidad separada
+   * para la pantalla —vive dentro de su madre, con su stock y sus movimientos—
+   * así que quien guardó recibe todo el árbol actualizado de una.
+   *
+   * No dispara `evolucion.snapshot`: el historial de precios es por (producto,
+   * lista) y todavía no distingue paquetes, así que llamarlo daría la impresión
+   * de auditoría sin auditar nada. Está anotado como pendiente en /info.
+   */
+  async setListasPresentacion(presId: number, items: any[]) {
+    const [pr] = await this.db.select().from(presentaciones)
+      .where(eq(presentaciones.id, presId)).limit(1);
+    if (!pr) throw new NotFoundException('Presentación inexistente.');
+    await this.listas.setFormatoPresentacion(presId, items || []);
+    return this.get(pr.productoId);
+  }
 }
 
 @Controller('productos')
@@ -1185,6 +1249,16 @@ export class ProductosController {
   @Put(':id/listas')
   setListas(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setListas(id, body?.listas ?? body?.listasPrecio ?? body);
+  }
+
+  /**
+   * El formato de venta de un PAQUETE fraccionado. Va por su propia ruta y no
+   * por la de la madre: son dos cosas que se cotizan por separado, y mezclarlas
+   * en un mismo PUT haría que guardar una pudiera borrar la otra.
+   */
+  @Put('presentaciones/:presId/listas')
+  setListasPresentacion(@Param('presId', ParseIntPipe) presId: number, @Body() body: any) {
+    return this.svc.setListasPresentacion(presId, body?.listas ?? body);
   }
 }
 

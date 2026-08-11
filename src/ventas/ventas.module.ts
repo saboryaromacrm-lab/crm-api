@@ -39,7 +39,7 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, formatoActivo, precioLista, precioPresentacion, precioVentaFila } from '../inventario/pricing';
+import { costoNetoEntry, costoNetoPresentacion, formatoActivo, precioLista, precioVentaFila } from '../inventario/pricing';
 
 const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
@@ -606,30 +606,30 @@ export class VentasService {
       const costoNeto = costoPorProd.get(p.id) ?? 0;
       const opts = { iva: p.iva, redondeo };
 
-      // El formato de venta del producto, ordenado por preferencia de lista.
-      // Solo esto llega al POS: lo que no está cargado, no se vende. Cada fila
-      // resuelve su precio con el MISMO helper que la ficha del producto
-      // (markup o precio definido): un solo lugar donde se deriva.
-      const efectivas = formatos
-        .filter((f) => f.productoId === p.id && porLista.has(f.listaId))
-        .map((f) => {
-          const pv = precioVentaFila(costoNeto, f, opts);
-          return {
-            ...f,
-            orden: porLista.get(f.listaId)!.orden,
-            netoUnitario: pv.netoUnitario,
-            // Markup EQUIVALENTE: las presentaciones derivan su precio de acá,
-            // venga de un % o de un precio fijado a mano.
-            markupEf: costoNeto > 0 ? ((pv.netoUnitario / costoNeto) - 1) * 100 : f.markup,
-          };
-        })
+      /*
+       * El formato de venta, ordenado por preferencia de lista. Solo esto llega
+       * al POS: lo que no está cargado, no se vende. Cada fila resuelve su precio
+       * con el MISMO helper que la ficha del producto (markup o precio definido).
+       *
+       * `presId` elige de quién son las filas: null = el producto suelto, un id =
+       * uno de sus paquetes, que se cotiza solo desde la 0053. Sin ese filtro, la
+       * madre mostraría como propios los precios de sus hijos.
+       */
+      const efectivasDe = (presId: number | null, costo: number) => formatos
+        .filter((f) => f.productoId === p.id && (f.presentacionId ?? null) === presId && porLista.has(f.listaId))
+        .map((f) => ({
+          ...f,
+          orden: porLista.get(f.listaId)!.orden,
+          netoUnitario: precioVentaFila(costo, f, opts).netoUnitario,
+        }))
         .sort((a, b) => a.orden - b.orden);
+
+      const efectivas = efectivasDe(null, costoNeto);
 
       // El precio "de vidriera" es el del piso: lo que se paga sin habilitar
       // nada. Si el producto no tiene el piso cargado, la más cara de las suyas.
       const filaBase = efectivas.find((ef) => ef.listaId === listaBase?.id)
         ?? efectivas[efectivas.length - 1] ?? null;
-      const markupBase = filaBase?.markupEf ?? 0;
 
       /*
        * El "solo para fraccionar" (la Pimienta de Jamaica que llega 1 kg y se
@@ -677,9 +677,14 @@ export class VentasService {
       });
 
       for (const pres of press.filter((x) => x.productoId === p.id)) {
-        // La presentación SÍ respeta la lista: parte del precio por kg de esa
-        // lista y le suma el recargo de fraccionamiento. Un mayorista paga la
-        // bolsa de 1 kg a precio mayorista.
+        /*
+         * EL PAQUETE SE COTIZA SOLO (0053). Su costo es el del kilo por lo que
+         * consume; el precio sale de SUS filas, no de las de la madre. Sin filas
+         * no tiene precio y eso NO es cero: viaja `sinFormato` y el POS lo
+         * bloquea con el motivo. Un cero se vendería.
+         */
+        const suyas = efectivasDe(pres.id, costoNetoPresentacion(costoNeto, pres.tamKg));
+        const pisoPres = suyas.find((ef) => ef.listaId === listaBase?.id) ?? suyas[suyas.length - 1] ?? null;
         items.push({
           key: `s${pres.id}`,
           productoId: p.id,
@@ -699,12 +704,19 @@ export class VentasService {
           fraccionable: false,
           iva: p.iva,
           codigoBarras: pres.codigoBarras,
-          precio: money(precioPresentacion(costoNeto, pres, markupBase, opts)),
-          precios: efectivas.map((ef) => ({
+          precio: pisoPres ? money(pisoPres.netoUnitario) : 0,
+          /** Sin formato de venta cargado: el POS lo muestra y explica por qué no se puede vender. */
+          sinFormato: suyas.length === 0,
+          precios: suyas.map((ef) => ({
             listaId: ef.listaId,
-            precio: money(precioPresentacion(costoNeto, pres, ef.markupEf, opts)),
+            precio: money(ef.netoUnitario),
             unidadesMinimas: ef.unidadesMinimas,
+            unidades: ef.unidades,
           })),
+          /** La caja de N paquetes tiene su propio código, igual que en el producto. */
+          formatosVenta: suyas
+            .filter((ef) => ef.codigoBarras || ef.unidades > 1)
+            .map((ef) => ({ listaId: ef.listaId, codigoBarras: ef.codigoBarras, unidades: ef.unidades })),
           stock: money(stockDe.get(clave(p.id, pres.id, sucursalId)) ?? 0),
           stockSucursales: desglose(p.id, pres.id),
         });

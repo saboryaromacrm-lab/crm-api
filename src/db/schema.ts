@@ -297,18 +297,24 @@ export const productoEtiquetas = pgTable('producto_etiquetas', {
 /**
  * Presentaciones (tamaños fraccionables) de un producto a granel.
  *
- * `recargo` es lo que agrega el FRACCIONAMIENTO (envase y mano de obra), no el
- * margen completo: el precio parte del precio por kg de la lista del cliente y
- * después se le suma este recargo. Así un mayorista paga la bolsa de 1 kg a
- * precio mayorista, que antes no pasaba.
+ * La presentación define UNA sola cosa: **el tamaño**, o sea cuánto granel
+ * consume cada paquete. Nada de plata vive acá.
  *
- *     precio = costoNeto/kg × (1 + ganancia_lista%) × tamKg × (1 + recargo%)
+ * Tuvo un `recargo` (lo que se cobraba de más por fraccionar) porque el precio
+ * era derivado de la madre: precio por kg de la lista × tamaño × recargo. Se
+ * borró en la 0053: el paquete tiene **formato de venta propio** en
+ * `producto_listas`, con su markup o su precio fijo, su caja por N y su mínimo,
+ * igual que un producto. Un solo recargo no alcanzaba para expresar el
+ * mostrador — y, peor, las 73 madres sin listas de venta dejaban a sus paquetes
+ * sin precio real (el cálculo se caía al costo neto).
+ *
+ *     costo del paquete = costoNeto/kg × tamKg          ← sigue derivado
+ *     precio            = su fila de producto_listas    ← ahora es propio
  */
 export const presentaciones = pgTable('presentaciones', {
   id: serial('id').primaryKey(),
   productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
   tamKg: doublePrecision('tam_kg').notNull(),
-  recargo: doublePrecision('recargo').notNull().default(0),
   // Cada tamaño fraccionado lleva su propia etiqueta, así que su propio código.
   codigoBarras: text('codigo_barras').notNull().default(''),
 }, (t) => ({
@@ -507,9 +513,23 @@ export const listasVenta = pgTable('listas_venta', {
 }));
 
 /**
- * FORMATO DE VENTA de un producto. La fila ES la habilitación: existe = se
- * vende así. No hay `disponible` porque borrar la fila dice lo mismo con una
+ * FORMATO DE VENTA de **lo que se vende**. La fila ES la habilitación: existe =
+ * se vende así. No hay `disponible` porque borrar la fila dice lo mismo con una
  * sola verdad.
+ *
+ * "Lo que se vende" son DOS cosas y por eso `presentacionId` (0053):
+ *
+ *   presentacion_id NULL  el producto tal cual entra: la unidad, o el granel
+ *                         por kg. Es el caso de siempre.
+ *   presentacion_id = N   un PAQUETE fraccionado ("Lentejas · 500 g"), que se
+ *                         cotiza solo: su markup, su caja por N, su mínimo y su
+ *                         código. El costo sigue derivado de la madre
+ *                         (costoNeto/kg × tamKg), el precio ya no.
+ *
+ * Misma tabla a propósito: un solo motor de precio (`precioVentaFila`), una sola
+ * validación de códigos, un solo historial. Con una tabla aparte, la derivación
+ * markup/precio-fijo y el redondeo de góndola habrían quedado escritos dos
+ * veces — y cuando una regla de plata se escribe dos veces, una ya está mal.
  */
 /** Cómo se define el precio de un formato de venta. */
 export const modoPrecioEnum = pgEnum('modo_precio', [
@@ -520,11 +540,18 @@ export const modoPrecioEnum = pgEnum('modo_precio', [
 export const productoListas = pgTable('producto_listas', {
   id: serial('id').primaryKey(),
   productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /**
+   * NULL = el producto tal cual. Con id = el paquete fraccionado que se cotiza
+   * solo. `productoId` viaja igual en las filas de paquete (es el de su madre):
+   * así "todo el formato de venta de esta familia" sigue siendo UNA consulta.
+   */
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'cascade' }),
   listaId: integer('lista_id').notNull().references(() => listasVenta.id, { onDelete: 'cascade' }),
   /**
    * En cuántas unidades se vende este formato: 1 = por unidad (minorista),
    * 12 = por caja de 12 (mayorista). Es del PAR producto×lista — el mismo
-   * alfajor se vende suelto en minorista y por caja en mayorista.
+   * alfajor se vende suelto en minorista y por caja en mayorista. En un paquete
+   * son paquetes: "caja de 12 bolsas de 500 g".
    */
   unidades: doublePrecision('unidades').notNull().default(1),
   /**
@@ -550,8 +577,15 @@ export const productoListas = pgTable('producto_listas', {
    */
   unidadesMinimas: doublePrecision('unidades_minimas').notNull().default(0),
 }, (t) => ({
-  uq: uniqueIndex('uq_producto_lista').on(t.productoId, t.listaId),
+  /*
+   * DOS únicos parciales, no uno solo con la presentación adentro: en Postgres
+   * los NULL son distintos entre sí, así que (5, NULL, 3) entraría dos veces y
+   * la madre tendría dos precios para la misma lista.
+   */
+  uq: uniqueIndex('uq_producto_lista').on(t.productoId, t.listaId).where(sql`${t.presentacionId} IS NULL`),
+  uqPres: uniqueIndex('uq_presentacion_lista').on(t.presentacionId, t.listaId).where(sql`${t.presentacionId} IS NOT NULL`),
   ixProd: index('ix_producto_listas_producto').on(t.productoId),
+  ixPres: index('ix_producto_listas_presentacion').on(t.presentacionId),
   uqCodigo: uniqueIndex('uq_producto_lista_codigo').on(t.codigoBarras).where(sql`${t.codigoBarras} <> ''`),
 }));
 
