@@ -71,6 +71,12 @@ export class OperacionesController {
     return this.inv.opFraccionar(body);
   }
 
+  /** "Puse 20 paquetes y son 19": ajusta los paquetes Y el granel de una vez. */
+  @Post('corregir-fraccionado')
+  corregirFraccionado(@Body() body: any) {
+    return this.inv.opCorregirFraccionado(body);
+  }
+
   @Post('movimiento')
   movimiento(@Body() body: any) {
     return this.inv.opSimple(body);

@@ -332,6 +332,64 @@ export class InventarioService {
     });
   }
 
+  /**
+   * CORREGIR UNA TANDA MAL CARGADA. "Puse 20 paquetes de 500 g y son 19."
+   *
+   * Mueve las DOS puntas: los paquetes y el granel del que salieron. Editar solo
+   * los paquetes cambiaría los kilos totales del producto de la nada, y el
+   * fraccionamiento no crea ni destruye mercadería: la convierte. Con 19 en vez
+   * de 20, el medio kilo que nunca se envasó **vuelve al granel**.
+   *
+   * Es para el ERROR DE CARGA. Si el paquete se rompió o se perdió, eso es una
+   * merma o una incidencia: ahí la mercadería no volvió a ningún lado y tiene que
+   * quedar registrada como pérdida, con su costo.
+   *
+   * Toca solo el DISPONIBLE. Lo comprometido está apartado para un envío ya
+   * confirmado: bajarlo por acá rompería esa reserva sin que el envío se enterara.
+   */
+  async opCorregirFraccionado(o: any) {
+    return this.db.transaction(async (tx) => {
+      const prod = await this.getProducto(tx, o.productoId);
+      if (!prod || prod.tipo !== 'granel') {
+        throw new BadRequestException('Solo los productos a granel tienen fraccionados.');
+      }
+      const [pres] = await tx.select().from(presentaciones)
+        .where(and(eq(presentaciones.id, o.presId), eq(presentaciones.productoId, prod.id))).limit(1);
+      if (!pres) throw new BadRequestException('Ese paquete no es de este producto.');
+      const sucId = o.sucursalId;
+      const real = Math.round(Number(o.cantidadReal));
+      if (!Number.isFinite(real) || real < 0) throw new BadRequestException('La cantidad real no puede ser negativa.');
+
+      const actual = await this.cant(tx, prod.id, sucId, pres.id, 'disponible');
+      const delta = real - actual;
+      if (Math.abs(delta) < 1e-9) return { ok: true, sinCambios: true };
+
+      const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
+      if (delta > 0) {
+        // Sumar paquetes es fraccionar más: tiene que haber granel para eso.
+        const granel = await this.cant(tx, prod.id, sucId, null, 'disponible');
+        if (kg > granel + 1e-9) {
+          throw new BadRequestException(
+            `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCant(prod.tipo, null, granel)}.`,
+          );
+        }
+      }
+
+      const base = { productoId: prod.id, sucursalId: sucId };
+      await this.addDelta(tx, { ...base, presentacionId: pres.id, estado: 'disponible' }, delta);
+      await this.addDelta(tx, { ...base, presentacionId: null, estado: 'disponible' }, delta > 0 ? -kg : kg);
+
+      const tam = this.fmtTam(pres.tamKg);
+      const m = await this.mov(tx, {
+        tipo: 'fraccionamiento', productoId: prod.id, sucursalId: sucId, presentacionId: pres.id,
+        signo: 0, cantidad: kg, unidad: 'kg', presLabel: `Corrección · ${tam}`,
+        usuarioId: o.usuarioId ?? null, motivo: (o.motivo ?? '').trim(),
+        descripcion: `Corrigió ${tam}: ${actual} → ${real} paquetes (${kg} kg ${delta > 0 ? 'salen del' : 'vuelven al'} granel)`,
+      });
+      return { ok: true, movimiento: m, delta, kg };
+    });
+  }
+
   /** Movimiento simple: devolución (+), ajuste (±), merma/vencido/defectuoso (−). */
   async opSimple(o: any) {
     return this.db.transaction(async (tx) => this.opSimpleTx(tx, o));
