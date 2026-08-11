@@ -379,6 +379,13 @@
       "when": 1787070000000,
       "tag": "0053_formato_venta_presentacion",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1787080000000,
+      "tag": "0054_oferta_alcanza_paquete",
+      "breakpoints": true
     }
   ]
 }

@@ -26,7 +26,7 @@ export const TIPOS_OFERTA = [
 ] as const;
 export type TipoOferta = (typeof TIPOS_OFERTA)[number];
 
-const ALCANCES = ['producto', 'marca', 'categoria', 'etiqueta'] as const;
+const ALCANCES = ['producto', 'marca', 'categoria', 'etiqueta', 'presentacion'] as const;
 
 /**
  * Qué necesita cada mecánica. `check` devuelve el error o null; `alcance` dice
@@ -97,6 +97,8 @@ class UpsertOfertaDto {
   @IsOptional() @IsString() sucursales?: string;
   @IsOptional() @IsString() mediosPago?: string;
   @IsOptional() @IsBoolean() soloPrecioBase?: boolean;
+  /** El alcance por la madre alcanza también a sus paquetes fraccionados. */
+  @IsOptional() @IsBoolean() incluyeFraccionados?: boolean;
   @IsOptional() @IsBoolean() activa?: boolean;
   @IsOptional() @IsArray() alcances?: AlcanceDto[];
   @IsOptional() @IsArray() componentes?: ComponenteDto[];
@@ -150,6 +152,7 @@ export class OfertasService {
       sucursales: (dto.sucursales ?? '').trim(),
       mediosPago: dto.tipo === 'ticket' ? (dto.mediosPago ?? '').trim() : '',
       soloPrecioBase: dto.soloPrecioBase ?? true,
+      incluyeFraccionados: dto.incluyeFraccionados ?? false,
       activa: dto.activa ?? true,
     };
     const error = regla.check(o);
@@ -166,7 +169,7 @@ export class OfertasService {
       .filter((a) => ALCANCES.includes(a.tipo as any) && Number(a.refId) > 0)
       .map((a) => ({ tipo: a.tipo as any, refId: Number(a.refId) }));
     if (regla.alcance && !alcances.length) {
-      throw new BadRequestException('Elegí a qué productos, marcas, categorías o etiquetas alcanza.');
+      throw new BadRequestException('Elegí a qué productos, paquetes, marcas, categorías o etiquetas alcanza.');
     }
 
     const componentes = (dto.componentes ?? [])

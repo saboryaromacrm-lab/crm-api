@@ -679,6 +679,13 @@ export const tipoOfertaEnum = pgEnum('tipo_oferta', [
 
 export const alcanceOfertaEnum = pgEnum('alcance_oferta', [
   'producto', 'marca', 'categoria', 'etiqueta',
+  /**
+   * UN paquete fraccionado ("Lentejas 500 g"), sin tocar el kilo suelto ni los
+   * otros tamaños. Existe desde la 0054, cuando el paquete empezó a cotizarse
+   * solo: antes la única forma de ponerlo en oferta era ponerle la oferta a la
+   * madre, que se la aplicaba a todo.
+   */
+  'presentacion',
 ]);
 
 export const ofertas = pgTable('ofertas', {
@@ -712,6 +719,17 @@ export const ofertas = pgTable('ofertas', {
    * vidriera es descontar dos veces sin que nadie lo haya decidido.
    */
   soloPrecioBase: boolean('solo_precio_base').notNull().default(true),
+  /**
+   * Cuando el alcance se resuelve por la MADRE (producto, marca, categoría o
+   * etiqueta), ¿entran también sus paquetes fraccionados?
+   *
+   * Arranca APAGADO. Antes de la 0054 entraban siempre, pero por arrastre: el
+   * motor compara el `productoId` del renglón y el de un paquete es el de su
+   * madre. Con el paquete cotizándose solo, eso era un descuento que nadie
+   * decidió. El alcance `presentacion` no mira este tilde: apunta al paquete a
+   * propósito.
+   */
+  incluyeFraccionados: boolean('incluye_fraccionados').notNull().default(false),
   activa: boolean('activa').notNull().default(true),
 });
 

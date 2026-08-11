@@ -57,13 +57,27 @@ const DIAS = sql<number>`(${vencimientos.fechaVencimiento} - ${HOY_AR})`;
  * caja: si el motor dice que la oferta alcanza al producto, este aviso también.
  */
 
-/** ¿El alcance de la oferta llega a este producto? Varias filas = unión. */
-function alcanzaProducto(o: any, p: { id: number; marcaId: number | null; categoriaId: number | null; etiquetas: number[] }) {
+/**
+ * ¿El alcance de la oferta llega a ESTE registro? Varias filas = unión.
+ *
+ * `presId` distingue el paquete fraccionado de su madre (0054): los cuatro
+ * alcances de siempre se resuelven con datos de la madre y el paquete los
+ * heredaría todos, así que al paquete solo lo alcanzan si la oferta tiene el
+ * tilde `incluyeFraccionados`. El alcance `presentacion` es al revés: apunta a
+ * un paquete y NO alcanza al granel suelto.
+ */
+function alcanzaProducto(
+  o: any,
+  p: { id: number; marcaId: number | null; categoriaId: number | null; etiquetas: number[] },
+  presId: number | null = null,
+) {
   // El de ticket alcanza al total del ticket, no a productos.
   if (o.tipo === 'ticket') return false;
   // El del combo son sus componentes (no usa filas de alcance).
   if (o.tipo === 'combo') return (o.componentes ?? []).some((c: any) => c.productoId === p.id);
   return (o.alcances ?? []).some((a: any) => {
+    if (a.tipo === 'presentacion') return presId != null && a.refId === presId;
+    if (presId != null && !o.incluyeFraccionados) return false;
     switch (a.tipo) {
       case 'producto': return a.refId === p.id;
       case 'marca': return a.refId === p.marcaId;
@@ -339,10 +353,17 @@ export class VencimientosService {
         sucursales: String(v.sucursalId),
         activa: true,
         soloPrecioBase: true,
-        /* Alcance = el PRODUCTO (así lo matchea el motor del POS). Viaja con
-         * nombre para que la ficha se lea aunque el producto no esté en el
-         * catálogo del POS (sin precio de mostrador todavía). */
-        alcances: [{ tipo: 'producto', refId: v.productoId, nombre: prod.nombre }],
+        /*
+         * El alcance apunta a LO QUE VENCE. Si el registro es de un paquete
+         * fraccionado, la oferta va al paquete (alcance `presentacion`, 0054) y
+         * no a la madre: descontarle el kilo suelto para salvar 12 bolsas de
+         * 500 g es regalar margen de mercadería que no vence. Viaja con nombre
+         * para que la ficha se lea aunque el artículo todavía no esté en el
+         * catálogo del POS (sin precio de mostrador).
+         */
+        alcances: [v.presentacionId
+          ? { tipo: 'presentacion', refId: v.presentacionId, nombre: v.nombre }
+          : { tipo: 'producto', refId: v.productoId, nombre: prod.nombre }],
       },
     };
   }
@@ -368,7 +389,7 @@ export class VencimientosService {
     if (!oferta) throw new NotFoundException('Oferta inexistente.');
 
     const prod = (await this.productosParaAlcance([reg.productoId]))[0];
-    if (!prod || !alcanzaProducto(oferta, prod)) {
+    if (!prod || !alcanzaProducto(oferta, prod, reg.presentacionId)) {
       throw new BadRequestException(
         `La oferta «${oferta.nombre}» no alcanza a ${reg.nombre}: sin eso el registro figuraría en oferta y en la caja no descontaría nada.`,
       );
@@ -427,11 +448,11 @@ export class VencimientosService {
       /* Las candidatas: la vinculada (aunque hoy no alcance — ese desajuste ES
        * la noticia) y toda oferta que llegue al producto por cualquier vía. */
       const candidatas = todas.filter((o: any) => (
-        o.id === v.ofertaId || (prod && alcanzaProducto(o, prod))
+        o.id === v.ofertaId || (prod && alcanzaProducto(o, prod, v.presentacionId))
       ));
       for (const o of candidatas) {
         const est = estadoOferta(o, ahora);
-        const alcanza = !!prod && alcanzaProducto(o, prod);
+        const alcanza = !!prod && alcanzaProducto(o, prod, v.presentacionId);
         const cubreSuc = cubreSucursal(o, v.sucursalId);
         const hasta = o.hasta ? new Date(o.hasta) : null;
         const vence = new Date(`${v.fechaVencimiento}T23:59:59`);

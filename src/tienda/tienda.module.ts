@@ -244,7 +244,10 @@ export class TiendaService {
       const disponibleWeb = disponibleParaWeb > 1e-9;
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];
 
-      // Una promo por producto: la de mayor beneficio entre las que alcanzan (misma regla que el POS).
+      /* Una promo por producto: la de mayor beneficio entre las que alcanzan
+       * (misma regla que el POS). El alcance `presentacion` no entra: el sitio
+       * publica el producto SUELTO, no sus paquetes — una oferta apuntada a un
+       * paquete de 250 g no puede bajarle el precio al kilo. */
       const matches = ofertasWeb.filter((o: any) => (o.alcances ?? []).some((a: any) => {
         if (a.tipo === 'producto') return a.refId === p.id;
         if (a.tipo === 'marca') return a.refId === p.marcaId;
