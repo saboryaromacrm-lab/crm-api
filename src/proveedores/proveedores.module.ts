@@ -4,6 +4,7 @@ import {
 } from '@nestjs/common';
 import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
 import { and, eq } from 'drizzle-orm';
+import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { proveedorPercepciones, proveedores } from '../db/schema';
 
@@ -128,12 +129,28 @@ export class ProveedoresController {
   @Get(':id/percepciones') percepciones(@Param('id', ParseIntPipe) id: number) {
     return this.svc.percepciones(id);
   }
+  /*
+   * LAS LECTURAS QUEDAN ABIERTAS Y LAS ESCRITURAS PIDEN PERMISO.
+   *
+   * El padrón lo lee medio sistema —la cajera eligiendo a quién le pagó cuando
+   * llegó el camión, Gastos, el filtro del catálogo—, así que cerrar el `GET`
+   * habría roto pantallas de tres módulos. Escribir es otra cosa: el CUIT es lo
+   * que usa la bandeja para reconocer de quién es una factura, y borrar un
+   * proveedor cascadea sus formatos de compra y con ellos el historial de costos.
+   *
+   * Las dos claves son un OR porque es UN padrón con flags mercadería/gastos:
+   * lo administran los dos mundos.
+   */
+  @Permiso('compras.proveedores', 'gastos.proveedores')
   @Put(':id/percepciones') setPercepciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setPercepciones(id, body?.percepciones ?? body);
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Permiso('compras.proveedores', 'gastos.proveedores')
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
+  @Permiso('compras.proveedores', 'gastos.proveedores')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto) { return this.svc.update(id, dto); }
+  @Permiso('compras.proveedores', 'gastos.proveedores')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
 }
 

@@ -30,6 +30,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import {
   gastoAdjuntos, gastoCategorias, gastos, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
+import { Auth, type Sesion } from '../auth/auth.decoradores';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -394,7 +395,7 @@ export class GastosService {
     }
   }
 
-  async crear(dto: GastoDto) {
+  async crear(dto: GastoDto, sucursalSesion: number) {
     const [cat] = await this.db.select().from(gastoCategorias)
       .where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
     if (!cat) throw new BadRequestException('Elegí el rubro al que se imputa el gasto.');
@@ -457,7 +458,7 @@ export class GastosService {
         // del gasto lo firma el mismo que carga el gasto.
         usuarioId: dto.usuarioId,
         imputaciones: [{ gastoId: creado.id, importe: Number(dto.pagoInmediato.importe) || total }],
-      });
+      }, sucursalSesion);
     }
     return this.get(creado.id);
   }
@@ -546,7 +547,7 @@ export class GastosService {
    * proveedor. Ese giro es lo que habilita el circuito inverso — que la cajera
    * pague cuando llega la mercadería, sin que el documento exista todavía.
    */
-  async pagar(id: number, dto: PagoDto) {
+  async pagar(id: number, dto: PagoDto, sucursalSesion: number) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('El gasto está anulado.');
@@ -563,7 +564,7 @@ export class GastosService {
       cajaSesionId: dto.cajaSesionId,
       usuarioId: dto.usuarioId,
       imputaciones: [{ gastoId: g.id, importe }],
-    });
+    }, sucursalSesion);
     return this.get(id);
   }
 
@@ -791,7 +792,9 @@ export class GastosController {
   }
 
   @Get() list(@Query() q: any) { return this.svc.list(q ?? {}); }
-  @Post() crear(@Body() dto: GastoDto) { return this.svc.crear(dto); }
+  // La sucursal sale de la SESION: es contra lo que se valida el turno de caja
+  // cuando el gasto se paga en el acto con efectivo.
+  @Post() crear(@Body() dto: GastoDto, @Auth() auth: Sesion) { return this.svc.crear(dto, auth.sucursalId); }
 
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: GastoDto) {
@@ -800,8 +803,8 @@ export class GastosController {
   @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.anular(id, body?.motivo);
   }
-  @Post(':id/pagos') pagar(@Param('id', ParseIntPipe) id: number, @Body() dto: PagoDto) {
-    return this.svc.pagar(id, dto);
+  @Post(':id/pagos') pagar(@Param('id', ParseIntPipe) id: number, @Body() dto: PagoDto, @Auth() auth: Sesion) {
+    return this.svc.pagar(id, dto, auth.sucursalId);
   }
   /** Usar un pago a cuenta que ya existe. Quitarlo se hace desde Pagos. */
   @Post(':id/aplicar-pago') aplicarPago(@Param('id', ParseIntPipe) id: number, @Body() body: any) {

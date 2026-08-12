@@ -1,6 +1,6 @@
 import {
   Body, Controller, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Post, Query,
+  ForbiddenException, NotFoundException, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
@@ -16,6 +16,8 @@ import {
 /* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
  * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
  * y este módulo ya importa de `pagos`: exportarla desde acá cerraba el ciclo. */
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { tienePermiso } from '../auth/auth.guard';
 import { etiquetaDoc } from '../common/documentos';
 import { normalizarPuntoVenta } from '../facturas/facturas.module';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -295,11 +297,18 @@ export class ComprobantesService {
     return porId;
   }
 
-  async list(q: { proveedorId?: number; tipo?: string; estado?: string }) {
+  async list(q: { proveedorId?: number; tipo?: string; estado?: string; verLiquidaciones?: boolean }) {
     const conds: any[] = [];
     if (q.proveedorId) conds.push(eq(comprobantes.proveedorId, Number(q.proveedorId)));
     if (q.tipo) conds.push(eq(comprobantes.tipo, q.tipo as any));
     if (q.estado) conds.push(eq(comprobantes.estado, q.estado as any));
+    /*
+     * SIN el permiso `liquidaciones`, la mitad no facturada no viaja — ni
+     * pidiéndola por `?tipo=liquidacion`. El `ne` corre igual que el filtro de
+     * arriba, así que la combinación "pedí liquidaciones y no puedo verlas"
+     * devuelve vacío en vez de todo.
+     */
+    if (!q.verLiquidaciones) conds.push(ne(comprobantes.tipo, 'liquidacion' as any));
     const where = conds.length ? and(...conds) : undefined;
     const rows = await this.db.select().from(comprobantes).where(where).orderBy(desc(comprobantes.id));
     if (!rows.length) return [];
@@ -469,7 +478,26 @@ export class ComprobantesService {
     }
   }
 
-  async create(dto: CreateComprobanteDto) {
+  async create(dto: CreateComprobanteDto, opciones: { puedeTocarPrecios?: boolean; sucursalSesion: number }) {
+    /*
+     * RECIBIR MERCADERÍA Y TOCAR PRECIOS SON DOS PERMISOS DISTINTOS.
+     *
+     * Estos dos bloques del alta llaman al servicio de precios por adentro, así
+     * que sin este corte alcanzaba `compras.facturacion` para reescribir el
+     * costo de catálogo —y con él el precio de góndola— salteando el
+     * `@Permiso('precios')` que cierra su controller.
+     *
+     * Se RECHAZA en vez de ignorar en silencio: quien recibe la mercadería tildó
+     * "actualizar costos" y tiene que enterarse de que eso no se aplicó, no
+     * descubrirlo la semana que viene mirando un margen que nunca cambió.
+     */
+    if (!opciones.puedeTocarPrecios && (dto.actualizarCostos?.length || dto.activarProveedor?.length)) {
+      throw new ForbiddenException(
+        'Para actualizar costos o cambiar el proveedor activo hace falta el permiso de precios. '
+        + 'Registrá el comprobante sin esa parte y pedile a quien maneja precios que la haga.',
+      );
+    }
+
     const [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
     if (!dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
@@ -840,7 +868,7 @@ export class ComprobantesService {
           cajaSesionId: dto.pagoContado?.cajaSesionId,
           usuarioId: dto.usuarioId,
           imputaciones: [{ comprobanteId: id, importe: contado }],
-        });
+        }, opciones.sucursalSesion);
       }
 
       /*
@@ -918,13 +946,36 @@ export class ComprobantesService {
   }
 }
 
+/**
+ * TODO EL CONTROLLER PIDE `compras.facturacion`, lecturas incluidas.
+ *
+ * Acá vive la deuda con los proveedores y lo que se les compró a cada precio:
+ * no es un dato que necesite ninguna otra pantalla del sistema (el arranque del
+ * inventario arma lo suyo directo de la base, no pasando por acá), así que
+ * cerrarlo entero no le saca nada a nadie.
+ */
 @Controller('comprobantes')
+@Permiso('compras.facturacion')
 export class ComprobantesController {
   constructor(private readonly svc: ComprobantesService) {}
 
   @Get()
-  list(@Query('proveedorId') proveedorId?: string, @Query('tipo') tipo?: string, @Query('estado') estado?: string) {
-    return this.svc.list({ proveedorId: proveedorId ? Number(proveedorId) : undefined, tipo, estado });
+  list(
+    @Auth() auth: Sesion,
+    @Query('proveedorId') proveedorId?: string,
+    @Query('tipo') tipo?: string,
+    @Query('estado') estado?: string,
+  ) {
+    return this.svc.list({
+      proveedorId: proveedorId ? Number(proveedorId) : undefined, tipo, estado,
+      /*
+       * LA MITAD NO FACTURADA es un permiso aparte (`liquidaciones`). El filtro
+       * estaba SOLO en el navegador, así que `?tipo=liquidacion` la devolvía
+       * igual a quien se le había negado: el que esconde el botón no puede ser
+       * el mismo que decide si el dato viaja.
+       */
+      verLiquidaciones: tienePermiso(auth.permisos, ['liquidaciones']),
+    });
   }
 
   @Get('cuenta/:proveedorId')
@@ -944,8 +995,25 @@ export class ComprobantesController {
   }
 
   @Post()
-  create(@Body() dto: CreateComprobanteDto) {
-    return this.svc.create(dto);
+  create(@Body() dto: CreateComprobanteDto, @Auth() auth: Sesion) {
+    /*
+     * LA PUERTA DE ATRÁS DE PRECIOS.
+     *
+     * `create` llama por adentro a `precios.actualizarCostos` y
+     * `precios.activarProveedor` con datos que vienen del body. El controller de
+     * precios está cerrado con `@Permiso('precios')`… y esto lo saltea: un solo
+     * POST reescribía el costo de catálogo y con él el precio de góndola.
+     *
+     * Es la regla de las dos puertas otra vez — cerrar el controller no alcanza
+     * cuando otro módulo llama al servicio por adentro. Recibir mercadería
+     * (`compras.facturacion`) y tocar precios son dos permisos distintos, así que
+     * se piden los dos.
+     */
+    return this.svc.create(dto, {
+      puedeTocarPrecios: tienePermiso(auth.permisos, ['precios']),
+      // Para el pago contado: el turno de caja tiene que ser de esta sucursal.
+      sucursalSesion: auth.sucursalId,
+    });
   }
 }
 

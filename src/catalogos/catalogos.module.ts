@@ -20,6 +20,7 @@ import {
 } from '@nestjs/common';
 import { IsBoolean, IsInt, IsOptional, IsString } from 'class-validator';
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
+import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, etiquetas, marcas, productoEtiquetas, productos, reglasMarca, subcategorias,
@@ -267,10 +268,17 @@ export class CatalogosController {
 
   @Get() catalogo() { return this.svc.catalogo(); }
 
+  /*
+   * El GET queda abierto (marcas y categorias son etiquetas, y el arranque del
+   * inventario ya las trae para todos). Las escrituras piden permiso: fusionar
+   * dos marcas reapunta todos sus productos y no tiene vuelta atras.
+   */
+  @Permiso('compras.catalogos')
   @Post(':tipo') crear(@Param('tipo') tipo: TipoCatalogo, @Body() dto: UpsertCatalogoDto) {
     return this.svc.crear(tipo, dto);
   }
 
+  @Permiso('compras.catalogos')
   @Patch(':tipo/:id') editar(
     @Param('tipo') tipo: TipoCatalogo,
     @Param('id', ParseIntPipe) id: number,
@@ -279,10 +287,12 @@ export class CatalogosController {
     return this.svc.editar(tipo, id, dto);
   }
 
+  @Permiso('compras.catalogos')
   @Delete(':tipo/:id') borrar(@Param('tipo') tipo: TipoCatalogo, @Param('id', ParseIntPipe) id: number) {
     return this.svc.borrar(tipo, id);
   }
 
+  @Permiso('compras.catalogos')
   @Post(':tipo/:id/fusionar') fusionar(
     @Param('tipo') tipo: TipoCatalogo,
     @Param('id', ParseIntPipe) id: number,

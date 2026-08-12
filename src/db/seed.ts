@@ -300,6 +300,13 @@ async function main() {
     condicionPago: 'cuenta_corriente', recepcion: false, usuarioId: ana.id,
     observaciones: 'Factura de la compra inicial de harina',
     items: [{ productoId: harina.id, cantidad: 55, costoUnitario: 700, descuento: 5, iva: 10.5 }],
+  }, {
+    // El seed es un script de confianza que corre sin sesión: pasa los dos
+    // permisos en vez de tener que inventar una. `sucursalSesion` no se usa acá
+    // (esta factura no tiene pago contado), pero es obligatorio a propósito —
+    // que el compilador obligue a pensarlo en cada llamador es justamente el
+    // punto.
+    puedeTocarPrecios: true, sucursalSesion: dist.id,
   });
 
   /* ======================== VENTAS ======================== */

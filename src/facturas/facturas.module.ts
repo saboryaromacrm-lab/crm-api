@@ -44,6 +44,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
@@ -409,6 +410,23 @@ export class FacturasService {
     const [a] = await this.db.select({ lecturaId: facturaArchivos.lecturaId })
       .from(facturaArchivos).where(eq(facturaArchivos.id, id)).limit(1);
     if (!a) throw new NotFoundException('Ese archivo no existe.');
+    /*
+     * UNA VEZ CARGADA, EL PAPEL NO SE TOCA MÁS.
+     *
+     * Este borrado es DURO: la fila se va y con ella la imagen. Mientras la
+     * factura está en la bandeja tiene sentido —se sacó una foto de más, se
+     * fotografió la hoja equivocada—, pero cuando ya está cargada esa imagen es
+     * el respaldo del comprobante que quedó en la contabilidad. Borrarla deja el
+     * asiento sin el papel que lo justifica, y no hay vuelta atrás.
+     */
+    const [lec] = await this.db.select({ estado: facturaLecturas.estado })
+      .from(facturaLecturas).where(eq(facturaLecturas.id, a.lecturaId)).limit(1);
+    if (lec?.estado === 'cargada') {
+      throw new BadRequestException(
+        'Esa factura ya está cargada: sus páginas son el respaldo del comprobante y no se borran. '
+        + 'Si el comprobante está mal, anulalo desde Facturación.',
+      );
+    }
     const restantes = await this.db.select({ id: facturaArchivos.id }).from(facturaArchivos)
       .where(eq(facturaArchivos.lecturaId, a.lecturaId));
     if (restantes.length <= 1) {
@@ -883,7 +901,17 @@ export class FacturasService {
  * CONTROLADOR
  * ==========================================================================*/
 
+/*
+ * LA BANDEJA DE PAPELES, ENTERA, PIDE `compras.lecturas`.
+ *
+ * No la consume ninguna otra pantalla (el contador del sidebar sale del
+ * arranque del inventario, que lo calcula solo), asi que cerrarla completa no
+ * le saca nada a nadie. Sin esto, cualquier sesion podia hacer desaparecer del
+ * trabajo pendiente la factura que subio la cajera, pisar el encabezado que
+ * vino del QR, o BORRAR una pagina escaneada de una factura ya cargada.
+ */
 @Controller('facturas')
+@Permiso('compras.lecturas')
 export class FacturasController {
   constructor(private readonly svc: FacturasService) {}
 

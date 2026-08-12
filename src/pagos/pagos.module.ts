@@ -25,7 +25,7 @@
  *   · El pago solo se imputa a documentos DEL MISMO proveedor.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, Get, ForbiddenException, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -34,6 +34,7 @@ import {
   MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import {
@@ -502,7 +503,16 @@ export class PagosProveedorService {
    * Escritura
    * ==================================================================== */
 
-  async crear(dto: CrearPagoDto) {
+  /**
+   * `sucursalSesion`: la sucursal con la que se LOGUEÓ quien pide. Es lo que
+   * cierra la mitad que faltaba del candado del turno de caja (ver adentro).
+   *
+   * Es OBLIGATORIO a propósito, aunque haga más ruido en los tres llamadores
+   * internos (el pago contado de una factura y los dos de Gastos): si fuera
+   * opcional, cada uno de ellos sería un desvío que se saltea el candado sin
+   * que nada lo avise — y son justamente caminos que aceptan un `cajaSesionId`.
+   */
+  async crear(dto: CrearPagoDto, sucursalSesion: number) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
 
@@ -581,11 +591,23 @@ export class PagosProveedorService {
          * sucursal con turno abierto. Ahora manda el turno y la discrepancia se
          * rechaza en vez de resolverse sola.
          *
-         * FALTA la mitad de esto y no se puede cerrar acá: que el turno sea el
-         * de QUIEN pide. Eso necesita sesión autenticada del lado del servidor
-         * (hoy `usuarioId` lo declara el cliente), y es parte del bloqueante de
-         * autenticación del deploy.
+         * Y ACÁ ESTÁ LA MITAD QUE FALTABA, cerrada el 12/8 con la sesión ya
+         * autenticada: **el turno tiene que ser el de la sucursal con la que se
+         * logueó quien pide**. Sin esto, el candado de arriba no servía de nada:
+         * bastaba con NO mandar `sucursalId` y pasar el `cajaSesionId` de un
+         * turno abierto de otra sucursal para cargarle un egreso al cajón
+         * ajeno — la cajera de Fontana cerraba el arqueo en falta y la
+         * diferencia quedaba congelada en la fila.
+         *
+         * Los ids de turno se ven en cualquier listado de pagos, así que no
+         * había que adivinar nada.
          */
+        if (sesion.sucursalId !== sucursalSesion) {
+          throw new ForbiddenException(
+            'Ese turno de caja es de otra sucursal. El egreso en efectivo sale del cajón de la sucursal '
+            + 'con la que entraste.',
+          );
+        }
         if (sucursalId != null && sucursalId !== sesion.sucursalId) {
           throw new BadRequestException(
             'Ese turno de caja es de otra sucursal: el egreso sale del cajón donde está abierto el turno.',
@@ -949,7 +971,28 @@ export class PagosProveedorService {
 
 /* ------------------------------- Controller ------------------------------- */
 
+/**
+ * PLATA QUE SALE: TRES PERMISOS, PORQUE SON TRES CAMINOS LEGÍTIMOS.
+ * ============================================================================
+ * Este controller no tenía NINGÚN permiso, así que cualquier sesión —incluida
+ * la del rol Cafetería, que ve una sola pantalla— podía crear un egreso de
+ * efectivo, anular un pago ajeno o leer la cuenta corriente de un proveedor.
+ *
+ * Las tres claves son un OR, y ninguna está de más:
+ *   * `compras.pagos` — administración pagando facturas.
+ *   * `gastos.pagos_proveedor` — el mismo padrón de proveedores del lado de
+ *     Gastos (el modelo es UN padrón con flags mercadería/gastos).
+ *   * `ventas.caja` — **la cajera le paga al proveedor cuando llega el
+ *     camión**. Es el caso más común de todos y sale de la pantalla de Caja
+ *     (CajaModals, egreso con destino "proveedor"); dejarlo afuera habría roto
+ *     el circuito real del mostrador.
+ *
+ * Lo que el permiso NO puede resolver es de qué cajón sale la plata: eso lo
+ * cierra el candado de `crear`, que exige que el turno sea de la sucursal de la
+ * sesión.
+ */
 @Controller('pagos-proveedor')
+@Permiso('compras.pagos', 'gastos.pagos_proveedor', 'ventas.caja')
 export class PagosProveedorController {
   constructor(private readonly svc: PagosProveedorService) {}
 
@@ -978,7 +1021,11 @@ export class PagosProveedorController {
   }
 
   @Get() list(@Query() q: ListarPagosDto) { return this.svc.list(q ?? {}); }
-  @Post() crear(@Body() dto: CrearPagoDto) { return this.svc.crear(dto); }
+  // La sucursal sale de la SESIÓN, no del body: es con lo que se compara el
+  // turno de caja para que el egreso no pueda salir del cajón de otra sucursal.
+  @Post() crear(@Body() dto: CrearPagoDto, @Auth() auth: Sesion) {
+    return this.svc.crear(dto, auth.sucursalId);
+  }
 
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Post(':id/imputar') imputar(@Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto) {
