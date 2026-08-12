@@ -51,3 +51,14 @@ export interface Sesion {
 export const Auth = createParamDecorator((_d: unknown, ctx: ExecutionContext): Sesion => {
   return ctx.switchToHttp().getRequest().auth;
 });
+
+/*
+ * El `usuarioId` del body lo pone el SERVIDOR en todos los endpoints — no hay
+ * que hacer nada en el controller. Lo hace `AutorInterceptor`, que está
+ * registrado global junto al guard; ahí está explicado por qué en un solo lugar
+ * y no repetido en 11 archivos.
+ *
+ * La sucursal NO se pisa igual: en casi todos los endpoints es un DATO (el
+ * admin mirando el stock de Express 2), no "dónde estoy". Donde sí significa
+ * "mi sucursal" —el chat— se toma de la sesión a mano y con su comentario.
+ */

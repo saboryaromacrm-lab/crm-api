@@ -5,6 +5,7 @@ import {
 import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength } from 'class-validator';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Permiso } from '../auth/auth.decoradores';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
@@ -1216,15 +1217,20 @@ export class ProductosController {
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
+  @Permiso('compras.productos')
   @Post() create(@Body() dto: UpsertProductoDto) { return this.svc.create(dto); }
   /** Catálogo completo de un proveedor, en una sola transacción. */
+  @Permiso('compras.productos')
   @Post('importar') importar(@Body() dto: ImportarDto) { return this.svc.importar(dto); }
+  @Permiso('compras.productos')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
     return this.svc.update(id, dto);
   }
+  @Permiso('compras.productos')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
 
   /** Dar de baja (discontinuado / archivado) y reactivar: el mismo endpoint. */
+  @Permiso('compras.productos')
   @Post(':id/estado')
   cambiarEstado(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarEstadoDto) {
     return this.svc.cambiarEstado(id, dto);
@@ -1232,20 +1238,24 @@ export class ProductosController {
 
   /* Los discontinuados que ya se agotaron: sugerencia, no automatismo. */
   @Get('sugerencias/archivado') sugerenciasArchivado() { return this.svc.sugerenciasArchivado(); }
+  @Permiso('compras.productos')
   @Post('archivar-lote') archivarLote(@Body() dto: ArchivarLoteDto) {
     return this.svc.archivarLote(dto.ids, dto.motivo);
   }
 
+  @Permiso('compras.productos')
   @Put(':id/presentaciones')
   setPresentaciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setPresentaciones(id, body?.presentaciones ?? body);
   }
 
+  @Permiso('compras.productos')
   @Put(':id/formatos-compra')
   setFormatosCompra(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setFormatosCompra(id, body?.formatos ?? body?.proveedores ?? body);
   }
 
+  @Permiso('precios', 'ventas.listas')
   @Put(':id/listas')
   setListas(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setListas(id, body?.listas ?? body?.listasPrecio ?? body);
@@ -1256,6 +1266,7 @@ export class ProductosController {
    * por la de la madre: son dos cosas que se cotizan por separado, y mezclarlas
    * en un mismo PUT haría que guardar una pudiera borrar la otra.
    */
+  @Permiso('precios', 'ventas.listas')
   @Put('presentaciones/:presId/listas')
   setListasPresentacion(@Param('presId', ParseIntPipe) presId: number, @Body() body: any) {
     return this.svc.setListasPresentacion(presId, body?.listas ?? body);

@@ -451,7 +451,11 @@ export class GastosService {
         concepto: (dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
         sucursalId: dto.sucursalId,
         cajaSesionId: dto.pagoInmediato.cajaSesionId,
-        usuarioId: dto.pagoInmediato.usuarioId ?? dto.usuarioId,
+        // `dto.usuarioId` y NO el del objeto anidado: el interceptor que pone el
+        // autor solo pisa el nivel de arriba del body, así que el `usuarioId`
+        // de `pagoInmediato` seguiría siendo el que mandó el cliente. El pago
+        // del gasto lo firma el mismo que carga el gasto.
+        usuarioId: dto.usuarioId,
         imputaciones: [{ gastoId: creado.id, importe: Number(dto.pagoInmediato.importe) || total }],
       });
     }

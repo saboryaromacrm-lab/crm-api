@@ -148,8 +148,14 @@ class ConfirmarVentaDto {
   pagos?: VentaPagoDto[];
 }
 
+/*
+ * DELEGAR ES EL CASO EN QUE EL id NO ES EL PROPIO: se le pasa el borrador a
+ * otro vendedor. Por eso el campo se llama `paraUsuarioId` y no `usuarioId` —
+ * si se llamara igual que el autor, el interceptor que pone el autor del lado
+ * del servidor lo pisaria y delegar terminaria delegandose a uno mismo.
+ */
 class DelegarVentaDto {
-  @IsInt() usuarioId!: number;
+  @IsInt() paraUsuarioId!: number;
 }
 
 /**
@@ -1384,7 +1390,7 @@ export class VentasController {
   @Post() create(@Body() dto: CreateVentaDto) { return this.svc.create(dto); }
   @Put(':id') actualizar(@Param('id', ParseIntPipe) id: number, @Body() dto: CreateVentaDto) { return this.svc.actualizar(id, dto); }
   @Post(':id/confirmar') confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarVentaDto) { return this.svc.confirmar(id, dto); }
-  @Post(':id/delegar') delegar(@Param('id', ParseIntPipe) id: number, @Body() dto: DelegarVentaDto) { return this.svc.delegar(id, dto.usuarioId); }
+  @Post(':id/delegar') delegar(@Param('id', ParseIntPipe) id: number, @Body() dto: DelegarVentaDto) { return this.svc.delegar(id, dto.paraUsuarioId); }
   @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number) { return this.svc.anular(id); }
   @Delete(':id') descartar(@Param('id', ParseIntPipe) id: number) { return this.svc.descartar(id); }
 }

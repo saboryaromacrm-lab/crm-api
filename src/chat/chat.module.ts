@@ -27,6 +27,7 @@ import { IsInt, IsOptional, IsString, MaxLength } from 'class-validator';
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { chatLecturas, chatMensajes, sucursales, usuarios } from '../db/schema';
+import { Auth, type Sesion } from '../auth/auth.decoradores';
 
 const LIMITE_BOOTSTRAP = 400;
 const LIMITE_POLL = 100;
@@ -234,31 +235,37 @@ export class ChatService {
   }
 }
 
+/**
+ * QUIÉN SOY Y DÓNDE ESTOY SALEN DE LA SESIÓN, NO DE LA URL.
+ *
+ * Acá era más grave que en el resto del sistema. El poller pedía
+ * `/chat/mensajes?sucursalId=1&usuarioId=9`, y `visiblesPara()` usa ese
+ * `usuarioId` para decidir qué mensajes PRIVADOS mostrar: cambiar el número en
+ * la barra de direcciones leía las conversaciones 1-a-1 de otro. Y con
+ * `sucursalId` pasaba lo mismo para el canal de otra sucursal.
+ *
+ * Los DTO de las dos escrituras siguen validando su forma, pero el usuario y la
+ * sucursal se sobreescriben con los de la sesión: lo que el cliente mande en
+ * esos dos campos ya no se mira.
+ */
 @Controller('chat')
 export class ChatController {
   constructor(private readonly svc: ChatService) {}
 
-  @Get('bootstrap') bootstrap(
-    @Query('sucursalId') sucursalId: string,
-    @Query('usuarioId') usuarioId: string,
-  ) {
-    return this.svc.bootstrap(Number(sucursalId) || 0, Number(usuarioId) || 0);
+  @Get('bootstrap') bootstrap(@Auth() s: Sesion) {
+    return this.svc.bootstrap(s.sucursalId, s.usuarioId);
   }
 
-  @Get('mensajes') nuevos(
-    @Query('sucursalId') sucursalId: string,
-    @Query('usuarioId') usuarioId: string,
-    @Query('desde') desde: string,
-  ) {
-    return this.svc.nuevos(Number(sucursalId) || 0, Number(usuarioId) || 0, Number(desde) || 0);
+  @Get('mensajes') nuevos(@Auth() s: Sesion, @Query('desde') desde: string) {
+    return this.svc.nuevos(s.sucursalId, s.usuarioId, Number(desde) || 0);
   }
 
-  @Post('mensajes') enviar(@Body() dto: EnviarMensajeDto) {
-    return this.svc.enviar(dto);
+  @Post('mensajes') enviar(@Body() dto: EnviarMensajeDto, @Auth() s: Sesion) {
+    return this.svc.enviar({ ...dto, usuarioId: s.usuarioId, sucursalId: s.sucursalId });
   }
 
-  @Post('leido') leido(@Body() dto: MarcarLeidoDto) {
-    return this.svc.marcarLeido(dto);
+  @Post('leido') leido(@Body() dto: MarcarLeidoDto, @Auth() s: Sesion) {
+    return this.svc.marcarLeido({ ...dto, usuarioId: s.usuarioId, sucursalId: s.sucursalId });
   }
 }
 

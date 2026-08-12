@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { AuthGuard } from './auth.guard';
+import { AutorInterceptor } from './autor.interceptor';
 import { FrenoLogin } from './freno-login';
 import { SesionesService } from './sesiones.service';
 
@@ -18,6 +19,9 @@ import { SesionesService } from './sesiones.service';
     SesionesService,
     FrenoLogin,
     { provide: APP_GUARD, useClass: AuthGuard },
+    // Corre después del guard y antes de los pipes: el `usuarioId` del body ya
+    // es el de la sesión cuando el DTO se valida.
+    { provide: APP_INTERCEPTOR, useClass: AutorInterceptor },
   ],
   exports: [SesionesService, FrenoLogin],
 })

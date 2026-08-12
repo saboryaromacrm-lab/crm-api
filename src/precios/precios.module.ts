@@ -27,6 +27,7 @@ import {
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Permiso } from '../auth/auth.decoradores';
 import {
   listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
   productoProveedorCostos, productoProveedores, productos, proveedores, roles, usuarios,
@@ -629,7 +630,12 @@ export class PreciosService {
   }
 }
 
+/*
+ * PRECIOS: escrituras Y lecturas. El historial dice cuanto se gana con cada
+ * producto -- no es un dato mas del catalogo.
+ */
 @Controller('precios')
+@Permiso('precios')
 export class PreciosController {
   constructor(
     private readonly svc: PreciosService,

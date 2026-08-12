@@ -25,6 +25,7 @@ import {
 import { IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Permiso } from '../auth/auth.decoradores';
 import {
   clienteListas, listasVenta, marcas, modalidadesVenta, presentaciones, productoListas, productos, reglasMarca, ventaItems,
 } from '../db/schema';
@@ -478,30 +479,40 @@ export class ListasController {
 
   @Get() catalogo() { return this.svc.catalogo(); }
 
+  @Permiso('ventas.listas', 'precios')
   @Post('modalidades') crearMod(@Body() dto: UpsertModalidadDto) { return this.svc.crearModalidad(dto); }
+  @Permiso('ventas.listas', 'precios')
   @Patch('modalidades/:id') editarMod(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertModalidadDto) {
     return this.svc.editarModalidad(id, dto);
   }
+  @Permiso('ventas.listas', 'precios')
   @Delete('modalidades/:id') borrarMod(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarModalidad(id); }
 
   /* Reglas de marca — la única condición global. */
   @Get('reglas-marca') reglas() { return this.svc.reglas(); }
+  @Permiso('ventas.listas', 'precios')
   @Post('reglas-marca') crearRegla(@Body() dto: UpsertReglaMarcaDto) { return this.svc.crearRegla(dto); }
+  @Permiso('ventas.listas', 'precios')
   @Patch('reglas-marca/:id') editarRegla(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertReglaMarcaDto) {
     return this.svc.editarRegla(id, dto);
   }
+  @Permiso('ventas.listas', 'precios')
   @Delete('reglas-marca/:id') borrarRegla(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarRegla(id); }
 
   /** Listas predeterminadas de un cliente (reemplaza el conjunto completo). */
+  @Permiso('ventas.listas', 'ventas.clientes')
   @Put('cliente/:id')
   setCliente(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setListasDeCliente(id, body?.listas ?? []);
   }
 
+  @Permiso('ventas.listas', 'precios')
   @Post() crear(@Body() dto: UpsertListaDto) { return this.svc.crearLista(dto); }
+  @Permiso('ventas.listas', 'precios')
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertListaDto) {
     return this.svc.editarLista(id, dto);
   }
+  @Permiso('ventas.listas', 'precios')
   @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarLista(id); }
 }
 
