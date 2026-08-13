@@ -66,6 +66,11 @@ export class SesionesService {
         activo: usuarios.activo,
         rolId: roles.id,
         rolClave: roles.clave,
+        // El NOMBRE del rol además de la clave: es lo que el encabezado le
+        // muestra a la persona ("Administrador"), y sin él `/auth/yo` devolvía
+        // menos campos que el login — el frontend reemplaza el usuario con esta
+        // respuesta, así que el nombre del rol se perdía en el primer F5.
+        rolNombre: roles.nombre,
         permisos: roles.permisos,
         sucursalId: sucursales.id,
         sucursalNombre: sucursales.nombre,
@@ -105,10 +110,27 @@ export class SesionesService {
       nombre: f.nombre,
       rolId: f.rolId,
       rolClave: f.rolClave ?? '',
+      rolNombre: f.rolNombre ?? '',
       permisos: (f.permisos as string[]) ?? [],
       sucursalId: f.sucursalId,
       sucursalNombre: f.sucursalNombre,
     };
+  }
+
+  /**
+   * Mueve la sucursal DE ESTA SESIÓN.
+   *
+   * `sucursalId` se fijaba en el login y no se actualizaba nunca, así que
+   * cuando el jefe cambiaba de sucursal desde el encabezado el cambio duraba
+   * hasta el F5 siguiente: `/auth/yo` devolvía la sucursal vieja (la de la
+   * sesión) y pisaba la elegida, mientras el contexto de los módulos —que NO
+   * se pisa— seguía en la nueva. El sistema quedaba partido: el encabezado y
+   * el chat en una sucursal y Compras/Almacén/Ventas en otra.
+   */
+  async moverSucursal(sesionId: number, sucursalId: number) {
+    await this.db.update(sesiones)
+      .set({ sucursalId, ultimoUso: new Date() })
+      .where(eq(sesiones.id, sesionId));
   }
 
   /** Salir: mata ESTA sesión y no las otras (la tablet del local sigue abierta). */
@@ -127,15 +149,11 @@ export class SesionesService {
     return { ok: true };
   }
 
-  /** Las sesiones abiertas de alguien, para poder mirarlas y cortarlas. */
-  async listarDe(usuarioId: number) {
-    return this.db.select({
-      id: sesiones.id, creadaEn: sesiones.creadaEn, ultimoUso: sesiones.ultimoUso,
-      expiraEn: sesiones.expiraEn, userAgent: sesiones.userAgent, sucursalId: sesiones.sucursalId,
-    }).from(sesiones)
-      .where(and(eq(sesiones.usuarioId, usuarioId), lt(new Date() as any, sesiones.expiraEn)))
-      .orderBy(sesiones.ultimoUso);
-  }
+  /* "Ver y cortar las sesiones abiertas" es una función que TODAVÍA NO EXISTE.
+   * Acá vivía un `listarDe` que ningún endpoint llamaba —o sea que nunca se
+   * ejecutó— y que además tenía los argumentos del `lt` al revés. Se borró: el
+   * día que se construya la pantalla, se escribe con una prueba que la
+   * ejercite. Está anotado en /info › Pendientes. */
 
   /** Barrido de vencidas. Lo llama el login: no hace falta un cron para esto. */
   async limpiarVencidas() {

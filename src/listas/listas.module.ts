@@ -22,12 +22,12 @@ import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
 } from '@nestjs/common';
-import { IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
 import {
-  clienteListas, listasVenta, marcas, modalidadesVenta, presentaciones, productoListas, productos, reglasMarca, ventaItems,
+  clienteListas, clientes, listasVenta, marcas, modalidadesVenta, presentaciones, productoListas, productos, reglasMarca, ventaItems,
 } from '../db/schema';
 
 /** Una fila del formato de venta, con la identidad de la lista ya pegada. */
@@ -49,18 +49,21 @@ export function etiquetaLista(lista: { numero: number; nombre: string }, modalid
   return lista.nombre ? `${base} · ${lista.nombre}` : base;
 }
 
-/** Marca comparable: sin mayúsculas, acentos ni espacios de más. */
-export function normMarca(v: any): string {
-  return String(v ?? '').trim().toLowerCase()
-    .normalize('NFD').replace(/\p{Diacritic}/gu, '');
-}
-
 /* ------------------------------- DTOs ------------------------------- */
 
 class UpsertModalidadDto {
   @IsString() nombre!: string;
   @IsOptional() @IsInt() orden?: number;
   @IsOptional() @IsBoolean() activa?: boolean;
+}
+
+/**
+ * Las listas que se le asignan a un cliente. Recibía `any`, o sea que el
+ * `ValidationPipe` no miraba nada: `{"listas":["7; drop"]}` entraba al filtro de
+ * enteros del servicio y quedaba en silencio, y una lista de 10.000 ids también.
+ */
+class SetListasClienteDto {
+  @IsArray() @ArrayMaxSize(50) @IsInt({ each: true }) listas!: number[];
 }
 
 /** La lista ya no lleva markup ni condición: son del producto. */
@@ -288,8 +291,31 @@ export class ListasService {
       .orderBy(asc(listasVenta.orden), asc(listasVenta.id));
   }
 
-  /** Reemplaza el conjunto de listas predeterminadas del cliente. */
+  /**
+   * Reemplaza el conjunto de listas predeterminadas del cliente.
+   *
+   * EL CONSUMIDOR FINAL NO ADMITE LISTAS, y es el candado que faltaba. Asignarle
+   * una lista a un cliente es una de las cuatro puertas que habilitan un precio
+   * (`resolverRenglones` la mira en `delCliente`), así que un `PUT` sobre el
+   * cliente genérico —`{"listas":[7]}` con 7 = "Mayorista 3"— ponía **todos** los
+   * tickets de mostrador a precio mayorista, y el portero de precios los aprobaba
+   * porque la lista estaba legítimamente habilitada para ese cliente. Nadie
+   * necesitaba `precio_manual` y ningún renglón quedaba marcado como pisado.
+   *
+   * El Consumidor Final es un cliente DEL SISTEMA, no una ficha comercial: mismo
+   * trato que ya le da el módulo de clientes, que no deja desactivarlo ni
+   * borrarlo.
+   */
   async setListasDeCliente(clienteId: number, listaIds: number[]) {
+    const [cli] = await this.db.select({ esConsumidorFinal: clientes.esConsumidorFinal, nombre: clientes.nombre })
+      .from(clientes).where(eq(clientes.id, clienteId)).limit(1);
+    if (!cli) throw new NotFoundException('Cliente inexistente.');
+    if (cli.esConsumidorFinal && (listaIds ?? []).length) {
+      throw new BadRequestException(
+        `${cli.nombre} es el cliente genérico del mostrador: no lleva listas asignadas. `
+        + 'Si querés que un cliente pague mayorista, cargalo como cliente propio.',
+      );
+    }
     const ids = [...new Set((listaIds || []).filter((x) => Number.isInteger(x)))];
     await this.db.transaction(async (tx) => {
       await tx.delete(clienteListas).where(eq(clienteListas.clienteId, clienteId));
@@ -502,8 +528,8 @@ export class ListasController {
   /** Listas predeterminadas de un cliente (reemplaza el conjunto completo). */
   @Permiso('ventas.listas', 'ventas.clientes')
   @Put('cliente/:id')
-  setCliente(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.setListasDeCliente(id, body?.listas ?? []);
+  setCliente(@Param('id', ParseIntPipe) id: number, @Body() dto: SetListasClienteDto) {
+    return this.svc.setListasDeCliente(id, dto?.listas ?? []);
   }
 
   @Permiso('ventas.listas', 'precios')

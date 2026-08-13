@@ -17,8 +17,9 @@ import {
 import {
   IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString,
 } from 'class-validator';
-import { asc, eq, sql } from 'drizzle-orm';
+import { asc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Permiso } from '../auth/auth.decoradores';
 import { ofertaAlcances, ofertaComponentes, ofertas, ventaItems } from '../db/schema';
 
 export const TIPOS_OFERTA = [
@@ -230,21 +231,36 @@ export class OfertasService {
   /** Para validar al confirmar: las ofertas de ticket con medio de pago exigido. */
   async ticketConMedios(ids: number[]) {
     if (!ids.length) return [];
-    const todas = await this.db.select().from(ofertas);
-    return todas.filter((o) => ids.includes(o.id) && o.tipo === 'ticket' && o.mediosPago.trim() !== '');
+    // Solo las del ticket que se está cobrando: traer la tabla entera para
+    // descartarla en memoria era gratis con diez promos y no lo es con mil.
+    const suyas = await this.db.select().from(ofertas).where(inArray(ofertas.id, ids));
+    return suyas.filter((o) => o.tipo === 'ticket' && o.mediosPago.trim() !== '');
   }
 }
 
+/**
+ * Crear una oferta es tocar el precio de TODAS las cajas del sistema: el
+ * catálogo del POS se la lleva al abrir el turno. Sin permiso, una promo de
+ * "100% en la categoría Aceites" quedaba activa hasta que alguien la notara.
+ *
+ * La lectura queda abierta a sesión válida: el POS y Vencimientos la consumen.
+ */
 @Controller('ofertas')
 export class OfertasController {
   constructor(private readonly svc: OfertasService) {}
 
   @Get() listar() { return this.svc.listar(); }
-  @Post() crear(@Body() dto: UpsertOfertaDto) { return this.svc.crear(dto); }
-  @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertOfertaDto) {
+
+  @Post() @Permiso('ventas.ofertas', 'ofertas')
+  crear(@Body() dto: UpsertOfertaDto) { return this.svc.crear(dto); }
+
+  @Patch(':id') @Permiso('ventas.ofertas', 'ofertas')
+  editar(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertOfertaDto) {
     return this.svc.editar(id, dto);
   }
-  @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrar(id); }
+
+  @Delete(':id') @Permiso('ventas.ofertas', 'ofertas')
+  borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrar(id); }
 }
 
 @Module({

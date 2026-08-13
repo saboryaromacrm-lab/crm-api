@@ -17,12 +17,12 @@
  * sistema evita el clásico descuadre de centavos entre compras y ventas.
  */
 import {
-  Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Post, Put, Query,
+  Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
+  BadRequestException, NotFoundException, Param, ParseIntPipe, Post, Put, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
+  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -32,6 +32,9 @@ import {
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
   ventaExtras, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
+import { ALICUOTAS_IVA } from '../common/iva';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { esJefe, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { CajaModule, CajaService } from '../caja/caja.module';
@@ -39,13 +42,128 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, costoNetoPresentacion, formatoActivo, precioLista, precioVentaFila } from '../inventario/pricing';
+import { costoNetoEntry, costoNetoPresentacion, formatoActivo, precioVentaFila } from '../inventario/pricing';
 
 const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
 
+/**
+ * Las secciones del módulo Ventas, con las mismas claves del catálogo de
+ * permisos (usuarios.module.ts). Sirven para los endpoints que no son de una
+ * pantalla en particular sino del módulo entero — hoy el bootstrap.
+ */
+const SECCIONES_VENTAS = [
+  'ventas.pos', 'ventas.listado', 'ventas.ordenes', 'ventas.presupuestos',
+  'ventas.clientes', 'ventas.cobranzas', 'ventas.caja', 'ventas.listas',
+  'ventas.ofertas', 'ventas.cambios', 'ventas.configuracion',
+] as const;
+
 /** Redondeo monetario a 2 decimales (evita el arrastre de flotantes). */
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** El precio de una oferta se carga CON IVA; las cuentas van en neto. */
+const netoDe = (precioFinal: number, iva: number) => (Number(precioFinal) || 0) / (1 + (Number(iva) || 0) / 100);
+
+/**
+ * ¿ESTA OFERTA ALCANZA A ESTE RENGLÓN? Espejo de `alcanzaRenglon` del motor del
+ * POS (`domain/ofertas.js`), del lado que manda.
+ *
+ * Faltaba por completo: el servidor comprobaba que la promo estuviera ACTIVA y
+ * nada más, así que con cualquier oferta viva en el sistema se le colgaba su
+ * descuento a un producto que no estaba en ella. Con un 3×2 de galletitas
+ * activo, un renglón de aceite de $80.000 se cobraba $1.
+ *
+ * El paquete fraccionado es el caso fino y va igual que en el POS: lo alcanza su
+ * propia `presentacion`, y las de la madre solo si la oferta lo dice
+ * (`incluyeFraccionados`).
+ */
+function ofertaAlcanza(
+  o: { alcances?: { tipo: string; refId: number }[]; incluyeFraccionados?: boolean; tipo?: string;
+    componentes?: { productoId: number }[] },
+  r: { productoId: number; presentacionId: number | null; marcaId: number | null;
+    categoriaId: number | null; etiquetas: number[] },
+): boolean {
+  // El alcance del COMBO son sus componentes, no la tabla de alcances.
+  if (o.tipo === 'combo') {
+    return (o.componentes ?? []).some((c) => c.productoId === r.productoId);
+  }
+  const esPaquete = r.presentacionId != null;
+  return (o.alcances ?? []).some((a) => {
+    if (a.tipo === 'presentacion') return esPaquete && r.presentacionId === a.refId;
+    if (esPaquete && !o.incluyeFraccionados) return false;
+    switch (a.tipo) {
+      case 'producto': return r.productoId === a.refId;
+      case 'marca': return r.marcaId === a.refId;
+      case 'categoria': return r.categoriaId === a.refId;
+      case 'etiqueta': return (r.etiquetas ?? []).includes(a.refId);
+      default: return false;
+    }
+  });
+}
+
+/**
+ * LO MÁXIMO QUE ESTA MECÁNICA PUEDE DESCONTAR en un renglón. `null` = no se
+ * puede acotar con lo que hay acá (el combo reparte su ahorro entre renglones de
+ * productos distintos, así que su techo por renglón es el bruto).
+ *
+ * Antes solo se acotaban las de porcentaje; para `nxm`, `pack` y `precio_fijo`
+ * el único límite era el 100% del renglón, o sea ninguno. Los tres techos de acá
+ * son EXACTOS —salen de la misma cuenta que hace el motor del POS— y se miden
+ * sobre el neto ya bonificado, que es donde el navegador también los mide.
+ */
+function techoDeOferta(
+  o: { tipo: string; porcentaje?: number; precio?: number; lleva?: number; paga?: number },
+  datos: { cantidad: number; precioUnitario: number; descuento: number; iva: number },
+): number | null {
+  const { cantidad: c, iva } = datos;
+  const p = datos.precioUnitario * (1 - datos.descuento / 100);
+  const lleva = Number(o.lleva) || 0;
+  const paga = Number(o.paga) || 0;
+
+  switch (o.tipo) {
+    case 'porcentaje':
+      return money(c * p * ((Number(o.porcentaje) || 0) / 100));
+    case 'segunda_unidad':
+      // Un par por cada dos unidades, y el descuento cae sobre la segunda.
+      return money(Math.floor(c / 2) * p * ((Number(o.porcentaje) || 0) / 100));
+    case 'nxm': {
+      if (lleva < 2 || paga < 1 || paga >= lleva) return 0;
+      return money(Math.floor(c / lleva) * (lleva - paga) * p);
+    }
+    case 'precio_fijo': {
+      const pf = netoDe(Number(o.precio) || 0, iva);
+      return pf >= p ? 0 : money(c * (p - pf));
+    }
+    case 'pack': {
+      if (lleva < 2) return 0;
+      const ahorro = lleva * p - netoDe(Number(o.precio) || 0, iva);
+      return ahorro <= 0 ? 0 : money(Math.floor(c / lleva) * ahorro);
+    }
+    default:
+      // 'ticket' y 'combo': el importe no se deriva de este renglón solo.
+      return null;
+  }
+}
+
+/**
+ * LA FECHA DE UN DOCUMENTO DE MOSTRADOR. Es AHORA, salvo para un jefe.
+ *
+ * Un cajero podía emitir un ticket fechado dos meses atrás y colgarlo del turno
+ * abierto de hoy: quedaba fuera de cualquier corte por fecha y adentro del
+ * arqueo de hoy. El jefe sí necesita fechar distinto (carga diferida,
+ * corrección), pero la fecha tiene que ser real: `new Date('chau')` es un
+ * `Invalid Date` que llegaba crudo al insert y salía un 500 donde va un 400.
+ *
+ * Vive acá y exportada porque la venta y la COBRANZA son el mismo caso, y la
+ * cobranza nació sin esta regla: se podía fechar un recibo en noviembre, la
+ * plata entraba al turno de hoy y ningún corte del mes lo veía.
+ */
+export function fechaDeDocumento(pedida: string | undefined, esJefeSesion: boolean) {
+  if (!pedida || !esJefeSesion) return new Date();
+  const f = new Date(pedida);
+  if (Number.isNaN(f.getTime())) throw new BadRequestException(`Fecha inválida: ${pedida}`);
+  return f;
+}
 
 /* ---------------- Días de un filtro de fechas ----------------
  *
@@ -80,35 +198,86 @@ export function letraFacturaPara(cliente: { condicionIva: string }, config: Reco
 
 /* ------------------------------- DTOs ------------------------------- */
 
-const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto'] as const;
+const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto', 'presupuesto'] as const;
+
+/**
+ * Renglón YA pasado por `resolverRenglones`. El tipo es distinto del DTO a
+ * propósito: `iva` no existe en lo que manda el cliente y sí existe acá, así que
+ * el compilador impide calcular totales con renglones sin resolver.
+ */
+type RenglonResuelto = VentaItemDto & {
+  iva: number;
+  precioUnitario: number;
+  precioLista: number;
+  descuento: number;
+  ofertaDescuento: number;
+};
+
+/**
+ * Lo que el CONTROLLER resolvió de la sesión y el body no puede decir.
+ *
+ * Está en un objeto aparte del DTO justamente para que se vea la frontera: todo
+ * lo de acá lo decide el servidor mirando quién llamó, no lo que mandó.
+ */
+export interface OpcionesVenta {
+  /**
+   * DÓNDE SE GRABA la venta nueva: la sucursal de la sesión, o la pedida si
+   * quien llama es un jefe (`sucursalDeOperacion`).
+   */
+  sucursalSesion?: number;
+  /**
+   * QUÉ SE PUEDE TOCAR de lo que ya existe. `undefined` = sin restricción (jefe);
+   * un número = solo los documentos de esa sucursal.
+   *
+   * Son dos cosas distintas y por eso son dos campos: el jefe GRABA en la
+   * sucursal que elige y además puede TOCAR la de cualquiera; el cajero hace las
+   * dos cosas únicamente en la suya. Cuando esto era un solo campo, el jefe
+   * quedaba encerrado en su propia sucursal para editar y anular.
+   */
+  soloSuSucursal?: number;
+  /** Permiso `precio_manual`: pisar el precio, la lista y el tope de descuento. */
+  puedePisarPrecio?: boolean;
+  /** Rol admin/superadmin: puede fechar la venta y anular contra un turno cerrado. */
+  esJefe?: boolean;
+}
 
 class VentaItemDto {
   @IsInt() productoId!: number;
   @IsOptional() @IsInt() presentacionId?: number;
-  @IsNumber() cantidad!: number;
+  /* Con techo: `1e12` unidades no es un error de tipeo del cajero, y sin `@Max`
+   * el subtotal se va a Infinity y contamina cualquier suma que lo incluya. */
+  @IsNumber() @Min(0) @Max(1_000_000) cantidad!: number;
   @IsOptional() @IsInt() listaId?: number;
   @IsOptional() @IsString() lista?: string;
   @IsOptional() @IsIn(ORIGENES_LISTA as unknown as string[]) listaOrigen?: string;
-  @IsOptional() @IsNumber() precioLista?: number;
-  @IsOptional() @IsNumber() precioUnitario?: number;
-  @IsOptional() @IsNumber() descuento?: number;
+  @IsOptional() @IsNumber() @Min(0) precioLista?: number;
+  @IsOptional() @IsNumber() @Min(0) precioUnitario?: number;
+  /** PORCENTAJE. El tope del vendedor lo pone la configuración; 100 es el techo físico. */
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
   /** Oferta aplicada por el motor del POS: referencia + nombre + importe neto. */
   @IsOptional() @IsInt() ofertaId?: number;
   @IsOptional() @IsString() oferta?: string;
-  @IsOptional() @IsNumber() ofertaDescuento?: number;
-  @IsOptional() @IsNumber() iva?: number;
+  @IsOptional() @IsNumber() @Min(0) ofertaDescuento?: number;
+  /*
+   * `iva` NO está acá: la alícuota es del PRODUCTO y la pone el servidor (ver
+   * `resolverRenglones`). Cuando la elegía el cliente, un `iva: -200` daba un
+   * total negativo y una venta en cuenta corriente le BAJABA la deuda al cliente
+   * — invisible en Cobranzas, que solo lista saldos positivos.
+   */
 }
 
 class VentaExtraDto {
-  @IsString() concepto!: string;
-  @IsNumber() importe!: number;
-  @IsOptional() @IsNumber() iva?: number;
+  @IsString() @MaxLength(120) concepto!: string;
+  @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
+  /* Acá sí la elige el cargador —un flete no es un producto del catálogo— pero
+   * solo entre las alícuotas que existen en la ley. */
+  @IsOptional() @IsIn(ALICUOTAS_IVA as unknown as number[]) iva?: number;
 }
 
 class VentaPagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
-  @IsNumber() importe!: number;
-  @IsOptional() @IsString() referencia?: string;
+  @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
+  @IsOptional() @IsString() @MaxLength(120) referencia?: string;
 }
 
 export class CreateVentaDto {
@@ -156,6 +325,15 @@ class ConfirmarVentaDto {
  */
 class DelegarVentaDto {
   @IsInt() paraUsuarioId!: number;
+}
+
+/**
+ * ANULAR PIDE MOTIVO, y es obligatorio a propósito: es lo único que distingue
+ * una devolución legítima de un faltante tapado. Queda en `anuladoMotivo` (0059)
+ * junto a quién y cuándo.
+ */
+class AnularVentaDto {
+  @IsString() @MaxLength(300) motivo!: string;
 }
 
 /**
@@ -789,10 +967,410 @@ export class VentasService {
   /* ------------------------------ Cálculo ------------------------------ */
 
   /**
+   * EL PORTERO DEL RENGLÓN — corre ANTES de la aritmética, y es el que decide.
+   * ==========================================================================
+   * Hasta acá `calcularTotales` tomaba `precioUnitario`, `descuento` e `iva` tal
+   * como venían del cliente. Con eso, un cajero con la consola del navegador
+   * abierta se llevaba la mercadería gratis en un request:
+   *
+   *   items: [{ productoId: 312, cantidad: 10, precioUnitario: 8000, descuento: 100 }]
+   *   pagos: [{ medio: 'efectivo', importe: 0.01 }]
+   *
+   * neto 0 → total 0 → `validarPagos` compara |0,01 − 0| > 0,01 y pasa. Ticket
+   * numerado, diez unidades menos de stock, y el arqueo esperando un centavo. La
+   * variante silenciosa era peor: `descuento: 40` con `listaOrigen: 'auto'` daba
+   * precio mayorista a un consumidor final y el renglón quedaba registrado como
+   * si la regla lo hubiera habilitado.
+   *
+   * Tres cosas dejan de ser del cliente:
+   *
+   *  1. EL IVA sale del producto. No es una opinión del punto de venta: es la
+   *     alícuota del artículo. Mandaba `iva: -200` y el total daba NEGATIVO, así
+   *     que la venta en cuenta corriente le BAJABA la deuda al cliente — y como
+   *     Cobranzas solo lista saldos > 0, el comprobante no aparecía en pantalla.
+   *  2. EL PRECIO se recalcula contra la fila de `producto_listas` de la lista
+   *     con la que dice venderse, con el mismo helper que la ficha del producto.
+   *     El que no coincide se rechaza.
+   *  3. LA LISTA tiene que estar habilitada por una de las cuatro puertas del
+   *     motor (cliente, unidades del producto, regla de marca, monto del ticket),
+   *     medidas acá contra el ticket real. Mandar el `listaId` mayorista con su
+   *     precio mayorista ya no alcanza: hay que haberlo ganado.
+   *
+   * El permiso `precio_manual` levanta 2 y 3, y el tope de descuento: es la
+   * decisión del dueño de que alguien pueda regatear en el mostrador. Sin él, lo
+   * que se cobra es lo que dice el catálogo.
+   *
+   * `congelados` es la SEXTA puerta y la agregó el mordisco que se llevó este
+   * mismo portero: un presupuesto se cotiza hoy y se cobra la semana que viene,
+   * así que su precio ya no coincide con el de la lista. Con esto, un renglón
+   * que viene de un presupuesto confirmado y vigente se cobra al precio con el
+   * que se prometió, sin pedir `precio_manual` — que era lo que dejaba al
+   * vendedor sin poder cerrar el pedido que la casa ya había firmado.
+   */
+  /**
+   * Los precios que la casa ya prometió por escrito, para que el portero los
+   * reconozca. Devuelve un mapa vacío —o sea, ninguna excepción— salvo que la
+   * venta declare un presupuesto que exista, sea **de este cliente**, esté
+   * **confirmado** y **no esté vencido**. Las tres condiciones importan: sin la
+   * del cliente, cualquiera invocaría el presupuesto ajeno para llevarse su
+   * precio; sin la del estado, valdría un borrador que se escribe solo; y sin la
+   * del vencimiento, un precio de hace un año seguiría vigente para siempre.
+   */
+  private async congeladosDePresupuesto(
+    presupuestoId: number | undefined, clienteId: number, sucursalId?: number | null,
+  ) {
+    const vacio = new Map<string, { precioLista: number; listaId: number | null }>();
+    if (!presupuestoId) return vacio;
+
+    const [pre] = await this.db.select().from(presupuestos)
+      .where(eq(presupuestos.id, Number(presupuestoId))).limit(1);
+    if (!pre) throw new BadRequestException('El presupuesto que se quiere cerrar no existe.');
+    /*
+     * SE AVISA ACÁ, en el alta del borrador, y no recién al cobrar.
+     *
+     * `cerrarPresupuesto` valida lo mismo, pero corre al CONFIRMAR: un ticket
+     * armado contra el pedido de otro cliente o de otra sucursal se aceptaba
+     * entero y explotaba con el cliente esperando en el mostrador. Las dos
+     * validaciones tienen que existir —la de allá es la que protege la
+     * transacción— pero esta es la que hace que el error llegue a tiempo.
+     */
+    if (pre.clienteId !== clienteId) {
+      throw new BadRequestException('Ese presupuesto es de otro cliente.');
+    }
+    if (sucursalId != null && pre.sucursalId !== sucursalId) {
+      throw new BadRequestException(
+        'Ese presupuesto se cotizó en otra sucursal: tiene la mercadería reservada allá.',
+      );
+    }
+    // Estado y vencimiento NO cortan: un pedido todavía no confirmado, o vencido,
+    // se puede cerrar igual — lo que no se hereda es su precio congelado.
+    if (pre.estado !== 'confirmado') return vacio;
+    if (pre.vencimiento && pre.vencimiento.getTime() < Date.now()) return vacio;
+
+    const renglones = await this.db.select().from(presupuestoItems)
+      .where(eq(presupuestoItems.presupuestoId, pre.id));
+    for (const r of renglones) {
+      vacio.set(`${r.productoId}:${r.presentacionId ?? ''}`, {
+        precioLista: money(r.precioLista),
+        listaId: r.listaId ?? null,
+      });
+    }
+    return vacio;
+  }
+
+  private async resolverRenglones(
+    itemsDto: VentaItemDto[],
+    cliente: { id: number },
+    config: any,
+    puedePisarPrecio: boolean,
+    congelados: Map<string, { precioLista: number; listaId: number | null }> = new Map(),
+  ): Promise<RenglonResuelto[]> {
+    const items = itemsDto ?? [];
+    if (!items.length) return [];
+
+    const ids = [...new Set(items.map((it) => Number(it.productoId)))];
+    /* Las etiquetas del producto son para el ALCANCE de las ofertas: una promo
+     * puede apuntar a una etiqueta ('Sin TACC'), y sin esta consulta el alcance
+     * por etiqueta rechazaría promos legítimas. */
+    const [prods, press, provs, filas, cat, asignadas, etiqs] = await Promise.all([
+      this.db.select().from(productos).where(inArray(productos.id, ids)),
+      this.db.select().from(presentaciones).where(inArray(presentaciones.productoId, ids)),
+      this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
+      this.db.select().from(productoListas).where(inArray(productoListas.productoId, ids)),
+      this.listas.catalogo(),
+      this.db.select().from(clienteListas).where(eq(clienteListas.clienteId, cliente.id)),
+      this.db.select().from(productoEtiquetas).where(inArray(productoEtiquetas.productoId, ids)),
+    ]);
+    const etiquetasDe = new Map<number, number[]>();
+    for (const e of etiqs) {
+      const arr = etiquetasDe.get(e.productoId);
+      if (arr) arr.push(e.etiquetaId); else etiquetasDe.set(e.productoId, [e.etiquetaId]);
+    }
+
+    const prodDe = new Map(prods.map((p) => [p.id, p]));
+    const presDe = new Map(press.map((p) => [p.id, p]));
+    const redondeo = config.redondeoPrecio;
+    const activas = (cat.listas ?? []).filter((l: any) => l.activa);
+    const listaDe = new Map<number, any>(activas.map((l: any) => [l.id, l]));
+    const baseId = activas.find((l: any) => l.id === config.listaBaseId)?.id
+      ?? activas[0]?.id ?? null;
+    const delCliente = new Set(asignadas.map((a) => a.listaId));
+
+    /*
+     * Los AGREGADOS del ticket: unidades por producto y por marca. Se cuentan
+     * sobre las cantidades y no sobre los precios, igual que en el motor del POS
+     * y por la misma razón — si dependieran del precio, aplicar una lista
+     * cambiaría la calificación y el resultado dependería del orden de carga.
+     */
+    const porProducto = new Map<number, number>();
+    const porMarca = new Map<number, number>();
+    for (const it of items) {
+      const c = Number(it.cantidad) || 0;
+      if (!(c > 0)) continue;
+      const pid = Number(it.productoId);
+      porProducto.set(pid, (porProducto.get(pid) ?? 0) + c);
+      const marcaId = prodDe.get(pid)?.marcaId;
+      if (marcaId) porMarca.set(marcaId, (porMarca.get(marcaId) ?? 0) + c);
+    }
+
+    /** Modalidades que las reglas de MARCA le abren a cada marca. */
+    const modalidadesDeMarca = new Map<number, Set<number>>();
+    for (const r of (cat.reglasMarca ?? []) as any[]) {
+      const min = Number(r.unidadesMinimas) || 0;
+      if (!r.activa || !(min > 0)) continue;
+      if ((porMarca.get(r.marcaId) ?? 0) + 1e-9 < min) continue;
+      const s = modalidadesDeMarca.get(r.marcaId) ?? new Set<number>();
+      s.add(r.modalidadId);
+      modalidadesDeMarca.set(r.marcaId, s);
+    }
+
+    /*
+     * La puerta del MONTO se mide sobre pesos, y acá se mide con los precios que
+     * el ticket declara. Es la dirección generosa a propósito: el motor del POS
+     * la sugiere después de aplicar el beneficio (que baja el total), así que
+     * medirla sobre el bruto rechazaría ventas legítimas. El medio de pago que
+     * esa modalidad exige lo sigue validando `validarMediosPagoMonto`.
+     */
+    const brutoTicket = items.reduce(
+      (a, it) => a + (Number(it.cantidad) || 0) * (Number(it.precioUnitario ?? it.precioLista) || 0), 0,
+    );
+    const modalidadPorMonto = config.montoMinimoMayorista > 0 && config.modalidadMontoId
+      && brutoTicket + 1e-9 >= config.montoMinimoMayorista
+      ? config.modalidadMontoId
+      : null;
+
+    /*
+     * Ofertas activas, para acotar cuánto puede descontar una promo. Se piden
+     * SOLO si algún renglón declara un descuento de oferta: este método corre en
+     * cada autoguardado del ticket (una vez por tecla, con retardo) y el catálogo
+     * de ofertas son tres consultas —ofertas + alcances + componentes— que en el
+     * 95% de los tickets no se leen. El resto de la validación no las mira.
+     */
+    const declaranOferta = items.some((it) => (Number(it.ofertaDescuento) || 0) > 0);
+    const ofertasActivas = new Map<number, any>(
+      declaranOferta ? ((await this.ofertas.activas()) as any[]).map((o) => [o.id, o]) : [],
+    );
+
+    return items.map((it) => {
+      const prod = prodDe.get(Number(it.productoId));
+      if (!prod) throw new BadRequestException('Uno de los artículos del ticket no existe.');
+      const presId = it.presentacionId ?? null;
+      const pres = presId ? presDe.get(presId) : null;
+      if (presId && (!pres || pres.productoId !== prod.id)) {
+        throw new BadRequestException(`El envasado que se está vendiendo no es de ${prod.nombre}.`);
+      }
+      const etiqueta = `${prod.nombre}${pres ? ` (${pres.tamKg} kg)` : ''}`;
+      const cantidad = Number(it.cantidad) || 0;
+
+      /* -- El costo con el que se cotiza, igual que en el catálogo del POS -- */
+      const suyos = provs.filter((x) => x.productoId === prod.id);
+      const costoBase = costoNetoEntry(formatoActivo(suyos), prod.iva);
+      const costo = pres ? costoNetoPresentacion(costoBase, pres.tamKg) : costoBase;
+
+      /* -- El formato de venta del artículo, ordenado por preferencia -- */
+      const suyas = filas
+        .filter((f) => f.productoId === prod.id && (f.presentacionId ?? null) === presId && listaDe.has(f.listaId))
+        .map((f) => ({ fila: f, lista: listaDe.get(f.listaId)! }))
+        .sort((a, b) => a.lista.orden - b.lista.orden);
+      if (!suyas.length) {
+        throw new BadRequestException(
+          `${etiqueta} no tiene formato de venta cargado: no se puede vender hasta que tenga precio.`,
+        );
+      }
+
+      /*
+       * EL PISO. Es la lista base si el artículo la tiene cargada; si no, la
+       * última de las suyas — misma caída que el motor del POS, para que un
+       * producto sin el piso siga siendo vendible en vez de quedar trabado.
+       */
+      const piso = suyas.find((s) => s.lista.id === baseId) ?? suyas[suyas.length - 1];
+
+      const elegida = it.listaId ? suyas.find((s) => s.fila.listaId === it.listaId) : piso;
+      if (!elegida) {
+        throw new BadRequestException(
+          `${etiqueta} no se vende con esa lista de precios. Elegí una de las que tiene cargadas.`,
+        );
+      }
+
+      /*
+       * ¿VIENE COTIZADO? El renglón del presupuesto confirmado y vigente que
+       * esta venta cierra, si lo hay. Es la puerta que se abre antes que las
+       * otras: la casa ya le puso precio por escrito a este artículo.
+       */
+      const congelado = congelados.get(`${prod.id}:${presId ?? ''}`) ?? null;
+
+      /* -- ¿Se ganó esa lista? Las cuatro puertas, en O -- */
+      const esPiso = elegida.fila.listaId === piso.fila.listaId;
+      const minimo = Number(elegida.fila.unidadesMinimas) || 0;
+      /*
+       * El mínimo se mide contra lo que el TICKET lleva de ese producto, no
+       * contra este renglón: es la misma cuenta que hace el motor del POS
+       * (`agregadosTicket`). Si midiera el renglón, un ticket con el mismo
+       * producto en dos renglones tendría el precio habilitado en la pantalla y
+       * rechazado por la API — y el cajero se enteraría al cobrar.
+       */
+      const llevadas = porProducto.get(prod.id) ?? cantidad;
+      const habilitada = esPiso
+        || !!congelado
+        || delCliente.has(elegida.fila.listaId)
+        || (minimo > 0 && llevadas + 1e-9 >= minimo)
+        || !!modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId)
+        || (modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto);
+      if (!habilitada && !puedePisarPrecio) {
+        throw new BadRequestException(
+          `${etiqueta}: el ticket no habilita la lista ${elegida.lista.nombre}`
+          + `${minimo > 0 ? ` (pide ${minimo} unidades y el ticket lleva ${llevadas})` : ''}`
+          + '. Hace falta el permiso para pisar precios.',
+        );
+      }
+
+      /* -- El precio: el de la fila, salvo que se pise con permiso -- */
+      const netoLista = money(precioVentaFila(costo, elegida.fila, { iva: prod.iva, redondeo }).netoUnitario);
+      const pedido = it.precioUnitario != null ? money(it.precioUnitario) : netoLista;
+      const difiere = Math.abs(pedido - netoLista) > 0.01;
+      /*
+       * EL PRECIO COTIZADO NO ES UN PRECIO PISADO.
+       *
+       * Un presupuesto existe para que el precio no se mueva entre que se cotiza
+       * y que se cobra — para eso tiene vencimiento. Sin esta excepción, todo
+       * pedido cotizado con una lista que no fuera la base dejaba de poder
+       * cerrarse en el POS apenas los precios cambiaban: el vendedor veía
+       * "hace falta el permiso para pisar precios" sobre un pedido que la casa
+       * ya había prometido por escrito.
+       *
+       * No es un agujero: el precio tiene que coincidir con el renglón de un
+       * presupuesto CONFIRMADO y VIGENTE de ESTE cliente, cargado de la base
+       * (ver `congeladosDePresupuesto`). No es un número que el cliente HTTP
+       * elige — es uno que ya está escrito en un documento.
+       */
+      const honraCotizado = !!congelado && Math.abs(pedido - congelado.precioLista) <= 0.01;
+      const pisado = difiere && !honraCotizado;
+      if (pisado && !puedePisarPrecio) {
+        throw new BadRequestException(
+          `${etiqueta}: el precio de la lista ${elegida.lista.nombre} es $${netoLista.toFixed(2)} `
+          + `y se está cobrando $${pedido.toFixed(2)}. Hace falta el permiso para pisar precios.`,
+        );
+      }
+      if (pisado && pedido < 0) throw new BadRequestException(`${etiqueta}: el precio no puede ser negativo.`);
+
+      /* -- El descuento: 0..100 por DTO, y el tope de la configuración acá -- */
+      const desc = Number(it.descuento) || 0;
+      const tope = Number(config.descuentoMaxVendedor) || 0;
+      if (desc > tope + 1e-9 && !puedePisarPrecio) {
+        throw new BadRequestException(
+          `${etiqueta}: el descuento de ${desc}% supera el tope de ${tope}%. Hace falta el permiso para pisar precios.`,
+        );
+      }
+
+      /*
+       * LA OFERTA. El importe que descuenta lo calcula el motor del POS, así que
+       * acá no se recalcula: se ACOTA. La promo tiene que existir y estar activa,
+       * y si es de las que se expresan en porcentaje, no puede descontar más que
+       * ese porcentaje del renglón.
+       *
+       * PENDIENTE anotado en /info: para `nxm`, `pack`, `precio_fijo` y `combo` el
+       * techo sigue siendo el bruto del renglón, porque el importe exacto depende
+       * del alcance y de los componentes — eso pide reevaluar las ofertas en el
+       * servidor, que es trabajo aparte.
+       */
+      let ofertaDesc = Math.max(0, Number(it.ofertaDescuento) || 0);
+      let ofertaId = it.ofertaId ?? null;
+      if (ofertaDesc > 0) {
+        const of = ofertaId ? ofertasActivas.get(ofertaId) : null;
+        if (!of) {
+          throw new BadRequestException(`${etiqueta}: la oferta que descuenta ese importe no está activa.`);
+        }
+        /*
+         * PRIMERO EL ALCANCE, que no se miraba en absoluto: alcanzaba con que
+         * existiera UNA promo activa en el sistema para colgarle su descuento a
+         * cualquier producto. Con un 3×2 de galletitas vivo, un renglón de aceite
+         * de $80.000 se cobraba $1 y quedaba registrado como "promo aplicada".
+         */
+        if (!ofertaAlcanza(of, {
+          productoId: prod.id, presentacionId: presId,
+          marcaId: prod.marcaId as number | null, categoriaId: prod.categoriaId as number | null,
+          etiquetas: etiquetasDe.get(prod.id) ?? [],
+        })) {
+          throw new BadRequestException(
+            `${etiqueta}: la oferta "${of.nombre}" no incluye este artículo.`,
+          );
+        }
+        /*
+         * Y DESPUÉS EL TECHO, ahora por mecánica y no solo para las de
+         * porcentaje. El importe exacto lo sigue calculando el motor del POS
+         * (recalcula con cada tecla); acá se acota cuánto puede llegar a ser.
+         *
+         * `null` es el combo y la de ticket: su ahorro se reparte entre renglones
+         * de productos distintos, así que no se puede derivar de este renglón
+         * solo. Para esos dos el techo sigue siendo el bruto —queda anotado en
+         * Pendientes— pero ya no se les puede pedir prestado el descuento para
+         * otro producto, que era la parte grave.
+         */
+        const techo = techoDeOferta(of, {
+          cantidad, precioUnitario: pedido, descuento: desc, iva: prod.iva,
+        });
+        if (techo != null && ofertaDesc > techo + 0.01) {
+          throw new BadRequestException(
+            `${etiqueta}: la oferta "${of.nombre}" descuenta hasta $${techo.toFixed(2)} y se está aplicando $${ofertaDesc.toFixed(2)}.`,
+          );
+        }
+      } else {
+        // Sin importe no hay promo: se limpia la etiqueta para que el ticket no
+        // diga "3×2" en un renglón que se cobró entero.
+        ofertaId = null;
+        ofertaDesc = 0;
+      }
+
+      return {
+        ...it,
+        cantidad,
+        listaId: elegida.fila.listaId,
+        lista: elegida.lista.etiqueta || elegida.lista.nombre || '',
+        /*
+         * El origen lo dice el SERVIDOR, no es una etiqueta que el cliente elige
+         * para que su renglón parezca legal. 'presupuesto' va primero porque es
+         * lo contrario de 'manual' aunque los dos se salgan del precio de lista:
+         * uno está respaldado por un documento y el otro es alguien tocándolo en
+         * el mostrador. Confundirlos volvería inútil esta columna, que existe
+         * justamente para poder auditar quién regala precio mayorista.
+         */
+        listaOrigen: honraCotizado ? 'presupuesto' : (pisado ? 'manual' : (esPiso ? 'base' : 'auto')),
+        /*
+         * `precioLista` es el de la fila... salvo en el cotizado, donde el precio
+         * de referencia ES el que se prometió: si acá quedara el de hoy, el
+         * ticket mostraría un "descuento" fantasma por la diferencia entre el
+         * precio viejo y el nuevo, y ese número entra en los reportes.
+         */
+        precioLista: honraCotizado ? congelado!.precioLista : netoLista,
+        precioUnitario: pedido,
+        descuento: desc,
+        ofertaId,
+        ofertaDescuento: ofertaDesc,
+        iva: prod.iva,
+      } as RenglonResuelto;
+    });
+  }
+
+  /**
    * Neto, descuento, IVA y total de ítems + extras. Un único lugar para que el
    * borrador, la edición y la confirmación no puedan descuadrar entre sí.
+   *
+   * Recibe los renglones YA resueltos por `resolverRenglones`: acá solo hay
+   * aritmética, y ningún número de esta función viene del cliente sin pasar por
+   * ese portero.
+   *
+   * SE REDONDEA RENGLÓN POR RENGLÓN, y no una sola vez al final. Son dos cosas:
+   *
+   *  1. El renglón se GUARDA redondeado (`subtotal: money(neto)`), así que
+   *     acumular el neto crudo dejaba una cabecera que no era la suma de sus
+   *     propias filas: el ticket impreso no cerraba consigo mismo.
+   *  2. El POS suma exactamente así (`totalesTicket` en domain/pos.js redondea
+   *     cada renglón). Con cuatro renglones de granel de medio centavo la
+   *     diferencia llegaba a $0,02 y `validarPagos` —que tolera un centavo—
+   *     rechazaba el cobro con "los pagos suman $X y el total es $Y", con el
+   *     cliente enfrente y sin nada para corregir en pantalla.
    */
-  private calcularTotales(itemsDto: VentaItemDto[] = [], extrasDto: VentaExtraDto[] = []) {
+  private calcularTotales(itemsDto: RenglonResuelto[] = [], extrasDto: VentaExtraDto[] = []) {
     let subtotalNeto = 0;
     let descuentoTotal = 0;
     let ivaTotal = 0;
@@ -805,14 +1383,19 @@ export class VentasService {
       const desc = Number(it.descuento) || 0;
       const ivaP = it.iva != null ? Number(it.iva) : 21;
 
-      const bruto = cantidad * precioUnitario;
+      const brutoCrudo = cantidad * precioUnitario;
+      const bonificado = brutoCrudo * (1 - desc / 100);
       // La oferta resta un IMPORTE neto después del descuento porcentual; el
       // tope en 0 evita que una promo mal calculada deje un renglón negativo.
-      const ofertaDesc = Math.min(Math.max(0, Number(it.ofertaDescuento) || 0), bruto * (1 - desc / 100));
-      const neto = bruto * (1 - desc / 100) - ofertaDesc;
+      const ofertaDesc = Math.min(Math.max(0, Number(it.ofertaDescuento) || 0), bonificado);
+      const netoCrudo = bonificado - ofertaDesc;
+      const bruto = money(brutoCrudo);
+      const neto = money(netoCrudo);
       subtotalNeto += neto;
       descuentoTotal += bruto - neto;
-      ivaTotal += (neto * ivaP) / 100;
+      // El IVA sale del neto SIN redondear y se redondea después, igual que
+      // `calcularRenglon` del POS: mismo número en la pantalla y en el papel.
+      ivaTotal += money((netoCrudo * ivaP) / 100);
 
       return {
         productoId: it.productoId,
@@ -1007,7 +1590,11 @@ export class VentasService {
     }
   }
 
-  async create(dto: CreateVentaDto) {
+  /**
+   * `opciones` es lo que el CONTROLLER resolvió de la sesión, y no puede venir
+   * del body: la sucursal donde se vende y si esta persona puede pisar precios.
+   */
+  async create(dto: CreateVentaDto, opciones: OpcionesVenta = {}) {
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.consumidorFinal();
     if (!cliente.activo) throw new BadRequestException('El cliente está desactivado.');
@@ -1020,14 +1607,38 @@ export class VentasService {
     await this.validarSoloFraccionar(dto.items ?? []);
     await this.validarEstadoVendible(dto.items ?? []);
 
-    const tot = this.calcularTotales(dto.items ?? [], dto.extras ?? []);
-    const condicionPago = dto.condicionPago ?? 'contado';
-    const sucursalId = dto.sucursalId ?? cliente.sucursalId ?? null;
+    // La sucursal se resuelve ANTES del portero: el presupuesto que el ticket
+    // dice cerrar se valida contra ella.
+    const sucursalId = opciones.sucursalSesion ?? cliente.sucursalId ?? null;
     if (!sucursalId) throw new BadRequestException('Indicá la sucursal de la venta.');
+
+    /* El portero corre TAMBIÉN en el borrador: el precio del renglón se guarda
+     * al armarlo, y `confirmar` cobra lo que está guardado sin recalcular. Si
+     * solo se validara al confirmar, el precio inventado ya estaría adentro. */
+    const congelados = await this.congeladosDePresupuesto(dto.presupuestoId, cliente.id, sucursalId);
+    const items = await this.resolverRenglones(
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados,
+    );
+    const tot = this.calcularTotales(items, dto.extras ?? []);
+    const condicionPago = dto.condicionPago ?? 'contado';
+    /*
+     * TOTAL POSITIVO. Con el IVA del producto ya no puede dar negativo, pero un
+     * ticket de $0 igual no es una venta: es mercadería que sale sin cobrarse.
+     * Una devolución se hace con nota de crédito, no con un total en cero.
+     */
+    if (!esBorrador && !(tot.total > 0)) {
+      throw new BadRequestException('El total de la venta tiene que ser mayor a 0.');
+    }
 
     const tipo = dto.tipo ?? (tipoVentaPara(cliente, config) as (typeof TIPOS)[number]);
     const puntoVenta = String(config.puntoVenta || '0001');
-    const fecha = dto.fecha ? new Date(dto.fecha) : new Date();
+    /*
+     * LA FECHA es AHORA, salvo para un jefe. Un cajero podía emitir un ticket
+     * fechado dos meses atrás y colgarlo del turno abierto de hoy: quedaba fuera
+     * de cualquier corte por fecha y adentro del arqueo de hoy. Y una fecha
+     * inválida (`"chau"`) llegaba como `Invalid Date` al insert y salía un 500.
+     */
+    const fecha = fechaDeDocumento(dto.fecha, !!opciones.esJefe);
 
     /* -- Borrador: queda abierto, sin número, sin stock, sin caja -- */
     if (esBorrador) {
@@ -1080,7 +1691,7 @@ export class VentasService {
       }
 
       if (dto.presupuestoId) {
-        await this.cerrarPresupuesto(tx, Number(dto.presupuestoId), v.id, sucursalId, dto.usuarioId);
+        await this.cerrarPresupuesto(tx, Number(dto.presupuestoId), v.id, sucursalId, cliente.id, dto.usuarioId);
       }
 
       await this.inv.egresarStockItems(tx, {
@@ -1103,10 +1714,38 @@ export class VentasService {
    * y sale por la venta, aunque el cajero haya agregado o sacado renglones
    * respecto de lo cotizado.
    */
-  private async cerrarPresupuesto(tx: any, presupuestoId: number, ventaId: number, sucursalId: number, usuarioId?: number | null) {
+  private async cerrarPresupuesto(
+    tx: any, presupuestoId: number, ventaId: number, sucursalId: number,
+    clienteId: number, usuarioId?: number | null,
+  ) {
     const [pre] = await tx.select().from(presupuestos).where(eq(presupuestos.id, presupuestoId)).limit(1);
     if (!pre) throw new BadRequestException('El presupuesto ya no existe.');
     if (pre.estado !== 'confirmado') throw new BadRequestException('Solo se cierra un presupuesto confirmado — actualizá la pantalla.');
+    /*
+     * EL PRESUPUESTO TIENE QUE SER DE ESTE CLIENTE Y DE ESTA SUCURSAL.
+     *
+     * No se verificaba ninguna de las dos, y `presupuestoId` viaja en el body:
+     * un ticket de $1 a Consumidor Final con `presupuestoId: 57` cerraba el
+     * pedido de $480.000 de otro — desaparecía de la bandeja de armado, quedaba
+     * apuntando a esa venta de un peso, y los 300 kg reservados volvían a
+     * disponible para que los comprara cualquiera.
+     *
+     * La de sucursal era peor todavía, porque fallaba en SILENCIO: la reserva se
+     * liberaba con la sucursal de la VENTA, así que un pedido reservado en
+     * Fontana y cerrado desde otra caja liberaba stock donde no había nada
+     * comprometido —`move()` devuelve `false` y nadie mira el retorno— y la
+     * mercadería de Fontana quedaba apartada para siempre, sin ningún documento
+     * abierto que explicara por qué.
+     */
+    if (pre.clienteId !== clienteId) {
+      throw new BadRequestException('Ese presupuesto es de otro cliente.');
+    }
+    if (pre.sucursalId !== sucursalId) {
+      throw new BadRequestException(
+        'Ese presupuesto se cotizó en otra sucursal: tiene la mercadería reservada allá. '
+        + 'Cerralo desde esa caja.',
+      );
+    }
     const gano = await tx.update(presupuestos)
       .set({ estado: 'cerrado', ventaId })
       .where(and(eq(presupuestos.id, pre.id), eq(presupuestos.estado, 'confirmado')))
@@ -1115,8 +1754,9 @@ export class VentasService {
     if (pre.reservado) {
       const preItems = await tx.select().from(presupuestoItems)
         .where(eq(presupuestoItems.presupuestoId, pre.id));
+      // Con la sucursal DEL PRESUPUESTO: es donde está lo comprometido.
       await this.inv.reservarItems(tx, {
-        sucursalId, usuarioId: usuarioId ?? null, liberar: true,
+        sucursalId: pre.sucursalId, usuarioId: usuarioId ?? null, liberar: true,
         descripcion: `${pre.codigo}: cerrado en venta`,
         items: preItems,
       });
@@ -1137,11 +1777,22 @@ export class VentasService {
    * ticket completo (no con un delta): así el estado del servidor siempre es
    * exactamente lo que el cajero ve en pantalla.
    */
-  async actualizar(id: number, dto: CreateVentaDto) {
+  async actualizar(id: number, dto: CreateVentaDto, opciones: OpcionesVenta = {}) {
     const actual = await this.exigirBorrador(id);
+    if (opciones.soloSuSucursal && actual.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Ese ticket es de otra sucursal.');
+    }
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.get(actual.clienteId);
-    const tot = this.calcularTotales(dto.items ?? [], dto.extras ?? []);
+    /* Mismo portero que en el alta: el borrador se edita en cada tecla del POS y
+     * es de donde `confirmar` toma los precios sin volver a calcularlos. El
+     * presupuesto sale del BORRADOR GUARDADO y no del DTO: el cajero sigue
+     * editando el ticket, y el documento que lo respalda no se cambia tecleando. */
+    const congelados = await this.congeladosDePresupuesto(actual.presupuestoId ?? undefined, cliente.id, actual.sucursalId);
+    const items = await this.resolverRenglones(
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados,
+    );
+    const tot = this.calcularTotales(items, dto.extras ?? []);
 
     await this.db.transaction(async (tx) => {
       await tx.update(ventas).set({
@@ -1168,8 +1819,11 @@ export class VentasService {
    * registran los pagos. Los ítems son los que ya están guardados, para que lo
    * que se confirma sea exactamente lo último que se guardó.
    */
-  async confirmar(id: number, dto: ConfirmarVentaDto) {
+  async confirmar(id: number, dto: ConfirmarVentaDto, opciones: OpcionesVenta = {}) {
     const borrador = await this.exigirBorrador(id);
+    if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Ese ticket es de otra sucursal.');
+    }
     if (!borrador.items.length) throw new BadRequestException('El ticket está vacío.');
     // El borrador pudo nacer antes de que el producto se marcara "solo para
     // fraccionar" o se archivara: se re-valida acá, que es donde el stock sale.
@@ -1203,7 +1857,20 @@ export class VentasService {
       await tx.update(ventas).set({
         tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago,
         cajaSesionId: turno?.id ?? null,
-        usuarioId: dto.usuarioId ?? borrador.usuarioId,
+        /*
+         * LA VENTA ES DE QUIEN LA ARMÓ, y quien la cobró va aparte (0060).
+         *
+         * Esta línea decía `dto.usuarioId ?? borrador.usuarioId`, o sea que la
+         * intención estaba escrita: respetar al vendedor del borrador. Pero el
+         * `AutorInterceptor` pone `body.usuarioId` con el de la sesión en TODAS
+         * las escrituras, así que `dto.usuarioId` nunca es `undefined` y el `??`
+         * nunca caía del otro lado. Marta armaba el ticket toda la mañana, Juan
+         * apretaba F2 para cobrarlo porque Marta fue al baño, y la venta quedaba
+         * a nombre de Juan: en el listado, en los reportes por vendedor y en el
+         * movimiento de stock. Con comisiones por vendedor, es plata.
+         */
+        usuarioId: borrador.usuarioId ?? dto.usuarioId ?? null,
+        cobradoPor: dto.usuarioId ?? null,
         observaciones: dto.observaciones ?? borrador.observaciones,
       }).where(eq(ventas.id, id));
 
@@ -1215,11 +1882,12 @@ export class VentasService {
 
       // El borrador nació de un presupuesto: este cobro lo cierra.
       if (borrador.presupuestoId) {
-        await this.cerrarPresupuesto(tx, borrador.presupuestoId, id, sucursalId, dto.usuarioId ?? borrador.usuarioId);
+        await this.cerrarPresupuesto(tx, borrador.presupuestoId, id, sucursalId, cliente.id, dto.usuarioId ?? borrador.usuarioId);
       }
 
       await this.inv.egresarStockItems(tx, {
         sucursalId,
+        // Acá sí va QUIEN COBRÓ: es el que ejecutó el movimiento de stock.
         usuarioId: dto.usuarioId ?? borrador.usuarioId,
         permitirNegativo: !!config.permitirStockNegativo,
         descripcion: `Venta ${borrador.puntoVenta}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
@@ -1230,40 +1898,107 @@ export class VentasService {
     return this.get(id);
   }
 
-  /** Pasa la venta abierta a otro vendedor (cambio de turno, mostrador ocupado). */
-  async delegar(id: number, usuarioId: number) {
-    await this.exigirBorrador(id);
+  /**
+   * Pasa la venta abierta a otro vendedor (cambio de turno, mostrador ocupado).
+   *
+   * DOS candados, no tres. Este comentario prometía un tercero —"y en la misma
+   * sucursal"— que el modelo no puede sostener: `usuarios` NO tiene sucursal,
+   * porque la sucursal vive en la SESIÓN (es lo que permite que el mismo
+   * empleado atienda hoy en Express 2 y mañana en la Distribuidora). Así que se
+   * puede firmar el ticket a nombre de alguien que hoy está en otro mostrador.
+   * El daño es acotado —el borrador no se mueve de esta sucursal, así que el
+   * otro no puede retomarlo— pero es plantarle un ticket a un compañero.
+   *
+   * Cerrarlo de verdad pide decidir el modelo (¿el empleado tiene sucursal fija,
+   * o se mira su última sesión?), y eso es del dueño. Queda anotado en /info; lo
+   * que NO queda es un comentario diciendo que está resuelto.
+   *
+   * Los dos que sí están: el borrador tiene que ser de esta sucursal (o quien
+   * pide es jefe), y el destinatario tiene que estar activo — sin eso se le
+   * robaba el ticket a otro cajero y se le firmaba a un empleado dado de baja.
+   */
+  async delegar(id: number, usuarioId: number, opciones: OpcionesVenta = {}) {
+    const borrador = await this.exigirBorrador(id);
+    if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Ese ticket es de otra sucursal.');
+    }
     const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, usuarioId)).limit(1);
     if (!u) throw new BadRequestException('Usuario inexistente.');
+    if (!u.activo) throw new BadRequestException(`${u.nombre} está dado de baja: no se le puede pasar el ticket.`);
     await this.db.update(ventas).set({ usuarioId }).where(eq(ventas.id, id));
     return this.get(id);
   }
 
-  /** Descarta un borrador. No dejó rastro en stock ni en numeración. */
-  async descartar(id: number) {
-    await this.exigirBorrador(id);
+  /**
+   * Descarta un borrador. No dejó rastro en stock ni en numeración.
+   *
+   * Solo el de la propia sucursal: es un `delete` real, y un loop sobre los ids
+   * que devuelve `GET /ventas?estado=borrador` limpiaba los tickets abiertos de
+   * todas las cajas en el momento de más gente.
+   */
+  async descartar(id: number, opciones: OpcionesVenta = {}) {
+    const borrador = await this.exigirBorrador(id);
+    if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Ese ticket es de otra sucursal.');
+    }
     await this.db.delete(ventas).where(eq(ventas.id, id));
     return { ok: true };
   }
 
   /**
-   * Anulación: devuelve la mercadería al stock. Se bloquea si ya hay una
-   * cobranza imputada — primero se anula la cobranza, si no el saldo del
-   * cliente queda inconsistente.
+   * ANULACIÓN — la operación más delicada del módulo.
+   *
+   * Devuelve la mercadería al stock y saca la venta del arqueo: el turno deja de
+   * esperar esa plata. En una venta al contado eso es exactamente la forma de
+   * tapar un faltante — a las 10 se vende $50.000 en efectivo, a las 19:55 se
+   * anula, el esperado baja $50.000, el stock vuelve (así que el inventario
+   * también cuadra) y el cierre da diferencia 0. Por eso:
+   *
+   *  - pide el permiso `devoluciones` (en el controller);
+   *  - guarda QUIÉN, CUÁNDO y POR QUÉ (0059), y el usuario llega hasta el
+   *    movimiento de reingreso de stock — antes el controller no lo pasaba y el
+   *    movimiento quedaba sin autor, que es justo lo que se necesita para
+   *    investigar esto;
+   *  - NO se puede anular contra un turno ya cerrado: ese arqueo está firmado.
+   *    Una venta de un turno cerrado se corrige con nota de crédito, que deja el
+   *    dinero donde está y registra el ajuste aparte.
+   *
+   * Se sigue bloqueando si hay una cobranza imputada: primero se anula la
+   * cobranza, si no el saldo del cliente queda inconsistente.
    */
-  async anular(id: number, usuarioId?: number) {
+  async anular(id: number, motivo: string, usuarioId?: number, opciones: OpcionesVenta = {}) {
     const v = await this.get(id);
     if (v.estado === 'anulada') throw new BadRequestException('La venta ya está anulada.');
     if (v.estado === 'borrador') throw new BadRequestException('Es una venta abierta: descartala en vez de anularla.');
     if (v.cobrado > 0.009) throw new BadRequestException('Tiene cobranzas imputadas. Anulá primero la cobranza.');
+    if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Esa venta es de otra sucursal.');
+    }
+    const razon = (motivo ?? '').trim();
+    if (!razon) throw new BadRequestException('Indicá por qué se anula la venta.');
+
+    if (v.cajaSesionId) {
+      const turno = await this.caja.getOpcional(v.cajaSesionId);
+      if (turno && turno.estado === 'cerrada' && !opciones.esJefe) {
+        throw new BadRequestException(
+          'El turno de caja de esa venta ya está cerrado: su arqueo quedó firmado. '
+          + 'Corregila con una nota de crédito en vez de anularla.',
+        );
+      }
+    }
 
     await this.db.transaction(async (tx) => {
-      await tx.update(ventas).set({ estado: 'anulada' }).where(eq(ventas.id, id));
+      await tx.update(ventas).set({
+        estado: 'anulada',
+        anuladoPor: usuarioId ?? null,
+        anuladoEn: new Date(),
+        anuladoMotivo: razon,
+      }).where(eq(ventas.id, id));
       if (v.sucursalId) {
         await this.inv.reingresarStockItems(tx, {
           sucursalId: v.sucursalId,
           usuarioId,
-          descripcion: `Anulación venta ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`,
+          descripcion: `Anulación venta ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}: ${razon}`,
           items: v.items,
         });
       }
@@ -1275,7 +2010,7 @@ export class VentasService {
    * Snapshot del módulo Ventas: SOLO catálogos chicos. Deliberadamente no trae
    * ventas ni cobranzas (crecen sin techo) — esas se piden paginadas por panel.
    */
-  async bootstrap() {
+  async bootstrap(sesion?: Sesion) {
     await this.cli.consumidorFinal(); // garantiza el cliente genérico
     const [cls, cfg, sucs, usrsRaw, rolesCat, asignaciones, cat, marcasCat] = await Promise.all([
       this.db.select().from(clientes).orderBy(clientes.nombre),
@@ -1289,13 +2024,25 @@ export class VentasService {
       this.db.select({ id: marcas.id, nombre: marcas.nombre })
         .from(marcas).where(eq(marcas.activa, true)).orderBy(marcas.nombre),
     ]);
-    // Usuarios SIN hash y con su rol dinámico resuelto (clave + permisos).
+    /*
+     * Usuarios SIN hash y con su rol resuelto. LOS PERMISOS VAN SOLO DEL PROPIO
+     * USUARIO: antes viajaba el array completo de cada empleado, o sea el mapa de
+     * quién puede qué en toda la empresa —quién tiene `precio_manual`, quién
+     * `diferencias`— servido a cualquier sesión que abriera cualquier pantalla de
+     * Ventas. Eso es el mapa de a quién apuntar.
+     *
+     * No rompe nada, y está verificado: los dos lugares que leen `permisos`
+     * (`PosPanel` y `PresupuestosPanel`) buscan SU PROPIO usuario en la lista. El
+     * resto solo necesita el nombre para los selectores.
+     */
     const rolDe = new Map(rolesCat.map((r) => [r.id, r]));
     const usrs = usrsRaw.map((u) => {
       const r = rolDe.get(u.rolId);
+      const esYo = u.id === sesion?.usuarioId;
       return {
         id: u.id, nombre: u.nombre, activo: u.activo, rolId: u.rolId,
-        rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '', permisos: r?.permisos ?? [],
+        rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '',
+        permisos: esYo ? (r?.permisos ?? []) : [],
       };
     });
     // Las listas predeterminadas de cada cliente en UNA consulta, no una por
@@ -1314,12 +2061,49 @@ export class VentasService {
   }
 }
 
+/**
+ * VENTAS — el mostrador.
+ *
+ * `ventas.pos` de base (es la pantalla desde donde se hace todo esto), y llaves
+ * propias donde la acción no es "vender": el listado es su propia sección y
+ * anular es la acción `devoluciones`.
+ *
+ * Todo lo que decide QUIÉN y DÓNDE sale de `@Auth()` y viaja en `OpcionesVenta`.
+ * El `usuarioId` del body ya lo pone el `AutorInterceptor` global.
+ */
 @Controller('ventas')
+@Permiso('ventas.pos')
 export class VentasController {
   constructor(private readonly svc: VentasService) {}
 
-  // Las rutas literales van ANTES de ':id' para que Nest no las tome como id.
-  @Get('bootstrap') bootstrap() { return this.svc.bootstrap(); }
+  /**
+   * Lo que el servidor resolvió de la sesión. Un solo lugar para los 6
+   * escritores, así ninguno puede quedarse con una regla distinta.
+   *
+   * `sucursalPedida` es el `sucursalId` del body: una PISTA que solo se respeta
+   * si quien llama es un jefe.
+   */
+  private opciones(sesion: Sesion, sucursalPedida?: number): OpcionesVenta {
+    const jefe = esJefe(sesion);
+    return {
+      sucursalSesion: sucursalDeOperacion(sesion, sucursalPedida),
+      // El jefe cruza sucursales (corrige la carga de otro mostrador); el cajero
+      // solo toca lo suyo. `undefined` = sin restricción.
+      soloSuSucursal: jefe ? undefined : sesion.sucursalId,
+      // La llave que le da sentido del lado del servidor a `descuentoMaxVendedor`
+      // y `overrideListaRequiereAdmin`, que hasta ahora solo vivían en el navegador.
+      puedePisarPrecio: tienePermiso(sesion.permisos, ['precio_manual']),
+      esJefe: jefe,
+    };
+  }
+
+  /*
+   * El BOOTSTRAP lo pide el shell del módulo antes de saber en qué panel va a
+   * entrar, así que lo abre cualquier sección de Ventas: si pidiera `ventas.pos`,
+   * un rol que solo administra clientes no podría entrar a su propia pantalla.
+   */
+  @Get('bootstrap') @Permiso(...SECCIONES_VENTAS)
+  bootstrap(@Auth() sesion: Sesion) { return this.svc.bootstrap(sesion); }
 
   @Get('catalogo')
   catalogo(@Query('sucursalId', ParseIntPipe) sucursalId: number) {
@@ -1329,9 +2113,18 @@ export class VentasController {
   @Get('cuenta/:clienteId')
   cuenta(@Param('clienteId', ParseIntPipe) clienteId: number) { return this.svc.cuenta(clienteId); }
 
-  /** El listado de la pantalla Ventas: filtros + paginado + totales del filtro. */
+  /**
+   * El listado de la pantalla Ventas: filtros + paginado + totales del filtro.
+   *
+   * LA SUCURSAL LA MANDA LA SESIÓN, no el query. El candado del cajero estaba
+   * solo en React (`sucursalFija`): sin `?sucursalId=`, esta consulta devolvía las
+   * ventas de las cinco sucursales con cliente, cajero, medios de pago y el
+   * bloque de totales del período. La facturación del negocio en una URL.
+   */
   @Get('listado')
+  @Permiso('ventas.listado')
   listado(
+    @Auth() sesion: Sesion,
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
     @Query('sucursalId') sucursalId?: string,
@@ -1360,7 +2153,8 @@ export class VentasController {
       estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
       medioPago: uno(medioPago, MEDIOS, 'Medio de pago'),
       origen: uno(origen, ['pos', 'presupuesto'], 'Origen'),
-      sucursalId: num(sucursalId), usuarioId: num(usuarioId),
+      sucursalId: esJefe(sesion) ? num(sucursalId) : sesion.sucursalId,
+      usuarioId: num(usuarioId),
       clienteId: num(clienteId), cajaSesionId: num(cajaSesionId),
       conOferta: conOferta === 'true',
       offset: num(offset), limit: num(limit),
@@ -1368,7 +2162,9 @@ export class VentasController {
   }
 
   @Get()
+  @Permiso('ventas.pos', 'ventas.listado')
   list(
+    @Auth() sesion: Sesion,
     @Query('clienteId') clienteId?: string,
     @Query('sucursalId') sucursalId?: string,
     @Query('estado') estado?: string,
@@ -1377,22 +2173,80 @@ export class VentasController {
     @Query('limit') limit?: string,
     @Query('incluirItems') incluirItems?: string,
   ) {
+    /* El enum se valida ACÁ también: `?estado=xyz` entraba crudo a Postgres y
+     * salía un 500 donde corresponde un 400. `listado` ya lo hacía; este método
+     * era el que faltaba de los dos. */
+    if (estado && !['borrador', 'confirmada', 'anulada', 'pendiente_cae'].includes(estado)) {
+      throw new BadRequestException(`Estado inválido: ${estado}`);
+    }
     return this.svc.list({
       clienteId: clienteId ? Number(clienteId) : undefined,
-      sucursalId: sucursalId ? Number(sucursalId) : undefined,
+      // Misma regla que el listado: el cajero ve la suya y nada más.
+      sucursalId: esJefe(sesion) ? (sucursalId ? Number(sucursalId) : undefined) : sesion.sucursalId,
       estado, desde, hasta,
       limit: limit ? Number(limit) : undefined,
       incluirItems: incluirItems === 'true',
     });
   }
 
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Post() create(@Body() dto: CreateVentaDto) { return this.svc.create(dto); }
-  @Put(':id') actualizar(@Param('id', ParseIntPipe) id: number, @Body() dto: CreateVentaDto) { return this.svc.actualizar(id, dto); }
-  @Post(':id/confirmar') confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarVentaDto) { return this.svc.confirmar(id, dto); }
-  @Post(':id/delegar') delegar(@Param('id', ParseIntPipe) id: number, @Body() dto: DelegarVentaDto) { return this.svc.delegar(id, dto.paraUsuarioId); }
-  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number) { return this.svc.anular(id); }
-  @Delete(':id') descartar(@Param('id', ParseIntPipe) id: number) { return this.svc.descartar(id); }
+  @Get(':id') @Permiso('ventas.pos', 'ventas.listado', 'ventas.cobranzas')
+  get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+
+  /*
+   * VER EL PUNTO DE VENTA Y COBRAR SON DOS PERMISOS, y la API los confundía.
+   *
+   * `ventas.pos` es la clave de la PANTALLA y es la de la clase; `ventas` es la
+   * ACCIÓN de cobrar, existe en el catálogo desde siempre y **no se exigía en
+   * ningún endpoint** — el único lugar que la respetaba era un botón de otra
+   * pantalla. O sea que un rol "Consulta de mostrador", creado para que vean
+   * precios y stock, podía armar un ticket, confirmarlo, descontar stock y
+   * meterle el efectivo al turno del cajero.
+   *
+   * Va sola y no junto a `ventas.pos`: las claves de un mismo `@Permiso` se
+   * evalúan con O, así que ponerlas juntas lo dejaría igual que antes.
+   * Verificado antes de aplicarlo: los cinco roles que hoy ven el POS ya tienen
+   * la acción, así que a nadie se le corta el cobro.
+   */
+  @Post()
+  @Permiso('ventas')
+  create(@Body() dto: CreateVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.create(dto, this.opciones(sesion, dto.sucursalId));
+  }
+
+  @Put(':id')
+  @Permiso('ventas')
+  actualizar(@Param('id', ParseIntPipe) id: number, @Body() dto: CreateVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.actualizar(id, dto, this.opciones(sesion, dto.sucursalId));
+  }
+
+  @Post(':id/confirmar')
+  @Permiso('ventas')
+  confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.confirmar(id, dto, this.opciones(sesion));
+  }
+
+  @Post(':id/delegar')
+  @Permiso('ventas')
+  delegar(@Param('id', ParseIntPipe) id: number, @Body() dto: DelegarVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.delegar(id, dto.paraUsuarioId, this.opciones(sesion));
+  }
+
+  /*
+   * `devoluciones` y no `ventas.pos`: anular le saca el efectivo al arqueo del
+   * turno, así que es la acción con la que se tapa un faltante. El usuario que
+   * queda en `anuladoPor` es el de la sesión — el body no puede mentirlo.
+   */
+  @Post(':id/anular')
+  @Permiso('devoluciones')
+  anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.anular(id, dto.motivo, sesion.usuarioId, this.opciones(sesion));
+  }
+
+  @Delete(':id')
+  @Permiso('ventas')
+  descartar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.descartar(id, this.opciones(sesion));
+  }
 }
 
 @Module({

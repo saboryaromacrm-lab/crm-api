@@ -1,10 +1,11 @@
-import { Inject, Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
-import { and, asc, eq, gte, inArray, isNull, lte, or, desc, sql } from 'drizzle-orm';
+import { Inject, Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { and, asc, eq, gte, inArray, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
+import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
-  comprobantes, comprobanteItems, facturaLecturas, pedidosCafeteria, vencimientos,
+  comprobantes, facturaLecturas, pedidosCafeteria, vencimientos,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
@@ -134,19 +135,52 @@ export class InventarioService {
     const e = await this.getEntry(tx, { productoId, sucursalId, presentacionId, estado });
     return e ? e.cantidad : 0;
   }
-  private async move(tx: any, base: Omit<Coord, 'estado'>, desde: EstadoStock, hacia: EstadoStock, c: number) {
+  /**
+   * MUEVE STOCK DE UN ESTADO A OTRO, o **corta la operación entera**.
+   *
+   * Antes devolvía `false` cuando no había con qué mover, y **ninguno de sus
+   * ocho llamadores miraba el retorno**. Eso no era un descuido de uno: era el
+   * contrato mal elegido, porque el `false` no tiene ningún camino natural hacia
+   * el usuario. La cadena que salía de ahí, con 10 unidades:
+   *
+   *   1. Se confirma la lista de una transferencia. Entre la validación y este
+   *      `move`, una venta del POS se lleva el stock: no se reserva nada, pero
+   *      el movimiento de auditoría "stock reservado" se inserta igual.
+   *   2. El despacho intenta comprometido → en_tránsito y falla igual, en
+   *      silencio, e inserta "despacho hacia destino".
+   *   3. La recepción da por hecho que hay algo en tránsito y suma en el
+   *      destino: **el origen queda en −10 y el destino gana 10 unidades que
+   *      nunca existieron**, con tres movimientos diciendo que todo salió bien.
+   *
+   * Ahora LANZA. Está siempre adentro de una transacción, así que el throw
+   * revierte todo lo que la operación venía haciendo — que es exactamente lo que
+   * se quiere: si la mercadería no está, el documento no se emite.
+   */
+  private async move(tx: any, base: Omit<Coord, 'estado'>, desde: EstadoStock, hacia: EstadoStock, c: number): Promise<void> {
     const from = await this.getOrCreate(tx, { ...base, estado: desde });
-    if (from.cantidad + 1e-9 < c) return false;
+    if (from.cantidad + 1e-9 < c) this.sinStock(desde, from.cantidad, c);
     // El WHERE re-verifica el saldo EN el UPDATE: si otra transacción se llevó
-    // el stock entre la lectura y acá, esto no descuenta de más — devuelve
-    // false y el llamador aborta.
+    // el stock entre la lectura y acá, no descuenta de más — no toca ninguna
+    // fila, y la operación se corta igual que arriba.
     const res: any = await tx.execute(
       sql`UPDATE stock SET cantidad = cantidad - ${c} WHERE id = ${from.id} AND cantidad >= ${c} - 1e-9`,
     );
-    if (!res.rowCount) return false;
+    if (!res.rowCount) this.sinStock(desde, from.cantidad, c);
     const to = await this.getOrCreate(tx, { ...base, estado: hacia });
     await tx.execute(sql`UPDATE stock SET cantidad = cantidad + ${c} WHERE id = ${to.id}`);
-    return true;
+  }
+
+  /** Un solo mensaje para las dos salidas de `move`, en castellano de mostrador. */
+  private sinStock(estado: EstadoStock, hay: number, pedido: number): never {
+    const donde: Record<string, string> = {
+      disponible: 'disponible', comprometido: 'comprometido',
+      en_transito: 'en tránsito', retenido: 'retenido',
+      defectuoso: 'como defectuoso', vencido: 'como vencido',
+    };
+    throw new BadRequestException(
+      `No hay stock ${donde[estado] ?? estado} suficiente: hay ${Math.round(hay * 1000) / 1000} y hacen falta ${pedido}. `
+      + 'La operación no se registró.',
+    );
   }
 
   /* ------------------------- Costos / precios ------------------------- */
@@ -264,7 +298,10 @@ export class InventarioService {
           await this.marcarFormatoActivo(tx, prod.id, formato.id);
         }
       }
-      const venc = o.fechaVencimiento ? new Date(o.fechaVencimiento) : null;
+      /* Misma trampa: un vencimiento '2026-09-01' se guardaba como el 31/8 a las
+       * 21 h, y el vigía de fechas lo daba por vencido un día antes. El módulo
+       * de Vencimientos ya lo parsea así; acá faltaba. */
+      const venc = fechaLocal(o.fechaVencimiento);
       const m = await this.mov(tx, {
         tipo: 'compra', productoId: prod.id, sucursalId: sucId, signo: 1, cantidad: c,
         unidad: this.unidadDe(prod.tipo, null), estadoHacia: 'disponible', usuarioId: o.usuarioId ?? null,
@@ -787,9 +824,9 @@ export class InventarioService {
    * Los renglones en 0 se guardan igual: recién agregado y sin tipear todavía
    * es un estado normal mientras se arma. Se limpian al enviar.
    */
-  async guardarBorrador(id: number, o: { items?: any[]; observaciones?: string; usuarioId?: number }) {
+  async guardarBorrador(id: number, o: { items?: any[]; observaciones?: string; usuarioId?: number }, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.borradorVigente(tx, id);
+      const t = await this.borradorVigente(tx, id, soloSuc);
       const crudos = Array.isArray(o.items) ? o.items : [];
       if (crudos.length > 300) throw new BadRequestException('Demasiados renglones en un pedido (máximo 300).');
 
@@ -831,9 +868,9 @@ export class InventarioService {
    * origen lo ve en su bandeja. Los renglones en 0 se van (son los que se
    * agregaron y nunca se completaron).
    */
-  async enviarBorrador(id: number, o: { usuarioId?: number } = {}) {
+  async enviarBorrador(id: number, o: { usuarioId?: number } = {}, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.borradorVigente(tx, id);
+      const t = await this.borradorVigente(tx, id, soloSuc);
       const items = await tx.select().from(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
       const vacios = items.filter((it: any) => !(it.cantidad > 1e-9));
       if (items.length - vacios.length === 0) {
@@ -858,9 +895,9 @@ export class InventarioService {
    * no tuvo código, no tocó stock y nadie lo vio. Dejarlo como "cancelada"
    * llenaría el historial de pedidos que jamás existieron.
    */
-  async descartarBorrador(id: number) {
+  async descartarBorrador(id: number, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.borradorVigente(tx, id);
+      const t = await this.borradorVigente(tx, id, soloSuc);
       await tx.delete(transferenciaItems).where(eq(transferenciaItems.transferenciaId, t.id));
       await tx.delete(transferenciaHist).where(eq(transferenciaHist.transferenciaId, t.id));
       await tx.delete(transferencias).where(eq(transferencias.id, t.id));
@@ -869,9 +906,35 @@ export class InventarioService {
   }
 
   /** Guarda común de los tres de arriba: existe y TODAVÍA es borrador. */
-  private async borradorVigente(tx: any, id: number) {
+  /**
+   * EL DUEÑO DE CADA LADO DEL REMITO (decisión del dueño, 13/8/2026).
+   *
+   * La red es pull: cada sucursal **pide** y **recibe** lo que llega a ella
+   * (`destinoId`) y **prepara** lo que sale de ella (`origenId`). El único
+   * pedido que prepara alguien que no es su dueño es el de la Cafetería, y ese
+   * va por otro circuito.
+   *
+   * `soloSuc` es `null` para el jefe, que atraviesa las tres puntas.
+   */
+  private exigirLado(t: any, soloSuc: number | null | undefined, lado: 'origenId' | 'destinoId') {
+    if (soloSuc == null) return;
+    if (t[lado] !== soloSuc) {
+      throw new ForbiddenException(
+        lado === 'destinoId'
+          ? 'Ese pedido es de otra sucursal: lo pide y lo recibe ella.'
+          : 'Esa transferencia sale de otra sucursal: la prepara ella.',
+      );
+    }
+  }
+
+  private async borradorVigente(tx: any, id: number, soloSuc?: number | null) {
     const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
     if (!t) throw new NotFoundException('Pedido inexistente.');
+    /* Contra el DESTINO: el borrador es el pedido del día de una ruta, y se
+     * guarda solo. Un `PUT` con `items: []` sobre el id de otra ruta le borraba
+     * a esa sucursal el trabajo de toda la jornada, y el borrador no tiene
+     * historial: desaparecía sin dejar rastro. */
+    this.exigirLado(t, soloSuc, 'destinoId');
     if (t.estado !== 'borrador') {
       throw new BadRequestException('Este pedido ya se envió: no se edita como borrador.');
     }
@@ -886,9 +949,11 @@ export class InventarioService {
    * fue confirmada todavía (confirmada = mercadería apartada y reservada; para
    * tocarla hay que desconfirmar primero).
    */
-  private async transferEnPreparacion(tx: any, id: number) {
+  private async transferEnPreparacion(tx: any, id: number, soloSuc?: number | null) {
     const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
     if (!t) throw new NotFoundException('Transferencia inexistente.');
+    // Contra el ORIGEN: preparar es sacar mercadería del propio depósito.
+    this.exigirLado(t, soloSuc, 'origenId');
     if (t.estado !== 'preparada') throw new BadRequestException('Solo se edita durante la preparación.');
     return t;
   }
@@ -898,9 +963,9 @@ export class InventarioService {
   }
 
   /** Edita cantidad preparada y/o motivo de un renglón, con su lista sin confirmar. */
-  async editarItemTransferencia(id: number, itemId: number, o: { cantidadPreparada?: number; motivo?: string }) {
+  async editarItemTransferencia(id: number, itemId: number, o: { cantidadPreparada?: number; motivo?: string }, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.transferEnPreparacion(tx, id);
+      const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const [it] = await tx.select().from(transferenciaItems)
         .where(and(eq(transferenciaItems.id, itemId), eq(transferenciaItems.transferenciaId, id))).limit(1);
       if (!it) throw new NotFoundException('Renglón inexistente.');
@@ -927,9 +992,9 @@ export class InventarioService {
    * `cantidad` (lo pedido) queda en 0: nadie lo pidió — el remito lo muestra
    * como "Agregado".
    */
-  async agregarItemTransferencia(id: number, o: { productoId: number; presId?: number | null; cantidad: number; motivo?: string }) {
+  async agregarItemTransferencia(id: number, o: { productoId: number; presId?: number | null; cantidad: number; motivo?: string }, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.transferEnPreparacion(tx, id);
+      const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const prod = await this.getProducto(tx, o.productoId);
       if (!prod) throw new BadRequestException('Producto inválido.');
       if (this.listaBloqueada(t, this.listaDe(prod.tipo))) {
@@ -947,9 +1012,9 @@ export class InventarioService {
   }
 
   /** Quita un renglón agregado (los pedidos por el destino no se borran: se ponen en 0). */
-  async quitarItemTransferencia(id: number, itemId: number) {
+  async quitarItemTransferencia(id: number, itemId: number, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const t = await this.transferEnPreparacion(tx, id);
+      const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const [it] = await tx.select().from(transferenciaItems)
         .where(and(eq(transferenciaItems.id, itemId), eq(transferenciaItems.transferenciaId, id))).limit(1);
       if (!it) throw new NotFoundException('Renglón inexistente.');
@@ -972,10 +1037,10 @@ export class InventarioService {
    * El reclamo del flag es atómico (`WHERE flag = <contrario>`): dos clics
    * simultáneos en Confirmar reservarían dos veces — solo uno gana el UPDATE.
    */
-  async confirmarListaTransferencia(id: number, o: { tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number }) {
+  async confirmarListaTransferencia(id: number, o: { tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number }, soloSuc?: number | null) {
     if (o.tipo !== 'enteros' && o.tipo !== 'granel') throw new BadRequestException('Lista inválida.');
     return this.db.transaction(async (tx) => {
-      const t = await this.transferEnPreparacion(tx, id);
+      const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const col = o.tipo === 'enteros' ? transferencias.enterosListo : transferencias.granelListo;
       const gano = await tx.update(transferencias)
         .set(o.tipo === 'enteros' ? { enterosListo: o.listo } : { granelListo: o.listo })
@@ -1063,10 +1128,12 @@ export class InventarioService {
    * pendiente. Sin eso, el doble clic en Preparar ejecutaba dos pasos — el
    * segundo request encontraba la transferencia ya preparada y la despachaba.
    */
-  async avanzarTransferencia(id: number, usuarioId?: number, desde?: string) {
+  async avanzarTransferencia(id: number, usuarioId?: number, desde?: string, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
+      // Avanzar es preparar y despachar: sale del depósito del ORIGEN.
+      this.exigirLado(t, soloSuc, 'origenId');
       if (desde && t.estado !== desde) {
         throw new BadRequestException('La transferencia cambió de estado — actualizá la pantalla.');
       }
@@ -1129,10 +1196,14 @@ export class InventarioService {
    * merma/vencido/defectuoso), así que el faltante se cierra con el circuito
    * que ya existe, sin uno nuevo.
    */
-  async recibirTransferencia(id: number, o: { items?: { itemId: number; cantidadRecibida: number }[]; usuarioId?: number; observaciones?: string } = {}) {
+  async recibirTransferencia(id: number, o: { items?: { itemId: number; cantidadRecibida: number }[]; usuarioId?: number; observaciones?: string } = {}, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
+      /* Contra el DESTINO: cualquiera cerraba el remito ajeno declarando 0
+       * recibido, y los kilos quedaban comprometidos en el origen atados a
+       * incidencias que alguien tenía que investigar. */
+      this.exigirLado(t, soloSuc, 'destinoId');
       if (t.estado !== 'transito') throw new BadRequestException('Solo se recibe lo que está en tránsito.');
       // Mismo reclamo atómico que en avanzar: dos recepciones simultáneas del
       // mismo remito duplicarían el ingreso al destino.
@@ -1163,7 +1234,25 @@ export class InventarioService {
         await tx.update(transferenciaItems).set({ cantidadRecibida: rec }).where(eq(transferenciaItems.id, it.id));
 
         if (rec > 1e-9) {
-          // Lo recibido: sale del origen (en_transito) y entra al destino.
+          /*
+           * Lo recibido: sale del origen (en_transito) y entra al destino.
+           *
+           * EL EGRESO SE VERIFICA ANTES. `addDelta` resta sin piso, así que si
+           * el tránsito no tenía esas unidades —porque la reserva o el despacho
+           * fallaron antes en silencio— el origen quedaba en NEGATIVO y el
+           * destino sumaba igual: un agujero de un lado y stock inventado del
+           * otro, con los movimientos diciendo que todo salió bien. Estamos
+           * dentro de la transacción, así que el throw revierte la recepción
+           * entera: nadie firma un remito que no ocurrió.
+           */
+          const enTransito = await this.cant(tx, it.productoId, t.origenId, it.presentacionId, 'en_transito');
+          if (enTransito + 1e-9 < rec) {
+            throw new BadRequestException(
+              `${t.codigo}: ${prod.nombre} figura con ${this.fmtCant(prod.tipo, it.presentacionId, enTransito)} en tránsito `
+              + `y se están recibiendo ${this.fmtCant(prod.tipo, it.presentacionId, rec)}. `
+              + 'El remito quedó inconsistente: revisalo antes de recibirlo.',
+            );
+          }
           await this.addDelta(tx, { productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId, estado: 'en_transito' }, -rec);
           await this.mov(tx, {
             tipo: 'transferencia', productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId, signo: -1,
@@ -1212,10 +1301,12 @@ export class InventarioService {
     });
   }
 
-  async cancelarTransferencia(id: number) {
+  async cancelarTransferencia(id: number, usuarioId?: number, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
+      // Cancelar libera la reserva del ORIGEN: es de quien la preparó.
+      this.exigirLado(t, soloSuc, 'origenId');
       // El borrador no se cancela: se descarta y se borra (nunca fue documento).
       if (t.estado === 'borrador') throw new BadRequestException('Este pedido todavía se está armando: se descarta, no se cancela.');
       if (t.estado !== 'pendiente' && t.estado !== 'preparada') throw new BadRequestException('Solo se cancelan transferencias pendientes o preparadas.');
@@ -1239,6 +1330,9 @@ export class InventarioService {
           await this.mov(tx, {
             tipo: 'transferencia', productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId, signo: 0,
             cantidad: it.cantidadPreparada, unidad: this.unidadDe(prod.tipo, it.presentacionId), estadoDesde: 'comprometido', estadoHacia: 'disponible',
+            // Quién canceló. Liberar una reserva le devuelve a la góndola algo
+            // que otro había apartado: sin autor, el movimiento era anónimo.
+            usuarioId: usuarioId ?? null,
             refTransferenciaId: t.id, descripcion: `${t.codigo}: cancelada, stock liberado`,
           });
         }
@@ -1249,7 +1343,7 @@ export class InventarioService {
   }
 
   /* ============================ INCIDENCIAS ============================ */
-  async crearIncidencia(o: any) {
+  async crearIncidencia(o: any, autorId?: number) {
     return this.db.transaction(async (tx) => {
       const prod = await this.getProducto(tx, o.productoId);
       if (!prod) throw new BadRequestException('Producto inválido.');
@@ -1269,25 +1363,70 @@ export class InventarioService {
       await this.mov(tx, {
         tipo: 'ajuste', productoId: prod.id, sucursalId: sucId, presentacionId: presId, signo: 0, cantidad: c,
         unidad: this.unidadDe(prod.tipo, presId), estadoDesde: 'disponible', estadoHacia: 'comprometido',
-        refIncidenciaId: inc.id, usuarioId: o.responsableId ?? null, descripcion: `${codigo} (${o.tipo}): ${this.fmtCant(prod.tipo, presId, c)} a comprometido`,
+        /*
+         * EL AUTOR DEL MOVIMIENTO ES QUIEN LO HIZO, no el "responsable".
+         *
+         * Acá decía `o.responsableId`, que lo elige el cliente de un desplegable
+         * con todos los usuarios: se cargaba una incidencia por 40 kg "a nombre
+         * de Marta" y, cuando alguien la resolviera como merma, la pérdida
+         * figuraba contra ella. El login promete en pantalla que lo que hacés
+         * queda registrado a tu nombre.
+         *
+         * `responsableId` sigue existiendo en la incidencia porque es OTRO dato
+         * —a quién se le atribuye el faltante— y son cosas distintas: uno cargó
+         * el papel, al otro se lo están imputando.
+         */
+        refIncidenciaId: inc.id, usuarioId: autorId ?? null, descripcion: `${codigo} (${o.tipo}): ${this.fmtCant(prod.tipo, presId, c)} a comprometido`,
       });
       return { ok: true, id: inc.id, codigo };
     });
   }
 
-  async avanzarIncidencia(id: number) {
+  async avanzarIncidencia(id: number, soloSuc?: number | null) {
     const [inc] = await this.db.select().from(incidencias).where(eq(incidencias.id, id)).limit(1);
     if (!inc) throw new NotFoundException('Incidencia inexistente.');
-    if (inc.estado !== 'pendiente') throw new BadRequestException("Usá 'Resolver' para cerrar la incidencia.");
-    await this.db.update(incidencias).set({ estado: 'revision' }).where(eq(incidencias.id, id));
+    if (soloSuc != null && inc.sucursalId !== soloSuc) {
+      throw new ForbiddenException('Esa incidencia es de otra sucursal.');
+    }
+    // Reclamo condicional, igual que el resto del módulo: sin él, dos clics
+    // pisaban el estado y el `if` de arriba miraba una foto vieja.
+    const gano = await this.db.update(incidencias).set({ estado: 'revision' })
+      .where(and(eq(incidencias.id, id), eq(incidencias.estado, 'pendiente')))
+      .returning({ id: incidencias.id });
+    if (!gano.length) throw new BadRequestException("Usá 'Resolver' para cerrar la incidencia.");
     return { ok: true };
   }
 
-  async resolverIncidencia(id: number, resolucion: string) {
+  async resolverIncidencia(id: number, resolucion: string, autorId?: number, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
-      const [inc] = await tx.select().from(incidencias).where(eq(incidencias.id, id)).limit(1);
+      /*
+       * LA ÚNICA TRANSICIÓN DEL MÓDULO QUE NO RECLAMABA SU ESTADO, y con eso
+       * INVENTABA UNIDADES.
+       *
+       * Todo el resto de Almacén usa `FOR UPDATE` o un `WHERE estado = <el que
+       * leí>`; acá se leía la fila suelta, se movía el stock y recién después se
+       * marcaba 'resuelta'. Un doble clic con la base cargada: las dos
+       * ejecuciones leen `comprometido = 10`, las dos pasan el chequeo, y las dos
+       * aplican el delta RELATIVO — `comprometido = 10 − 10 − 10 = −10` y
+       * `disponible = +20`. Diez unidades de la nada. Con `merma`, la pérdida se
+       * asienta dos veces en el reporte.
+       *
+       * El candado va en dos capas y las dos hacen falta: `FOR UPDATE` serializa
+       * a la segunda hasta que la primera termina, y el reclamo condicional de
+       * abajo hace que esa segunda encuentre el estado ya cambiado.
+       */
+      const [inc] = await tx.select().from(incidencias)
+        .where(eq(incidencias.id, id)).limit(1).for('update');
       if (!inc) throw new NotFoundException('Incidencia inexistente.');
+      if (soloSuc != null && inc.sucursalId !== soloSuc) {
+        throw new ForbiddenException('Esa incidencia es de otra sucursal.');
+      }
       if (inc.estado === 'resuelta') throw new BadRequestException('La incidencia ya está resuelta.');
+      const reclamada = await tx.update(incidencias)
+        .set({ estado: 'resuelta' })
+        .where(and(eq(incidencias.id, id), ne(incidencias.estado, 'resuelta')))
+        .returning({ id: incidencias.id });
+      if (!reclamada.length) throw new BadRequestException('La incidencia ya está resuelta.');
       const prod = await this.getProducto(tx, inc.productoId);
       const c = inc.cantidad;
       const comprom = await this.cant(tx, prod.id, inc.sucursalId, inc.presentacionId, 'comprometido');
@@ -1300,7 +1439,8 @@ export class InventarioService {
       else if (resolucion === 'vencido') { tipoMov = 'vencido'; await this.addDelta(tx, { productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId, estado: 'vencido' }, c); estadoHacia = 'vencido'; }
       else if (resolucion === 'defectuoso') { tipoMov = 'defectuoso'; await this.addDelta(tx, { productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
       else throw new BadRequestException('Resolución inválida.');
-      await tx.update(incidencias).set({ estado: 'resuelta', resolucion, fechaResolucion: new Date(), activa: false }).where(eq(incidencias.id, id));
+      // El estado ya se reclamó al entrar; acá van los datos de la resolución.
+      await tx.update(incidencias).set({ resolucion, fechaResolucion: new Date(), activa: false }).where(eq(incidencias.id, id));
       /*
        * La baja por incidencia es una pérdida como cualquier otra: congela su
        * costo (si no, figuraba en $0 en el reporte de pérdidas de Vencimientos,
@@ -1314,6 +1454,10 @@ export class InventarioService {
         signo: resolucion === 'liberar' ? 0 : -1, cantidad: c, unidad: inc.unidad, estadoDesde: 'comprometido', estadoHacia,
         costoUnitario: esPerdida ? await this.costoDePerdida(tx, prod, inc.presentacionId) : 0,
         motivo: `Incidencia ${inc.codigo} · ${inc.tipo}`,
+        /* QUIÉN LA RESOLVIÓ. Es el movimiento que convierte mercadería en
+         * pérdida —figura en el reporte de Vencimientos con su costo— y era el
+         * único de esa familia sin firma. */
+        usuarioId: autorId ?? null,
         refIncidenciaId: inc.id, descripcion: `${inc.codigo} resuelta: ${resolucion === 'liberar' ? 'liberado a disponible' : 'baja por ' + resolucion}`,
       });
       return { ok: true };
@@ -1339,15 +1483,36 @@ export class InventarioService {
   async operacionesAlmacen(q: { sucursalId: number; desde?: string; hasta?: string; limit?: number }) {
     const sucId = Number(q.sucursalId);
     if (!sucId) throw new BadRequestException('Indicá la sucursal.');
-    const desde = q.desde ? new Date(q.desde) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    /* `fechaLocal` y no `new Date(q.desde)`: '2026-08-13' pelado es medianoche
+     * UTC, o sea las 21 h del 12 en Formosa, así que el libro del almacén
+     * arrancaba TRES HORAS ANTES del día pedido y se comía los movimientos de
+     * la noche anterior. El `hasta` de al lado ya lo hacía bien — eran dos
+     * criterios en dos líneas consecutivas. */
+    const desde = fechaLocal(q.desde) ?? new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const hasta = q.hasta ? new Date(`${q.hasta}T23:59:59`) : new Date();
     const limit = Math.min(Math.max(Number(q.limit) || 300, 1), 1000);
 
-    const [ts, tItems, tHist, comps, movs, sucs, usrs, prods] = await Promise.all([
-      this.db.select().from(transferencias)
-        .where(or(eq(transferencias.origenId, sucId), eq(transferencias.destinoId, sucId))),
-      this.db.select().from(transferenciaItems),
-      this.db.select().from(transferenciaHist),
+    /*
+     * Los remitos de ESTA sucursal salen primero, y sus hijos se piden POR ESOS
+     * IDS. Antes las dos consultas de abajo eran `select().from(...)` PELADO:
+     * el libro de un mes de un local se traía la tabla ENTERA de renglones y la
+     * tabla ENTERA de historial de todas las sucursales, para después tirar el
+     * 90% con un `filter` en memoria. Es la misma trampa que `listTransferencias`
+     * ya documenta y resuelve así; acá había quedado sin arreglar, y encima el
+     * `filter` corre DENTRO del bucle: una pasada por la tabla completa por cada
+     * remito, y tres por cada uno que tenga historial.
+     */
+    const ts = await this.db.select().from(transferencias)
+      .where(or(eq(transferencias.origenId, sucId), eq(transferencias.destinoId, sucId)));
+    const tIds = ts.map((t) => t.id);
+
+    const [tItems, tHist, comps, movs, sucs, usrs, prods] = await Promise.all([
+      tIds.length
+        ? this.db.select().from(transferenciaItems).where(inArray(transferenciaItems.transferenciaId, tIds))
+        : Promise.resolve([] as any[]),
+      tIds.length
+        ? this.db.select().from(transferenciaHist).where(inArray(transferenciaHist.transferenciaId, tIds))
+        : Promise.resolve([] as any[]),
       this.db.select().from(comprobantes)
         .where(and(eq(comprobantes.sucursalId, sucId), eq(comprobantes.recepcion, true),
           gte(comprobantes.fechaCarga, desde), lte(comprobantes.fechaCarga, hasta))),
@@ -1356,7 +1521,7 @@ export class InventarioService {
           inArray(movimientos.tipo, ['ajuste', 'merma', 'vencido', 'defectuoso'] as any),
           gte(movimientos.fecha, desde), lte(movimientos.fecha, hasta))),
       this.db.select().from(sucursales),
-      this.db.select().from(usuarios),
+      this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
       this.db.select({ id: productos.id, nombre: productos.nombre }).from(productos),
     ]);
     const nomSuc = new Map(sucs.map((s) => [s.id, s.nombre]));
@@ -1380,7 +1545,17 @@ export class InventarioService {
           filas.push({
             id: `t${t.id}-env`, tipo: 'transferencia_enviada', codigo: t.codigo, fecha: f, fechaCarga: t.fecha,
             concepto: `Envío a ${nomSuc.get(t.destinoId) ?? '—'}`,
-            monto: items.reduce((a, i) => a + i.cantidad * i.costoUnitario, 0),
+            /*
+             * Se valúa LO PREPARADO, que es lo que subió al camión y lo único
+             * que tiene costo congelado (`despacharTransferencia` saltea los
+             * renglones en 0). Acá decía `i.cantidad` —lo PEDIDO— y el libro no
+             * coincidía ni con el detalle del remito (que ya usaba lo preparado)
+             * ni con su propio comentario, en las dos direcciones: un renglón
+             * agregado durante la preparación tiene `cantidad = 0`, así que
+             * mercadería que salió del depósito figuraba en $0; y un renglón
+             * corto (pidieron 20, había 14) se valuaba por 20.
+             */
+            monto: items.reduce((a, i) => a + i.cantidadPreparada * i.costoUnitario, 0),
             observaciones: t.observaciones, usuario: nomUsr.get(usuarioEstado(t.id, 'transito') as number) ?? nomUsr.get(t.usuarioId as number) ?? '',
             refTransferenciaId: t.id,
           });
@@ -1393,7 +1568,8 @@ export class InventarioService {
           filas.push({
             id: `t${t.id}-rec`, tipo: 'transferencia_recibida', codigo: t.codigo, fecha: f, fechaCarga: t.fecha,
             concepto: `Recepción desde ${nomSuc.get(t.origenId) ?? '—'}`,
-            monto: items.reduce((a, i) => a + (i.cantidadRecibida ?? i.cantidad) * i.costoUnitario, 0),
+            // Lo CONTADO al recibir; si no se contó, lo que viajó (nunca lo pedido).
+            monto: items.reduce((a, i) => a + (i.cantidadRecibida ?? i.cantidadPreparada) * i.costoUnitario, 0),
             observaciones: t.observaciones, usuario: nomUsr.get(usuarioEstado(t.id, 'recibida') as number) ?? '',
             refTransferenciaId: t.id,
           });
@@ -1428,8 +1604,14 @@ export class InventarioService {
   }
 
   /* ============================ LECTURAS ============================ */
-  async existencias() {
-    const rows = await this.db.select().from(stock);
+  /**
+   * Las existencias. `soloSuc` = null para el jefe; para el resto, SU sucursal.
+   * Sin el filtro, cualquier sesion se llevaba el stock completo de los cinco
+   * locales, que es la foto del negocio entero.
+   */
+  async existencias(soloSuc?: number | null) {
+    const rows = await this.db.select().from(stock)
+      .where(soloSuc != null ? eq(stock.sucursalId, soloSuc) : undefined);
     return rows.filter((r) => r.cantidad > 1e-9);
   }
 
@@ -1449,10 +1631,34 @@ export class InventarioService {
       .limit(limit);
   }
 
-  async listTransferencias() {
-    const ts = await this.db.select().from(transferencias).orderBy(desc(transferencias.id));
-    const items = await this.db.select().from(transferenciaItems);
-    const hist = await this.db.select().from(transferenciaHist);
+  /**
+   * Los remitos. El que no es jefe ve los que SALEN o LLEGAN a su sucursal: en
+   * una red pull las dos puntas le interesan, pero los de terceros no. De paso
+   * deja de exponer los ids de los borradores ajenos, que era como se llegaba a
+   * ellos para vaciarlos.
+   */
+  async listTransferencias(soloSuc?: number | null) {
+    const ts = await this.db.select().from(transferencias)
+      .where(soloSuc != null
+        ? or(eq(transferencias.origenId, soloSuc), eq(transferencias.destinoId, soloSuc))
+        : undefined)
+      .orderBy(desc(transferencias.id))
+      /*
+       * TECHO. Un remito viejo no se opera: se mira en el historial, que tiene
+       * su propia pantalla con filtros. Sin límite, esto se traía TODAS las
+       * transferencias con TODOS sus renglones y TODO su historial —tres
+       * consultas sin `where`— en cada bootstrap y después de cada mutación. Hoy
+       * son decenas de filas; en dos años son decenas de miles, y la pantalla se
+       * cae sola sin que nadie haya hecho nada raro.
+       */
+      .limit(300);
+    if (!ts.length) return [];
+    // Y los hijos SOLO de los que se devuelven, no las tablas enteras.
+    const ids = ts.map((t) => t.id);
+    const [items, hist] = await Promise.all([
+      this.db.select().from(transferenciaItems).where(inArray(transferenciaItems.transferenciaId, ids)),
+      this.db.select().from(transferenciaHist).where(inArray(transferenciaHist.transferenciaId, ids)),
+    ]);
     return ts.map((t) => ({
       ...t,
       items: items.filter((i) => i.transferenciaId === t.id),
@@ -1460,8 +1666,10 @@ export class InventarioService {
     }));
   }
 
-  async listIncidencias() {
-    return this.db.select().from(incidencias).orderBy(desc(incidencias.id));
+  async listIncidencias(soloSuc?: number | null) {
+    return this.db.select().from(incidencias)
+      .where(soloSuc != null ? eq(incidencias.sucursalId, soloSuc) : undefined)
+      .orderBy(desc(incidencias.id));
   }
 
   /**
@@ -1495,7 +1703,7 @@ export class InventarioService {
       urgentesVenc] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
-      this.db.select().from(usuarios),
+      this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
       this.db.select().from(productos),
       this.db.select().from(presentaciones),
       this.db.select().from(productoProveedores),

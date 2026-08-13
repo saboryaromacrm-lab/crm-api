@@ -14,11 +14,12 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
-  IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min,
+  IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min,
 } from 'class-validator';
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { clientes, cobranzas, ventas } from '../db/schema';
+import { Permiso } from '../auth/auth.decoradores';
+import { clientes, cobranzas, presupuestos, ventas } from '../db/schema';
 
 const COND_IVA = ['responsable_inscripto', 'monotributo', 'consumidor_final', 'exento', 'no_categorizado'] as const;
 const TIPOS_DOC = ['cuit', 'cuil', 'dni', 'sin_identificar'] as const;
@@ -36,7 +37,10 @@ export class UpsertClienteDto {
   @IsOptional() @IsString() localidad?: string;
   @IsOptional() @IsString() telefono?: string;
   @IsOptional() @IsString() email?: string;
-  @IsOptional() @IsNumber() @Min(0) descuento?: number;
+  /* Tope 100: es un PORCENTAJE. Sin el `@Max` se podía dejar un cliente con
+   * `descuento: 90` (o 900) y ese número se aplica solo a cada renglón que el
+   * POS le carga, sin que nadie lo vuelva a mirar. */
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
   @IsOptional() @IsInt() vendedorId?: number | null;
   @IsOptional() @IsInt() sucursalId?: number | null;
   @IsOptional() @IsBoolean() ctaCteHabilitada?: boolean;
@@ -164,11 +168,19 @@ export class ClientesService {
     return c;
   }
 
-  /** Cuántos documentos referencian al cliente (define si se puede borrar). */
+  /**
+   * Cuántos documentos referencian al cliente (define si se puede borrar).
+   *
+   * Los TRES que tienen FK `restrict` contra clientes, no dos: faltaba
+   * presupuestos, así que un cliente con presupuestos y sin ventas caía en el
+   * `delete` de abajo y explotaba con un error de clave ajena crudo en vez de
+   * hacer la baja lógica que este comentario promete.
+   */
   private async usos(id: number) {
     const [v] = await this.db.select({ n: sql<number>`count(*)::int` }).from(ventas).where(eq(ventas.clienteId, id));
     const [c] = await this.db.select({ n: sql<number>`count(*)::int` }).from(cobranzas).where(eq(cobranzas.clienteId, id));
-    return (v?.n ?? 0) + (c?.n ?? 0);
+    const [p] = await this.db.select({ n: sql<number>`count(*)::int` }).from(presupuestos).where(eq(presupuestos.clienteId, id));
+    return (v?.n ?? 0) + (c?.n ?? 0) + (p?.n ?? 0);
   }
 
   /**
@@ -194,6 +206,14 @@ export class ClientesService {
   }
 }
 
+/**
+ * Las ESCRITURAS piden `ventas.clientes`; las lecturas quedan abiertas a sesión
+ * válida porque el padrón lo consumen el POS, los presupuestos y la tienda.
+ *
+ * Sin esto, cualquier sesión podía habilitar cuenta corriente y poner un límite
+ * de crédito de siete cifras — que es la precondición cómoda para vender a
+ * cuenta corriente sin que ningún control salte.
+ */
 @Controller('clientes')
 export class ClientesController {
   constructor(private readonly svc: ClientesService) {}
@@ -202,10 +222,18 @@ export class ClientesController {
     return this.svc.list({ activo: activo === undefined ? undefined : activo === 'true' });
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Post() create(@Body() dto: UpsertClienteDto) { return this.svc.create(dto); }
-  @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertClienteDto) { return this.svc.update(id, dto); }
-  @Post(':id/reactivar') reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }
-  @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
+
+  @Post() @Permiso('ventas.clientes')
+  create(@Body() dto: UpsertClienteDto) { return this.svc.create(dto); }
+
+  @Patch(':id') @Permiso('ventas.clientes')
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertClienteDto) { return this.svc.update(id, dto); }
+
+  @Post(':id/reactivar') @Permiso('ventas.clientes')
+  reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }
+
+  @Delete(':id') @Permiso('ventas.clientes')
+  remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
 }
 
 @Module({

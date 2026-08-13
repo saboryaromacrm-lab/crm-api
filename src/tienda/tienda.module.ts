@@ -22,6 +22,7 @@ import {
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
 import { Publico } from '../auth/auth.decoradores';
+import { MIMES_IMAGEN } from '../common/archivos';
 import type { Response } from 'express';
 import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -41,6 +42,9 @@ const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
 /** Últimos N días para considerar un producto "recién reingresado" (stock de nuevo > 0). */
 const DIAS_REINGRESO = 14;
+
+/** Renglones máximos de un pedido del sitio. Es el único endpoint público que ESCRIBE. */
+const MAX_RENGLONES_PEDIDO = 100;
 
 /**
  * ¿La oferta está vigente ahora, en esta sucursal? Misma regla que el motor
@@ -201,6 +205,27 @@ export class TiendaService {
     };
     if (!listaTienda) return vacio;
 
+    /*
+     * PRE-ÍNDICE de las tablas hijas, un solo pase cada una. Sin esto, adentro
+     * del loop de productos había un `filas.find` sobre `productoListas` entera
+     * y un `provs.filter` sobre `productoProveedores` entera POR CADA producto:
+     * O(productos × filas). En un endpoint público que además corre en cada
+     * pedido, con el catálogo grande son millones de comparaciones. El `.has`
+     * conserva el "primer match" que hacía `.find` (hay una sola fila por
+     * producto en la lista de la tienda, pero por las dudas).
+     */
+    const filaTiendaPorProducto = new Map<number, any>();
+    for (const f of filas) {
+      if (f.presentacionId == null && f.listaId === listaTienda.id && !filaTiendaPorProducto.has(f.productoId)) {
+        filaTiendaPorProducto.set(f.productoId, f);
+      }
+    }
+    const provsPorProducto = new Map<number, any[]>();
+    for (const x of provs) {
+      const arr = provsPorProducto.get(x.productoId);
+      if (arr) arr.push(x); else provsPorProducto.set(x.productoId, [x]);
+    }
+
     const items: any[] = [];
     for (const p of prods) {
       /*
@@ -213,11 +238,10 @@ export class TiendaService {
        * paquetes (el stock que mira ya es el del granel). Sin el filtro de
        * presentación podría tomar la fila de un paquete de 250 g y publicar ESE
        * precio como si fuera el del kilo. */
-      const filaTienda = filas.find((f) => f.productoId === p.id
-        && f.presentacionId == null && f.listaId === listaTienda.id);
+      const filaTienda = filaTiendaPorProducto.get(p.id);
       if (!filaTienda) continue;
 
-      const costoNeto = costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)), p.iva);
+      const costoNeto = costoNetoEntry(formatoActivo(provsPorProducto.get(p.id) ?? []), p.iva);
       const pv = precioVentaFila(costoNeto, filaTienda, { iva: p.iva, redondeo: cfg.redondeoPrecio });
       /*
        * Sin precio real no hay publicación: una fila mayorista con el costo a
@@ -387,17 +411,63 @@ export class TiendaService {
     const dni = String(c.dni ?? '').replace(/\D/g, '');
     if (dni.length < 7 || dni.length > 8) throw new BadRequestException('El DNI debe tener entre 7 y 8 dígitos (es solo para identificarte, no es de facturación).');
 
+    /*
+     * El techo va ANTES de tocar la base: el body admite 4 MB, y con
+     * `{"productoId":1,"cantidad":1}` repetido eso son ~110.000 renglones
+     * válidos en un solo INSERT. Un carrito de verdad no tiene 100 productos
+     * distintos.
+     */
+    if (carritoIn.length > MAX_RENGLONES_PEDIDO) {
+      throw new BadRequestException(`Un pedido no puede tener más de ${MAX_RENGLONES_PEDIDO} renglones.`);
+    }
+
     const cat = await this.catalogo();
     const porId = new Map<number, any>(cat.items.map((i: any): [number, any] => [i.id, i]));
 
-    const resueltos: { prod: any; cantidad: number }[] = [];
+    /*
+     * Se AGRUPA por producto: el mismo producto repetido en dos renglones es un
+     * solo renglón con la suma. Sin esto, el tope de stock de más abajo se
+     * esquiva partiendo el pedido en pedacitos que por separado entran.
+     *
+     * `Number.isFinite` y no `|| 0`: `Number('1e999')` es Infinity, es truthy,
+     * pasa `cantidad > 0` y Postgres lo GUARDA en `double precision` — desde
+     * ahí contamina el total del pedido y el ranking de las estadísticas.
+     */
+    const porProducto = new Map<number, { prod: any; cantidad: number }>();
     for (const linea of carritoIn) {
       const prod = porId.get(Number(linea?.productoId));
-      const cantidad = Number(linea?.cantidad) || 0;
-      if (!prod || cantidad <= 0) continue;
-      resueltos.push({ prod, cantidad });
+      const cantidad = Number(linea?.cantidad);
+      if (!prod || !Number.isFinite(cantidad) || cantidad <= 0) continue;
+      const acc = porProducto.get(prod.id);
+      if (acc) acc.cantidad += cantidad;
+      else porProducto.set(prod.id, { prod, cantidad });
     }
+    const resueltos = [...porProducto.values()];
     if (!resueltos.length) throw new BadRequestException('Ningún producto del pedido está disponible.');
+
+    /*
+     * EL STOCK LO DECIDE EL SERVIDOR. El carrito del sitio ya topea la cantidad
+     * (`cart.tsx`), pero eso es una comodidad del navegador: acá se vuelve a
+     * mirar contra el mismo `disponible` que publica el catálogo (el stock de
+     * la Distribuidora menos el piso reservado para el mostrador). También
+     * cubre el caso honesto: el pedido que quedó abierto media hora mientras
+     * otro se llevaba lo último.
+     */
+    const agotados = resueltos.filter((r) => !r.prod.enStock);
+    if (agotados.length) {
+      throw new BadRequestException(
+        `Se quedó sin stock: ${agotados.map((r) => r.prod.nombre).join(', ')}. `
+        + 'Sacalo del carrito y volvé a intentar.',
+      );
+    }
+    const excedidos = resueltos.filter((r) => r.cantidad > r.prod.disponible);
+    if (excedidos.length) {
+      throw new BadRequestException(
+        'No tenemos esa cantidad: '
+        + excedidos.map((r) => `${r.prod.nombre} (quedan ${r.prod.disponible} ${r.prod.unidad})`).join(', ')
+        + '. Ajustá el carrito y volvé a intentar.',
+      );
+    }
 
     // Precio EFECTIVO: si hay una promo con precio unitario propio (porcentaje / precio_fijo),
     // el pedido se cotiza con ese precio — el cliente vio ese número, se le cobra ese número.
@@ -467,9 +537,13 @@ export class TiendaService {
 
     return this.presupuestos.crearDesdeWeb({
       clienteId: existente?.id ?? null, sucursalId: cat.sucursalId,
-      entrega: dto.entrega, observaciones: dto.observaciones,
+      // Topes de largo del lado del servidor: el `maxLength` del checkout vive
+      // en el navegador y no protege al `POST` directo. Un pedido con 3 MB de
+      // texto en observaciones vuelve inusable la bandeja de Órdenes al pintarla.
+      entrega: dto.entrega, observaciones: String(dto.observaciones ?? '').slice(0, 500),
       webCliente: {
-        nombre: String(c.nombre ?? '').trim(), apellido: String(c.apellido ?? '').trim(),
+        nombre: String(c.nombre ?? '').trim().slice(0, 60),
+        apellido: String(c.apellido ?? '').trim().slice(0, 60),
         telefono, dni,
       },
       items,
@@ -500,7 +574,33 @@ export class TiendaController {
   @RateLimit('eventos')
   eventos(@Body() body: any) { return this.svc.eventos(body ?? {}); }
 
-  /** Sirve el binario de una imagen del sitio. El `?v=` del catálogo versiona el caché. */
+  /**
+   * Sirve el binario de una imagen del sitio. El `?v=` del catálogo versiona el caché.
+   *
+   * ESTE ENDPOINT ES EL QUE VUELVE PELIGROSA UNA SUBIDA. Es público, y nginx lo
+   * publica en el MISMO ORIGEN que el dashboard (`location /api/`), donde vive
+   * el token de sesión del CRM. Un archivo que el navegador trate como
+   * documento —un SVG, por ejemplo— correría ahí adentro con la sesión de quien
+   * abra el link. Tres candados, y ninguno reemplaza a los otros:
+   *
+   *   1. el mime sale de una lista blanca, no de la base: aunque una fila vieja
+   *      o una migración metan otra cosa, de acá no sale;
+   *   2. `Content-Disposition: attachment` — el navegador la baja en vez de
+   *      renderizarla si alguien la abre como página;
+   *   3. `Content-Security-Policy: sandbox` — y si igual la renderiza, ahí
+   *      adentro no corre script ni hay acceso al origen.
+   *
+   * El `<img src="...">` del sitio sigue andando igual: una etiqueta `img` no
+   * mira el `Content-Disposition`.
+   *
+   * Y el CUARTO encabezado va al revés que los otros tres: helmet marca toda la
+   * API como `Cross-Origin-Resource-Policy: same-origin`, que es lo correcto
+   * para el resto —el dashboard comparte origen con la API— pero deja al sitio
+   * público sin poder mostrar una sola imagen cuando vive en otro dominio (o en
+   * otro puerto, como en desarrollo: el navegador corta con
+   * ERR_BLOCKED_BY_RESPONSE.NotSameOrigin y no se ve ni el logo). Estas
+   * imágenes son públicas por definición, así que ACÁ Y SOLO ACÁ se abre.
+   */
   @Get('imagenes/:tipo/:refId')
   @RateLimit('imagenes')
   async imagen(
@@ -510,7 +610,11 @@ export class TiendaController {
   ) {
     const img = await this.svc.imagen(tipo, refId);
     if (!img) throw new NotFoundException('Imagen inexistente.');
+    if (!MIMES_IMAGEN.has(img.mime)) throw new NotFoundException('Imagen inexistente.');
     res.setHeader('Content-Type', img.mime);
+    res.setHeader('Content-Disposition', `attachment; filename="${tipo}-${refId}"`);
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.send(Buffer.from(img.data, 'base64'));
   }

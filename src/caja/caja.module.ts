@@ -13,12 +13,14 @@
  *    contra el resumen del banco/posnet, así que se guardan como foto.
  */
 import {
-  Body, Controller, Get, Inject, Injectable, Module, BadRequestException,
+  Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { IsIn, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
 } from '../db/schema';
@@ -26,7 +28,12 @@ import {
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
 class AbrirCajaDto {
-  @IsInt() sucursalId!: number;
+  /*
+   * PISTA, no orden: para el cajero la sucursal sale de su sesión (ver
+   * `sucursalDeOperacion`). Sigue en el DTO porque el jefe abre la caja de
+   * cualquier sucursal, que es justamente lo que un cajero no puede hacer.
+   */
+  @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
   // Obligatorio: un turno SIEMPRE arranca declarando su fondo (ver `abrir`).
   @IsNumber() montoInicial!: number;
@@ -159,8 +166,13 @@ export class CajaService {
 
   /* ------------------------------ Escritura ------------------------------ */
 
-  async abrir(dto: AbrirCajaDto) {
-    const abierta = await this.actual(dto.sucursalId);
+  /**
+   * `sucursalId` lo resuelve el CONTROLLER contra la sesión, no el DTO: un
+   * cajero abría el turno de otra sucursal mandando otro número, y con eso le
+   * arruinaba el fondo inicial del día o le bloqueaba la apertura.
+   */
+  async abrir(dto: AbrirCajaDto, sucursalId: number) {
+    const abierta = await this.actual(sucursalId);
     if (abierta) {
       throw new BadRequestException('Ya hay un turno de caja abierto en esta sucursal. Cerralo antes de abrir otro.');
     }
@@ -170,7 +182,7 @@ export class CajaService {
     if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
 
     const [c] = await this.db.insert(cajaSesiones).values({
-      sucursalId: dto.sucursalId,
+      sucursalId,
       usuarioId: dto.usuarioId ?? null,
       montoInicial,
       estado: 'abierta',
@@ -198,13 +210,17 @@ export class CajaService {
    * el mismo snapshot, le alcanza con que nadie pueda confirmar un movimiento
    * nuevo mientras el candado está tomado.
    */
-  async cerrar(id: number, dto: CerrarCajaDto) {
+  async cerrar(id: number, dto: CerrarCajaDto, sucursalSesion: number | null) {
     const declarado = money(dto.declaradoEfectivo);
+    // Mismo piso que el control intermedio (`control`), que sí lo tenía: un
+    // declarado negativo dejaba una diferencia inventada congelada en la fila.
+    if (declarado < 0) throw new BadRequestException('El efectivo declarado no puede ser negativo.');
 
     return this.db.transaction(async (tx) => {
       const [sesion] = await tx.select().from(cajaSesiones)
         .where(eq(cajaSesiones.id, id)).limit(1).for('update');
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
 
       const a = await this.arqueo(id);
@@ -227,8 +243,9 @@ export class CajaService {
    * Guarda la foto (fecha/hora, esperado, contado, diferencia, quién) y nada
    * más — no mueve dinero ni cambia el estado. Es puro control entre arqueos.
    */
-  async control(id: number, dto: ControlCajaDto) {
+  async control(id: number, dto: ControlCajaDto, sucursalSesion: number | null) {
     const sesion = await this.get(id);
+    if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
     if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado: los controles son entre la apertura y el cierre.');
     const contado = money(dto.contadoEfectivo);
     if (contado < 0) throw new BadRequestException('El efectivo contado no puede ser negativo.');
@@ -245,7 +262,7 @@ export class CajaService {
     return c;
   }
 
-  async movimiento(id: number, dto: MovimientoCajaDto) {
+  async movimiento(id: number, dto: MovimientoCajaDto, sucursalSesion: number | null) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe debe ser mayor a 0.');
     if (!dto.motivo?.trim()) throw new BadRequestException('Indicá el motivo del movimiento.');
@@ -257,6 +274,10 @@ export class CajaService {
       const [sesion] = await tx.select().from(cajaSesiones)
         .where(eq(cajaSesiones.id, id)).limit(1).for('update');
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      /* El id del turno se ve en cualquier listado: sin esto, un egreso "pago
+       * flete" bajaba el efectivo esperado del cajón AJENO y esa cajera cerraba
+       * en falta. Mismo ataque que se cerró en los pagos a proveedor. */
+      if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
 
       const [m] = await tx.insert(cajaMovimientos).values({
@@ -279,28 +300,107 @@ export class CajaService {
   }
 }
 
+/**
+ * El turno de caja es la pantalla `ventas.caja`, y las cuatro escrituras piden
+ * ese permiso. El MOVIMIENTO manual —meter o sacar plata del cajón— pide además
+ * `diferencias`: es la acción con la que se justifica un faltante, no parte de
+ * abrir y cerrar el turno.
+ */
 @Controller('caja')
+@Permiso('ventas.caja')
 export class CajaController {
   constructor(private readonly svc: CajaService) {}
 
+  /*
+   * También con `ventas.pos`: el punto de venta pregunta si hay turno abierto
+   * para saber si puede cobrar (PosPanel), y un cajero que vende sin administrar
+   * la caja no tiene por qué tener la pantalla de Caja.
+   */
   @Get('actual/:sucursalId')
+  @Permiso('ventas.caja', 'ventas.pos')
   actual(@Param('sucursalId', ParseIntPipe) sucursalId: number) { return this.svc.actual(sucursalId); }
 
+  /*
+   * LAS LECTURAS TAMBIÉN SON POR SUCURSAL. Las cuatro escrituras ya comparaban
+   * contra la de la sesión, pero mirar quedó abierto: `GET /caja` sin parámetros
+   * listaba los turnos de las cinco sucursales con su fondo inicial, lo
+   * declarado, lo esperado y **la diferencia** de cada arqueo, y
+   * `GET /caja/:id/arqueo` daba el efectivo que debería haber AHORA MISMO en el
+   * cajón de un turno abierto ajeno. Es el histórico de faltantes de cada
+   * compañero, y no rompe ninguna pantalla cerrarlo: `CajaPanel` ya trabaja
+   * sobre la sucursal del contexto.
+   */
   @Get()
-  list(@Query('sucursalId') sucursalId?: string, @Query('estado') estado?: string, @Query('limit') limit?: string) {
+  list(
+    @Auth() sesion: Sesion,
+    @Query('sucursalId') sucursalId?: string,
+    @Query('estado') estado?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const mia = soloSuSucursal(sesion);
     return this.svc.list({
-      sucursalId: sucursalId ? Number(sucursalId) : undefined,
+      sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
       estado, limit: limit ? Number(limit) : undefined,
     });
   }
 
-  @Get(':id/arqueo') arqueo(@Param('id', ParseIntPipe) id: number) { return this.svc.arqueo(id); }
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Get(':id/arqueo')
+  async arqueo(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    await this.exigirMiTurno(id, sesion);
+    return this.svc.arqueo(id);
+  }
 
-  @Post('abrir') abrir(@Body() dto: AbrirCajaDto) { return this.svc.abrir(dto); }
-  @Post(':id/cerrar') cerrar(@Param('id', ParseIntPipe) id: number, @Body() dto: CerrarCajaDto) { return this.svc.cerrar(id, dto); }
-  @Post(':id/control') control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto) { return this.svc.control(id, dto); }
-  @Post(':id/movimiento') mov(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoCajaDto) { return this.svc.movimiento(id, dto); }
+  @Get(':id')
+  async get(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    await this.exigirMiTurno(id, sesion);
+    return this.svc.get(id);
+  }
+
+  /** El turno tiene que ser de mi sucursal, salvo que sea un jefe (`null`). */
+  private async exigirMiTurno(id: number, sesion: Sesion) {
+    const mia = soloSuSucursal(sesion);
+    if (mia == null) return;
+    const t = await this.svc.getOpcional(id);
+    if (t && t.sucursalId !== mia) {
+      throw new ForbiddenException('Ese turno es de otra sucursal.');
+    }
+  }
+
+  /*
+   * Las cuatro escrituras trabajan sobre LA sucursal de la sesión. El jefe puede
+   * apuntar a otra al abrir (`sucursalDeOperacion`); para cerrar, controlar o
+   * mover plata la sucursal se compara contra la del turno, adentro del servicio
+   * y bajo el mismo candado que ya tenía.
+   */
+  @Post('abrir')
+  abrir(@Body() dto: AbrirCajaDto, @Auth() sesion: Sesion) {
+    const sucursalId = sucursalDeOperacion(sesion, dto.sucursalId);
+    if (!sucursalId) throw new BadRequestException('Tu sesión no tiene sucursal: volvé a entrar eligiéndola.');
+    return this.svc.abrir(dto, sucursalId);
+  }
+
+  @Post(':id/cerrar')
+  cerrar(@Param('id', ParseIntPipe) id: number, @Body() dto: CerrarCajaDto, @Auth() sesion: Sesion) {
+    return this.svc.cerrar(id, dto, soloSuSucursal(sesion));
+  }
+
+  @Post(':id/control')
+  control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
+    return this.svc.control(id, dto, soloSuSucursal(sesion));
+  }
+
+  /*
+   * `diferencias` SOLO, sin `ventas.caja`: el permiso del método REEMPLAZA al de
+   * la clase (el guard resuelve handler y después clase), y las claves de un
+   * mismo `@Permiso` se evalúan con O — poner las dos acá haría que alcanzara
+   * con ver la caja. Sacar plata del cajón es la acción más fuerte del módulo y
+   * pide su propia llave.
+   */
+  @Post(':id/movimiento')
+  @Permiso('diferencias')
+  mov(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoCajaDto, @Auth() sesion: Sesion) {
+    return this.svc.movimiento(id, dto, soloSuSucursal(sesion));
+  }
 }
 
 @Module({

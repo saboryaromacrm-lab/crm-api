@@ -38,11 +38,12 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsInt, IsNumber, IsOptional, IsString, MaxLength, ValidateNested,
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, gt, gte, inArray, lte, ne, sql } from 'drizzle-orm';
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { ClaveServicio, Permiso } from '../auth/auth.decoradores';
 import {
   enviosCafeteria, envioCafeteriaItems, gastos, pedidoCafeteriaItems, pedidosCafeteria,
   presentaciones, productoProveedores, productos, sucursales, usuarios,
@@ -57,7 +58,7 @@ const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 class EnvioItemDto {
   @IsInt() productoId!: number;
   @IsOptional() @IsInt() presentacionId?: number;
-  @IsNumber() cantidad!: number;
+  @IsNumber() @Min(0.001) @Max(100000) cantidad!: number;
 }
 
 class CrearEnvioDto {
@@ -67,7 +68,7 @@ class CrearEnvioDto {
   @IsOptional() @IsInt() usuarioId?: number;
   /** El pedido que este envío viene a cumplir: lo cierra en el mismo acto. */
   @IsOptional() @IsInt() pedidoId?: number;
-  @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => EnvioItemDto)
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => EnvioItemDto)
   items!: EnvioItemDto[];
 }
 
@@ -75,12 +76,17 @@ class EditarEnvioDto {
   /**
    * La versión que la pantalla estaba mirando. Si en el medio otro la cambió,
    * el edit se rechaza en vez de pisar en silencio lo que el otro hizo.
+   *
+   * OBLIGATORIA. Era `@IsOptional()`, y un candado que se abre no mandando la
+   * llave no es un candado: bastaba un `PUT` sin el campo para saltear la
+   * comparación entera y ganar siempre. El `FOR UPDATE` de abajo evita el estado
+   * roto a medias, no la pisada.
    */
-  @IsOptional() @IsInt() version?: number;
+  @IsInt() version!: number;
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => EnvioItemDto)
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => EnvioItemDto)
   items!: EnvioItemDto[];
 }
 
@@ -92,13 +98,13 @@ class AnularEnvioDto {
 class PedidoItemDto {
   @IsInt() productoId!: number;
   @IsOptional() @IsInt() presentacionId?: number;
-  @IsNumber() cantidad!: number;
+  @IsNumber() @Min(0.001) @Max(100000) cantidad!: number;
 }
 
 class CrearPedidoDto {
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => PedidoItemDto)
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => PedidoItemDto)
   items!: PedidoItemDto[];
 }
 
@@ -114,16 +120,32 @@ export class CafeteriaService {
     private readonly inv: InventarioService,
   ) {}
 
-  /** Costo unitario de HOY del formato activo ($/kg del granel, $/paquete de la presentación). */
+  /**
+   * Costo unitario de HOY del formato activo ($/kg del granel, $/paquete de la
+   * presentación).
+   *
+   * Las TRES consultas salen antes del bucle: con 300 renglones de tope, un
+   * SELECT por renglón eran cientos de idas y vueltas con la transacción —y la
+   * del envío además egresa stock, o sea que tiene filas tomadas mientras tanto.
+   */
   private async valuarItems(tx: any, items: { productoId: number; presentacionId?: number | null }[]) {
     const ids = [...new Set(items.map((it) => it.productoId))];
-    const provs = await tx.select().from(productoProveedores)
-      .where(inArray(productoProveedores.productoId, ids));
+    const presIds = [...new Set(items.map((it) => it.presentacionId).filter(Boolean))] as number[];
+    const [provs, prods, press] = await Promise.all([
+      tx.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
+      tx.select().from(productos).where(inArray(productos.id, ids)),
+      presIds.length
+        ? tx.select().from(presentaciones).where(inArray(presentaciones.id, presIds))
+        : Promise.resolve([]),
+    ]);
+    const prodDe = new Map<number, any>(prods.map((p: any) => [p.id, p]));
+    const presPorId = new Map<number, any>(press.map((p: any) => [p.id, p]));
+
     const out = new Map<string, { prod: any; pres: any; costoU: number }>();
     for (const it of items) {
       const clave = `${it.productoId}-${it.presentacionId ?? 0}`;
       if (out.has(clave)) continue;
-      const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
+      const prod = prodDe.get(it.productoId);
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       // Archivado = fuera de catálogo: no se pide ni se manda al café.
       if (prod.estado === 'archivado') {
@@ -131,7 +153,7 @@ export class CafeteriaService {
       }
       let pres: any = null;
       if (it.presentacionId) {
-        [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
+        pres = presPorId.get(it.presentacionId) ?? null;
         if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
       }
       const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
@@ -262,7 +284,7 @@ export class CafeteriaService {
         .where(eq(enviosCafeteria.id, id)).limit(1).for('update');
       if (!envio) throw new NotFoundException('Envío inexistente.');
       if (envio.estado === 'anulado') throw new BadRequestException('Un envío anulado no se edita.');
-      if (o.version != null && o.version !== envio.version) {
+      if (o.version !== envio.version) {
         throw new BadRequestException('El envío cambió desde que abriste la pantalla — actualizá y volvé a intentar.');
       }
 
@@ -525,8 +547,21 @@ export class CafeteriaService {
    * el detalle completo. `ahora` va en la respuesta para que coffit lo guarde
    * como el próximo `desde`: así el cursor lo pone el reloj de ESTE servidor y
    * no hay agujeros por relojes desfasados.
+   *
+   * EL CURSOR ES EL DE LA ÚLTIMA FILA ENVIADA, NO EL RELOJ DE PARED, y esa
+   * diferencia perdía envíos en silencio. La página corta en 200: si hubo 250
+   * cambios —un reproceso, una tanda de ediciones— coffit recibía los primeros
+   * 200 y guardaba `ahora` como próximo cursor, con lo cual **los 50 restantes,
+   * cuyo `actualizadoEn` es anterior a ese `ahora`, no se devolvían nunca más**.
+   * Del otro lado eran 50 envíos de mercadería que no ingresaron a la cafetería
+   * y que nadie iba a notar hasta un inventario.
+   *
+   * Ahora, cuando la página se llena, el cursor es el `actualizadoEn` del
+   * último envío devuelto y viaja `hayMas: true` para que coffit vuelva a
+   * pedir enseguida en vez de esperar al próximo ciclo.
    */
   async sync(desde?: string) {
+    const TOPE = 200;
     const ahora = new Date();
     const corte = desde ? new Date(desde) : null;
     if (desde && Number.isNaN(corte!.getTime())) {
@@ -535,7 +570,27 @@ export class CafeteriaService {
     const envios = await this.db.select().from(enviosCafeteria)
       .where(corte ? gt(enviosCafeteria.actualizadoEn, corte) : undefined)
       .orderBy(asc(enviosCafeteria.actualizadoEn))
-      .limit(200);
+      .limit(TOPE);
+    const hayMas = envios.length === TOPE;
+
+    /*
+     * SE VACÍA EL GRUPO DE LA ÚLTIMA MARCA DE TIEMPO antes de mover el cursor.
+     *
+     * El cursor es una fecha y la próxima página pide `> cursor`, así que si el
+     * corte de 200 cayera en medio de un grupo de envíos con el MISMO
+     * `actualizadoEn` —dos ediciones en la misma transacción—, los que quedaron
+     * del otro lado se perderían igual que antes, solo que más raro y más
+     * difícil de encontrar. Traerlos ahora hace que `>` sea exacto en vez de
+     * casi siempre exacto.
+     */
+    if (hayMas) {
+      const ultima = envios[envios.length - 1].actualizadoEn;
+      const yaEstan = new Set(envios.map((e) => e.id));
+      const empatados = await this.db.select().from(enviosCafeteria)
+        .where(eq(enviosCafeteria.actualizadoEn, ultima));
+      for (const e of empatados) if (!yaEstan.has(e.id)) envios.push(e);
+    }
+    const cursor = hayMas ? envios[envios.length - 1].actualizadoEn : ahora;
 
     const items = envios.length
       ? await this.db.select().from(envioCafeteriaItems)
@@ -549,7 +604,12 @@ export class CafeteriaService {
       porEnvio.set(it.envioId, arr);
     }
     return {
-      ahora: ahora.toISOString(),
+      /* `ahora` es el próximo `desde`. Con la página llena NO es el reloj: es la
+       * marca del último envío devuelto, para no saltearse los que quedaron. */
+      ahora: cursor.toISOString(),
+      /* Coffit tiene que volver a pedir enseguida en vez de esperar su ciclo:
+       * sin esto, una tanda grande tarda horas en llegar entera. */
+      hayMas,
       envios: envios.map((e) => ({ ...e, items: porEnvio.get(e.id) ?? [] })),
     };
   }
@@ -570,10 +630,28 @@ export class CafeteriaService {
     const condsItems = [...conds];
     if (buscar) condsItems.push(sql`${envioCafeteriaItems.nombre} ilike ${`%${buscar}%`}`);
 
-    const [cab] = await this.db.select({
-      envios: sql<number>`count(*)::int`,
-      costoTotal: sql<number>`coalesce(sum(${enviosCafeteria.totalCosto}), 0)`,
-    }).from(enviosCafeteria).where(and(...conds));
+    /*
+     * LA CABECERA SE MIDE SOBRE EL MISMO CONJUNTO QUE LA TABLA.
+     *
+     * Sin `buscar` es la suma de las cabeceras de los envíos, que es lo exacto
+     * (`totalCosto` es el número congelado del envío). CON `buscar` no puede
+     * serlo: la tabla de abajo muestra un artículo y la tarjeta mostraba la
+     * plata del período entero al lado — buscar un café de $50.000 en un mes de
+     * $2.000.000 dejaba las dos cifras a diez centímetros y sin relación. Los
+     * otros dos números de esa misma fila («Artículos» y «Kg totales») ya
+     * respetaban el filtro, así que la tarjeta se contradecía sola.
+     */
+    const [cab] = buscar
+      ? await this.db.select({
+        envios: sql<number>`count(distinct ${envioCafeteriaItems.envioId})::int`,
+        costoTotal: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad} * ${envioCafeteriaItems.costoUnitario}), 0)`,
+      }).from(envioCafeteriaItems)
+        .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
+        .where(and(...condsItems))
+      : await this.db.select({
+        envios: sql<number>`count(*)::int`,
+        costoTotal: sql<number>`coalesce(sum(${enviosCafeteria.totalCosto}), 0)`,
+      }).from(enviosCafeteria).where(and(...conds));
 
     const productosAgg = await this.db.select({
       productoId: envioCafeteriaItems.productoId,
@@ -647,7 +725,19 @@ export class CafeteriaService {
   }
 }
 
+/**
+ * DOS PANTALLAS Y DOS LLAVES, y son de lados opuestos del mostrador:
+ * `almacen.cafeteria` es la de la distribuidora (arma y edita los envíos, que
+ * EGRESAN stock real) y `almacen.cafeteria-pedidos` es la del rol Cafetería,
+ * que solo pide. La clase pide la primera y los tres endpoints de pedidos
+ * aceptan además la segunda — sin eso, el rol Cafetería se quedaba sin su única
+ * pantalla.
+ *
+ * `sync` va aparte y con su propio comentario: es el único endpoint del sistema
+ * que consume una aplicación EXTERNA.
+ */
 @Controller('cafeteria')
+@Permiso('almacen.cafeteria')
 export class CafeteriaController {
   constructor(private readonly svc: CafeteriaService) {}
 
@@ -672,26 +762,45 @@ export class CafeteriaController {
     return this.svc.metrica({ desde, hasta, buscar });
   }
 
-  /** El endpoint de coffit: todo lo que cambió desde el cursor. */
-  @Get('sync') sync(@Query('desde') desde?: string) {
+  /**
+   * EL ENDPOINT DE COFFIT: todo lo que cambió desde el cursor.
+   *
+   * Es el único que consume una aplicación EXTERNA, y por eso tiene su propia
+   * llave: `COFFIT_TOKEN` en el `.env`, que se manda en `X-Coffit-Token`. Sin
+   * esa cabecera sigue valiendo la sesión del CRM, así que **hoy no rompe nada**
+   * y el día que se coordine con coffit alcanza con cargarle el secreto.
+   *
+   * Por qué hacía falta: hasta acá coffit se autenticaba con un token de sesión
+   * común de 12 h, o sea con usuario y contraseña de alguien del CRM guardados
+   * en la configuración de otra máquina. Ese token no es "solo lectura de
+   * envíos" — es el panel entero, y con él se mueve stock. El contrato
+   * (`docs/contrato-coffit.md`) prometía un token de solo lectura desde el
+   * principio; esto es ese token, y **solo abre esta puerta**.
+   */
+  @Get('sync')
+  @ClaveServicio('COFFIT_TOKEN')
+  sync(@Query('desde') desde?: string) {
     return this.svc.sync(desde);
   }
-
   /* ---- Pedidos de la cafetería (la demanda) ---- */
 
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Get('pedidos') listPedidos(@Query('estado') estado?: string, @Query('limit') limit?: string) {
     return this.svc.listPedidos({ estado, limit: limit ? Number(limit) : undefined });
   }
 
   /** El poller del aviso del admin: un count, nada más. */
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Get('pedidos-pendientes') pedidosPendientes() {
     return this.svc.pedidosPendientes();
   }
 
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Get('pedidos/:id') getPedido(@Param('id', ParseIntPipe) id: number) {
     return this.svc.getPedido(id);
   }
 
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Post('pedidos') crearPedido(@Body() dto: CrearPedidoDto) {
     return this.svc.crearPedido(dto);
   }
@@ -700,6 +809,7 @@ export class CafeteriaController {
     return this.svc.tomarPedido(id);
   }
 
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Post('pedidos/:id/anular') anularPedido(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPedidoDto) {
     return this.svc.anularPedido(id, dto);
   }

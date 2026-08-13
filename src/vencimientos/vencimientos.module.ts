@@ -28,9 +28,11 @@
  * vencidos se adelantarían un día.
  */
 import { Body, Controller, Delete, Get, Inject, Injectable, Module, Param, ParseIntPipe, Post, Put, Query, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { sucursalDeOperacion } from '../auth/auth.guard';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, ValidateNested,
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -114,7 +116,10 @@ class ItemControlDto {
 class CrearSesionDto {
   @IsInt() sucursalId!: number;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => ItemControlDto)
+  /* Techo: `valuar()` hace UN SELECT POR RENGLÓN dentro de la transacción, así
+   * que 50.000 renglones dejaban la conexión tomada minutos. El borrador del
+   * pedido ya usaba 300; mismo número. */
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => ItemControlDto)
   items!: ItemControlDto[];
 }
 
@@ -147,15 +152,34 @@ export class VencimientosService {
   ) {}
 
   /* ---------------- Valuación (patrón cafetería, costo del formato activo) ---------------- */
+  /*
+   * Las TRES consultas salen ANTES del bucle, no una por renglón.
+   *
+   * Esto corre dentro de la transacción del control, con un techo de 300
+   * renglones: un SELECT del producto (y otro de la presentación) por renglón
+   * eran hasta 600 idas y vueltas con la conexión tomada, casi todas repetidas
+   * —una góndola de un mismo producto son diez fechas distintas—. El orden del
+   * bucle no cambia, así que el primer renglón inválido sigue siendo el que
+   * corta y con el mismo mensaje.
+   */
   private async valuar(tx: any, items: { productoId: number; presentacionId?: number | null }[]) {
     const ids = [...new Set(items.map((it) => it.productoId))];
-    const provs = await tx.select().from(productoProveedores)
-      .where(inArray(productoProveedores.productoId, ids));
+    const presIds = [...new Set(items.map((it) => it.presentacionId).filter(Boolean))] as number[];
+    const [provs, prods, press] = await Promise.all([
+      tx.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
+      tx.select().from(productos).where(inArray(productos.id, ids)),
+      presIds.length
+        ? tx.select().from(presentaciones).where(inArray(presentaciones.id, presIds))
+        : Promise.resolve([]),
+    ]);
+    const prodDe = new Map<number, any>(prods.map((p: any) => [p.id, p]));
+    const presDe = new Map<number, any>(press.map((p: any) => [p.id, p]));
+
     const out = new Map<string, { prod: any; pres: any; costoU: number }>();
     for (const it of items) {
       const clave = `${it.productoId}-${it.presentacionId ?? 0}`;
       if (out.has(clave)) continue;
-      const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
+      const prod = prodDe.get(it.productoId);
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       /* Archivado no se controla: si no se vende, no tiene sentido vigilar su
        * fecha. El DISCONTINUADO sí — es justo el que hay que sacar a tiempo. */
@@ -164,7 +188,7 @@ export class VencimientosService {
       }
       let pres: any = null;
       if (it.presentacionId) {
-        [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
+        pres = presDe.get(it.presentacionId) ?? null;
         if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
       }
       const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
@@ -788,7 +812,14 @@ export class VencimientosService {
   }
 }
 
+/**
+ * El vigía de fechas es la pantalla `almacen.vencimientos`. PROCESAR es otra
+ * cosa: da de baja el stock de verdad y asienta la pérdida contable, así que
+ * pide `inventario` — la misma llave que el movimiento manual, porque es
+ * exactamente la misma consecuencia.
+ */
 @Controller('vencimientos')
+@Permiso('almacen.vencimientos')
 export class VencimientosController {
   constructor(private readonly svc: VencimientosService) {}
 
@@ -797,11 +828,17 @@ export class VencimientosController {
   @Get('resumen') resumen() { return this.svc.resumen(); }
   @Get('reportes') reportes(@Query('periodo') periodo?: string) { return this.svc.reportes(periodo || 'mes'); }
   @Get('ofertas') ofertas() { return this.svc.ofertasEnJuego(); }
-  @Post('sesiones') crearSesion(@Body() dto: CrearSesionDto) { return this.svc.crearSesion(dto); }
+  @Post('sesiones')
+  crearSesion(@Body() dto: CrearSesionDto, @Auth() sesion: Sesion) {
+    // El control se carga en la sucursal donde se está mirando la góndola.
+    return this.svc.crearSesion({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) as number });
+  }
   @Get(':id/borrador-oferta') borradorOferta(@Param('id', ParseIntPipe) id: number) { return this.svc.borradorOferta(id); }
   @Put(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarVencimientoDto) { return this.svc.editar(id, dto); }
   @Delete(':id') eliminar(@Param('id', ParseIntPipe) id: number) { return this.svc.eliminar(id); }
-  @Post(':id/procesar') procesar(@Param('id', ParseIntPipe) id: number, @Body() dto: ProcesarDto) { return this.svc.procesar(id, dto); }
+  @Post(':id/procesar')
+  @Permiso('inventario')
+  procesar(@Param('id', ParseIntPipe) id: number, @Body() dto: ProcesarDto) { return this.svc.procesar(id, dto); }
   @Post(':id/vincular-oferta') vincularOferta(@Param('id', ParseIntPipe) id: number, @Body() dto: VincularOfertaDto) {
     return this.svc.vincularOferta(id, dto);
   }

@@ -31,11 +31,25 @@ async function bootstrap() {
    * Detrás del proxy del hosting, la request llega "desde" el proxy: sin esto,
    * el rate limit vería UNA sola IP para todos los visitantes y los bloquearía
    * en conjunto. `trust proxy` hace que `req.ip` sea la IP real del visitante
-   * (X-Forwarded-For). CHECKLIST DEL DEPLOY: Node tiene que quedar escuchando
-   * solo en localhost, con nginx como única puerta — si se puede llegar a Node
-   * directo, ese encabezado se puede falsificar.
+   * (X-Forwarded-For), y de ahí salen tanto el cupo de la tienda como el freno
+   * de intentos del login.
+   *
+   * Por qué `'loopback'` y NO `true`. Con `true`, Express se cree TODA la cadena
+   * de X-Forwarded-For y toma el PRIMER valor — que lo escribe el cliente. Un
+   * atacante manda `X-Forwarded-For: 10.0.0.1` y su `req.ip` pasa a ser eso: se
+   * hace pasar por infraestructura interna (que el cupo exime) y de paso diluye
+   * el freno del login cambiando de "IP" en cada intento. Con `'loopback'`,
+   * Express solo confía en un proxy que venga de 127.0.0.1 —o sea nginx, que
+   * está en la misma máquina— y toma el valor que NGINX puso ($remote_addr, la
+   * IP real). Si alguien llega a Node directo (no por loopback), su encabezado
+   * se ignora y `req.ip` es su socket verdadero: la falsificación no sirve.
+   *
+   * CHECKLIST DEL DEPLOY: esto se apoya en dos patas que están en deploy/ —
+   * nginx pisa X-Forwarded-For con $remote_addr (no lo concatena), y Node
+   * escucha SOLO en localhost (HOST=127.0.0.1). Las tres juntas cierran la
+   * falsificación; sacar cualquiera la reabre.
    */
-  app.getHttpAdapter().getInstance().set('trust proxy', true);
+  app.getHttpAdapter().getInstance().set('trust proxy', 'loopback');
 
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));

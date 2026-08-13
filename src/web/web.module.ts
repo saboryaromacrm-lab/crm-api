@@ -15,17 +15,44 @@
  * Mayorista que aplica `TiendaService.catalogo()`.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Logger, Module,
-  NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Patch, Post, Query,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable,
+  Logger, Module, NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Patch,
+  Post, Query,
 } from '@nestjs/common';
-import { and, eq, gte, isNull, lt, ne } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, lt, ne } from 'drizzle-orm';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { tienePermiso } from '../auth/auth.guard';
+import { MIMES_IMAGEN, mimeReal } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  presupuestoItems, presupuestos, productos, stock, sucursales, webEventos, webImagenes,
+  categorias, configuracion, marcas, presupuestoItems, presupuestos, productos, stock,
+  sucursales, webEventos, webImagenes,
 } from '../db/schema';
 
-// 'logo' y 'favicon' usan refId 1: hay uno solo de cada uno.
-const TIPOS_IMAGEN = new Set(['producto', 'categoria', 'marca', 'banner', 'logo', 'favicon']);
+/**
+ * QUÉ PERMISO PIDE CADA IMAGEN — y de acá sale todo lo demás.
+ *
+ * No todas las imágenes del sitio son la misma responsabilidad: la foto de un
+ * producto la carga quien administra el catálogo web, el banner y las
+ * categorías quien arma el contenido, y el logo del sitio es configuración.
+ * Son las mismas tres secciones que ya divide el panel (`web.config.js`).
+ *
+ * El tipo de imagen es un dato del cuerpo, así que el decorador del endpoint no
+ * puede saber cuál corresponde: pide CUALQUIERA de los tres (el piso) y el
+ * servicio exige el exacto. Para que esas dos puertas no puedan discrepar, las
+ * dos se derivan de este mapa — agregar un tipo nuevo acá las actualiza juntas.
+ */
+const PERMISO_DE_IMAGEN: Record<string, string> = {
+  producto: 'web.productos',
+  categoria: 'web.contenido',
+  marca: 'web.contenido',
+  banner: 'web.contenido',
+  // 'logo' y 'favicon' usan refId 1: hay uno solo de cada uno.
+  logo: 'web.configuracion',
+  favicon: 'web.configuracion',
+};
+/** El piso del decorador: las claves del mapa, sin repetir. */
+const PERMISOS_IMAGEN = [...new Set(Object.values(PERMISO_DE_IMAGEN))];
 /** Tope generoso para fotos de catálogo; el banner es la imagen más grande. */
 const MAX_IMG_KB = 800;
 
@@ -112,29 +139,92 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
     }));
   }
 
-  /** Sube (o reemplaza) una imagen. `data` viene como data-URL del navegador. */
-  async subirImagen(tipo: string, refId: number, data: string) {
-    if (!TIPOS_IMAGEN.has(tipo)) throw new BadRequestException('Tipo de imagen inválido.');
-    const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(String(data ?? ''));
+  /**
+   * El permiso EXACTO que pide este tipo de imagen. Usa el mismo `tienePermiso`
+   * que el guard —el `*` del superadmin incluido— para que la regla no exista
+   * escrita de dos maneras distintas.
+   */
+  private exigirPermisoDeImagen(tipo: string, sesion: Sesion) {
+    const clave = PERMISO_DE_IMAGEN[tipo];
+    if (!clave) throw new BadRequestException('Tipo de imagen inválido.');
+    if (!tienePermiso(sesion?.permisos ?? [], [clave])) {
+      throw new ForbiddenException('Tu rol no tiene permiso para esto.');
+    }
+  }
+
+  /**
+   * Sube (o reemplaza) una imagen. `data` viene como data-URL del navegador.
+   *
+   * EL FORMATO SALE DE LOS BYTES, no del rótulo que mandó el cliente. Esta
+   * imagen vuelve a salir por `GET /tienda/imagenes/...`, que es público y
+   * vive en el MISMO ORIGEN que el dashboard: un archivo que se hace pasar
+   * por imagen y en realidad ejecuta JavaScript (el caso clásico es el SVG)
+   * correría con la sesión del CRM de quien lo abra. Por eso se contrasta la
+   * firma y se guarda lo que los bytes dicen ser, no lo declarado.
+   *
+   * No le quita nada al uso real: el panel pasa toda imagen por el canvas y
+   * exporta WebP (o PNG en Safari) — nunca sube un SVG.
+   */
+  /**
+   * El `refId` al que se cuelga la imagen tiene que EXISTIR. Sin esto, un
+   * `POST /web/imagenes/producto/$i` en un `for` de 1 a 5000 dejaba miles de
+   * filas de 800 KB colgadas de productos inexistentes, que engordan cada
+   * backup para siempre. `logo` y `favicon` son únicos: hay uno solo de cada
+   * uno, así que su `refId` es SIEMPRE 1 (y no `logo/2`, `logo/3`… basura).
+   * Devuelve el `refId` ya resuelto.
+   */
+  private async resolverRefId(tipo: string, refId: number): Promise<number> {
+    if (tipo === 'logo' || tipo === 'favicon') return 1;
+    const existe = async (tabla: any) =>
+      (await this.db.select({ id: tabla.id }).from(tabla).where(eq(tabla.id, refId)).limit(1)).length > 0;
+    if (tipo === 'producto' && await existe(productos)) return refId;
+    if (tipo === 'categoria' && await existe(categorias)) return refId;
+    if (tipo === 'marca' && await existe(marcas)) return refId;
+    if (tipo === 'banner') {
+      // El banner cuelga de un slide de la portada, que vive en la config web.
+      const [row] = await this.db.select({ valor: configuracion.valor })
+        .from(configuracion).where(eq(configuracion.clave, 'web')).limit(1);
+      const slides = (row?.valor as any)?.slides;
+      if (Array.isArray(slides) && slides.some((s: any) => Number(s?.id) === refId)) return refId;
+    }
+    throw new NotFoundException('No existe eso a lo que le querés poner imagen.');
+  }
+
+  async subirImagen(tipo: string, refId: number, data: string, sesion: Sesion) {
+    this.exigirPermisoDeImagen(tipo, sesion);
+    const ref = await this.resolverRefId(tipo, refId);
+    const m = /^data:([\w.+-]+\/[\w.+-]+);base64,(.+)$/i.exec(String(data ?? ''));
     if (!m) throw new BadRequestException('Mandá la imagen como data-URL (PNG/JPG/WebP).');
-    const [, mime, base64] = m;
-    const kb = (base64.length * 3) / 4 / 1024;
+    const [, declarado, base64] = m;
+
+    const buf = Buffer.from(base64, 'base64');
+    const kb = buf.length / 1024;
     if (kb > MAX_IMG_KB) {
       throw new BadRequestException(`La imagen pesa ${Math.round(kb)} KB: usá una de hasta ${MAX_IMG_KB} KB.`);
     }
+    const real = mimeReal(buf);
+    if (!real || !MIMES_IMAGEN.has(real)) {
+      throw new BadRequestException('Ese archivo no es una imagen PNG, JPG ni WebP.');
+    }
+    if (real !== declarado.toLowerCase()) {
+      throw new BadRequestException(`El archivo dice ser ${declarado} pero su contenido es ${real}.`);
+    }
 
+    // Se re-codifica desde el buffer ya validado: lo que se guarda es
+    // exactamente lo que se contrastó, sin restos del texto original.
+    const limpio = buf.toString('base64');
     const [img] = await this.db.insert(webImagenes)
-      .values({ tipo: tipo as any, refId, mime, data: base64, actualizadoEn: new Date() })
+      .values({ tipo: tipo as any, refId: ref, mime: real, data: limpio, actualizadoEn: new Date() })
       .onConflictDoUpdate({
         target: [webImagenes.tipo, webImagenes.refId],
-        set: { mime, data: base64, actualizadoEn: new Date() },
+        set: { mime: real, data: limpio, actualizadoEn: new Date() },
       })
       .returning({ tipo: webImagenes.tipo, refId: webImagenes.refId, actualizadoEn: webImagenes.actualizadoEn });
     return { ok: true, url: `tienda/imagenes/${img.tipo}/${img.refId}?v=${new Date(img.actualizadoEn).getTime()}` };
   }
 
-  async borrarImagen(tipo: string, refId: number) {
-    if (!TIPOS_IMAGEN.has(tipo)) throw new BadRequestException('Tipo de imagen inválido.');
+  async borrarImagen(tipo: string, refId: number, sesion: Sesion) {
+    this.exigirPermisoDeImagen(tipo, sesion);
     await this.db.delete(webImagenes)
       .where(and(eq(webImagenes.tipo, tipo as any), eq(webImagenes.refId, refId)));
     return { ok: true };
@@ -152,13 +242,22 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
     const desde = new Date(Date.now() - n * 86400000);
     desde.setHours(0, 0, 0, 0);
 
-    const [evs, prods, pedidosWeb, items] = await Promise.all([
+    const [evs, prods, pedidosWeb] = await Promise.all([
       this.db.select().from(webEventos).where(gte(webEventos.fecha, desde)),
       this.db.select({ id: productos.id, nombre: productos.nombre }).from(productos),
       this.db.select().from(presupuestos)
         .where(and(eq(presupuestos.origen, 'web'), gte(presupuestos.fecha, desde), ne(presupuestos.estado, 'cancelado'))),
-      this.db.select().from(presupuestoItems),
     ]);
+
+    /*
+     * Los renglones SOLO de los pedidos del período, no toda la tabla hija
+     * histórica: a los dos años de operación, bajar `presupuesto_items` entera
+     * para cruzarla contra un puñado de pedidos web tira la pantalla sola.
+     */
+    const idsPeriodo = pedidosWeb.map((p) => p.id);
+    const items = idsPeriodo.length
+      ? await this.db.select().from(presupuestoItems).where(inArray(presupuestoItems.presupuestoId, idsPeriodo))
+      : [];
 
     /* Serie por día (con los días sin tráfico en cero: el gráfico no miente saltándolos). */
     const claveDia = (d: Date) => d.toISOString().slice(0, 10);
@@ -241,31 +340,54 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
   }
 }
 
+/**
+ * Cada endpoint pide SU permiso, no uno solo para todo el módulo: las cuatro
+ * claves de Web ya existían en el catálogo de permisos y se chequeaban nada más
+ * que en el navegador (`WebPage.jsx`, `secciones.filter`), o sea que escondían
+ * el botón pero no la llamada. Sin esto, cualquiera con una sesión válida podía
+ * poner el sitio entero en "Sin stock" o cambiarle el logo.
+ */
 @Controller('web')
 export class WebController {
   constructor(private readonly svc: WebService) {}
 
   @Get('estadisticas')
+  @Permiso('web.estadisticas')
   estadisticas(@Query('dias') dias?: string) {
     return this.svc.estadisticas(dias ? Number(dias) : 30);
   }
 
   @Get('productos')
+  @Permiso('web.productos')
   productos() { return this.svc.productosAdmin(); }
 
   @Patch('productos/:id')
+  @Permiso('web.productos')
   producto(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.editarProducto(id, body ?? {});
   }
 
+  /* El piso: alguna de las tres. Cuál corresponde depende del `tipo`, y eso lo
+   * exige el servicio con el mismo mapa del que sale esta lista. */
   @Post('imagenes/:tipo/:refId')
-  subir(@Param('tipo') tipo: string, @Param('refId', ParseIntPipe) refId: number, @Body() body: any) {
-    return this.svc.subirImagen(tipo, refId, body?.data);
+  @Permiso(...PERMISOS_IMAGEN)
+  subir(
+    @Param('tipo') tipo: string,
+    @Param('refId', ParseIntPipe) refId: number,
+    @Body() body: any,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.svc.subirImagen(tipo, refId, body?.data, sesion);
   }
 
   @Delete('imagenes/:tipo/:refId')
-  borrar(@Param('tipo') tipo: string, @Param('refId', ParseIntPipe) refId: number) {
-    return this.svc.borrarImagen(tipo, refId);
+  @Permiso(...PERMISOS_IMAGEN)
+  borrar(
+    @Param('tipo') tipo: string,
+    @Param('refId', ParseIntPipe) refId: number,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.svc.borrarImagen(tipo, refId, sesion);
   }
 }
 

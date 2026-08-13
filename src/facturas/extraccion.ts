@@ -40,20 +40,62 @@ const importarPdfjs = () => {
 /** Misma línea = misma altura, con tolerancia: los renglones no vienen a Y exacta. */
 const TOLERANCIA_Y = 2.5;
 
+/*
+ * TECHOS DEL EXTRACTOR — un PDF no confiable no puede decidir cuánto trabaja
+ * el servidor.
+ * ============================================================================
+ * El archivo lo sube cualquiera desde un celular, y esto corre en el MISMO
+ * proceso que atiende el POS: Node es uno solo. Sin techo, un PDF válido de 2 MB
+ * (pasa la verificación de bytes sin problema) con decenas de miles de páginas o
+ * con streams que expanden a cientos de MB de texto **deja toda la API sin
+ * responder mientras parsea**, y con suerte muere por falta de memoria. Los
+ * límites que ya existían —2,5 MB por archivo, 20 páginas— cuentan las páginas
+ * SUBIDAS a la bandeja, no las que el PDF tiene adentro.
+ *
+ * Los tres son generosos para una factura real: la más larga que vimos (Bavosi)
+ * tiene 3 páginas y unos 4.000 fragmentos.
+ */
+const MAX_PAGINAS_PDF = 30;
+const MAX_FRAGMENTOS = 200_000;
+
+export class PdfDemasiadoGrande extends Error {}
+
 export async function extraerLineasPdf(buf: Buffer): Promise<LineaPdf[]> {
   const pdfjs = await importarPdfjs();
-  // `verbosity: 0` calla el aviso de fuentes estándar, que acá no importa:
-  // no se renderiza nada, solo se lee el texto.
-  const tarea = pdfjs.getDocument({ data: new Uint8Array(buf), verbosity: 0 });
+  const tarea = pdfjs.getDocument({
+    data: new Uint8Array(buf),
+    // `verbosity: 0` calla el aviso de fuentes estándar, que acá no importa:
+    // no se renderiza nada, solo se lee el texto.
+    verbosity: 0,
+    /*
+     * Por defecto pdf.js COMPILA CON eval los programas de fuente del archivo,
+     * para acelerar el renderizado. Acá no se renderiza nada, así que es
+     * superficie de ejecución sobre un archivo que subió un desconocido a
+     * cambio de exactamente ningún beneficio.
+     */
+    isEvalSupported: false,
+  });
   const doc = await tarea.promise;
   const lineas: LineaPdf[] = [];
+  let fragmentos = 0;
   try {
+    if (doc.numPages > MAX_PAGINAS_PDF) {
+      throw new PdfDemasiadoGrande(
+        `Ese PDF tiene ${doc.numPages} páginas: no parece una factura. El límite es ${MAX_PAGINAS_PDF}.`,
+      );
+    }
     for (let p = 1; p <= doc.numPages; p++) {
       const page = await doc.getPage(p);
       const tc = await page.getTextContent();
       const frags: FragPdf[] = tc.items
         .filter((it: any) => it.str && it.str.trim())
         .map((it: any) => ({ x: it.transform[4], y: it.transform[5], s: it.str }));
+      fragmentos += frags.length;
+      if (fragmentos > MAX_FRAGMENTOS) {
+        throw new PdfDemasiadoGrande(
+          'Ese PDF tiene demasiado texto para leerlo acá. Cargá los renglones a mano.',
+        );
+      }
       // De arriba hacia abajo, y dentro de la línea de izquierda a derecha.
       frags.sort((a, b) => b.y - a.y || a.x - b.x);
       let actual: LineaPdf | null = null;
@@ -65,6 +107,9 @@ export async function extraerLineasPdf(buf: Buffer): Promise<LineaPdf[]> {
           actual.frags.push(f);
         }
       }
+      // pdf.js CACHEA cada página en el documento: sin esto, un PDF largo
+      // acumula todas las páginas parseadas en memoria hasta el final.
+      page.cleanup();
     }
   } finally {
     // En pdfjs 6 el destroy vive en la TAREA de carga, no en el documento.

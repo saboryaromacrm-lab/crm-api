@@ -42,7 +42,7 @@ async function main() {
   const caja = new CajaService(db as any);
   const ofertasSvc = new OfertasService(db as any);
   const vtas = new VentasService(db as any, inv, cfg, cli, caja, listasSvc, ofertasSvc);
-  const cobr = new CobranzasService(db as any, cli, cfg, vtas);
+  const cobr = new CobranzasService(db as any, cli, cfg, vtas, caja);
 
   await truncateAll(pool);
 
@@ -67,7 +67,10 @@ async function main() {
   }).returning();
   const [rAdmin] = await db.insert(schema.roles).values({
     clave: 'admin', nombre: 'Administrador', esSistema: true,
-    permisos: ['ventas', 'presupuestos', 'devoluciones', 'diferencias', 'precios', 'ofertas', 'facturas', 'inventario', 'merma', 'defectuoso', 'incidencia_crear', 'etiquetas', 'pedidos', 'preparar', 'fraccionar', 'config', 'ver'],
+    // `precio_manual` es la llave para pisar el precio de un renglón y pasar el
+    // tope de descuento: la tiene el admin porque es quien regatea en el
+    // mostrador. El cajero NO — para él el precio es el de la lista.
+    permisos: ['ventas', 'presupuestos', 'devoluciones', 'diferencias', 'precios', 'precio_manual', 'ofertas', 'facturas', 'inventario', 'merma', 'defectuoso', 'incidencia_crear', 'etiquetas', 'pedidos', 'preparar', 'fraccionar', 'config', 'ver'],
     descripcion: 'Cargas de facturas, controles de inventario y almacenes.',
   }).returning();
   const [rFrac] = await db.insert(schema.roles).values({
@@ -336,27 +339,35 @@ async function main() {
     condicionIva: 'consumidor_final', telefono: '11-6000-4455', localidad: 'Pilar', sucursalId: ex1.id,
   });
 
-  // Dos ventas en cuenta corriente: le dan saldo real a la cobranza de abajo.
+  /*
+   * Dos ventas en cuenta corriente: le dan saldo real a la cobranza de abajo.
+   *
+   * `puedePisarPrecio` porque el seed escribe precios a mano en vez de tomarlos
+   * de las listas, y `sucursalSesion` porque la sucursal ya no sale del dto — las
+   * dos son lo que el controller resolvería de una sesión de admin. El `iva` no
+   * viaja: lo pone el servidor con la alícuota del producto.
+   */
+  const comoAdmin = { puedePisarPrecio: true, sucursalSesion: dist.id, esJefe: true };
   const v1 = await vtas.create({
-    clienteId: kiosco.id, sucursalId: dist.id, usuarioId: carla.id, condicionPago: 'cuenta_corriente',
+    clienteId: kiosco.id, usuarioId: carla.id, condicionPago: 'cuenta_corriente',
     observaciones: 'Pedido semanal',
     items: [
-      { productoId: galletitas.id, cantidad: 12, precioLista: 900, descuento: 5, iva: 21 },
-      { productoId: yerba.id, cantidad: 6, precioLista: 2400, iva: 21 },
+      { productoId: galletitas.id, cantidad: 12, precioLista: 900, precioUnitario: 900, descuento: 5 },
+      { productoId: yerba.id, cantidad: 6, precioLista: 2400, precioUnitario: 2400 },
     ],
-  });
+  }, comoAdmin);
   await vtas.create({
-    clienteId: dietetica.id, sucursalId: dist.id, usuarioId: carla.id, condicionPago: 'cuenta_corriente',
-    items: [{ productoId: avena.id, cantidad: 4, precioLista: 1800, iva: 21 }],
-  });
+    clienteId: dietetica.id, usuarioId: carla.id, condicionPago: 'cuenta_corriente',
+    items: [{ productoId: avena.id, cantidad: 4, precioLista: 1800, precioUnitario: 1800 }],
+  }, comoAdmin);
 
   // Cobranza parcial del kiosco: paga una parte de la primera venta.
   await cobr.create({
-    clienteId: kiosco.id, sucursalId: dist.id, usuarioId: ana.id,
+    clienteId: kiosco.id, usuarioId: ana.id,
     observaciones: 'Pago parcial a cuenta del pedido semanal',
     pagos: [{ medio: 'transferencia', importe: 10000, referencia: 'CBU 0070…' }],
     imputaciones: [{ ventaId: v1.id, importe: 10000 }],
-  });
+  }, dist.id);
 
   await pool.end();
   // eslint-disable-next-line no-console

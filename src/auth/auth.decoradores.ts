@@ -11,6 +11,24 @@ import { SetMetadata, createParamDecorator, ExecutionContext } from '@nestjs/com
 
 export const PUBLICO_KEY = 'crm:publico';
 export const PERMISO_KEY = 'crm:permiso';
+export const CLAVE_SERVICIO_KEY = 'crm:clave-servicio';
+
+/**
+ * ESTE ENDPOINT TAMBIÉN ACEPTA UNA CLAVE DE SERVICIO, para una aplicación que
+ * no es una persona y por lo tanto no tiene sesión.
+ *
+ * Recibe el nombre de la variable de entorno donde vive el secreto. Si esa
+ * variable no está cargada, la puerta simplemente no existe y el endpoint sigue
+ * pidiendo sesión como cualquier otro — así se puede preparar el cambio sin
+ * romper a nadie y activarlo el día que se coordina con el otro sistema.
+ *
+ * NO es `@Publico()`: la clave se compara en el guard, que es la única puerta
+ * del sistema. Hacerlo con `@Publico()` + un chequeo en el controller dejaba el
+ * endpoint sin `req.auth` incluso para una sesión legítima, o sea que había que
+ * reimplementar la autenticación adentro del handler — dos puertas otra vez.
+ */
+export const ClaveServicio = (variableEntorno: string) =>
+  SetMetadata(CLAVE_SERVICIO_KEY, variableEntorno);
 
 /**
  * Este endpoint NO pide sesión. Son cinco casos y ninguno más:
@@ -35,6 +53,8 @@ export interface Sesion {
   nombre: string;
   rolId: number;
   rolClave: string;
+  /** El nombre visible del rol ("Administrador"), para el encabezado. */
+  rolNombre: string;
   permisos: string[];
   sucursalId: number;
   sucursalNombre: string;

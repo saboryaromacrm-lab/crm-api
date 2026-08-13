@@ -33,7 +33,7 @@ import {
   productoProveedorCostos, productoProveedores, productos, proveedores, roles, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { costoNetoEntry, formatoActivo, precioFinal, precioLista, precioVentaFila } from '../inventario/pricing';
+import { costoNetoEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -555,10 +555,6 @@ export class PreciosService {
 
       // Productos involucrados, solo si el lote además cambió el proveedor activo.
       const prodIds = [...new Set(actuales.map((e: any) => e.productoId))];
-      const prods = prodIds.length
-        ? await tx.select().from(productos).where(inArray(productos.id, prodIds))
-        : [];
-      const prodPorId = new Map(prods.map((p: any) => [p.id, p]));
 
       const revertibles: any[] = [];
       const salteadas: any[] = [];

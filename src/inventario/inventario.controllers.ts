@@ -1,13 +1,228 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Put, Query } from '@nestjs/common';
+/**
+ * LOS CONTROLLERS DEL ALMACÉN — permisos, sucursal y validación
+ * ============================================================================
+ * Hasta acá estos 26 endpoints eran la puerta más abierta del sistema: **cero
+ * `@Permiso`, cero `@Auth()` y `@Body() any` en los ocho POST**. El catálogo de
+ * permisos que los describe existe desde siempre (`usuarios.module.ts`) y lo
+ * miraba **únicamente el navegador**: el rol Cafetería —que ve una sola
+ * pantalla— copiaba su token y con un POST daba de baja 300 kg como merma, o
+ * los inventaba.
+ *
+ * Tres reglas, y las tres estaban escritas en otro lado:
+ *
+ *  1. LA LLAVE. Sección (`almacen.*`) para mirar, acción para operar. Cuando la
+ *     acción es más fuerte que la pantalla —dar de baja mercadería, fraccionar,
+ *     preparar un pedido— va sola en el método: las claves de un mismo
+ *     `@Permiso` se evalúan con O, así que ponerla al lado de la sección sería
+ *     lo mismo que no ponerla.
+ *
+ *  2. LA SUCURSAL sale de la sesión. `sucursalDeOperacion` para lo que se
+ *     GRABA, `soloSuSucursal` para lo que se TOCA. Esto no era un ataque de
+ *     consola: el desplegable del panel listaba todas las sucursales sin mirar
+ *     el rol, así que el repositor de Fontana elegía "Express 2" y le bajaba el
+ *     stock a un local donde no pisa.
+ *
+ *  3. LOS NÚMEROS. `@Body() any` deja pasar `cantidad: 1e999`, que es
+ *     `Infinity`, que es `> 0` y por lo tanto pasa el guard del servicio. La
+ *     fila de stock queda en `Infinity` PARA SIEMPRE —`Infinity − 300` sigue
+ *     siendo `Infinity`— y solo se arregla con un UPDATE a mano.
+ *
+ * LAS TRANSFERENCIAS tienen su propia regla, decidida por el dueño (13/8): cada
+ * sucursal PREPARA lo que sale de ella (`origenId`) y PIDE y RECIBE lo que
+ * llega a ella (`destinoId`). El único pedido que prepara alguien que no es su
+ * dueño es el de la Cafetería, y ese va por otro circuito (`cafeteria/`).
+ */
+import {
+  Body, Controller, Delete, ForbiddenException, Get, Param, ParseIntPipe,
+  Patch, Post, Put, Query,
+} from '@nestjs/common';
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
+  Max, MaxLength, Min, ValidateNested,
+} from 'class-validator';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { InventarioService } from './inventario.service';
+
+/*
+ * TOPES. Cien mil unidades es más de lo que entra en cualquier depósito de este
+ * negocio, y ese es el punto: lo que hay que impedir no es la carga grande sino
+ * la imposible. `@Max` además rechaza `Infinity` (class-validator lo compara), y
+ * `@IsNumber()` por sí solo ya rechaza `NaN` — que es lo que dejaba 200 kg
+ * varados en `en_transito` sin salida cuando llegaba `cantidadRecibida: "x"`.
+ */
+const MAX_CANT = 100_000;
+const MAX_ITEMS = 300;
+
+/**
+ * QUÉ MOVIMIENTOS SE PUEDEN CARGAR A MANO.
+ *
+ * `TIPOS_MOV` del servicio tiene once y el endpoint los aceptaba todos, pero
+ * seis de ellos son la firma de un documento: `compra` la pone la factura,
+ * `venta_granel` y `venta_fraccionada` el ticket, `transferencia` el remito,
+ * `fraccionamiento` su propia operación y `envio_cafeteria` el envío. Cargarlos
+ * a mano es inventar un documento que no existe — con `venta_granel` se
+ * descuenta stock sin ticket ni caja, que es la forma prolija de tapar un
+ * faltante, y el arqueo no lo ve nunca.
+ *
+ * Quedan los cinco que SON del almacén: los que corrigen la realidad contra el
+ * papel, y que por eso mismo cada uno pide su propia llave.
+ */
+const TIPOS_MANUALES = ['devolucion', 'ajuste', 'merma', 'vencido', 'defectuoso'] as const;
+
+/** Las bajas por pérdida tienen llave propia; el resto va con `inventario`. */
+const LLAVE_DE_TIPO: Record<string, string> = {
+  merma: 'merma',
+  vencido: 'merma',
+  defectuoso: 'defectuoso',
+};
+
+class CompraDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  @IsOptional() @IsInt() proveedorId?: number;
+  @IsOptional() @IsString() fechaVencimiento?: string;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class VentaDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class AsignacionDto {
+  @IsInt() presId!: number;
+  @IsNumber() @Min(0) @Max(MAX_CANT) cant!: number;
+}
+
+class FraccionarDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => AsignacionDto)
+  asignaciones!: AsignacionDto[];
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class CorregirFraccionadoDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsInt() presId!: number;
+  /*
+   * CUÁNTOS PAQUETES HAY DE VERDAD, no la diferencia contra lo cargado.
+   *
+   * El DTO decía `diferencia` y el servicio lee `cantidadReal` — el modal manda
+   * `cantidadReal`. Con `whitelist: true` el pipe borra lo que el DTO no
+   * declara, así que al servicio le llegaba `undefined`, `Math.round(Number(
+   * undefined))` daba NaN y la pantalla contestaba "La cantidad real no puede
+   * ser negativa" hiciera lo que hiciera: la corrección de fraccionado no se
+   * podía usar. El nombre lo manda el servicio, que es el que decide la cuenta.
+   */
+  @IsNumber() @Min(0) @Max(MAX_CANT) cantidadReal!: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class MovimientoDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsIn(TIPOS_MANUALES as unknown as string[]) tipo!: string;
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  /** Solo lo miran los tipos de dirección 0 (`ajuste`): +1 suma, cualquier otro resta. */
+  @IsOptional() @IsInt() signo?: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class AbrirBorradorDto {
+  @IsInt() origenId!: number;
+  @IsOptional() @IsInt() destinoId?: number;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class ItemBorradorDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsNumber() @Min(0) @Max(MAX_CANT) cantidad!: number;
+}
+
+class GuardarBorradorDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => ItemBorradorDto)
+  items?: ItemBorradorDto[];
+  @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class UsuarioDto {
+  @IsOptional() @IsInt() usuarioId?: number;
+  @IsOptional() @IsString() desde?: string;
+}
+
+class EditarItemDto {
+  @IsOptional() @IsNumber() @Min(0) @Max(MAX_CANT) cantidadPreparada?: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+class AgregarItemDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+class ConfirmarListaDto {
+  @IsIn(['enteros', 'granel']) tipo!: 'enteros' | 'granel';
+  @IsBoolean() listo!: boolean;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class ItemRecibidoDto {
+  @IsInt() itemId!: number;
+  /* `@IsNumber()` rechaza NaN: con `cantidadRecibida: "x"` los dos `if` de la
+   * recepción daban falso y la mercadería no entraba al destino, no volvía al
+   * origen y no generaba incidencia — quedaba en `en_transito` con el remito ya
+   * cerrado, y no hay ningún camino en el código que la saque de ahí. */
+  @IsNumber() @Min(0) @Max(MAX_CANT) cantidadRecibida!: number;
+}
+
+class RecibirDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => ItemRecibidoDto)
+  items?: ItemRecibidoDto[];
+  @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class CrearIncidenciaDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsString() @MaxLength(40) tipo!: string;
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  /** A quién se le ATRIBUYE el faltante. NO es el autor: ese sale de la sesión. */
+  @IsOptional() @IsInt() responsableId?: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+class ResolverIncidenciaDto {
+  @IsString() @MaxLength(40) resolucion!: string;
+}
+
+/* ------------------------------ Lecturas ------------------------------ */
 
 @Controller('stock')
 export class StockController {
   constructor(private readonly inv: InventarioService) {}
 
   @Get()
-  existencias() {
-    return this.inv.existencias();
+  @Permiso('almacen.existencias', 'compras.productos')
+  existencias(@Auth() sesion: Sesion) {
+    return this.inv.existencias(soloSuSucursal(sesion));
   }
 }
 
@@ -15,7 +230,14 @@ export class StockController {
 export class BootstrapController {
   constructor(private readonly inv: InventarioService) {}
 
-  /** Snapshot completo del estado del inventario (una sola llamada). */
+  /**
+   * Snapshot completo del inventario. QUEDA ABIERTO a cualquier sesión válida, y
+   * es una decisión, no un olvido: lo llama el sidebar de **todos** los módulos
+   * para los contadores del menú, así que un `@Permiso` acá le deja el menú roto
+   * a quien solo tiene Ventas. Lo que sí hay que recortar es su CONTENIDO —hoy
+   * viaja el catálogo con costos y márgenes—, y eso queda anotado en /info
+   * porque toca lo que consumen cuatro pantallas.
+   */
   @Get()
   bootstrap() {
     return this.inv.bootstrap();
@@ -26,75 +248,102 @@ export class BootstrapController {
 export class MovimientosController {
   constructor(private readonly inv: InventarioService) {}
 
+  /** El historial completo del stock: solo quien tiene el libro del almacén. */
   @Get()
+  @Permiso('almacen.operaciones', 'compras.historial')
   list(
+    @Auth() sesion: Sesion,
     @Query('productoId') productoId?: string,
     @Query('sucursalId') sucursalId?: string,
     @Query('tipo') tipo?: string,
     @Query('limit') limit?: string,
   ) {
+    const mia = soloSuSucursal(sesion);
     return this.inv.listMovimientos({
       productoId: productoId ? Number(productoId) : undefined,
-      sucursalId: sucursalId ? Number(sucursalId) : undefined,
+      // El que no es jefe ve el movimiento de SU local: con el filtro libre se
+      // reconstruía la operación completa de todas las sucursales.
+      sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
       tipo,
       limit: limit ? Number(limit) : undefined,
     });
   }
 }
 
+/* ------------------------------ Operaciones ------------------------------ */
+
 @Controller('operaciones')
+@Permiso('almacen.existencias')
 export class OperacionesController {
   constructor(private readonly inv: InventarioService) {}
 
   /** El libro del almacén: una fila por documento, valuada a costo. */
   @Get('almacen')
+  @Permiso('almacen.operaciones')
   almacen(
+    @Auth() sesion: Sesion,
     @Query('sucursalId') sucursalId?: string,
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
   ) {
-    return this.inv.operacionesAlmacen({ sucursalId: Number(sucursalId), desde, hasta });
+    const mia = soloSuSucursal(sesion);
+    return this.inv.operacionesAlmacen({ sucursalId: mia ?? Number(sucursalId), desde, hasta });
   }
 
+  /** Ingreso a mano. El camino normal es la factura de compra; este es la excepción. */
   @Post('compra')
-  compra(@Body() body: any) {
-    return this.inv.opCompra(body);
+  @Permiso('inventario')
+  compra(@Body() dto: CompraDto, @Auth() sesion: Sesion) {
+    return this.inv.opCompra({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   @Post('venta')
-  venta(@Body() body: any) {
-    return this.inv.opVenta(body);
+  @Permiso('inventario')
+  venta(@Body() dto: VentaDto, @Auth() sesion: Sesion) {
+    return this.inv.opVenta({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   @Post('fraccionar')
-  fraccionar(@Body() body: any) {
-    return this.inv.opFraccionar(body);
+  @Permiso('fraccionar')
+  fraccionar(@Body() dto: FraccionarDto, @Auth() sesion: Sesion) {
+    return this.inv.opFraccionar({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   /** "Puse 20 paquetes y son 19": ajusta los paquetes Y el granel de una vez. */
   @Post('corregir-fraccionado')
-  corregirFraccionado(@Body() body: any) {
-    return this.inv.opCorregirFraccionado(body);
+  @Permiso('fraccionar')
+  corregirFraccionado(@Body() dto: CorregirFraccionadoDto, @Auth() sesion: Sesion) {
+    return this.inv.opCorregirFraccionado({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
+  /**
+   * El movimiento manual. La llave DEPENDE DEL TIPO: dar de baja por merma o
+   * por vencimiento pide `merma`, por defectuoso pide `defectuoso`, y el ajuste
+   * o la devolución piden `inventario`. Es la única forma de que el permiso
+   * signifique lo que dice el catálogo — con una sola llave para los cinco,
+   * quien puede corregir un conteo podría asentar pérdidas.
+   */
   @Post('movimiento')
-  movimiento(@Body() body: any) {
-    return this.inv.opSimple(body);
+  @Permiso('inventario', 'merma', 'defectuoso')
+  movimiento(@Body() dto: MovimientoDto, @Auth() sesion: Sesion) {
+    const llave = LLAVE_DE_TIPO[dto.tipo] ?? 'inventario';
+    if (!sesion.permisos.includes('*') && !sesion.permisos.includes(llave)) {
+      throw new ForbiddenException(`Tu rol no puede cargar un movimiento de tipo "${dto.tipo}".`);
+    }
+    return this.inv.opSimple({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 }
 
+/* ---------------------------- Transferencias ---------------------------- */
+
 @Controller('transferencias')
+@Permiso('almacen.transferencias')
 export class TransferenciasController {
   constructor(private readonly inv: InventarioService) {}
 
   @Get()
-  list() {
-    return this.inv.listTransferencias();
-  }
-
-  @Post()
-  crear(@Body() body: any) {
-    return this.inv.crearTransferencia(body);
+  list(@Auth() sesion: Sesion) {
+    return this.inv.listTransferencias(soloSuSucursal(sesion));
   }
 
   /*
@@ -102,97 +351,140 @@ export class TransferenciasController {
    * abre o retoma el de esa ruta, `PUT` guarda la lista completa (lo llama el
    * guardado automático), `enviar` lo convierte en demanda y `DELETE` lo
    * descarta. Uno por ruta, no por cajero.
+   *
+   * Los cuatro se comparan contra `destinoId`, que es QUIEN PIDE. Sin eso, un
+   * `PUT` con `items: []` sobre el id de otra ruta borraba el pedido que esa
+   * sucursal venía armando desde la mañana — y el borrador no tiene historial,
+   * así que el trabajo del día desaparecía sin dejar rastro.
    */
   @Post('borrador')
-  borrador(@Body() body: any) {
+  @Permiso('pedidos')
+  borrador(@Body() dto: AbrirBorradorDto, @Auth() sesion: Sesion) {
+    const destinoId = sucursalDeOperacion(sesion, dto.destinoId);
     return this.inv.borradorTransferencia({
-      origenId: Number(body?.origenId), destinoId: Number(body?.destinoId), usuarioId: body?.usuarioId,
+      origenId: Number(dto.origenId), destinoId: Number(destinoId), usuarioId: dto.usuarioId,
     });
   }
 
   @Put(':id/borrador')
-  guardarBorrador(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.guardarBorrador(id, body ?? {});
+  @Permiso('pedidos')
+  guardarBorrador(@Param('id', ParseIntPipe) id: number, @Body() dto: GuardarBorradorDto, @Auth() sesion: Sesion) {
+    return this.inv.guardarBorrador(id, dto ?? {}, soloSuSucursal(sesion));
   }
 
   @Post(':id/enviar')
-  enviarBorrador(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.enviarBorrador(id, { usuarioId: body?.usuarioId });
+  @Permiso('pedidos')
+  enviarBorrador(@Param('id', ParseIntPipe) id: number, @Body() dto: UsuarioDto, @Auth() sesion: Sesion) {
+    return this.inv.enviarBorrador(id, { usuarioId: dto?.usuarioId }, soloSuSucursal(sesion));
   }
 
   @Delete(':id/borrador')
-  descartarBorrador(@Param('id', ParseIntPipe) id: number) {
-    return this.inv.descartarBorrador(id);
+  @Permiso('pedidos')
+  descartarBorrador(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.descartarBorrador(id, soloSuSucursal(sesion));
   }
 
+  /** Avanza el estado. Es la preparación: se compara contra el ORIGEN. */
   @Post(':id/avanzar')
-  avanzar(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.avanzarTransferencia(id, body?.usuarioId, body?.desde);
+  @Permiso('preparar')
+  avanzar(@Param('id', ParseIntPipe) id: number, @Body() dto: UsuarioDto, @Auth() sesion: Sesion) {
+    return this.inv.avanzarTransferencia(id, dto?.usuarioId, dto?.desde, soloSuSucursal(sesion));
   }
 
-  /* --- Preparación en dos listas (fase "preparada") --- */
+  /* --- Preparación en dos listas (fase "preparada"): siempre contra el ORIGEN --- */
 
   /** Edita cantidad preparada / motivo de un renglón (lista sin confirmar). */
   @Patch(':id/items/:itemId')
+  @Permiso('preparar')
   editarItem(
     @Param('id', ParseIntPipe) id: number,
     @Param('itemId', ParseIntPipe) itemId: number,
-    @Body() body: any,
+    @Body() dto: EditarItemDto,
+    @Auth() sesion: Sesion,
   ) {
-    return this.inv.editarItemTransferencia(id, itemId, body ?? {});
+    return this.inv.editarItemTransferencia(id, itemId, dto ?? {}, soloSuSucursal(sesion));
   }
 
   /** Agrega un renglón durante la preparación (mercadería que llegó a último momento). */
   @Post(':id/items')
-  agregarItem(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.agregarItemTransferencia(id, body ?? {});
+  @Permiso('preparar')
+  agregarItem(@Param('id', ParseIntPipe) id: number, @Body() dto: AgregarItemDto, @Auth() sesion: Sesion) {
+    return this.inv.agregarItemTransferencia(id, dto ?? ({} as AgregarItemDto), soloSuSucursal(sesion));
   }
 
   /** Quita un renglón AGREGADO (los pedidos por el destino se ponen en 0, no se borran). */
   @Delete(':id/items/:itemId')
-  quitarItem(@Param('id', ParseIntPipe) id: number, @Param('itemId', ParseIntPipe) itemId: number) {
-    return this.inv.quitarItemTransferencia(id, itemId);
+  @Permiso('preparar')
+  quitarItem(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('itemId', ParseIntPipe) itemId: number,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.inv.quitarItemTransferencia(id, itemId, soloSuSucursal(sesion));
   }
 
   /** Confirma o desconfirma una lista (enteros | granel). Confirmar = reservar stock. */
   @Post(':id/lista')
-  confirmarLista(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.confirmarListaTransferencia(id, body ?? {});
+  @Permiso('preparar')
+  confirmarLista(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarListaDto, @Auth() sesion: Sesion) {
+    return this.inv.confirmarListaTransferencia(id, dto, soloSuSucursal(sesion));
   }
 
-  /** Recepción CONTADA: cantidades por renglón; la diferencia va a incidencia. */
+  /**
+   * Recepción CONTADA: cantidades por renglón; la diferencia va a incidencia.
+   * Contra el DESTINO — sin esto, cualquiera cerraba el remito de otra sucursal
+   * declarando 0 recibido, y los 200 kg quedaban en el limbo del origen.
+   */
   @Post(':id/recibir')
-  recibir(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.recibirTransferencia(id, body ?? {});
+  @Permiso('pedidos')
+  recibir(@Param('id', ParseIntPipe) id: number, @Body() dto: RecibirDto, @Auth() sesion: Sesion) {
+    return this.inv.recibirTransferencia(id, dto ?? {}, soloSuSucursal(sesion));
   }
 
+  /** Cancelar libera la reserva del ORIGEN, así que es de quien la preparó. */
   @Post(':id/cancelar')
-  cancelar(@Param('id', ParseIntPipe) id: number) {
-    return this.inv.cancelarTransferencia(id);
+  @Permiso('preparar')
+  cancelar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.cancelarTransferencia(id, sesion.usuarioId, soloSuSucursal(sesion));
   }
 }
 
+/* ------------------------------ Incidencias ------------------------------ */
+
 @Controller('incidencias')
+@Permiso('almacen.incidencias')
 export class IncidenciasController {
   constructor(private readonly inv: InventarioService) {}
 
   @Get()
-  list() {
-    return this.inv.listIncidencias();
+  list(@Auth() sesion: Sesion) {
+    return this.inv.listIncidencias(soloSuSucursal(sesion));
   }
 
   @Post()
-  crear(@Body() body: any) {
-    return this.inv.crearIncidencia(body);
+  @Permiso('incidencia_crear')
+  crear(@Body() dto: CrearIncidenciaDto, @Auth() sesion: Sesion) {
+    return this.inv.crearIncidencia(
+      { ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) },
+      sesion.usuarioId,
+    );
   }
 
   @Post(':id/avanzar')
-  avanzar(@Param('id', ParseIntPipe) id: number) {
-    return this.inv.avanzarIncidencia(id);
+  @Permiso('incidencia_crear')
+  avanzar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.avanzarIncidencia(id, soloSuSucursal(sesion));
   }
 
+  /**
+   * RESOLVER es la acción fuerte: según la resolución, la mercadería vuelve a
+   * disponible o se da de baja como pérdida real. Por eso pide `inventario` y
+   * no la llave de crear — cualquiera puede reportar un faltante; cerrarlo
+   * contra el stock es otra cosa.
+   */
   @Post(':id/resolver')
-  resolver(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.inv.resolverIncidencia(id, body?.resolucion);
+  @Permiso('inventario')
+  resolver(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverIncidenciaDto, @Auth() sesion: Sesion) {
+    return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion));
   }
 }

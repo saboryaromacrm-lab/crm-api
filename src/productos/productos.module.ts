@@ -2,10 +2,14 @@ import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
-import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength } from 'class-validator';
+import {
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength,
+} from 'class-validator';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
+import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { tienePermiso } from '../auth/auth.guard';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
@@ -17,16 +21,17 @@ import {
   transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import {
-  costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioLista, precioVentaFila,
+  costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioVentaFila,
   type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
 
-/**
- * Alícuotas legales de IVA. Es una lista cerrada a propósito: tipear 2.1 en vez
- * de 21 no da error y descalabra todos los precios del producto en silencio.
+/*
+ * Las alícuotas legales de IVA viven en `common/iva`: es una lista cerrada a
+ * propósito —tipear 2.1 en vez de 21 no da error y descalabra los precios en
+ * silencio— y la usan también los comprobantes de compra. Estaba solo acá, así
+ * que el alta de un comprobante aceptaba cualquier número.
  */
-const ALICUOTAS_IVA = [0, 2.5, 5, 10.5, 21, 27];
 
 /** Ver `estadoProductoEnum`: activo → discontinuado → archivado, y vuelta. */
 const ESTADOS_PRODUCTO = ['activo', 'discontinuado', 'archivado'] as const;
@@ -99,9 +104,23 @@ class UpsertProductoDto {
  * escribe. Las marcas y los rubros viajan por NOMBRE porque el que importa no
  * conoce los ids — el servidor reusa el que existe o lo crea.
  */
+/** Tope de renglones por importación. Ver `importar()`. */
+export const MAX_ITEMS_IMPORT = 3000;
+
 class ImportarDto {
   @IsInt() proveedorId!: number;
-  @IsArray() items!: any[];
+  /*
+   * SIN TOPE, esto era una transacción de decenas de miles de inserts
+   * secuenciales con locks sobre `productos`, `marcas` y `categorias`: minutos
+   * en los que nadie más puede guardar nada del catálogo. El límite del body son
+   * 4 MB, que dan para unos 20.000 items. La masiva de precios ya se defiende con
+   * un tope de 5000 filas; acá no había ninguno.
+   *
+   * 3000 es holgado: el catálogo entero del sistema viejo entró en 92 productos.
+   */
+  @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
+    message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
+  }) items!: any[];
 }
 
 @Injectable()
@@ -123,7 +142,11 @@ export class ProductosService {
    * `get()` reusa esto mismo con un solo producto, así que hay una sola forma
    * de armar la respuesta y no pueden divergir.
    */
-  private async assembleMany(prods: any[]) {
+  /**
+   * `verCostos`: si es false, la respuesta sale SIN los costos de compra ni los
+   * márgenes. Ver el recorte al final de este método.
+   */
+  private async assembleMany(prods: any[], verCostos = true) {
     if (!prods.length) return [];
     const ids = prods.map((p) => p.id);
     const solo = ids.length === 1 ? ids[0] : null;
@@ -242,14 +265,42 @@ export class ProductosService {
             precioFinal: piso ? piso.precioFinalUnitario : null,
           };
         }),
-        // FORMATO DE COMPRA: cada uno con su cadena ya derivada (lista →
-        // descuentos → flete → neto → IVA), para que la pantalla solo muestre.
-        formatosCompra: mios.map((pv: any) => ({
-          ...pv,
-          ...costosFormato(pv, prod.iva),
-          costoNeto: costoNetoEntry(pv, prod.iva),
-        })),
-        listas,
+        /*
+         * FORMATO DE COMPRA: cada uno con su cadena ya derivada (lista →
+         * descuentos → flete → neto → IVA), para que la pantalla solo muestre.
+         *
+         * SE RECORTA SEGÚN QUIÉN PREGUNTA. Acá viajan el costo de compra, los
+         * cuatro descuentos, el flete y el costo neto — o sea el MARGEN de cada
+         * producto. Este listado lo lee todo el sistema (el POS necesita los
+         * precios), así que quedaba abierto a cualquier sesión mientras
+         * `/precios/historial` —el mismo tipo de dato— estaba cerrado con
+         * permiso. Era la inconsistencia de abrir las lecturas: se cerró una
+         * puerta y quedó la otra.
+         */
+        formatosCompra: mios.map((pv: any) => (verCostos
+          ? {
+            ...pv,
+            ...costosFormato(pv, prod.iva),
+            costoNeto: costoNetoEntry(pv, prod.iva),
+          }
+          /*
+           * Sin permiso se recortan LOS IMPORTES, no la fila entera. Lo
+           * sensible es cuánto se paga, no de quién se compra: vaciar el arreglo
+           * rompía en silencio todo filtro por proveedor —el del listado de
+           * productos y el del explorador del catálogo del pedido, que hace
+           * `formatosCompra.some(e => e.proveedorId === X)` y habría devuelto
+           * cero resultados sin decir por qué.
+           */
+          : {
+            id: pv.id,
+            productoId: pv.productoId,
+            proveedorId: pv.proveedorId,
+            /** El tamaño del bulto ("la bolsa es de 20 kg") no es un importe. */
+            cantidad: pv.cantidad,
+            usarParaPrecio: pv.usarParaPrecio,
+            codigoProveedor: pv.codigoProveedor,
+          })),
+        listas: verCostos ? listas : listas.map((l: any) => ({ ...l, markup: null })),
       };
     });
   }
@@ -266,15 +317,15 @@ export class ProductosService {
     return { marca: mapa(ms), categoria: mapa(cs), subcategoria: mapa(ss), etiqueta: mapa(es) };
   }
 
-  async list() {
+  async list(verCostos = true) {
     const rows = await this.db.select().from(productos).orderBy(productos.id);
-    return this.assembleMany(rows);
+    return this.assembleMany(rows, verCostos);
   }
 
-  async get(id: number) {
+  async get(id: number, verCostos = true) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
-    const [armado] = await this.assembleMany([p]);
+    const [armado] = await this.assembleMany([p], verCostos);
     return armado;
   }
 
@@ -343,8 +394,8 @@ export class ProductosService {
 
   private validarIva(iva?: number) {
     if (iva == null) return;
-    if (!ALICUOTAS_IVA.includes(iva)) {
-      throw new BadRequestException(`Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_IVA.join(', ')}%.`);
+    if (!esAlicuotaValida(iva)) {
+      throw new BadRequestException(`Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_TEXTO}%.`);
     }
   }
 
@@ -566,7 +617,7 @@ export class ProductosService {
         continue;
       }
       if (vistosCodigo.has(codigo)) { saltados.push({ codigo, nombre, motivo: 'código repetido en el archivo' }); continue; }
-      if (!ALICUOTAS_IVA.includes(Number(p.iva))) {
+      if (!esAlicuotaValida(p.iva)) {
         saltados.push({ codigo, nombre, motivo: `IVA inválido (${p.iva}%)` });
         continue;
       }
@@ -1084,6 +1135,35 @@ export class ProductosService {
       const porId = new Map(actuales.map((a: any) => [a.id, a]));
       for (const v of valid) {
         if (v.id && porId.has(v.id)) {
+          /*
+           * EL TAMAÑO NO SE CAMBIA CON PAQUETES EN STOCK.
+           *
+           * Borrar una presentación con stock ya estaba cerrado tres líneas más
+           * arriba; cambiarle el tamaño no, y es peor, porque no falla: pasa en
+           * silencio y reescribe el pasado. Con 500 paquetes de 0,5 kg cargados,
+           * guardar 5 kg convierte 250 kg de mercadería en 2.500 al instante —
+           * el costo del paquete se multiplica por diez (`costoNetoPresentacion`),
+           * la valorización del stock y el reporte de pérdidas mienten en la
+           * misma proporción, y corregir un fraccionado devuelve al granel diez
+           * veces los kilos que salieron.
+           *
+           * Un tamaño mal cargado se arregla creando la presentación correcta y
+           * dando de baja la equivocada, que es lo que deja rastro.
+           */
+          const vieja: any = porId.get(v.id);
+          if (Math.abs(Number(vieja.tamKg) - Number(v.tamKg)) > 1e-9) {
+            const [conStock] = await tx.select({ id: stock.id }).from(stock)
+              .where(and(eq(stock.presentacionId, v.id), gt(stock.cantidad, 1e-9)))
+              .limit(1);
+            if (conStock) {
+              const tam = vieja.tamKg < 1 ? `${Math.round(vieja.tamKg * 1000)} g` : `${vieja.tamKg} kg`;
+              throw new BadRequestException(
+                `La presentación de ${tam} tiene paquetes en stock: no se le puede cambiar el tamaño `
+                + '(cambiaría el costo y la equivalencia en granel de lo que ya está cargado). '
+                + 'Creá la presentación con el tamaño correcto y dale de baja a esta.',
+              );
+            }
+          }
           await tx.update(presentaciones)
             .set({ tamKg: v.tamKg, codigoBarras: v.codigoBarras })
             .where(eq(presentaciones.id, v.id));
@@ -1129,18 +1209,43 @@ export class ProductosService {
     const porId = new Map(existentes.map((e) => [e.id, e]));
     const enviados = new Set(validas.map((f) => Number(f.id)).filter((n) => porId.has(n)));
 
+    /*
+     * PISOS Y TECHOS DEL FORMATO DE COMPRA.
+     *
+     * Entraban con `Number(x) || 0` pelado, y de acá sale la cascada que fija el
+     * PRECIO DE GÓNDOLA: un `costo: -5000` o un `descuento: 150` daban costo
+     * neto negativo y el producto quedaba con precio bajo cero en la caja. No hay
+     * clamp más abajo en la cadena, así que el único lugar donde se puede cortar
+     * es la puerta.
+     *
+     * `plata` también filtra Infinity: `Number("1e999")` da Infinity y
+     * sobrevive a un `|| 0`, y en una columna `double precision` Postgres lo
+     * acepta — envenenando todo total que lo toque, sin vuelta atrás.
+     */
+    const plata = (v: unknown, tope = 1_000_000_000) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.min(n, tope);
+    };
+    /** Un descuento es un porcentaje: fuera de 0–100 no significa nada. */
+    const pct = (v: unknown) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.min(n, 100);
+    };
+
     const valores = (f: any, i: number) => ({
       productoId: id,
       proveedorId: Number(f.proveedorId),
-      cantidad: Number(f.cantidad) || 1,
-      costo: Number(f.costo) || 0,
-      descuento: Number(f.descuento) || 0,
-      descuento2: Number(f.descuento2) || 0,
-      descuento3: Number(f.descuento3) || 0,
-      descuento4: Number(f.descuento4) || 0,
-      flete: Number(f.flete) || 0,
+      cantidad: plata(f.cantidad, 1_000_000) || 1,
+      costo: plata(f.costo),
+      descuento: pct(f.descuento),
+      descuento2: pct(f.descuento2),
+      descuento3: pct(f.descuento3),
+      descuento4: pct(f.descuento4),
+      flete: plata(f.flete),
       modoCosto: (f.modoCosto === 'final' ? 'final' : 'lista') as 'lista' | 'final',
-      costoFinal: Number(f.costoFinal) || 0,
+      costoFinal: plata(f.costoFinal),
       usarParaPrecio: i === activo,
       codigoProveedor: (f.codigoProveedor ?? '').trim(),
     });
@@ -1205,7 +1310,15 @@ export class ProductosService {
 export class ProductosController {
   constructor(private readonly svc: ProductosService) {}
 
-  @Get() list() { return this.svc.list(); }
+  /*
+   * El catálogo lo lee todo el sistema, así que la LECTURA sigue abierta — pero
+   * los costos de compra y los márgenes solo viajan a quien tiene permiso para
+   * verlos. Sin esto, un cajero leía el margen de cada producto con el mismo
+   * token que le da su propio login.
+   */
+  @Get() list(@Auth() auth: Sesion) {
+    return this.svc.list(tienePermiso(auth.permisos, ['precios', 'compras.productos']));
+  }
   /** Antes de `:id`, si no "siguiente-codigo" entra como id y revienta. */
   @Get('siguiente-codigo') siguienteCodigo() { return this.svc.siguienteCodigo(); }
   /**
@@ -1215,7 +1328,9 @@ export class ProductosController {
   @Get('siguiente-ean') siguienteEan(@Query('excluir') excluir?: string) {
     return this.svc.siguienteEan13(String(excluir || '').split(',').filter(Boolean));
   }
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Get(':id') get(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
+    return this.svc.get(id, tienePermiso(auth.permisos, ['precios', 'compras.productos']));
+  }
 
   @Permiso('compras.productos')
   @Post() create(@Body() dto: UpsertProductoDto) { return this.svc.create(dto); }

@@ -17,7 +17,14 @@
  * Las IPs PRIVADAS y loopback están exentas: el SSR de Next y el CRM viven en
  * la misma máquina/red y todo su tráfico sale de ahí — limitarlos sería
  * limitar a la propia infraestructura. Los visitantes reales llegan por el
- * proxy con su IP pública en X-Forwarded-For (ver `trust proxy` en main.ts).
+ * proxy con su IP pública en X-Forwarded-For.
+ *
+ * ESTA EXENCIÓN ES SEGURA SOLO PORQUE `req.ip` NO SE PUEDE FALSIFICAR. Con
+ * `trust proxy: 'loopback'` en main.ts, `req.ip` es lo que nginx puso
+ * ($remote_addr), no lo que mandó el cliente. Si `req.ip` cae en un rango
+ * privado es porque el origen REAL es privado (una máquina de la red, no un
+ * visitante de internet). Con el viejo `trust proxy: true`, en cambio, bastaba
+ * un `X-Forwarded-For: 10.0.0.1` para colarse acá — por eso se cambió.
  */
 import {
   CanActivate, ExecutionContext, HttpException, Injectable, SetMetadata,

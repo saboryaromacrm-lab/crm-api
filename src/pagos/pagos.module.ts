@@ -35,6 +35,7 @@ import {
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { esJefe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import {
@@ -511,8 +512,13 @@ export class PagosProveedorService {
    * internos (el pago contado de una factura y los dos de Gastos): si fuera
    * opcional, cada uno de ellos sería un desvío que se saltea el candado sin
    * que nada lo avise — y son justamente caminos que aceptan un `cajaSesionId`.
+   *
+   * `cruzaSucursales` es `esJefe(sesion)`: habilita imputar el pago a un
+   * documento de otra sucursal (ver la guarda en `aplicar`). Va como bandera y
+   * no como sesión entera porque este servicio no debe conocer el modelo de
+   * permisos: le alcanza con saber si esta operación puede cruzar o no.
    */
-  async crear(dto: CrearPagoDto, sucursalSesion: number) {
+  async crear(dto: CrearPagoDto, sucursalSesion: number, cruzaSucursales = false) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
 
@@ -644,7 +650,7 @@ export class PagosProveedorService {
       }).returning();
 
       if (dto.imputaciones?.length) {
-        await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId);
+        await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales);
       }
       return pago.id;
     });
@@ -675,7 +681,9 @@ export class PagosProveedorService {
    * las tres funciones que bloquean (`aplicar`, `desimputar`, `anular`): dos
    * caminos que tomen los mismos dos candados en orden distinto se abrazan.
    */
-  private async aplicar(tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number) {
+  private async aplicar(
+    tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number, cruzaSucursales = false,
+  ) {
     for (const item of items) {
       const importe = money(item.importe);
       if (importe <= 0) throw new BadRequestException('El importe a aplicar tiene que ser mayor a 0.');
@@ -711,6 +719,7 @@ export class PagosProveedorService {
       }
 
       let docProveedorId: number | null;
+      let docSucursalId: number | null;
       let saldoDoc: number;
       let etiqueta: string;
 
@@ -724,6 +733,7 @@ export class PagosProveedorService {
         if (!g) throw new BadRequestException('Gasto inexistente.');
         if (g.estado === 'anulado') throw new BadRequestException('Ese gasto está anulado.');
         docProveedorId = g.proveedorId;
+        docSucursalId = g.sucursalId;
         saldoDoc = money(g.total - g.pagado);
         etiqueta = `gasto #${g.id}`;
       } else {
@@ -747,6 +757,7 @@ export class PagosProveedorService {
           );
         }
         docProveedorId = c.proveedorId;
+        docSucursalId = c.sucursalId;
         etiqueta = etiquetaDoc(c);
         /*
          * ESTA es la guarda que de verdad impide pagar de más, y hasta ahora
@@ -773,6 +784,33 @@ export class PagosProveedorService {
       if ((pago.proveedorId ?? null) !== (docProveedorId ?? null)) {
         throw new BadRequestException(`Ese pago es de otro proveedor: no se puede aplicar a ${etiqueta}.`);
       }
+
+      /*
+       * NI LA DE OTRA SUCURSAL. Esta regla existía solo en el frontend, que
+       * filtra la lista de pagos por la sucursal del documento — y lo que se
+       * ofrece no puede ser lo único que decide qué se acepta.
+       *
+       * Sirve para tapar un faltante: se saca plata del cajón de Fontana, se
+       * busca un gasto legítimo de Centro por el mismo importe y se lo imputa
+       * ahí. El pago desaparece de la bandeja de "sin aplicar" —que es JUSTO el
+       * contador que mira el dueño— y el egreso queda explicado por un
+       * comprobante de otro mostrador. Nadie lo vuelve a mirar.
+       *
+       * `null` de cualquiera de los dos lados no restringe: es "sin sucursal"
+       * (el gasto de toda la empresa, o un pago por transferencia que no salió
+       * de ninguna caja). Y el jefe cruza, porque corregir lo que se cargó en
+       * el mostrador equivocado es exactamente su trabajo.
+       */
+      if (
+        !cruzaSucursales
+        && pago.sucursalId != null && docSucursalId != null
+        && pago.sucursalId !== docSucursalId
+      ) {
+        throw new BadRequestException(
+          `Ese pago se registró en otra sucursal: no se puede aplicar a ${etiqueta}, que es de otra. `
+          + 'Si está mal cargado, lo corrige un administrador.',
+        );
+      }
       if (saldoDoc <= EPS) throw new BadRequestException(`${etiqueta} ya está saldado.`);
       if (importe - saldoDoc > EPS) {
         throw new BadRequestException(`A ${etiqueta} le faltan ${saldoDoc.toFixed(2)}: no se le puede aplicar más.`);
@@ -792,7 +830,7 @@ export class PagosProveedorService {
     }
   }
 
-  async imputar(pagoId: number, dto: ImputarDto) {
+  async imputar(pagoId: number, dto: ImputarDto, cruzaSucursales = false) {
     if (!dto?.imputaciones?.length) throw new BadRequestException('No indicaste ninguna imputación.');
     const [p] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, pagoId)).limit(1);
     if (!p) throw new NotFoundException('Pago inexistente.');
@@ -801,7 +839,9 @@ export class PagosProveedorService {
     if (!p.proveedorId) {
       throw new BadRequestException('Ese pago se registró sin proveedor: solo vale para el documento con el que nació.');
     }
-    await this.db.transaction(async (tx) => this.aplicar(tx, pagoId, dto.imputaciones, dto.usuarioId));
+    await this.db.transaction(
+      async (tx) => this.aplicar(tx, pagoId, dto.imputaciones, dto.usuarioId, cruzaSucursales),
+    );
     return this.get(pagoId);
   }
 
@@ -1024,12 +1064,15 @@ export class PagosProveedorController {
   // La sucursal sale de la SESIÓN, no del body: es con lo que se compara el
   // turno de caja para que el egreso no pueda salir del cajón de otra sucursal.
   @Post() crear(@Body() dto: CrearPagoDto, @Auth() auth: Sesion) {
-    return this.svc.crear(dto, auth.sucursalId);
+    return this.svc.crear(dto, auth.sucursalId, esJefe(auth));
   }
 
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Post(':id/imputar') imputar(@Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto) {
-    return this.svc.imputar(id, dto);
+  // El jefe puede imputar cruzando sucursales; el mostrador, no (ver `aplicar`).
+  @Post(':id/imputar') imputar(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.imputar(id, dto, esJefe(auth));
   }
   @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPagoDto) {
     return this.svc.anular(id, dto?.motivo);

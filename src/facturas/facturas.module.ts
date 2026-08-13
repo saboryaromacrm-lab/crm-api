@@ -45,12 +45,13 @@ import {
 import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { Permiso } from '../auth/auth.decoradores';
+import { mimeReal, nombreSeguro } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
   proveedorArticulos, proveedores, sucursales, usuarios,
 } from '../db/schema';
-import { clave, extraerLineasPdf, pegarNumeros } from './extraccion';
+import { clave, extraerLineasPdf, pegarNumeros, PdfDemasiadoGrande } from './extraccion';
 import { RECETAS } from './recetas';
 
 /* ============================================================================
@@ -200,27 +201,11 @@ const MAX_BYTES = Math.floor(2.5 * 1024 * 1024);
 /** Páginas por factura. Una factura larga tiene 3 o 4 hojas, no 200. */
 const MAX_PAGINAS = 20;
 
-/**
- * FIRMAS DE ARCHIVO — los primeros bytes de verdad.
- *
- * El mime que llega en el prefijo de la data URL lo escribe el cliente: decir
- * `data:image/png;base64,` y mandar cualquier otra cosa es gratis. Como el
- * archivo después se sirve CON ese mime, creerle es alojar contenido arbitrario
- * en el dominio del sistema. Estas firmas son el contraste contra los bytes.
+/*
+ * Las FIRMAS de archivo (qué es el binario según sus bytes, no según lo que
+ * dijo el cliente) viven en `common/archivos.ts`: las comparte con el módulo
+ * Web, que sube y sirve las imágenes del sitio con el mismo riesgo.
  */
-const FIRMAS: Array<{ mime: string; test: (b: Buffer) => boolean }> = [
-  { mime: 'image/jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
-  { mime: 'image/png', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
-  // WebP es un contenedor RIFF: "RIFF" .... "WEBP".
-  { mime: 'image/webp', test: (b) => b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP' },
-  { mime: 'application/pdf', test: (b) => b.subarray(0, 5).toString('ascii') === '%PDF-' },
-];
-
-/** Qué es el archivo según sus bytes, o null si no es ninguno de los admitidos. */
-const mimeReal = (b: Buffer) => (b.length < 12 ? null : FIRMAS.find((f) => f.test(b))?.mime ?? null);
-
-/** Para el `filename` de la respuesta: sin comillas, saltos ni rutas. */
-const nombreSeguro = (n: string) => (n || 'factura').replace(/[^\w.\- ]+/g, '_').slice(0, 100);
 
 class ArchivoDto {
   @IsOptional() @IsString() @MaxLength(160) nombre?: string;
@@ -314,7 +299,7 @@ export class FacturasService {
       throw new BadRequestException(`El archivo dice ser ${declarado} pero su contenido es ${real}.`);
     }
 
-    return { nombre: nombreSeguro(String(a?.nombre ?? '')), mime: real, data: b64 };
+    return { nombre: nombreSeguro(String(a?.nombre ?? ''), 'factura'), mime: real, data: b64 };
   }
 
   /**
@@ -577,7 +562,7 @@ export class FacturasService {
      * con un nombre saneado, no el que vino en el pedido.
      */
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Disposition', `inline; filename="${nombreSeguro(a.nombre)}"`);
+    res.setHeader('Content-Disposition', `inline; filename="${nombreSeguro(a.nombre, 'factura')}"`);
     res.setHeader('Cache-Control', 'private, max-age=86400');
     res.end(Buffer.from(a.data, 'base64'));
   }
@@ -747,9 +732,31 @@ export class FacturasService {
       );
     }
 
-    const lineas = await extraerLineasPdf(Buffer.from(pdf.data, 'base64'));
+    let lineas;
+    try {
+      lineas = await extraerLineasPdf(Buffer.from(pdf.data, 'base64'));
+    } catch (e) {
+      /*
+       * Los techos del extractor (páginas y fragmentos) llegan como este error.
+       * Se traduce a 400 con el motivo: es un archivo que no sirve, no una falla
+       * del sistema, y quien lo subió tiene que poder entender qué hacer.
+       */
+      if (e instanceof PdfDemasiadoGrande) throw new BadRequestException(e.message);
+      throw e;
+    }
     const totalFrags = lineas.reduce((a, x) => a + x.frags.length, 0);
-    const texto = lineas.map((x) => `[p${x.pagina}] ${pegarNumeros(x.texto)}`).join('\n');
+    /*
+     * El texto crudo viaja en la respuesta para poder armar la receta de un
+     * proveedor nuevo mirándolo. Va RECORTADO: los techos del extractor ya
+     * evitan lo grave (que el servidor se cuelgue), pero mandar megabytes de
+     * texto al navegador no le sirve a nadie — la receta se arma con la primera
+     * pantalla.
+     */
+    const MAX_TEXTO = 200_000;
+    const crudo = lineas.map((x) => `[p${x.pagina}] ${pegarNumeros(x.texto)}`).join('\n');
+    const texto = crudo.length > MAX_TEXTO
+      ? `${crudo.slice(0, MAX_TEXTO)}\n… (recortado: el PDF tiene ${crudo.length} caracteres de texto)`
+      : crudo;
     if (totalFrags < 15) {
       return {
         receta: null, cierra: false, encabezado: null, renglones: [], pie: null, texto,

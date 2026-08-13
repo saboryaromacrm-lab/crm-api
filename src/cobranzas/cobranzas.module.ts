@@ -14,42 +14,78 @@
  *    por `confirmada`. El recibo anulado queda como rastro.
  */
 import {
-  Body, Controller, Get, Inject, Injectable, Module, BadRequestException,
+  Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
+  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
+  Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
 import { cobranzaImputaciones, cobranzaPagos, cobranzas, ventas } from '../db/schema';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { VentasModule, VentasService, money } from '../ventas/ventas.module';
+import { CajaModule, CajaService } from '../caja/caja.module';
+import { VentasModule, VentasService, fechaDeDocumento, money } from '../ventas/ventas.module';
 
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
 
 /** Tolerancia de comparación monetaria (medio centavo). */
 const EPS = 0.005;
 
+/**
+ * TOPE DE UN IMPORTE DE RECIBO. Cien millones es una cifra que este negocio no
+ * ve en un recibo, y es exactamente el punto: sin techo, un solo request
+ * `{ medio: 'transferencia', importe: 9000000 }` dejaba al cliente con saldo a
+ * favor de nueve millones sin que entrara un peso, y a partir de ahí se llevaba
+ * mercadería en cuenta corriente para siempre — `validarCredito` compara contra
+ * ese saldo. La transferencia inventada recién se descubre conciliando el banco.
+ */
+const MAX_IMPORTE = 100_000_000;
+
 class PagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
-  @IsNumber() importe!: number;
+  @IsNumber() @Min(0) @Max(MAX_IMPORTE) importe!: number;
   @IsOptional() @IsString() referencia?: string;
 }
 
 class ImputacionDto {
   @IsInt() ventaId!: number;
-  @IsNumber() importe!: number;
+  @IsNumber() @Min(0) @Max(MAX_IMPORTE) importe!: number;
+}
+
+class AnularCobranzaDto {
+  @IsString() @MaxLength(300) motivo!: string;
+}
+
+/**
+ * Lo que la sesión habilita. Mismos dos campos que `OpcionesVenta` y por la
+ * misma razón: GRABAR en una sucursal y poder TOCAR la de otro son cosas
+ * distintas. El jefe hace las dos; el cajero, ninguna fuera de la suya.
+ */
+export interface OpcionesCobranza {
+  soloSuSucursal?: number;
+  /** Rol admin/superadmin: puede fechar el recibo y anular contra un turno cerrado. */
+  esJefe?: boolean;
 }
 
 export class CreateCobranzaDto {
   @IsInt() clienteId!: number;
+  /** Pista: para el cajero la sucursal sale de su sesión. Ver `sucursalDeOperacion`. */
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
-  /** Si la cobranza entra por caja, se imputa al turno para el arqueo. */
-  @IsOptional() @IsInt() cajaSesionId?: number;
+  /*
+   * `cajaSesionId` NO está acá y no vuelve: lo resuelve el servidor (ver
+   * `create`). El campo se aceptaba sin validar nada —turno cerrado, turno de
+   * otra sucursal, cualquier id— y encima el único cliente que crea cobranzas
+   * nunca lo mandaba, así que TODA cobranza nacía con el turno en null y el
+   * arqueo no la veía: el efectivo cobrado a un mayorista entraba al cajón y el
+   * cierre daba diferencia 0.
+   */
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() observaciones?: string;
   @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => PagoDto)
@@ -67,6 +103,7 @@ export class CobranzasService {
     private readonly cli: ClientesService,
     private readonly cfg: ConfiguracionService,
     private readonly vtas: VentasService,
+    private readonly caja: CajaService,
   ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
@@ -158,7 +195,13 @@ export class CobranzasService {
     );
   }
 
-  async create(dto: CreateCobranzaDto) {
+  /**
+   * `sucursalId` ya viene resuelto contra la sesión por el controller, y el TURNO
+   * lo resuelve este método: la plata de un recibo entra por una caja concreta o
+   * por administración, y eso no lo puede decidir el que manda el request.
+   */
+  async create(dto: CreateCobranzaDto, sucursalId: number, opciones: OpcionesCobranza = {}) {
+    const esJefeSesion = !!opciones.esJefe;
     const cliente = await this.cli.get(dto.clienteId);
     const config = await this.cfg.get('ventas');
 
@@ -166,6 +209,28 @@ export class CobranzasService {
     if (!pagos.length) throw new BadRequestException('Cargá al menos un medio de pago con importe.');
     const total = money(pagos.reduce((a, p) => a + Number(p.importe), 0));
     if (total <= 0) throw new BadRequestException('El total de la cobranza debe ser mayor a 0.');
+
+    /*
+     * EL TURNO DE CAJA, resuelto acá y no aceptado del cliente.
+     *
+     * Con efectivo el turno es obligatorio si la configuración lo pide: esa
+     * plata va a estar físicamente en el cajón, y una cobranza en efectivo que
+     * no cuelga de ningún turno es plata que el arqueo no espera — el cierre da
+     * diferencia 0 y el faltante no existe para el sistema.
+     *
+     * Sin efectivo (transferencia, tarjeta) igual se cuelga del turno abierto si
+     * hay: así el arqueo lo muestra en el desglose por medio, que es lo que se
+     * concilia después contra el resumen del banco. Si no hay turno abierto,
+     * queda en administración (`null`), que es el caso real de la transferencia
+     * que entra un sábado.
+     */
+    const hayEfectivo = pagos.some((p) => p.medio === 'efectivo');
+    const turno = await this.caja.actual(sucursalId);
+    if (hayEfectivo && !!config.cajaObligatoria && !turno) {
+      throw new BadRequestException(
+        'No hay un turno de caja abierto en esta sucursal, y el efectivo de un recibo tiene que entrar a una caja. Abrí la caja y volvé a cobrar.',
+      );
+    }
 
     /* -- Qué se imputa: lo que mandó el cliente, o FIFO sobre lo más viejo -- */
     let imputaciones = (dto.imputaciones ?? [])
@@ -196,7 +261,14 @@ export class CobranzasService {
     const aCuenta = money(total - imputado);
 
     const puntoVenta = String(config.puntoVenta || '0001');
-    const fecha = dto.fecha ? new Date(dto.fecha) : new Date();
+    /*
+     * La misma regla que la venta, que acá faltaba: un cajero fechaba el recibo
+     * en noviembre y la plata entraba igual al turno de HOY (el turno lo resuelve
+     * el servidor por sucursal). El recibo quedaba fuera de cualquier corte del
+     * mes y adentro del arqueo de hoy — la conciliación no cerraba nunca. Y
+     * `new Date('chau')` llegaba como `Invalid Date` al insert: 500 en vez de 400.
+     */
+    const fecha = fechaDeDocumento(dto.fecha, esJefeSesion);
 
     const id = await this.db.transaction(async (tx) => {
       if (imputaciones.length) {
@@ -218,9 +290,9 @@ export class CobranzasService {
       const numero = await this.siguienteNumero(tx, puntoVenta);
       const [c] = await tx.insert(cobranzas).values({
         puntoVenta, numero, fecha, clienteId: cliente.id,
-        sucursalId: dto.sucursalId ?? cliente.sucursalId ?? null,
+        sucursalId,
         usuarioId: dto.usuarioId ?? null,
-        cajaSesionId: dto.cajaSesionId ?? null,
+        cajaSesionId: turno?.id ?? null,
         total, aCuenta, estado: 'confirmada', observaciones: dto.observaciones ?? '',
       }).returning();
 
@@ -239,15 +311,53 @@ export class CobranzasService {
     return this.get(id);
   }
 
-  async anular(id: number) {
+  /**
+   * ANULAR UN RECIBO ES LA MISMA MANIOBRA QUE ANULAR UNA VENTA, y hasta acá era
+   * la puerta de al lado sin llave: `set({ estado: 'anulada' })` y nada más.
+   *
+   * El arqueo suma solo las cobranzas `confirmada` (ver `caja.arqueo`), así que
+   * anular le saca esa plata al efectivo esperado del cajón: se cobran $80.000
+   * a un mayorista a la mañana y a las 19:50 se anula el recibo — el esperado
+   * baja $80.000, el cierre da diferencia 0 y el faltante no existe para el
+   * sistema. De yapa, el saldo del cliente vuelve a subir como si nunca hubiera
+   * pagado. No pedía permiso propio, no pedía motivo y no guardaba quién.
+   *
+   * Ahora es el espejo de `ventas.anular`: permiso `devoluciones`, motivo
+   * obligatorio, rastro (0060), la sucursal de la sesión y —lo que de verdad lo
+   * cierra— **no se puede anular contra un turno ya cerrado**, cuyo arqueo está
+   * firmado. Eso se corrige con otro recibo, no reescribiendo el pasado.
+   */
+  async anular(id: number, motivo: string, usuarioId?: number, opciones: OpcionesCobranza = {}) {
     const c = await this.get(id);
     if (c.estado === 'anulada') throw new BadRequestException('La cobranza ya está anulada.');
-    await this.db.update(cobranzas).set({ estado: 'anulada' }).where(eq(cobranzas.id, id));
+    if (opciones.soloSuSucursal && c.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Ese recibo es de otra sucursal.');
+    }
+    const razon = (motivo ?? '').trim();
+    if (!razon) throw new BadRequestException('Indicá por qué se anula el recibo.');
+
+    if (c.cajaSesionId) {
+      const turno = await this.caja.getOpcional(c.cajaSesionId);
+      if (turno && turno.estado === 'cerrada' && !opciones.esJefe) {
+        throw new BadRequestException(
+          'El turno de caja de ese recibo ya está cerrado: su arqueo quedó firmado. '
+          + 'Corregilo con un recibo nuevo en vez de anularlo.',
+        );
+      }
+    }
+
+    await this.db.update(cobranzas).set({
+      estado: 'anulada',
+      anuladoPor: usuarioId ?? null,
+      anuladoEn: new Date(),
+      anuladoMotivo: razon,
+    }).where(eq(cobranzas.id, id));
     return this.get(id);
   }
 }
 
 @Controller('cobranzas')
+@Permiso('ventas.cobranzas')
 export class CobranzasController {
   constructor(private readonly svc: CobranzasService) {}
 
@@ -260,12 +370,35 @@ export class CobranzasController {
   }
 
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Post() create(@Body() dto: CreateCobranzaDto) { return this.svc.create(dto); }
-  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number) { return this.svc.anular(id); }
+
+  /** Lo que la sesión habilita, en un solo lugar (igual que en Ventas). */
+  private opciones(sesion: Sesion): OpcionesCobranza {
+    const jefe = esJefe(sesion);
+    return { esJefe: jefe, soloSuSucursal: jefe ? undefined : sesion.sucursalId };
+  }
+
+  @Post()
+  create(@Body() dto: CreateCobranzaDto, @Auth() sesion: Sesion) {
+    const sucursalId = sucursalDeOperacion(sesion, dto.sucursalId);
+    if (!sucursalId) throw new BadRequestException('Tu sesión no tiene sucursal: volvé a entrar eligiéndola.');
+    return this.svc.create(dto, sucursalId, this.opciones(sesion));
+  }
+
+  /*
+   * `devoluciones` SOLO, sin `ventas.cobranzas`: el permiso del método reemplaza
+   * al de la clase, y las claves de un mismo `@Permiso` se evalúan con O — poner
+   * las dos haría que alcanzara con ver la pantalla. Es la misma llave con la
+   * que se anula una venta, porque es la misma maniobra sobre la misma plata.
+   */
+  @Post(':id/anular')
+  @Permiso('devoluciones')
+  anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularCobranzaDto, @Auth() sesion: Sesion) {
+    return this.svc.anular(id, dto.motivo, sesion.usuarioId, this.opciones(sesion));
+  }
 }
 
 @Module({
-  imports: [ClientesModule, ConfiguracionModule, VentasModule],
+  imports: [ClientesModule, ConfiguracionModule, CajaModule, VentasModule],
   controllers: [CobranzasController],
   providers: [CobranzasService],
   exports: [CobranzasService],

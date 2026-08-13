@@ -4,10 +4,10 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength,
-  ValidateNested,
+  ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength,
+  Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, ne } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
@@ -17,7 +17,8 @@ import {
  * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
  * y este módulo ya importa de `pagos`: exportarla desde acá cerraba el ciclo. */
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { tienePermiso } from '../auth/auth.guard';
+import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
+import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { etiquetaDoc } from '../common/documentos';
 import { normalizarPuntoVenta } from '../facturas/facturas.module';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -69,13 +70,27 @@ class PercepcionDto {
   @IsOptional() @IsNumber() importe?: number;
 }
 
+/*
+ * TOPES Y PISOS DE LOS IMPORTES DEL RENGLÓN.
+ *
+ * Estaban con `@IsNumber()` pelado, y eso deja pasar cualquier cosa: `iva: 300`
+ * entraba tal cual e inflaba el total y el libro de IVA compras; `descuento:
+ * 150` dejaba el renglón en negativo. El `@IsNumber()` de class-validator sí
+ * rechaza NaN e Infinity por defecto, así que lo que faltaba era el rango.
+ *
+ * Los máximos son absurdamente altos a propósito: no están para juzgar una
+ * compra grande, están para que un número imposible no llegue a la base.
+ */
 class ComprobanteItemDto {
   @IsInt() productoId!: number;
   @IsOptional() @IsInt() presentacionId?: number;
-  @IsNumber() cantidad!: number;
-  @IsOptional() @IsNumber() costoUnitario?: number;
-  @IsOptional() @IsNumber() descuento?: number;
-  @IsOptional() @IsNumber() iva?: number;
+  @IsNumber() @Min(0) @Max(1_000_000) cantidad!: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) costoUnitario?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
+  /** Cerrada a la lista de la ley (`common/iva`), igual que en el producto. */
+  @IsOptional() @IsNumber() @IsIn(ALICUOTAS_IVA as unknown as number[], {
+    message: `Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_TEXTO}%.`,
+  }) iva?: number;
   /**
    * El código del artículo COMO LO IMPRIME LA FACTURA del proveedor, cuando el
    * renglón vino de la lectura del PDF. No se guarda en el ítem: alimenta el
@@ -297,7 +312,10 @@ export class ComprobantesService {
     return porId;
   }
 
-  async list(q: { proveedorId?: number; tipo?: string; estado?: string; verLiquidaciones?: boolean }) {
+  async list(q: {
+    proveedorId?: number; tipo?: string; estado?: string;
+    verLiquidaciones?: boolean; limit?: number;
+  }) {
     const conds: any[] = [];
     if (q.proveedorId) conds.push(eq(comprobantes.proveedorId, Number(q.proveedorId)));
     if (q.tipo) conds.push(eq(comprobantes.tipo, q.tipo as any));
@@ -310,7 +328,22 @@ export class ComprobantesService {
      */
     if (!q.verLiquidaciones) conds.push(ne(comprobantes.tipo, 'liquidacion' as any));
     const where = conds.length ? and(...conds) : undefined;
-    const rows = await this.db.select().from(comprobantes).where(where).orderBy(desc(comprobantes.id));
+    /*
+     * TECHO DEL LISTADO — era el único del sistema sin ninguno.
+     *
+     * Devolvía TODOS los comprobantes con todos sus ítems, percepciones, pagos y
+     * notas, y se pide al abrir Facturación y en cada recarga (cargar una factura
+     * recargaba la lista completa). Los vecinos ya tenían el suyo: movimientos
+     * 300, pagos 300/1000, historial de precios 100/500.
+     *
+     * Se pudo poner recién ahora: mientras el saldo del proveedor se calculaba
+     * en el navegador sumando esta lista, acotarla habría dejado el saldo mal
+     * **en silencio** para cualquier proveedor con más comprobantes que el tope.
+     * Ese cálculo se mudó a `saldos()`, que suma en la base sin traer nada.
+     */
+    const limit = Math.min(Math.max(Number(q.limit) || 300, 1), 1000);
+    const rows = await this.db.select().from(comprobantes).where(where)
+      .orderBy(desc(comprobantes.id)).limit(limit);
     if (!rows.length) return [];
 
     /*
@@ -478,7 +511,10 @@ export class ComprobantesService {
     }
   }
 
-  async create(dto: CreateComprobanteDto, opciones: { puedeTocarPrecios?: boolean; sucursalSesion: number }) {
+  async create(
+    dto: CreateComprobanteDto,
+    opciones: { puedeTocarPrecios?: boolean; sucursalSesion: number; cruzaSucursales?: boolean },
+  ) {
     /*
      * RECIBIR MERCADERÍA Y TOCAR PRECIOS SON DOS PERMISOS DISTINTOS.
      *
@@ -536,6 +572,19 @@ export class ComprobantesService {
     let bonificacionImporte = dto.bonificacionImporte != null
       ? Number(dto.bonificacionImporte) || 0
       : r2(bruto * bonifPct / 100);
+    /*
+     * EL SIGNO SE VALIDA ANTES DEL TECHO, y no es un detalle de orden.
+     *
+     * El techo de abajo compara `bonificacionImporte > bruto`. Con una
+     * bonificación NEGATIVA la comparación es falsa —así que el techo no se
+     * dispara—, y el clamp que sigue la deja en 0… pero antes ya había sumado al
+     * bruto: mandando ítems que dieran bruto negativo se grababa un comprobante
+     * con TOTAL NEGATIVO, que resta de la cuenta corriente del proveedor como
+     * una nota de crédito que nadie emitió.
+     */
+    if (!(bonificacionImporte >= 0)) {
+      throw new BadRequestException('La bonificación no puede ser negativa.');
+    }
     if (bonificacionImporte > bruto + 0.009) {
       throw new BadRequestException('La bonificación no puede ser mayor que el subtotal de los ítems.');
     }
@@ -582,6 +631,23 @@ export class ComprobantesService {
     const percepcionesTotal = percepciones.reduce((a, p) => a + p.importe, 0);
 
     const total = subtotalNeto + ivaTotal + percepcionesTotal;
+    /*
+     * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
+     *
+     * Es el cinturón de seguridad de lo de arriba: con los pisos del renglón y
+     * el signo de la bonificación ya validados no debería poder pasar, pero el
+     * total sale de sumar seis cosas y este es el número que va a la cuenta
+     * corriente del proveedor. Un negativo acá se comporta como una nota de
+     * crédito que nadie emitió — le baja la deuda al proveedor sin papel.
+     *
+     * La NC queda afuera de la regla a propósito: su total es positivo y lo que
+     * resta es el signo con que se aplica, no el importe.
+     */
+    if (['factura', 'liquidacion', 'nota_debito'].includes(dto.tipo) && total <= 0) {
+      throw new BadRequestException(
+        `El total de ${NOMBRE_TIPO[dto.tipo]} da ${r2(total)}: revisá las cantidades, los costos y la bonificación.`,
+      );
+    }
     const estado = dto.estado ?? 'confirmado';
     // El papel imprime cinco dígitos y el sistema usa cuatro: normalizar acá es
     // lo que hace que el único de la base cruce las dos formas de cargarlo.
@@ -851,7 +917,7 @@ export class ComprobantesService {
         await this.pagos.imputar(Number(t.pagoId), {
           imputaciones: [{ comprobanteId: id, importe: Number(t.importe) }],
           usuarioId: dto.usuarioId,
-        });
+        }, opciones.cruzaSucursales);
       }
       // Y después el resto que se paga en el acto.
       const contado = Number(dto.pagoContado?.importe) || 0;
@@ -868,7 +934,7 @@ export class ComprobantesService {
           cajaSesionId: dto.pagoContado?.cajaSesionId,
           usuarioId: dto.usuarioId,
           imputaciones: [{ comprobanteId: id, importe: contado }],
-        }, opciones.sucursalSesion);
+        }, opciones.sucursalSesion, opciones.cruzaSucursales);
       }
 
       /*
@@ -944,6 +1010,56 @@ export class ComprobantesService {
       comprobantes: conAjuste,
     };
   }
+
+  /**
+   * EL SALDO DE TODOS LOS PROVEEDORES, EN UNA CONSULTA.
+   * ==========================================================================
+   * Existe para que la pantalla deje de calcularlo. `cuentaProveedor()` del
+   * frontend sumaba sobre los comprobantes que tenía en memoria, y eso traía
+   * dos problemas:
+   *
+   *   1. era la CUARTA copia de la fórmula de la deuda, y ya se había
+   *      desalineado antes (le faltaba la liquidación, y filtraba por
+   *      `condicionPago`, criterio que el backend abandonó);
+   *   2. desde que el listado esconde las liquidaciones a quien no tiene el
+   *      permiso, ese saldo salía **más bajo que la deuda real** para ese
+   *      usuario, sin ningún aviso. Un saldo que depende de quién lo mira no es
+   *      un saldo.
+   *
+   * Y es lo que permite ponerle límite al listado: mientras el saldo se
+   * calculara con lo que había en memoria, acotar el listado lo habría dejado
+   * mal en silencio.
+   *
+   * Va en UNA consulta agrupada, no una por proveedor: son cinco líneas de SQL
+   * contra N viajes.
+   */
+  async saldos() {
+    const filas = await this.db
+      .select({
+        proveedorId: comprobantes.proveedorId,
+        // Mismo criterio que `cuenta()`: la deuda la define el DOCUMENTO y la
+        // cancela el PAGO. La NC resta; la orden de compra y el remito no suman.
+        deuda: sql<number>`coalesce(sum(case
+          when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total}
+          when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total}
+          else 0 end), 0)`,
+        pagado: sql<number>`coalesce(sum(case
+          when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.pagado}
+          else 0 end), 0)`,
+      })
+      .from(comprobantes)
+      .where(eq(comprobantes.estado, 'confirmado'))
+      .groupBy(comprobantes.proveedorId);
+
+    const porProveedor: Record<number, number> = {};
+    let total = 0;
+    for (const f of filas) {
+      const saldo = r2(Number(f.deuda) - Number(f.pagado));
+      porProveedor[f.proveedorId] = saldo;
+      total += saldo;
+    }
+    return { total: r2(total), porProveedor };
+  }
 }
 
 /**
@@ -965,9 +1081,11 @@ export class ComprobantesController {
     @Query('proveedorId') proveedorId?: string,
     @Query('tipo') tipo?: string,
     @Query('estado') estado?: string,
+    @Query('limit') limit?: string,
   ) {
     return this.svc.list({
       proveedorId: proveedorId ? Number(proveedorId) : undefined, tipo, estado,
+      limit: limit ? Number(limit) : undefined,
       /*
        * LA MITAD NO FACTURADA es un permiso aparte (`liquidaciones`). El filtro
        * estaba SOLO en el navegador, así que `?tipo=liquidacion` la devolvía
@@ -976,6 +1094,16 @@ export class ComprobantesController {
        */
       verLiquidaciones: tienePermiso(auth.permisos, ['liquidaciones']),
     });
+  }
+
+  /**
+   * Ruta fija ANTES de `cuenta/:proveedorId` y de `:id`: Nest resuelve por orden
+   * de declaración, así que si fuera después, `saldos` entraría como si fuera un
+   * id y devolvería 400.
+   */
+  @Get('saldos')
+  saldos() {
+    return this.svc.saldos();
   }
 
   @Get('cuenta/:proveedorId')
@@ -1013,6 +1141,8 @@ export class ComprobantesController {
       puedeTocarPrecios: tienePermiso(auth.permisos, ['precios']),
       // Para el pago contado: el turno de caja tiene que ser de esta sucursal.
       sucursalSesion: auth.sucursalId,
+      // Y para tomar un pago que ya existía: solo el jefe cruza de sucursal.
+      cruzaSucursales: esJefe(auth),
     });
   }
 }

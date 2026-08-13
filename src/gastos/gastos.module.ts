@@ -17,23 +17,81 @@
  *     revierte el pago. La plata que salió tiene que poder rastrearse siempre.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
-  NotFoundException, Param, ParseIntPipe, Patch, Post, Query, Res,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable,
+  Module, NotFoundException, Param, ParseIntPipe, Patch, Post, Query, Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import { Type } from 'class-transformer';
 import {
-  IsIn, IsInt, IsNumber, IsOptional, IsString,
+  IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, Min, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm';
+import { mimeReal, nombreSeguro } from '../common/archivos';
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   gastoAdjuntos, gastoCategorias, gastos, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
-import { Auth, type Sesion } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
-const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+/**
+ * Redondeo a dos decimales, y última red contra los números que no son números.
+ *
+ * `Number.isFinite` no está de adorno: `1e308` es un `number` finito que pasa
+ * cualquier `@IsNumber()`, pero multiplicado por 100 desborda a `Infinity`, que
+ * es truthy, sobrevive a `|| 0` y **Postgres lo acepta** en una columna
+ * `double precision`. Un solo gasto así dejaba el resumen del mes y el badge
+ * del sidebar en blanco. El tope de verdad lo pone `@Max(TOPE_IMPORTE)` en los
+ * DTOs —ahí el que carga recibe un mensaje—; esto es el piso de abajo.
+ */
+const money = (n: number) => {
+  const v = Number(n) * 100;
+  return Number.isFinite(v) ? Math.round(v) / 100 : 0;
+};
+
+/** Mil millones de pesos en un solo renglón de gasto: no existe, y corta el desborde. */
+const TOPE_IMPORTE = 1_000_000_000;
+
+/** Igual que la bandeja de facturas: una foto de comprobante no pesa más. */
+const MAX_BYTES_ADJUNTO = Math.floor(2.5 * 1024 * 1024);
+
+/** 'AAAA-MM-DD', lo único que manda un `<input type="date">`. */
+const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * QUIÉN ENTRA A GASTOS — las claves que el catálogo declaraba y nadie exigía.
+ * ============================================================================
+ * Este controller no tenía NINGÚN permiso. Las siete secciones y las cuatro
+ * acciones existían desde el primer día en `usuarios.module.ts`, se podían
+ * tildar en la pantalla de roles… y no las leía nadie: el único filtro era el
+ * sub-sidebar del dashboard, que decide qué panel dibuja. Con eso, cualquier
+ * sesión —el rol Cafetería, que ve una sola pantalla— pedía `/gastos/resumen` y
+ * se llevaba la estructura de costos entera de la empresa.
+ *
+ * `PISO` es el permiso de LECTURA del módulo: tener alguna de sus secciones.
+ * Va a nivel de clase y alcanza para los catálogos que todas las pantallas
+ * necesitan. Cada escritura vuelve a pedir lo suyo — y ojo con la semántica:
+ * un `@Permiso` de método REEMPLAZA al de la clase, no se suman, así que cada
+ * uno tiene que listar todo lo que acepta.
+ *
+ * `PERMISOS_PAGO` es el caso serio: los tres endpoints que terminan llamando a
+ * `PagosProveedorService.crear()` generan un EGRESO DE EFECTIVO en un turno de
+ * caja. Ese servicio ya estaba cerrado del lado de `PagosProveedorController`;
+ * Gastos lo volvía a abrir por el costado. Las claves son las mismas de allá
+ * (misma plata, mismos caminos legítimos) más la acción propia de gastos.
+ */
+const PISO_GASTOS = [
+  'gastos.gastos', 'gastos.pagos', 'gastos.pagos_proveedor', 'gastos.fijos',
+  'gastos.categorias', 'gastos.proveedores', 'gastos.resumen',
+];
+/** Ver un gasto: las tres secciones que lo muestran en pantalla. */
+const PERMISOS_VER = ['gastos.gastos', 'gastos.pagos', 'gastos.resumen'];
+/** Mover plata: crea el egreso del cajón. Espejo de `PagosProveedorController`. */
+const PERMISOS_PAGO = ['gastos_pagar', 'gastos_pagar_proveedor', 'ventas.caja'];
+/** Imputar: decidir contra qué documento se descuenta un pago que ya existe. */
+const PERMISOS_IMPUTAR = ['gastos_imputar', 'gastos.pagos_proveedor', 'compras.pagos'];
 
 /*
  * `fechaLocal` vive en `common/documentos`. Está compartida con Cafetería —eran
@@ -53,8 +111,30 @@ const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito'
 
 /* ------------------------------- DTOs ------------------------------- */
 
+/*
+ * LAS FECHAS SE VALIDAN, no se confían. `new Date('lunes')` no explota: devuelve
+ * `Invalid Date`, que viaja calladito hasta que Drizzle le pide un ISO y ahí sí
+ * revienta con un 500 y el stack en el log. Pagos ya lo había resuelto así; acá
+ * faltaba. Lo mismo con los importes y su `@Max`: ver el comentario de `money`.
+ */
+/*
+ * `PagoDto` va ANTES de `GastoDto` porque este lo referencia como tipo anidado:
+ * `emitDecoratorMetadata` escribe el `design:type` en el momento en que la clase
+ * se define, así que declararlo después explota con "Cannot access before
+ * initialization" al arrancar. No es orden estético.
+ */
+class PagoDto {
+  @IsNumber() @Min(0.01) @Max(TOPE_IMPORTE) importe!: number;
+  @IsOptional() @IsIn(MEDIOS as unknown as string[]) medio?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
+  @IsOptional() @IsString() referencia?: string;
+  /** Turno de caja del que sale el efectivo (genera el egreso). */
+  @IsOptional() @IsInt() cajaSesionId?: number;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
 class GastoDto {
-  @IsOptional() @IsString() fecha?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
   @IsOptional() @IsIn(TIPOS_DOC as unknown as string[]) tipoDoc?: string;
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: string;
   @IsOptional() @IsString() numero?: string;
@@ -66,27 +146,57 @@ class GastoDto {
   @IsOptional() @IsIn(['contado', 'cuenta_corriente']) condicionPago?: string;
   /** A qué negocio se imputa: la distribuidora (defecto) o la cafetería. */
   @IsOptional() @IsIn(['distribuidora', 'cafeteria']) negocio?: string;
-  @IsOptional() @IsString() vencimiento?: string;
-  @IsOptional() @IsNumber() neto?: number;
-  @IsOptional() @IsNumber() iva?: number;
-  @IsOptional() @IsNumber() otros?: number;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vencimiento?: string;
+  @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) neto?: number;
+  @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) iva?: number;
+  @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) otros?: number;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
   /**
    * Pago en el mismo acto del alta (el caso más común: se paga y se carga).
-   * Si viene, se registra como primer pago del gasto.
+   * Si viene, se registra como primer pago del gasto — y por eso el alta exige
+   * también el permiso de pagar (ver `PERMISOS_PAGO`).
    */
-  @IsOptional() pagoInmediato?: any;
+  @IsOptional() @ValidateNested() @Type(() => PagoDto) pagoInmediato?: PagoDto;
 }
 
-class PagoDto {
-  @IsNumber() importe!: number;
-  @IsOptional() @IsIn(MEDIOS as unknown as string[]) medio?: string;
-  @IsOptional() @IsString() fecha?: string;
-  @IsOptional() @IsString() referencia?: string;
-  /** Turno de caja del que sale el efectivo (genera el egreso). */
-  @IsOptional() @IsInt() cajaSesionId?: number;
+class AplicarPagoDto {
+  @IsInt() pagoId!: number;
+  @IsNumber() @Min(0.01) @Max(TOPE_IMPORTE) importe!: number;
   @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class AnularGastoDto {
+  @IsOptional() @IsString() motivo?: string;
+}
+
+class GenerarPeriodoDto {
+  @Matches(/^\d{4}-\d{2}$/, { message: 'El período va como AAAA-MM (por ejemplo 2026-08).' }) periodo!: string;
+  @IsOptional() @IsInt() usuarioId?: number;
+  @IsOptional() @IsInt({ each: true }) ids?: number[];
+}
+
+class AdjuntoDto {
+  @IsOptional() @IsString() nombre?: string;
+  @IsString() data!: string;
+}
+
+/**
+ * Los filtros que aceptan las TRES lecturas (listado, cuentas a pagar y
+ * resumen). Uno solo y compartido: con `@Query() q: any` el `whitelist` global
+ * no filtraba nada, así que cualquier cosa entraba al armado de condiciones.
+ * Cada endpoint usa el subconjunto que le sirve e ignora el resto.
+ */
+class ConsultaGastosDto {
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha "desde" va como AAAA-MM-DD.' }) desde?: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha "hasta" va como AAAA-MM-DD.' }) hasta?: string;
+  @IsOptional() @Type(() => Number) @IsInt() categoriaId?: number;
+  @IsOptional() @Type(() => Number) @IsInt() proveedorId?: number;
+  @IsOptional() @Type(() => Number) @IsInt() sucursalId?: number;
+  @IsOptional() @IsIn(['pendiente', 'pagado', 'anulado']) estado?: string;
+  @IsOptional() @IsIn(['distribuidora', 'cafeteria']) negocio?: string;
+  @IsOptional() @IsString() q?: string;
+  @IsOptional() @Type(() => Number) @IsInt() limit?: number;
 }
 
 class CategoriaDto {
@@ -102,9 +212,9 @@ class RecurrenteDto {
   @IsOptional() @IsInt() categoriaId?: number;
   @IsOptional() @IsInt() proveedorId?: number;
   @IsOptional() @IsInt() sucursalId?: number;
-  @IsOptional() @IsNumber() importeEstimado?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(TOPE_IMPORTE) importeEstimado?: number;
   @IsOptional() @IsIn(['mensual', 'bimestral', 'trimestral', 'semestral', 'anual']) frecuencia?: string;
-  @IsOptional() @IsInt() diaVencimiento?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(31) diaVencimiento?: number;
   @IsOptional() activo?: boolean;
   @IsOptional() @IsString() observaciones?: string;
 }
@@ -125,14 +235,36 @@ export class GastosService {
    * Todo lo chico que el módulo necesita para operar, en una sola llamada:
    * plan de gastos, proveedores (con su clasificación), sucursales, usuarios y
    * las plantillas de gastos fijos.
+   *
+   * PROVEEDORES, SUCURSALES Y USUARIOS van proyectados y no con `select()`
+   * pelado: esto lo pide todo el que abre el módulo, y un `SELECT *` arrastra
+   * cualquier columna que se agregue mañana. Rubros y plantillas sí van
+   * enteros, que es lo que las dos pantallas que los administran necesitan.
+   *
+   * Del padrón viajan SOLO el nombre y las dos banderas, que es lo que usan los
+   * selectores. La ficha completa —CUIT, condición de IVA, contacto— la pide la
+   * pantalla de Proveedores por su cuenta, así queda detrás de
+   * `gastos.proveedores` en vez de bajar con el arranque del módulo.
+   *
+   * Los gastos fijos solo viajan si el rol tiene su sección: el mismo criterio
+   * que el sub-sidebar, pero del lado que manda.
    */
-  async bootstrap() {
+  async bootstrap(sesion: Sesion) {
+    const verFijos = tienePermiso(sesion.permisos, ['gastos.fijos']);
     const [categorias, provs, sucs, users, recurrentes] = await Promise.all([
       this.db.select().from(gastoCategorias).orderBy(asc(gastoCategorias.orden), asc(gastoCategorias.nombre)),
-      this.db.select().from(proveedores).orderBy(asc(proveedores.nombre)),
-      this.db.select().from(sucursales).orderBy(asc(sucursales.id)),
+      this.db.select({
+        id: proveedores.id, nombre: proveedores.nombre,
+        // Las dos banderas separan, en el selector, quién factura gastos de
+        // quién vende mercadería. Ver el comentario de arriba sobre el resto.
+        proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos,
+      }).from(proveedores).orderBy(asc(proveedores.nombre)),
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
+        .from(sucursales).orderBy(asc(sucursales.id)),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo }).from(usuarios),
-      this.db.select().from(gastosRecurrentes).orderBy(asc(gastosRecurrentes.nombre)),
+      verFijos
+        ? this.db.select().from(gastosRecurrentes).orderBy(asc(gastosRecurrentes.nombre))
+        : Promise.resolve([]),
     ]);
     return { categorias, proveedores: provs, sucursales: sucs, usuarios: users, recurrentes };
   }
@@ -395,7 +527,36 @@ export class GastosService {
     }
   }
 
-  async crear(dto: GastoDto, sucursalSesion: number) {
+  /**
+   * LA SUCURSAL DEL DOCUMENTO NO LA ELIGE EL CLIENTE.
+   *
+   * Es a la que se le imputa el gasto: define el resumen por sucursal y, sobre
+   * todo, define qué pagos lo pueden explicar. Sin esto, un cajero de Express 2
+   * le colgaba $200.000 de "reparación" a Fontana y de paso creaba un documento
+   * tomable por los pagos a cuenta de Fontana.
+   *
+   * No usa `sucursalDeOperacion()` a propósito: ahí `null` no significa nada,
+   * y acá SÍ — es el gasto de toda la empresa (el alquiler de la oficina, el
+   * contador). Esa opción queda para el jefe, que es el único que ve más de un
+   * mostrador; el resto graba en la suya y punto.
+   */
+  private sucursalDelGasto(sesion: Sesion, pedida?: number | null): number | null {
+    if (esJefe(sesion)) return pedida ?? null;
+    return sesion.sucursalId ?? null;
+  }
+
+  async crear(dto: GastoDto, sesion: Sesion) {
+    /*
+     * El alta con "lo pagué y lo cargo" tildado hace salir plata del cajón, así
+     * que exige TAMBIÉN el permiso de pagar. El `@Permiso` del endpoint no puede
+     * expresar esto —es un OR fijo, y el pago es opcional—, así que la condición
+     * se pregunta acá, que es donde se sabe si el pago viene o no.
+     */
+    if (dto.pagoInmediato && !tienePermiso(sesion.permisos, PERMISOS_PAGO)) {
+      throw new ForbiddenException(
+        'Podés cargar el gasto, pero no registrar su pago: eso saca plata de la caja y necesita permiso propio.',
+      );
+    }
     const [cat] = await this.db.select().from(gastoCategorias)
       .where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
     if (!cat) throw new BadRequestException('Elegí el rubro al que se imputa el gasto.');
@@ -414,6 +575,8 @@ export class GastosService {
     const letra = dto.letra ?? 'B';
     await this.chequearDuplicado(proveedorId, letra, numero);
 
+    const sucursalId = this.sucursalDelGasto(sesion, dto.sucursalId);
+
     const [creado] = await this.db.insert(gastos).values({
         fecha: fechaLocal(dto.fecha) ?? undefined,
         tipoDoc: (dto.tipoDoc ?? 'factura') as any,
@@ -422,7 +585,7 @@ export class GastosService {
         proveedorId,
         proveedorTexto: proveedorId ? '' : (dto.proveedorTexto ?? '').trim(),
         categoriaId: cat.id,
-        sucursalId: dto.sucursalId ?? null,
+        sucursalId,
         descripcion: (dto.descripcion ?? '').trim(),
         condicionPago: (dto.condicionPago ?? 'contado') as any,
         negocio: (dto.negocio ?? 'distribuidora') as any,
@@ -442,23 +605,26 @@ export class GastosService {
      * recuperable. Perder también la carga sería peor.
      */
     if (dto.pagoInmediato) {
+      // El importe viene siempre: `PagoDto.importe` es obligatorio y tiene
+      // `@Min(0.01)`, así que el `|| total` que había acá era una rama muerta.
+      const importePago = money(dto.pagoInmediato.importe);
       await this.pagos.crear({
         destino: 'gastos',
         proveedorId: proveedorId ?? undefined,
-        importe: Number(dto.pagoInmediato.importe) || total,
+        importe: importePago,
         medio: dto.pagoInmediato.medio,
         fecha: dto.pagoInmediato.fecha,
         referencia: dto.pagoInmediato.referencia,
         concepto: (dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
-        sucursalId: dto.sucursalId,
+        sucursalId: sucursalId ?? undefined,
         cajaSesionId: dto.pagoInmediato.cajaSesionId,
         // `dto.usuarioId` y NO el del objeto anidado: el interceptor que pone el
         // autor solo pisa el nivel de arriba del body, así que el `usuarioId`
         // de `pagoInmediato` seguiría siendo el que mandó el cliente. El pago
         // del gasto lo firma el mismo que carga el gasto.
         usuarioId: dto.usuarioId,
-        imputaciones: [{ gastoId: creado.id, importe: Number(dto.pagoInmediato.importe) || total }],
-      }, sucursalSesion);
+        imputaciones: [{ gastoId: creado.id, importe: importePago }],
+      }, sesion.sucursalId, esJefe(sesion));
     }
     return this.get(creado.id);
   }
@@ -468,7 +634,7 @@ export class GastosService {
    * importes ya se movieron contra la caja o el banco, y cambiarlos por atrás
    * dejaría un pago mayor que su propio gasto.
    */
-  async editar(id: number, dto: GastoDto) {
+  async editar(id: number, dto: GastoDto, sesion: Sesion) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('El gasto está anulado: no se edita.');
@@ -482,7 +648,18 @@ export class GastosService {
     if (dto.descripcion != null) patch.descripcion = String(dto.descripcion).trim();
     if (dto.observaciones != null) patch.observaciones = String(dto.observaciones).trim();
     if (dto.vencimiento !== undefined) patch.vencimiento = fechaLocal(dto.vencimiento);
-    if (dto.sucursalId !== undefined) patch.sucursalId = dto.sucursalId ?? null;
+    /*
+     * MUDAR UN GASTO DE SUCURSAL ES COSA DEL JEFE — y para el resto el campo se
+     * IGNORA, no se clava en la suya.
+     *
+     * La diferencia importa: clavarlo convertía cualquier edición inocente de un
+     * no-jefe (corregir la descripción del alquiler de la oficina) en una
+     * re-imputación silenciosa a su propia sucursal. Un gasto de "toda la
+     * empresa" pasaba a ser de Express 2 por haberle arreglado una coma, y con
+     * eso cambiaba el resumen por sucursal y cambiaba qué pagos lo pueden
+     * explicar. En el ALTA sí se clava, porque ahí el documento nace.
+     */
+    if (dto.sucursalId !== undefined && esJefe(sesion)) patch.sucursalId = dto.sucursalId ?? null;
     // El negocio es imputación, no importe: se puede corregir aunque haya pagos.
     if (dto.negocio) patch.negocio = dto.negocio;
 
@@ -547,7 +724,7 @@ export class GastosService {
    * proveedor. Ese giro es lo que habilita el circuito inverso — que la cajera
    * pague cuando llega la mercadería, sin que el documento exista todavía.
    */
-  async pagar(id: number, dto: PagoDto, sucursalSesion: number) {
+  async pagar(id: number, dto: PagoDto, sesion: Sesion) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('El gasto está anulado.');
@@ -564,7 +741,7 @@ export class GastosService {
       cajaSesionId: dto.cajaSesionId,
       usuarioId: dto.usuarioId,
       imputaciones: [{ gastoId: g.id, importe }],
-    }, sucursalSesion);
+    }, sesion.sucursalId, esJefe(sesion));
     return this.get(id);
   }
 
@@ -572,24 +749,56 @@ export class GastosService {
    * Aplicar a este gasto un pago que YA existe — el que la cajera registró
    * antes de que el comprobante estuviera cargado. No mueve plata: la imputa.
    */
-  async aplicarPago(id: number, pagoId: number, importe: number, usuarioId?: number) {
-    await this.pagos.imputar(pagoId, {
-      imputaciones: [{ gastoId: id, importe: money(importe) }],
-      usuarioId,
-    });
+  async aplicarPago(id: number, dto: AplicarPagoDto, sesion: Sesion) {
+    await this.pagos.imputar(dto.pagoId, {
+      imputaciones: [{ gastoId: id, importe: money(dto.importe) }],
+      usuarioId: dto.usuarioId,
+    }, esJefe(sesion));
     return this.get(id);
   }
 
   /* ---------------- Adjuntos (foto del comprobante) ---------------- */
 
-  async subirAdjunto(gastoId: number, body: any) {
+  /**
+   * EL MIME SALE DE LOS BYTES, no de lo que dijo el cliente.
+   *
+   * Este adjunto se sirve de vuelta desde `/api/...`, o sea desde EL MISMO
+   * ORIGEN donde el dashboard guarda el token de sesión. Guardar el mime
+   * declarado y devolverlo tal cual convertía este endpoint en alojamiento de
+   * contenido arbitrario: `data:text/html;base64,<script>…</script>`, se le pasa
+   * el link al administrador ("mirá el comprobante"), y el script lee la sesión
+   * del `localStorage` y se la manda a otro lado. Con `image/svg+xml` es igual.
+   *
+   * `common/archivos.ts` ya tenía la tabla de firmas para los otros dos lugares
+   * que reciben binarios (Compras y Web); este era el tercero y quedó afuera.
+   */
+  async subirAdjunto(gastoId: number, dto: AdjuntoDto) {
     const [g] = await this.db.select({ id: gastos.id }).from(gastos).where(eq(gastos.id, gastoId)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
-    const dataUrl = String(body?.data ?? '');
-    const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-    if (!m) throw new BadRequestException('La imagen tiene que llegar como data URL en base64.');
+    const m = /^data:([^;]+);base64,(.+)$/.exec(String(dto?.data ?? ''));
+    if (!m) throw new BadRequestException('El comprobante tiene que llegar como data URL en base64.');
+
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > MAX_BYTES_ADJUNTO) {
+      const mb = (n: number) => (n / 1024 / 1024).toFixed(1).replace('.', ',');
+      throw new BadRequestException(`El archivo pesa ${mb(buf.length)} MB y el máximo es ${mb(MAX_BYTES_ADJUNTO)} MB.`);
+    }
+    const real = mimeReal(buf);
+    if (!real) {
+      throw new BadRequestException('Ese archivo no es una foto JPG/PNG/WebP ni un PDF: no se pudo reconocer el contenido.');
+    }
+    if (real !== m[1]) {
+      throw new BadRequestException(`El archivo dice ser ${m[1]} pero su contenido es ${real}.`);
+    }
+
     const [a] = await this.db.insert(gastoAdjuntos).values({
-      gastoId, nombre: String(body?.nombre ?? '').slice(0, 120), mime: m[1], data: m[2],
+      gastoId,
+      nombre: nombreSeguro(String(dto?.nombre ?? ''), 'comprobante'),
+      mime: real,
+      // Se re-arma el base64 desde los bytes ya validados: lo que se guarda es
+      // exactamente lo que se midió, sin los caracteres que el decodificador
+      // ignora al leer pero que quedarían en la fila.
+      data: buf.toString('base64'),
     }).returning({ id: gastoAdjuntos.id, nombre: gastoAdjuntos.nombre, mime: gastoAdjuntos.mime });
     return a;
   }
@@ -597,13 +806,36 @@ export class GastosService {
   async verAdjunto(id: number, res: Response) {
     const [a] = await this.db.select().from(gastoAdjuntos).where(eq(gastoAdjuntos.id, id)).limit(1);
     if (!a) throw new NotFoundException('Adjunto inexistente.');
-    const buf = Buffer.from(a.data, 'base64');
     res.setHeader('Content-Type', a.mime);
+    // `nosniff` cierra la otra mitad: sin él el navegador puede decidir que el
+    // archivo "en realidad" es otra cosa, y el mime verificado al subir deja de
+    // servir. `inline` con nombre saneado porque se mira al lado del gasto.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `inline; filename="${nombreSeguro(a.nombre, 'comprobante')}"`);
     res.setHeader('Cache-Control', 'private, max-age=86400');
-    res.end(buf);
+    res.end(Buffer.from(a.data, 'base64'));
   }
 
+  /**
+   * El adjunto es la PRUEBA de que ese egreso existió. Una vez que hay plata
+   * pagada contra el gasto, la foto del comprobante deja de ser un archivo
+   * suelto y pasa a ser el respaldo de esa salida: es la misma regla que ya
+   * cumplen `anular` (no anula con pagos) y `editar` (no toca importes con
+   * pagos). Antes esto era un `delete` pelado que ni siquiera miraba si el
+   * adjunto existía.
+   */
   async borrarAdjunto(id: number) {
+    const [a] = await this.db.select({ id: gastoAdjuntos.id, gastoId: gastoAdjuntos.gastoId })
+      .from(gastoAdjuntos).where(eq(gastoAdjuntos.id, id)).limit(1);
+    if (!a) throw new NotFoundException('Adjunto inexistente.');
+    const [g] = await this.db.select({ pagado: gastos.pagado })
+      .from(gastos).where(eq(gastos.id, a.gastoId)).limit(1);
+    if (Number(g?.pagado) > 0.009) {
+      throw new BadRequestException(
+        'El gasto ya tiene pagos registrados: el comprobante es el respaldo de esa salida y no se borra. '
+        + 'Revertí el pago primero.',
+      );
+    }
     await this.db.delete(gastoAdjuntos).where(eq(gastoAdjuntos.id, id));
     return { ok: true };
   }
@@ -669,41 +901,84 @@ export class GastosService {
    * por cada plantilla, no contra un flag: así reintentar nunca duplica, y si
    * alguien borra el gasto generado, la plantilla vuelve a ofrecerse.
    */
-  async previsualizarPeriodo(periodo: string) {
-    const { inicio, fin } = this.rangoPeriodo(periodo);
-    const plantillas = await this.db.select().from(gastosRecurrentes)
-      .where(eq(gastosRecurrentes.activo, true)).orderBy(asc(gastosRecurrentes.nombre));
-    if (!plantillas.length) return { periodo, pendientes: [], emitidos: [] };
+  previsualizarPeriodo(periodo: string) {
+    return this.calcularPeriodo(this.db, periodo, false);
+  }
 
-    const emitidos = await this.db.select().from(gastos).where(and(
-      inArray(gastos.recurrenteId, plantillas.map((p) => p.id)),
+  /**
+   * `conCandado` es lo que separa mirar de generar. La idempotencia se apoya en
+   * "leo qué falta, después inserto", y esas dos mitades corrían en momentos
+   * distintos: dos administradores apretando "Generar agosto" en el mismo
+   * segundo leían los dos la misma lista de pendientes y los dos insertaban —
+   * dos alquileres, dos internets, dos seguros del mismo mes en Cuentas a
+   * Pagar, y el que no lo nota paga dos veces.
+   *
+   * Con el candado sobre las PLANTILLAS, el segundo pedido espera; cuando entra,
+   * su lectura de gastos emitidos ya ve los del primero y no genera nada. No
+   * hace falta un único en la base: el cuello es la plantilla, no el gasto.
+   */
+  private async calcularPeriodo(ex: any, periodo: string, conCandado: boolean) {
+    const inicio = this.inicioPeriodo(periodo);
+    const consulta = ex.select().from(gastosRecurrentes)
+      .where(eq(gastosRecurrentes.activo, true)).orderBy(asc(gastosRecurrentes.nombre));
+    const plantillas = conCandado ? await consulta.for('update') : await consulta;
+    if (!plantillas.length) return { periodo, inicio, pendientes: [], emitidos: [] };
+
+    const emitidos = await ex.select().from(gastos).where(and(
+      inArray(gastos.recurrenteId, plantillas.map((p: any) => p.id)),
       ne(gastos.estado, 'anulado'),
     ));
 
     const pendientes: any[] = [];
     const yaEstan: any[] = [];
     for (const p of plantillas) {
+      /*
+       * DESDE CUÁNDO UNA EMISIÓN ANTERIOR TODAVÍA CUBRE ESTE PERÍODO. Mensual:
+       * solo la de este mismo mes. Bimestral: también la del mes pasado. De ahí
+       * el `meses - 1`.
+       *
+       * Se cuenta desde `inicio` (día 1) y no desde el fin del mes, y eso NO es
+       * cosmético: `setMonth` no recorta, DESBORDA. Con el 31 de marzo, restar
+       * un mes daba "31 de febrero" → 3 de marzo, o sea un límite POSTERIOR al
+       * gasto recién generado (día 1). El gasto no se encontraba, la plantilla
+       * volvía a ofrecerse y generar marzo dos veces creaba dos alquileres —
+       * sin ninguna concurrencia de por medio, apretando el botón dos veces.
+       * Desde el día 1 el desborde no existe: todos los meses tienen un día 1.
+       */
       const meses = MESES_FRECUENCIA[p.frecuencia] ?? 1;
-      const limite = new Date(fin);
-      limite.setMonth(limite.getMonth() - meses);
-      const previo = emitidos.find((g) => g.recurrenteId === p.id && new Date(g.fecha) > limite);
+      const desde = new Date(inicio);
+      desde.setMonth(desde.getMonth() - (meses - 1));
+      /*
+       * Y LA PUNTA DE ARRIBA, que faltaba: sin ella una emisión POSTERIOR
+       * contaba como si cubriera este período. Generado septiembre, pedir julio
+       * decía "ya está generado" y apuntaba al gasto de septiembre — o sea que
+       * rellenar un mes viejo era imposible y el motivo no se veía por ningún
+       * lado. El mes siguiente al período ya es otro período.
+       */
+      const hasta = new Date(inicio);
+      hasta.setMonth(hasta.getMonth() + 1);
+      const previo = emitidos.find((g: any) => {
+        if (g.recurrenteId !== p.id) return false;
+        const f = new Date(g.fecha);
+        return f >= desde && f < hasta;
+      });
       if (previo) yaEstan.push({ plantilla: p, gastoId: previo.id, fecha: previo.fecha });
       else pendientes.push({ plantilla: p, vencimiento: this.vencimientoDe(inicio, p.diaVencimiento) });
     }
-    return { periodo, pendientes, emitidos: yaEstan };
+    return { periodo, inicio, pendientes, emitidos: yaEstan };
   }
 
   async generarPeriodo(periodo: string, usuarioId?: number, soloIds?: number[]) {
-    const { inicio } = this.rangoPeriodo(periodo);
-    const previa = await this.previsualizarPeriodo(periodo);
-    const aGenerar = previa.pendientes.filter(
-      (x: any) => !soloIds?.length || soloIds.includes(x.plantilla.id),
-    );
-    if (!aGenerar.length) return { creados: 0, periodo, gastos: [] };
-
     const creados = await this.db.transaction(async (tx) => {
+      // La previa va ADENTRO y con candado: ver `calcularPeriodo`.
+      const previa = await this.calcularPeriodo(tx, periodo, true);
+      const aGenerar = previa.pendientes.filter(
+        (x: any) => !soloIds?.length || soloIds.includes(x.plantilla.id),
+      );
+      if (!aGenerar.length) return [];
+
       const filas = aGenerar.map((x: any) => ({
-        fecha: inicio,
+        fecha: previa.inicio,
         tipoDoc: 'factura' as const,
         letra: 'B' as const,
         numero: '',
@@ -729,16 +1004,14 @@ export class GastosService {
     return { creados: creados.length, periodo, gastos: creados.map((g) => g.id) };
   }
 
-  /** 'YYYY-MM' → primer y último instante del mes. */
-  private rangoPeriodo(periodo: string) {
+  /** 'YYYY-MM' → el primer instante de ese mes. */
+  private inicioPeriodo(periodo: string) {
     const m = /^(\d{4})-(\d{2})$/.exec(String(periodo ?? '').trim());
     if (!m) throw new BadRequestException('El período se indica como AAAA-MM (por ejemplo 2026-08).');
     const anio = Number(m[1]);
     const mes = Number(m[2]);
     if (mes < 1 || mes > 12) throw new BadRequestException('Mes inválido.');
-    const inicio = new Date(anio, mes - 1, 1, 0, 0, 0, 0);
-    const fin = new Date(anio, mes, 0, 23, 59, 59, 999);
-    return { inicio, fin };
+    return new Date(anio, mes - 1, 1, 0, 0, 0, 0);
   }
 
   /** Día de vencimiento dentro del mes, recortado al último día real (31 → 28/30). */
@@ -750,68 +1023,109 @@ export class GastosService {
 
 /* ------------------------------- Controller ------------------------------- */
 
+/**
+ * El `@Permiso` de la clase es el PISO de lectura (ver `PISO_GASTOS`). Cada
+ * método que escribe vuelve a declarar el suyo, y como el de método reemplaza
+ * al de clase, cada uno lista todo lo que acepta — no hereda nada.
+ */
 @Controller('gastos')
+@Permiso(...PISO_GASTOS)
 export class GastosController {
   constructor(private readonly svc: GastosService) {}
 
   /* Las rutas fijas van ANTES de `:id`: Nest resuelve por orden de declaración. */
-  @Get('bootstrap') bootstrap() { return this.svc.bootstrap(); }
-  @Get('pendientes') pendientes() { return this.svc.pendientes(); }
-  @Get('cuentas-a-pagar') cuentas(@Query() q: any) { return this.svc.cuentasAPagar(q ?? {}); }
-  @Get('resumen') resumen(@Query() q: any) { return this.svc.resumen(q ?? {}); }
+  @Get('bootstrap') bootstrap(@Auth() auth: Sesion) { return this.svc.bootstrap(auth); }
+  @Get('pendientes') @Permiso('gastos.gastos', 'gastos.pagos') pendientes() {
+    return this.svc.pendientes();
+  }
+  @Get('cuentas-a-pagar') @Permiso('gastos.pagos') cuentas(@Query() q: ConsultaGastosDto) {
+    return this.svc.cuentasAPagar(q ?? {});
+  }
+  @Get('resumen') @Permiso('gastos.resumen') resumen(@Query() q: ConsultaGastosDto) {
+    return this.svc.resumen(q ?? {});
+  }
 
+  // Leer el plan de rubros lo necesita cualquier pantalla del módulo (el
+  // selector del formulario); ADMINISTRARLO es su propia sección.
   @Get('categorias') categorias() { return this.svc.listCategorias(); }
-  @Post('categorias') crearCategoria(@Body() dto: CategoriaDto) { return this.svc.crearCategoria(dto); }
-  @Patch('categorias/:id') editarCategoria(@Param('id', ParseIntPipe) id: number, @Body() dto: CategoriaDto) {
+  @Post('categorias') @Permiso('gastos.categorias') crearCategoria(@Body() dto: CategoriaDto) {
+    return this.svc.crearCategoria(dto);
+  }
+  @Patch('categorias/:id') @Permiso('gastos.categorias') editarCategoria(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: CategoriaDto,
+  ) {
     return this.svc.editarCategoria(id, dto);
   }
-  @Delete('categorias/:id') borrarCategoria(@Param('id', ParseIntPipe) id: number) {
+  @Delete('categorias/:id') @Permiso('gastos.categorias') borrarCategoria(@Param('id', ParseIntPipe) id: number) {
     return this.svc.borrarCategoria(id);
   }
 
-  @Get('recurrentes') recurrentes() { return this.svc.listRecurrentes(); }
-  @Post('recurrentes') crearRecurrente(@Body() dto: RecurrenteDto) { return this.svc.crearRecurrente(dto); }
-  @Patch('recurrentes/:id') editarRecurrente(@Param('id', ParseIntPipe) id: number, @Body() dto: RecurrenteDto) {
+  @Get('recurrentes') @Permiso('gastos.fijos') recurrentes() { return this.svc.listRecurrentes(); }
+  @Post('recurrentes') @Permiso('gastos.fijos') crearRecurrente(@Body() dto: RecurrenteDto) {
+    return this.svc.crearRecurrente(dto);
+  }
+  @Patch('recurrentes/:id') @Permiso('gastos.fijos') editarRecurrente(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: RecurrenteDto,
+  ) {
     return this.svc.editarRecurrente(id, dto);
   }
-  @Delete('recurrentes/:id') borrarRecurrente(@Param('id', ParseIntPipe) id: number) {
+  @Delete('recurrentes/:id') @Permiso('gastos.fijos') borrarRecurrente(@Param('id', ParseIntPipe) id: number) {
     return this.svc.borrarRecurrente(id);
   }
-  @Get('recurrentes/periodo/:periodo') previa(@Param('periodo') periodo: string) {
+  @Get('recurrentes/periodo/:periodo') @Permiso('gastos.fijos') previa(@Param('periodo') periodo: string) {
     return this.svc.previsualizarPeriodo(periodo);
   }
-  @Post('recurrentes/generar') generar(@Body() body: any) {
-    return this.svc.generarPeriodo(body?.periodo, body?.usuarioId, body?.ids);
+  @Post('recurrentes/generar') @Permiso('gastos.fijos') generar(@Body() dto: GenerarPeriodoDto) {
+    return this.svc.generarPeriodo(dto.periodo, dto.usuarioId, dto.ids);
   }
 
-  @Get('adjuntos/:id') adjunto(@Param('id', ParseIntPipe) id: number, @Res() res: Response) {
+  @Get('adjuntos/:id') @Permiso(...PERMISOS_VER) adjunto(
+    @Param('id', ParseIntPipe) id: number, @Res() res: Response,
+  ) {
     return this.svc.verAdjunto(id, res);
   }
-  @Delete('adjuntos/:id') borrarAdjunto(@Param('id', ParseIntPipe) id: number) {
+  @Delete('adjuntos/:id') @Permiso('gastos.gastos') borrarAdjunto(@Param('id', ParseIntPipe) id: number) {
     return this.svc.borrarAdjunto(id);
   }
 
-  @Get() list(@Query() q: any) { return this.svc.list(q ?? {}); }
-  // La sucursal sale de la SESION: es contra lo que se valida el turno de caja
-  // cuando el gasto se paga en el acto con efectivo.
-  @Post() crear(@Body() dto: GastoDto, @Auth() auth: Sesion) { return this.svc.crear(dto, auth.sucursalId); }
+  @Get() @Permiso(...PERMISOS_VER) list(@Query() q: ConsultaGastosDto) { return this.svc.list(q ?? {}); }
+  /*
+   * La SESIÓN entera y no solo su sucursal: acá se decide a qué sucursal se
+   * imputa el gasto (jefe elige, el resto graba en la suya) y, si viene con
+   * "lo pagué y lo cargo" tildado, si esta persona puede además sacar plata
+   * del cajón. Las dos cosas se resuelven adentro, con la sesión a mano.
+   */
+  @Post() @Permiso('gastos.gastos') crear(@Body() dto: GastoDto, @Auth() auth: Sesion) {
+    return this.svc.crear(dto, auth);
+  }
 
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: GastoDto) {
-    return this.svc.editar(id, dto);
+  @Get(':id') @Permiso(...PERMISOS_VER) get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Patch(':id') @Permiso('gastos.gastos') editar(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: GastoDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.editar(id, dto, auth);
   }
-  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.anular(id, body?.motivo);
+  @Post(':id/anular') @Permiso('gastos_anular') anular(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: AnularGastoDto,
+  ) {
+    return this.svc.anular(id, dto?.motivo);
   }
-  @Post(':id/pagos') pagar(@Param('id', ParseIntPipe) id: number, @Body() dto: PagoDto, @Auth() auth: Sesion) {
-    return this.svc.pagar(id, dto, auth.sucursalId);
+  /** Sale plata del cajón: mismas claves que `PagosProveedorController`. */
+  @Post(':id/pagos') @Permiso(...PERMISOS_PAGO) pagar(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: PagoDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.pagar(id, dto, auth);
   }
   /** Usar un pago a cuenta que ya existe. Quitarlo se hace desde Pagos. */
-  @Post(':id/aplicar-pago') aplicarPago(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.aplicarPago(id, Number(body?.pagoId), Number(body?.importe), body?.usuarioId);
+  @Post(':id/aplicar-pago') @Permiso(...PERMISOS_IMPUTAR) aplicarPago(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: AplicarPagoDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.aplicarPago(id, dto, auth);
   }
-  @Post(':id/adjuntos') subir(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.subirAdjunto(id, body);
+  @Post(':id/adjuntos') @Permiso('gastos.gastos') subir(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: AdjuntoDto,
+  ) {
+    return this.svc.subirAdjunto(id, dto);
   }
 }
 
