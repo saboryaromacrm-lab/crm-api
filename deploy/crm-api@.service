@@ -27,6 +27,20 @@ WorkingDirectory=/srv/crm/%i/crm-api
 EnvironmentFile=/srv/crm/%i/crm-api/.env
 ExecStart=/usr/bin/node dist/main.js
 
+# LA ZONA HORARIA DEL PROCESO, y no es un detalle de presentación.
+#
+# El sistema decide "hoy" con el reloj de Node en varios lugares: si un gasto
+# está vencido, cuántos días faltan para un vencimiento, el badge del sidebar,
+# el día que le toca a un gasto fijo. Un VPS viene en UTC por defecto, y en
+# UTC−3 eso significa que **después de las 21:00 el servidor ya está en
+# mañana**: "vence hoy" se muestra como "vencido hace 1 día" y el contador de
+# vencidos cuenta de más, todas las noches, sin que nada lo avise.
+#
+# Es la misma trampa que ya está documentada del lado de las fechas de
+# formulario, pero de este lado. Se fija acá y no en el .env para que valga
+# aunque alguien copie un .env de otra máquina.
+Environment=TZ=America/Argentina/Buenos_Aires
+
 # Si se cae, vuelve. `RestartSec` evita el bucle apretado cuando la causa es
 # que Postgres todavía no está.
 Restart=always

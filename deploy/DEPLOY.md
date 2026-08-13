@@ -51,17 +51,26 @@ credenciales separadas, dev no *puede* conectarse a prod.
 
 ## 3. Antes de publicar nada
 
-- [ ] **Autenticación en la API. BLOQUEANTE.** Hoy no hay login del lado del
-      servidor: cualquiera que llegue a la API lee y escribe todo — costos,
-      precios, stock, ventas. Las dos etapas publicadas sin esto no son dos
-      ambientes, son dos copias del sistema abiertas en internet.
+- [ ] **Permisos del servidor, el pase de lectura. BLOQUEANTE PARCIAL.** El
+      login, el token de sesión y el guard global ya están: la API no responde
+      sin sesión, y las ESCRITURAS de Compras, Ventas, Almacén y Web ya exigen
+      su permiso. Lo que falta es cerrar por permiso las LECTURAS módulo por
+      módulo (los `GET` que hoy los ve cualquier sesión) y auditar los módulos
+      que quedan — Gerencia, Sistema, Gastos. Hasta entonces, una sesión de
+      cualquier rol puede LEER de más aunque no pueda escribir.
 - [ ] `HOST=127.0.0.1` en los dos `.env` del VPS. Sin esto Node escucha en
       todas las interfaces y se lo alcanza en `IP:3001` **saltando nginx**: se
       saltea el TLS y el `X-Forwarded-For` se vuelve falsificable.
       (En local queda `0.0.0.0`: la sync de coffit y las cajas consumen la API
       desde otras máquinas de la red.)
 - [ ] Firewall: solo 22, 80 y 443. Ni 3001, ni 4001, ni 5432.
-- [ ] `helmet` en la API (todavía falta).
+- [ ] **El vhost de la tienda pisa `X-Forwarded-For` con `$remote_addr`** (no lo
+      concatena con `$proxy_add_x_forwarded_for`). El de la API ya lo hace; el
+      de la tienda todavía no existe, y la receta que se copia de internet usa
+      la forma que concatena. Con `trust proxy: 'loopback'` en la API, el cupo
+      de la tienda y el freno del login confían en que ese encabezado lo escriba
+      nginx y no el cliente: si el vhost lo concatena, un `X-Forwarded-For:
+      10.0.0.1` a mano vuelve a saltear los dos frenos.
 - [ ] Cambiar la contraseña inicial `1234` del usuario Cafetería, en
       **Gerencia › Usuarios y roles**.
 
@@ -180,9 +189,36 @@ un `_journal.json`**.
 base** (`factura_archivos.data`, base64), así que el dump los incluye y la base
 crece del orden de **1 GB por año**.
 
+El dump es la base **entera**: hashes de contraseña, datos de clientes y los
+papeles de facturas. El script corre con `umask 077` y deja el directorio en
+`700`, así que el archivo queda solo para el usuario del cron — con el umask que
+hereda de cron (022) quedaba en `644` y lo leía cualquier cuenta del servidor.
+
 Un dump en el mismo disco que la base **no es un backup**: no cubre el caso más
-probable, que es perder el VPS. Falta sacarlo de la máquina (hay un `rclone`
-comentado al final del script).
+probable, que es perder el VPS. **Falta hacer esto una vez, y el script queda
+completo:**
+
+```bash
+rclone config                       # crear el remoto (Drive, S3, lo que uses)
+```
+
+y después pasarle el nombre del remoto por entorno en la línea del cron:
+
+```
+0 3 * * * crm BACKUP_REMOTO=drive:crm-backups /srv/crm/prod/crm-api/deploy/backup.sh prod
+```
+
+(Es la misma línea del punto 5, con la variable adelante. Ojo con las dos cosas
+que la hacen fallar en silencio: va en `/etc/cron.d/`, que **exige el campo de
+usuario** —el `crm` después de los asteriscos—, y la ruta es la de instalación
+real, `/srv/crm/prod/crm-api/deploy/`.)
+
+Mientras `BACKUP_REMOTO` no esté, cada corrida **avisa por stderr** que el dump
+quedó solo en ese disco, en vez de terminar con un "OK" que no dice toda la
+verdad. El script también deja `ultimo-ok.txt` en el directorio de destino con la
+fecha del último respaldo bueno y si salió o no de la máquina: es lo que hay que
+mirar para saber si el respaldo sigue vivo (sin correo configurado en el VPS, un
+cron que falla no avisa a nadie).
 
 **Y probar el restore.** Un backup no probado es una creencia:
 

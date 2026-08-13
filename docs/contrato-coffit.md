@@ -19,15 +19,40 @@ le hace a la cafetería, para ingresarlos al almacén **"Sabor y Aroma"** de cof
 
 Base local: `http://<ip-del-crm>:3001/api`
 
-> ⚠️ Hoy la API no tiene autenticación y solo debe usarse en la red local.
-> Cuando el CRM active sesiones, coffit va a recibir un token de solo lectura
-> para estas rutas; el contrato de datos no cambia.
+### Autenticación
+
+La API del CRM **ya tiene sesiones**: todos sus endpoints exigen un usuario
+logueado. Coffit no es una persona, así que tiene su propia llave.
+
+**Mandá el secreto en la cabecera `X-Clave-Servicio`** en cada llamada a
+`/cafeteria/sync`:
+
+    X-Clave-Servicio: <el secreto que te pasa el dueño>
+
+Esa clave abre **solo ese endpoint** — cualquier otra ruta del CRM le sigue
+pidiendo sesión. No es un usuario, no vence y no sirve para nada más; si se
+filtra, se cambia el valor en el CRM y listo.
+
+> Mientras el dueño no cargue el secreto, `sync` sigue aceptando una sesión
+> normal del CRM, así que el cambio se puede coordinar sin cortar el servicio.
+> El contrato de datos no cambia en ninguno de los dos casos.
 
 ### `GET /cafeteria/sync?desde=<ISO>` — el que hay que usar
 
 Devuelve **todo lo que cambió** desde el cursor `desde`: envíos creados,
 editados y **anulados**, con su detalle completo, ordenados por fecha de
-cambio. Sin `desde` devuelve todo el historial (máximo 200 por llamada).
+cambio. Sin `desde` devuelve todo el historial.
+
+La respuesta trae como máximo **200 envíos**. Cuando se llena viene
+`"hayMas": true`, y en ese caso **hay que volver a pedir enseguida** con el
+`ahora` de esa misma respuesta, sin esperar al próximo ciclo — repitiendo hasta
+que `hayMas` sea `false`.
+
+> Antes esto perdía envíos en silencio: con más de 200 cambios, el `ahora` que
+> devolvía el CRM era el reloj de pared, así que los que no habían entrado en la
+> página quedaban *detrás* del cursor y no se devolvían nunca más. Si guardaste
+> cursores de antes de este cambio, conviene pedir una vez sin `desde` para
+> reconciliar.
 
 ```json
 {
@@ -75,10 +100,13 @@ cambio. Sin `desde` devuelve todo el historial (máximo 200 por llamada).
 3. Cada vez que se sincronice: `GET /cafeteria/sync?desde=<ese ahora>`,
    procesar lo que venga, guardar el `ahora` nuevo.
 
-El cursor lo pone **el reloj del CRM** (por eso se usa el `ahora` de la
-respuesta y no la hora de coffit): relojes desfasados no abren agujeros.
-Si vienen 200 envíos justos, hay más: repetir con el `actualizadoEn` del
-último antes de dar por terminada la vuelta.
+El cursor lo pone **el CRM** (por eso se usa el `ahora` de la respuesta y no la
+hora de coffit): relojes desfasados no abren agujeros.
+
+Antes había que mirar si venían 200 justos y repetir a mano con el
+`actualizadoEn` del último. **Eso ya no hace falta**: cuando la página se llena,
+el `ahora` que devuelve el CRM *es* esa marca —no el reloj— y viene `hayMas:
+true` para avisarlo. Alcanza con repetir el paso 3 mientras `hayMas` sea `true`.
 
 ### `GET /cafeteria/envios/:id`
 
@@ -149,7 +177,9 @@ sync. Coffit debe guardar `(id, version)` de lo que ya procesó:
 ## Checklist del importador
 
 - [ ] Tabla de equivalencias por `(productoId, presentacionId)` con matcheo manual.
+- [ ] Clave de servicio en `X-Clave-Servicio` (no un usuario del CRM).
 - [ ] Cursor persistido con el `ahora` de cada respuesta.
+- [ ] Vuelta repetida mientras `hayMas` sea `true`.
 - [ ] Registro `(id, version)` de lo procesado; reprocesos idempotentes.
 - [ ] Edición → deshacer y re-aplicar; anulación → deshacer.
 - [ ] Contraste de `totalKg` contra la interpretación propia de `cantidad`.
