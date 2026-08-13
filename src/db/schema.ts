@@ -80,7 +80,18 @@ export const sucursales = pgTable('sucursales', {
   id: serial('id').primaryKey(),
   nombre: text('nombre').notNull(),
   tipo: tipoSucursalEnum('tipo').notNull().default('express'),
-});
+}, (t) => ({
+  /*
+   * UNA SOLA DISTRIBUIDORA (0062). `distribuidoraId()` toma la primera con ese
+   * tipo, y ese id decide a qué depósito entra una compra sin sucursal y de cuál
+   * sale un envío a la Cafetería. Con dos, "la primera" queda a merced del orden
+   * de los ids y la mercadería se mueve del lugar equivocado sin que nada avise.
+   * Parcial: las express son las que hagan falta.
+   */
+  uqDistribuidora: uniqueIndex('uq_sucursal_distribuidora')
+    .on(t.tipo)
+    .where(sql`${t.tipo} = 'distribuidora'`),
+}));
 
 /**
  * Proveedor. UNA sola tabla para el que trae mercadería y para el que factura
@@ -519,6 +530,14 @@ export const origenListaEnum = pgEnum('origen_lista', [
   'manual',    // la eligió una persona
   'marca',     // una regla de marca desbloqueó la modalidad
   'monto',     // el monto del ticket la desbloqueó (sujeta a medio de pago)
+  /*
+   * La casa se lo prometió por escrito (0061): el renglón viene de un
+   * presupuesto confirmado y vigente, y se cobra al precio con el que se
+   * cotizó aunque el de hoy sea otro. Es un origen propio y no 'manual'
+   * porque son cosas opuestas: uno es un precio respaldado por un documento
+   * y el otro es alguien tocándolo en el mostrador.
+   */
+  'presupuesto',
 ]);
 
 export const modalidadesVenta = pgTable('modalidades_venta', {
@@ -1057,6 +1076,17 @@ export const comprobantes = pgTable('comprobantes', {
   ixRef: index('ix_comprobantes_ref')
     .on(t.refComprobanteId)
     .where(sql`${t.refComprobanteId} is not null`),
+  /**
+   * POR PROVEEDOR NO HABÍA NINGÚN ÍNDICE USABLE, aunque `uq_comprobantes_numero`
+   * lo lleve de primera columna: ese es PARCIAL (`where numero is not null`), y
+   * un `where proveedor_id = X` no implica ese predicado, así que Postgres no
+   * puede usarlo. Y por proveedor filtran el listado, la cuenta corriente, las
+   * facturas que una nota puede ajustar y las dos consultas de la bandeja de
+   * pago — todo el circuito de pagarle a alguien (0058).
+   *
+   * `estado` de segunda porque casi todas esas consultas descartan las anuladas.
+   */
+  ixProveedor: index('ix_comprobantes_proveedor').on(t.proveedorId, t.estado),
 }));
 
 /**
@@ -1097,7 +1127,10 @@ export const comprobantePercepciones = pgTable('comprobante_percepciones', {
   alicuota: doublePrecision('alicuota').notNull().default(0),
   base: basePercepcionEnum('base').notNull().default('neto'),
   importe: doublePrecision('importe').notNull().default(0),
-});
+}, (t) => ({
+  /** Se consulta por comprobante en cada listado y en cada detalle (0058). */
+  ixComprobante: index('ix_comprobante_percepciones_comprobante').on(t.comprobanteId),
+}));
 
 export const comprobanteItems = pgTable('comprobante_items', {
   id: serial('id').primaryKey(),
@@ -1109,7 +1142,13 @@ export const comprobanteItems = pgTable('comprobante_items', {
   descuento: doublePrecision('descuento').notNull().default(0),
   iva: doublePrecision('iva').notNull().default(21),
   subtotal: doublePrecision('subtotal').notNull().default(0),
-});
+}, (t) => ({
+  /**
+   * Igual que `venta_items`: los renglones se piden siempre por su documento.
+   * Faltaba (0058) y era un scan completo en cada apertura de Facturación.
+   */
+  ixComprobante: index('ix_comprobante_items_comprobante').on(t.comprobanteId),
+}));
 
 /* ----------------------------------------------------------------------------
  * FACTURAS POR PROCESAR — la bandeja de papeles subidos
@@ -1345,6 +1384,26 @@ export const ventas = pgTable('ventas', {
   caeVencimiento: timestamp('cae_vencimiento', { withTimezone: true }),
   refVentaId: integer('ref_venta_id'),                    // NC/ND → venta que ajustan
   observaciones: text('observaciones').notNull().default(''),
+  /*
+   * QUIÉN ANULÓ, CUÁNDO Y POR QUÉ (0059).
+   *
+   * Anular una venta al contado le baja el efectivo esperado al arqueo, así que
+   * es la operación con la que se tapa un faltante: la venta desaparece del
+   * turno, el stock vuelve, y el cierre cuadra en cero. Sin estas tres columnas
+   * la anulación era anónima.
+   */
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
+  /*
+   * ARMAR Y COBRAR SON DOS ACTOS (0060). `usuarioId` es de quien armó el ticket;
+   * esta columna, de quien lo cobró. Antes se guardaba uno solo y encima el
+   * equivocado: confirmar pisaba al vendedor del borrador con el de quien
+   * apretaba F2, así que el ticket que armó Marta toda la mañana terminaba a
+   * nombre de Juan — en el listado, en los reportes por vendedor y en el
+   * movimiento de stock.
+   */
+  cobradoPor: integer('cobrado_por').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixCliente: index('ix_ventas_cliente').on(t.clienteId),
   ixFecha: index('ix_ventas_fecha').on(t.fecha),
@@ -1353,6 +1412,8 @@ export const ventas = pgTable('ventas', {
     .on(t.tipo, t.puntoVenta, t.numero)
     .where(sql`${t.numero} is not null`),
   ixAbiertas: index('ix_ventas_abiertas').on(t.sucursalId, t.estado),
+  /* El arqueo suma las ventas del turno en cada cierre y en cada control. */
+  ixCajaSesion: index('ix_ventas_caja_sesion').on(t.cajaSesionId),
 }));
 
 export const ventaItems = pgTable('venta_items', {
@@ -1439,9 +1500,16 @@ export const cobranzas = pgTable('cobranzas', {
   aCuenta: doublePrecision('a_cuenta').notNull().default(0),
   estado: estadoCobranzaEnum('estado').notNull().default('confirmada'),
   observaciones: text('observaciones').notNull().default(''),
+  /* Gemelas de las de `ventas` (0059): anular un recibo le saca la plata al
+   * arqueo del turno y le sube el saldo al cliente. Es la misma maniobra. */
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
 }, (t) => ({
   ixCliente: index('ix_cobranzas_cliente').on(t.clienteId),
   uqNumero: uniqueIndex('uq_cobranzas_numero').on(t.puntoVenta, t.numero),
+  /* El arqueo lo consulta dos veces por cierre y no tenía índice. */
+  ixCajaSesion: index('ix_cobranzas_caja_sesion').on(t.cajaSesionId),
 }));
 
 export const cobranzaPagos = pgTable('cobranza_pagos', {
@@ -1527,7 +1595,15 @@ export const presupuestos = pgTable('presupuestos', {
   subtotalNeto: doublePrecision('subtotal_neto').notNull().default(0),
   ivaTotal: doublePrecision('iva_total').notNull().default(0),
   total: doublePrecision('total').notNull().default(0),
-});
+}, (t) => ({
+  /*
+   * La tabla no tenía NINGÚN índice (0060). El primero es el que más duele: el
+   * contador de pedidos web pendientes lo pollea CADA navegador abierto, cada
+   * 30 segundos, y hacía scan completo de una tabla que crece todos los días.
+   */
+  ixEstadoOrigen: index('ix_presupuestos_estado_origen').on(t.estado, t.origen),
+  ixCliente: index('ix_presupuestos_cliente').on(t.clienteId),
+}));
 
 export const presupuestoItems = pgTable('presupuesto_items', {
   id: serial('id').primaryKey(),
@@ -1545,6 +1621,13 @@ export const presupuestoItems = pgTable('presupuesto_items', {
   descuento: doublePrecision('descuento').notNull().default(0),
   iva: doublePrecision('iva').notNull().default(21),
   lista: text('lista').notNull().default(''),
+  /*
+   * La lista con la que se cotizó, por ID (0060). `lista` de arriba es su nombre
+   * congelado para el papel; este es el que el sistema puede verificar. Sin él,
+   * cerrar el presupuesto en el POS mandaba el precio sin decir de dónde salía y
+   * el portero de precios lo tomaba por un precio pisado a mano.
+   */
+  listaId: integer('lista_id').references(() => listasVenta.id, { onDelete: 'set null' }),
   ofertaNombre: text('oferta_nombre').notNull().default(''),
   motivo: text('motivo').notNull().default(''),
 }, (t) => ({
@@ -1691,6 +1774,10 @@ export const gastos = pgTable('gastos', {
   ixEstado: index('ix_gastos_estado').on(t.estado, t.vencimiento),
   ixCategoria: index('ix_gastos_categoria').on(t.categoriaId),
   ixProveedor: index('ix_gastos_proveedor').on(t.proveedorId),
+  // La previa de gastos fijos consulta por esta columna DENTRO de la
+  // transacción que bloquea las plantillas: sin índice es un seq scan de la
+  // tabla entera con las filas tomadas.
+  ixRecurrente: index('ix_gastos_recurrente').on(t.recurrenteId),
 }));
 
 /* ============================================================================

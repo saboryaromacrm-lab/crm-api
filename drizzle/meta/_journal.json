@@ -407,6 +407,41 @@
       "when": 1787180200000,
       "tag": "0057_sesiones",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1787180300000,
+      "tag": "0058_indices_comprobantes",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1787180400000,
+      "tag": "0059_anulacion_con_rastro",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1787266800000,
+      "tag": "0060_lista_congelada_y_rastro_cobranza",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1787353200000,
+      "tag": "0061_origen_presupuesto",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1787439600000,
+      "tag": "0062_una_sola_distribuidora",
+      "breakpoints": true
     }
   ]
 }
