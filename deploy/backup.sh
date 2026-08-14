@@ -57,6 +57,35 @@ PARCIAL="$ARCHIVO.parcial"
 #     Ahí `pg_dump` ni siquiera existe en el host: hay que ejecutarlo ADENTRO y
 #     traerse la salida por stdout.
 if [ -n "${DOCKER_DB:-}" ]; then
+  # EL NOMBRE DEL CONTENEDOR NO ES EL DEL SERVICIO, Y ADEMÁS CAMBIA.
+  #
+  # Con Swarm —que es lo que usa Dokploy— el contenedor se llama
+  # `<servicio>.<réplica>.<id de tarea>`, y ese id **se regenera en cada
+  # deploy**. Un cron con el nombre completo escrito a mano anda hasta el
+  # próximo redeploy de la base y después falla todas las noches, sin que nadie
+  # lo note hasta el día que haga falta restaurar.
+  #
+  # Así que `DOCKER_DB` se acepta como PREFIJO: se le pasa el nombre del
+  # servicio (`saboryaromacrm-bvzncl`) y acá se resuelve al contenedor que esté
+  # corriendo en este momento. Si no hay ninguno, o si hay más de uno, corta con
+  # un error claro en vez de elegir por azar.
+  if ! docker inspect "$DOCKER_DB" >/dev/null 2>&1; then
+    COINCIDEN="$(docker ps --format '{{.Names}}' | grep -E "^${DOCKER_DB}(\.|$)" || true)"
+    CUANTOS="$(printf '%s' "$COINCIDEN" | grep -c . || true)"
+    if [ "$CUANTOS" -eq 0 ]; then
+      echo "!! No hay ningún contenedor corriendo que empiece con '$DOCKER_DB'." >&2
+      echo "   Mirá los que hay con:  docker ps --format '{{.Names}}'" >&2
+      exit 1
+    fi
+    if [ "$CUANTOS" -gt 1 ]; then
+      echo "!! '$DOCKER_DB' coincide con más de un contenedor:" >&2
+      printf '   %s\n' $COINCIDEN >&2
+      echo "   Afiná el nombre: un respaldo no puede elegir de cuál base sale." >&2
+      exit 1
+    fi
+    DOCKER_DB="$COINCIDEN"
+  fi
+
   docker exec -i "$DOCKER_DB" \
     pg_dump -Fc --no-owner --no-privileges -U "${PGUSER:-postgres}" "$BASE" > "$PARCIAL"
 else
