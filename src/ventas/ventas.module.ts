@@ -18,19 +18,19 @@
  */
 import {
   Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
-  BadRequestException, NotFoundException, Param, ParseIntPipe, Post, Put, Query,
+  BadRequestException, NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
+  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, marcas,
+  categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
-  ventaExtras, ventaItems, ventaPagos, ventas,
+  listasVenta, ventaExtras, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
@@ -211,6 +211,18 @@ type RenglonResuelto = VentaItemDto & {
   precioLista: number;
   descuento: number;
   ofertaDescuento: number;
+  /** Descuento con nombre que GANÓ en este renglón (null si no ganó ninguno). */
+  descuentoId: number | null;
+  descuentoNombre: string;
+};
+
+/** Un descuento con nombre ya validado y listo para aplicar. */
+type DescuentoResuelto = {
+  id: number;
+  nombre: string;
+  porcentaje: number;
+  listaId: number;
+  medioPago: string | null;
 };
 
 /**
@@ -300,6 +312,17 @@ export class CreateVentaDto {
   pagos?: VentaPagoDto[];
   /** Venta que nace de (o cierra) un presupuesto confirmado. */
   @IsOptional() @IsInt() presupuestoId?: number;
+  /**
+   * DESCUENTOS CON NOMBRE aplicados al ticket, por ID. Nunca porcentajes.
+   *
+   * Es la misma frontera que ya rige para el precio y la lista: el cliente dice
+   * CUÁL, el servidor dice CUÁNTO. Un `porcentaje` que llegara por acá sería
+   * exactamente el agujero que se cerró en Ventas — se lee de la tabla, se
+   * valida vigencia, sucursal, lista y permiso, y recién ahí se aplica.
+   *
+   * Uno por lista: dos de la misma lista competirían por los mismos renglones.
+   */
+  @IsOptional() @IsArray() @IsInt({ each: true }) descuentos?: number[];
 }
 
 class ConfirmarVentaDto {
@@ -1058,12 +1081,78 @@ export class VentasService {
     return vacio;
   }
 
+  /**
+   * DE IDS A DESCUENTOS REALES — el portero de los descuentos con nombre.
+   *
+   * El cliente HTTP manda ids y nada más. Todo lo que decide cuánto se descuenta
+   * sale de la tabla, y todo lo que decide SI SE PUEDE sale de la sesión. Es la
+   * misma frontera que ya rige para el precio y la lista, y por el mismo motivo:
+   * un porcentaje que viniera del navegador es un descuento que se lo pone el
+   * que compra.
+   *
+   * Cinco candados, en el orden en que fallan más seguido:
+   *
+   *  1. EXISTE Y ESTÁ ACTIVO. Un descuento dado de baja no se aplica más, y el
+   *     mensaje lo dice por nombre para que la cajera sepa cuál sacar.
+   *  2. VIGENTE. `vence` guarda el instante FINAL del día elegido, así que
+   *     alcanza con compararlo contra ahora: el descuento vale todo su último
+   *     día, que es lo que pidió el dueño. Nulo = sin vencimiento.
+   *  3. LA SUCURSAL SALE DE LA SESIÓN, no del body. Un descuento de Fontana no
+   *     se aplica desde Centro ni mandando `sucursalId` a mano. Nulo = todas.
+   *  4. EL PERMISO. Los que piden admin no los puede aplicar una cajera; sin
+   *     esto, publicar un 25% sería subirle el tope a todo el mundo.
+   *  5. UNO POR LISTA. Dos descuentos de la misma lista competirían por los
+   *     mismos renglones y el resultado dependería del orden del array.
+   */
+  private async resolverDescuentos(
+    ids: number[] = [],
+    /* Anulable porque la venta lo es. Con `null` no hay sucursal contra la cual
+     * validar, así que solo pasan los descuentos de alcance general: un
+     * descuento de Fontana no se cuela por un ticket sin sucursal. */
+    sucursalId: number | null,
+    puedeAdmin: boolean,
+  ): Promise<Map<number, DescuentoResuelto>> {
+    const porLista = new Map<number, DescuentoResuelto>();
+    const unicos = [...new Set((ids ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    if (!unicos.length) return porLista;
+
+    const filas = await this.db.select().from(descuentos).where(inArray(descuentos.id, unicos));
+    const ahora = new Date();
+
+    for (const id of unicos) {
+      const d = filas.find((f) => f.id === id);
+      if (!d) throw new BadRequestException('Uno de los descuentos aplicados ya no existe. Quitalo y volvé a intentar.');
+      if (!d.activo) throw new BadRequestException(`El descuento "${d.nombre}" está desactivado.`);
+      if (d.vence && d.vence.getTime() < ahora.getTime()) {
+        throw new BadRequestException(`El descuento "${d.nombre}" venció.`);
+      }
+      if (d.sucursalId != null && d.sucursalId !== sucursalId) {
+        throw new BadRequestException(`El descuento "${d.nombre}" no es de esta sucursal.`);
+      }
+      if (d.requiereAdmin && !puedeAdmin) {
+        throw new BadRequestException(`El descuento "${d.nombre}" lo tiene que aplicar un administrador.`);
+      }
+      const ya = porLista.get(d.listaId);
+      if (ya) {
+        throw new BadRequestException(
+          `"${ya.nombre}" y "${d.nombre}" son de la misma lista de precios: solo se puede aplicar uno.`,
+        );
+      }
+      porLista.set(d.listaId, {
+        id: d.id, nombre: d.nombre, porcentaje: Number(d.porcentaje) || 0,
+        listaId: d.listaId, medioPago: d.medioPago ?? null,
+      });
+    }
+    return porLista;
+  }
+
   private async resolverRenglones(
     itemsDto: VentaItemDto[],
     cliente: { id: number },
     config: any,
     puedePisarPrecio: boolean,
     congelados: Map<string, { precioLista: number; listaId: number | null }> = new Map(),
+    descuentosPorLista: Map<number, DescuentoResuelto> = new Map(),
   ): Promise<RenglonResuelto[]> {
     const items = itemsDto ?? [];
     if (!items.length) return [];
@@ -1151,7 +1240,7 @@ export class VentasService {
       declaranOferta ? ((await this.ofertas.activas()) as any[]).map((o) => [o.id, o]) : [],
     );
 
-    return items.map((it) => {
+    const resueltos = items.map((it) => {
       const prod = prodDe.get(Number(it.productoId));
       if (!prod) throw new BadRequestException('Uno de los artículos del ticket no existe.');
       const presId = it.presentacionId ?? null;
@@ -1254,7 +1343,7 @@ export class VentasService {
       if (pisado && pedido < 0) throw new BadRequestException(`${etiqueta}: el precio no puede ser negativo.`);
 
       /* -- El descuento: 0..100 por DTO, y el tope de la configuración acá -- */
-      const desc = Number(it.descuento) || 0;
+      let desc = Number(it.descuento) || 0;
       const tope = Number(config.descuentoMaxVendedor) || 0;
       if (desc > tope + 1e-9 && !puedePisarPrecio) {
         throw new BadRequestException(
@@ -1321,8 +1410,44 @@ export class VentasService {
         ofertaDesc = 0;
       }
 
+      /*
+       * EL DESCUENTO CON NOMBRE, y va último por dos motivos que no son de estilo.
+       *
+       * DESPUÉS DEL TOPE: el porcentaje de acá lo autorizó el dueño al crear el
+       * descuento, no la cajera al tipearlo, así que no pasa por
+       * `descuentoMaxVendedor`. Si se evaluara antes, "Atención por tardanza 25%"
+       * sería rechazado por el tope del 10% y el descuento no serviría para nada.
+       * El tope sigue vivo para lo que el vendedor pone a mano, que es lo que
+       * esa configuración existe para acotar.
+       *
+       * DESPUÉS DE LA OFERTA, y solo si no hay: un renglón en 3×2 o con precio
+       * fijo ya tiene su beneficio, y sumarle un 20% es pagar dos veces la misma
+       * promoción (decisión del dueño, 14/8/2026).
+       *
+       * Y GANA EL MAYOR, nunca se suman. Dos descuentos del 25% sumados dejan el
+       * producto a mitad de precio; encadenados, en 43%. El cliente entiende
+       * "te hago el mejor de los dos", y es el único criterio que no puede
+       * regalar de más por accidente.
+       *
+       * `descuentoId` se llena SOLO si ganó: si el 25% del cliente le gana al
+       * 20% de "Familiares", ese renglón no es de Familiares, y el reporte de
+       * cuánto cuesta cada autorización no tiene que contarlo.
+       */
+      let descuentoId: number | null = null;
+      let descuentoNombre = '';
+      if (ofertaDesc === 0) {
+        const dNom = descuentosPorLista.get(elegida.fila.listaId as number);
+        if (dNom && dNom.porcentaje > desc + 1e-9) {
+          desc = dNom.porcentaje;
+          descuentoId = dNom.id;
+          descuentoNombre = dNom.nombre;
+        }
+      }
+
       return {
         ...it,
+        descuentoId,
+        descuentoNombre,
         cantidad,
         listaId: elegida.fila.listaId,
         lista: elegida.lista.etiqueta || elegida.lista.nombre || '',
@@ -1349,6 +1474,27 @@ export class VentasService {
         iva: prod.iva,
       } as RenglonResuelto;
     });
+
+    /*
+     * Y UN DESCUENTO NO PUEDE QUEDAR COLGADO DE UNA LISTA QUE EL TICKET NO USA.
+     *
+     * La lista de cada renglón la decide el SERVIDOR (por condición, por monto,
+     * por presupuesto), así que el POS puede haber ofrecido el descuento con un
+     * ticket que después cambió de lista solo. Sin este chequeo el descuento
+     * quedaría "aplicado" sin tocar un peso: la pantalla lo muestra activo, el
+     * total no baja, y nadie entiende por qué.
+     *
+     * Va acá y no antes porque recién ahora se sabe con qué lista quedó cada
+     * renglón.
+     */
+    for (const d of descuentosPorLista.values()) {
+      if (!resueltos.some((r) => r.listaId === d.listaId)) {
+        throw new BadRequestException(
+          `El descuento "${d.nombre}" es de otra lista de precios: ningún renglón de este ticket la usa.`,
+        );
+      }
+    }
+    return resueltos;
   }
 
   /**
@@ -1410,6 +1556,15 @@ export class VentasService {
         ofertaId: it.ofertaId ?? null,
         oferta: (it.oferta ?? '').trim(),
         ofertaDescuento: money(ofertaDesc),
+        /*
+         * ESTA FUNCIÓN ARMA EL RENGLÓN CAMPO POR CAMPO, no con un spread. Es a
+         * propósito —nada llega a la tabla sin estar nombrado acá— pero tiene su
+         * contracara: una columna nueva que no se agregue en esta lista se
+         * pierde EN SILENCIO al guardar. Sin estas dos líneas, el descuento se
+         * aplicaría al total y el ticket no diría de dónde salió.
+         */
+        descuentoId: (it as any).descuentoId ?? null,
+        descuentoNombre: ((it as any).descuentoNombre ?? '').trim(),
         iva: ivaP,
         subtotal: money(neto),
       };
@@ -1503,6 +1658,56 @@ export class VentasService {
       if (invalido) {
         throw new BadRequestException(
           `La oferta "${o.nombre}" solo vale pagando con ${legibles}. Se está usando "${invalido}".`,
+        );
+      }
+    }
+  }
+
+  /**
+   * EL CANDADO DEL MEDIO DE PAGO — decisión del dueño, 14/8/2026.
+   *
+   * Un descuento puede exigir una forma de pago ("15% pagando en efectivo"). El
+   * problema es el ORDEN de las pantallas: el descuento se aplica en el ticket y
+   * el medio se elige después, al cobrar. Así que el candado tiene que estar
+   * acá, en la confirmación, que es lo último que pasa.
+   *
+   * Y la regla es ÍNTEGRO, no "que haya algo de ese medio". Sin eso, el POS
+   * —que permite pagar con varios medios a la vez— convierte el descuento en
+   * algo que se compra: una transferencia de $1 y el resto en efectivo se lleva
+   * el 25% sobre toda la venta. Se pide que NINGÚN pago sea de otro medio, que
+   * con los importes ya validados contra el total equivale a que el medio
+   * exigido lo cubra entero. Varios renglones del mismo medio están bien: son
+   * dos billetes, no dos formas de pago.
+   *
+   * La cuenta corriente no puede cumplirlo: al confirmar no hay ningún pago
+   * todavía —la plata entra después, con el recibo— así que no hay nada que
+   * verificar. Se rechaza en vez de dejarlo pasar sin control.
+   */
+  private validarMediosPagoDescuentos(
+    items: any[],
+    condicionPago: string,
+    pagos: VentaPagoDto[],
+    descuentosPorLista: Map<number, DescuentoResuelto>,
+  ) {
+    // Solo los que de verdad GANARON en algún renglón: uno que quedó tapado por
+    // el descuento del cliente no bajó un peso, y no tiene por qué condicionar
+    // con qué se paga.
+    const aplicados = new Set(items.map((it: any) => it.descuentoId).filter(Boolean) as number[]);
+    if (!aplicados.size) return;
+
+    for (const d of descuentosPorLista.values()) {
+      if (!d.medioPago || !aplicados.has(d.id)) continue;
+      if (condicionPago !== 'contado') {
+        throw new BadRequestException(
+          `El descuento "${d.nombre}" solo vale pagando al contado con ${d.medioPago}. `
+          + 'Quitalo o cambiá la condición de pago.',
+        );
+      }
+      const otro = (pagos ?? []).find((p) => Number(p.importe) > 0 && p.medio !== d.medioPago);
+      if (otro) {
+        throw new BadRequestException(
+          `El descuento "${d.nombre}" exige que TODA la venta se pague con ${d.medioPago}, `
+          + `y se está usando "${otro.medio}". Sacá el descuento o cobrá todo con ${d.medioPago}.`,
         );
       }
     }
@@ -1616,8 +1821,18 @@ export class VentasService {
      * al armarlo, y `confirmar` cobra lo que está guardado sin recalcular. Si
      * solo se validara al confirmar, el precio inventado ya estaría adentro. */
     const congelados = await this.congeladosDePresupuesto(dto.presupuestoId, cliente.id, sucursalId);
+    /*
+     * La sucursal sale de la resuelta arriba (sesión), y el permiso para los
+     * descuentos que piden admin es `precio_manual`: el mismo que ya levanta el
+     * tope de descuento. Quien puede tipear 25% a mano no gana nada nuevo
+     * eligiéndolo de una lista, y al revés —dejarlo tipear pero no elegir— sería
+     * una incoherencia que además empuja a hacerlo por el camino sin rastro.
+     */
+    const descuentosPorLista = await this.resolverDescuentos(
+      dto.descuentos, sucursalId, !!opciones.puedePisarPrecio,
+    );
     const items = await this.resolverRenglones(
-      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados,
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista,
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
@@ -1662,6 +1877,7 @@ export class VentasService {
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
     this.validarMediosPagoMonto(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
+    this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista);
     await this.validarCredito(cliente, config, condicionPago, tot.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 
@@ -1789,8 +2005,14 @@ export class VentasService {
      * presupuesto sale del BORRADOR GUARDADO y no del DTO: el cajero sigue
      * editando el ticket, y el documento que lo respalda no se cambia tecleando. */
     const congelados = await this.congeladosDePresupuesto(actual.presupuestoId ?? undefined, cliente.id, actual.sucursalId);
+    /* La sucursal es la de la VENTA que se edita, no la de la sesión: un jefe
+     * corrigiendo desde Centro un ticket de Fontana no puede colarle un
+     * descuento de Centro. */
+    const descuentosPorLista = await this.resolverDescuentos(
+      dto.descuentos, actual.sucursalId, !!opciones.puedePisarPrecio,
+    );
     const items = await this.resolverRenglones(
-      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados,
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista,
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
 
@@ -2249,10 +2471,181 @@ export class VentasController {
   }
 }
 
+/* ==================================================================== *
+ * DESCUENTOS CON NOMBRE — el ABM
+ * ==================================================================== */
+
+/**
+ * `vence` viaja como 'AAAA-MM-DD' y se guarda como el instante FINAL de ese día
+ * en hora argentina.
+ *
+ * Es la trampa que ya mordió dos veces a este proyecto y por eso está escrita
+ * acá: `new Date('2026-08-12')` es medianoche UTC, que en UTC−3 es el 11 a las
+ * 21:00. Guardado así, un descuento "hasta el 12" se moría el 11 a la tarde.
+ * Como el dueño pidió que valga TODO el día, se guarda el 12 a las 23:59:59.999
+ * de −03 — y de paso comparar contra `now()` alcanza, sin sumar días en cada
+ * consulta.
+ */
+const FIN_DEL_DIA_AR = 'T23:59:59.999-03:00';
+/*
+ * LA CADENA VACÍA ESTÁ PERMITIDA, y no es un descuido.
+ *
+ * `@IsOptional()` de class-validator solo perdona `null` y `undefined`: un `''`
+ * sí se valida y rebota. Y `''` es exactamente lo que manda un formulario con
+ * el campo en blanco, que además es el caso MÁS COMÚN (un descuento sin
+ * vencimiento y sin medio de pago exigido).
+ *
+ * Sin este `^$`, crear el descuento más simple de todos fallaba con "El
+ * vencimiento va como AAAA-MM-DD" sobre un campo que el usuario nunca tocó.
+ * Y en `editar`, la cadena vacía tiene un significado propio: BORRA el
+ * vencimiento. Así que tiene que llegar, no ser rechazada.
+ */
+const SOLO_FECHA = /^$|^\d{4}-\d{2}-\d{2}$/;
+
+const vencimientoDe = (v?: string | null): Date | null => {
+  const s = String(v ?? '').trim();
+  if (!s) return null;
+  const d = new Date(`${s.slice(0, 10)}${FIN_DEL_DIA_AR}`);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+class DescuentoDto {
+  @IsOptional() @IsString() @MaxLength(60) nombre?: string;
+  /* Tope 100: un descuento mayor regala el producto y encima da precio
+   * negativo. El 0 se permite para poder dejarlo "en pausa" sin borrarlo. */
+  @IsOptional() @IsNumber() @Min(0) @Max(100) porcentaje?: number;
+  @IsOptional() @IsString() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vence?: string;
+  /** Vacío/ausente = cualquier forma de pago (por eso `''` entra en la lista). */
+  @IsOptional() @IsIn(['', ...MEDIOS] as unknown as string[]) medioPago?: string;
+  @IsOptional() @IsInt() listaId?: number;
+  /** Ausente o null = TODAS las sucursales. */
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() requiereAdmin?: boolean;
+  @IsOptional() activo?: boolean;
+}
+
+@Injectable()
+export class DescuentosService {
+  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+
+  list() {
+    return this.db.select().from(descuentos).orderBy(desc(descuentos.activo), descuentos.nombre);
+  }
+
+  private async validar(dto: DescuentoDto, id?: number) {
+    const nombre = (dto.nombre ?? '').trim();
+    if (!nombre) throw new BadRequestException('Poné un nombre para el descuento (es el que ve la cajera).');
+    const conds: any[] = [eq(descuentos.nombre, nombre)];
+    if (id) conds.push(ne(descuentos.id, id));
+    const [ya] = await this.db.select({ id: descuentos.id }).from(descuentos).where(and(...conds)).limit(1);
+    if (ya) throw new BadRequestException(`Ya existe un descuento llamado "${nombre}".`);
+
+    /*
+     * LA LISTA ES OBLIGATORIA y no tiene default. Es la identidad del
+     * descuento: sin ella no se sabe sobre qué renglones cae, y un descuento
+     * "de todas las listas" rompería la regla de uno por lista.
+     */
+    const listaId = Number(dto.listaId) || 0;
+    if (!listaId) throw new BadRequestException('Elegí a qué lista de precios se aplica el descuento.');
+    const [l] = await this.db.select({ id: listasVenta.id }).from(listasVenta)
+      .where(eq(listasVenta.id, listaId)).limit(1);
+    if (!l) throw new BadRequestException('Esa lista de precios no existe.');
+
+    if (dto.sucursalId != null) {
+      const [s] = await this.db.select({ id: sucursales.id }).from(sucursales)
+        .where(eq(sucursales.id, Number(dto.sucursalId))).limit(1);
+      if (!s) throw new BadRequestException('Esa sucursal no existe.');
+    }
+    return { nombre, listaId };
+  }
+
+  async crear(dto: DescuentoDto) {
+    const { nombre, listaId } = await this.validar(dto);
+    const [d] = await this.db.insert(descuentos).values({
+      nombre,
+      porcentaje: Math.round((Number(dto.porcentaje) || 0) * 100) / 100,
+      vence: vencimientoDe(dto.vence),
+      medioPago: (dto.medioPago || null) as any,
+      listaId,
+      sucursalId: dto.sucursalId ?? null,
+      requiereAdmin: !!dto.requiereAdmin,
+      activo: dto.activo !== false,
+    }).returning();
+    return d;
+  }
+
+  async editar(id: number, dto: DescuentoDto) {
+    const [actual] = await this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1);
+    if (!actual) throw new NotFoundException('Ese descuento no existe.');
+    const { nombre, listaId } = await this.validar({ ...dto, nombre: dto.nombre ?? actual.nombre, listaId: dto.listaId ?? actual.listaId }, id);
+    await this.db.update(descuentos).set({
+      nombre,
+      porcentaje: dto.porcentaje != null ? Math.round(Number(dto.porcentaje) * 100) / 100 : actual.porcentaje,
+      // `vence` se distingue de "no lo mandaron": una cadena vacía lo BORRA.
+      vence: dto.vence !== undefined ? vencimientoDe(dto.vence) : actual.vence,
+      medioPago: dto.medioPago !== undefined ? ((dto.medioPago || null) as any) : actual.medioPago,
+      listaId,
+      sucursalId: dto.sucursalId !== undefined ? (dto.sucursalId ?? null) : actual.sucursalId,
+      requiereAdmin: dto.requiereAdmin != null ? !!dto.requiereAdmin : actual.requiereAdmin,
+      activo: dto.activo != null ? !!dto.activo : actual.activo,
+    }).where(eq(descuentos.id, id));
+    return this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1).then((r) => r[0]);
+  }
+
+  /**
+   * Borrar solo si NUNCA se usó. Con ventas atrás se da de baja, que es el
+   * mismo criterio que ya usan los rubros de gasto y los productos: borrar
+   * dejaría los reportes sin poder explicar de dónde salió un descuento.
+   */
+  async borrar(id: number) {
+    const [d] = await this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1);
+    if (!d) throw new NotFoundException('Ese descuento no existe.');
+    const [uso] = await this.db.select({ n: sql<number>`count(*)::int` }).from(ventaItems)
+      .where(eq(ventaItems.descuentoId, id));
+    if (Number(uso?.n) > 0) {
+      throw new BadRequestException(
+        `"${d.nombre}" ya se aplicó en ${uso.n} renglón(es) de venta: no se borra, se desactiva `
+        + 'para que deje de ofrecerse sin perder de dónde salió cada descuento hecho.',
+      );
+    }
+    await this.db.delete(descuentos).where(eq(descuentos.id, id));
+    return { ok: true };
+  }
+}
+
+/**
+ * DOS PUERTAS DISTINTAS, y no es un descuido.
+ *
+ * LEER es de cualquiera que venda: el POS necesita saber qué descuentos existen
+ * para ofrecerlos, y quien atiende el mostrador no tiene por qué poder
+ * crearlos. ESCRIBIR es de `ventas.configuracion`, la misma llave que ya
+ * gobierna el resto de las reglas del negocio.
+ *
+ * No hace falta un permiso nuevo: el que decide si una cajera puede APLICAR un
+ * descuento de los que piden admin es `precio_manual`, que ya existe y ya
+ * significa exactamente eso (ver `resolverDescuentos`).
+ */
+@Controller('descuentos')
+export class DescuentosController {
+  constructor(private readonly svc: DescuentosService) {}
+
+  @Get() @Permiso('ventas.pos', 'ventas.configuracion') list() { return this.svc.list(); }
+
+  @Post() @Permiso('ventas.configuracion') crear(@Body() dto: DescuentoDto) { return this.svc.crear(dto); }
+
+  @Patch(':id') @Permiso('ventas.configuracion') editar(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: DescuentoDto,
+  ) { return this.svc.editar(id, dto); }
+
+  @Delete(':id') @Permiso('ventas.configuracion') borrar(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.borrar(id);
+  }
+}
+
 @Module({
   imports: [InventarioModule, ConfiguracionModule, ClientesModule, CajaModule, ListasModule, OfertasModule],
-  controllers: [VentasController],
-  providers: [VentasService],
+  controllers: [VentasController, DescuentosController],
+  providers: [VentasService, DescuentosService],
   exports: [VentasService],
 })
 export class VentasModule {}

@@ -1352,6 +1352,60 @@ export const medioPagoEnum = pgEnum('medio_pago', [
   'efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro',
 ]);
 
+/* ============================================================================
+ * DESCUENTOS CON NOMBRE — los que el dueño autoriza de antemano
+ * ============================================================================
+ * Distintos de las otras tres cosas que ya bajan un precio, y por eso tabla
+ * propia:
+ *   · el descuento del CLIENTE es un atributo de con quién se vende;
+ *   · el descuento MANUAL del renglón es una decisión del vendedor, acotada por
+ *     `ventas.descuentoMaxVendedor`;
+ *   · la OFERTA es una promoción del catálogo, con su propia mecánica (3×2,
+ *     precio fijo) y su propio alcance por producto.
+ * Esto es otra cosa: una autorización con nombre ("Empleados", "Atención por
+ * tardanza") que el dueño crea una vez y la cajera elige en el momento.
+ *
+ * TRES DECISIONES QUE EXPLICAN LA FORMA DE LA TABLA (14/8/2026):
+ *
+ * 1. `listaId` es OBLIGATORIO. El descuento no cae sobre el subtotal de la
+ *    venta: cae sobre los renglones de SU lista. Si un cliente lleva algo de
+ *    Minorista y algo de Mayorista 1, un descuento de Mayorista 1 toca solo esa
+ *    parte. Eso es lo que vuelve coherente el "uno por lista": dos descuentos
+ *    de la misma lista competirían por los mismos renglones, y uno de "todas
+ *    las listas" competiría contra todos.
+ *
+ * 2. `sucursalId` NULO significa TODAS. Es lo contrario de la lista a
+ *    propósito: el alcance geográfico es una restricción opcional, el de lista
+ *    es la identidad del descuento.
+ *
+ * 3. `requiereAdmin` existe porque el porcentaje de acá **saltea el tope del
+ *    vendedor**: lo autorizó el dueño al crearlo, no la cajera al tipearlo. Sin
+ *    esta bandera, publicar un descuento del 25% equivaldría a subirle el tope
+ *    a todo el mundo, y `descuentoMaxVendedor` dejaría de significar algo.
+ */
+export const descuentos = pgTable('descuentos', {
+  id: serial('id').primaryKey(),
+  /** Único: dos "Empleados" en el desplegable de la caja es una trampa. */
+  nombre: text('nombre').notNull(),
+  porcentaje: doublePrecision('porcentaje').notNull().default(0),
+  /**
+   * VALE TODO EL DÍA. Se guarda el instante final del día elegido en hora
+   * argentina, así una comparación simple ya es correcta y nadie tiene que
+   * acordarse de sumar un día. Nulo = sin vencimiento.
+   */
+  vence: timestamp('vence', { withTimezone: true }),
+  /** Nulo = cualquier forma de pago. Si tiene valor, el pago debe ser ÍNTEGRO. */
+  medioPago: medioPagoEnum('medio_pago'),
+  listaId: integer('lista_id').notNull().references(() => listasVenta.id, { onDelete: 'restrict' }),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'cascade' }),
+  requiereAdmin: boolean('requiere_admin').notNull().default(false),
+  activo: boolean('activo').notNull().default(true),
+}, (t) => ({
+  uqNombre: uniqueIndex('uq_descuentos_nombre').on(t.nombre),
+  // El POS pregunta "cuáles sirven para ESTE ticket": activos, de estas listas.
+  ixVigentes: index('ix_descuentos_vigentes').on(t.activo, t.listaId),
+}));
+
 /**
  * Comprobante de VENTA. Tabla propia (no reusa `comprobantes`): la numeración la
  * asigna el sistema, lleva CAE, y su libro IVA es otro. `estado` nunca vuelve
@@ -1448,6 +1502,20 @@ export const ventaItems = pgTable('venta_items', {
   ofertaId: integer('oferta_id').references(() => ofertas.id, { onDelete: 'set null' }),
   oferta: text('oferta').notNull().default(''),
   ofertaDescuento: doublePrecision('oferta_descuento').notNull().default(0),
+  /**
+   * Descuento CON NOMBRE que ganó en este renglón, con la misma pareja
+   * id + texto congelado que `lista` y `oferta`, y por el mismo motivo: un
+   * ticket de hace seis meses tiene que reimprimirse diciendo "Empleados"
+   * aunque ese descuento se haya renombrado o dado de baja.
+   *
+   * Se llena SOLO si el nombrado ganó. La regla es "gana el mayor" contra lo
+   * que el renglón ya traía (descuento del cliente o puesto a mano), así que un
+   * renglón con 25% de cliente y un nombrado del 20% queda en 25% y con esto en
+   * nulo: el descuento no se aplicó ahí, y el reporte de cuánto costó cada
+   * autorización no tiene que contarlo.
+   */
+  descuentoId: integer('descuento_id').references(() => descuentos.id, { onDelete: 'set null' }),
+  descuentoNombre: text('descuento_nombre').notNull().default(''),
   subtotal: doublePrecision('subtotal').notNull().default(0),
   refItemId: integer('ref_item_id'),                      // NC parcial → ítem original
 }, (t) => ({
@@ -2174,7 +2242,7 @@ export const schema = {
   sucursales, proveedores, roles, usuarios, sesiones, productos, presentaciones, productoProveedores,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   modalidadesVenta, listasVenta, productoListas, clienteListas, reglasMarca,
-  ofertas, ofertaAlcances, ofertaComponentes, precioHistorial,
+  ofertas, ofertaAlcances, ofertaComponentes, precioHistorial, descuentos,
   productoProveedorCostos, stock, movimientos, transferencias, transferenciaItems, transferenciaHist,
   incidencias, comprobantes, comprobanteItems, facturaLecturas, facturaArchivos,
   clientes, cajaSesiones, cajaMovimientos, cajaControles, ventas, ventaItems, ventaExtras, ventaPagos,
