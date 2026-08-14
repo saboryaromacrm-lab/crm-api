@@ -214,6 +214,12 @@ type RenglonResuelto = VentaItemDto & {
   /** Descuento con nombre que GANÓ en este renglón (null si no ganó ninguno). */
   descuentoId: number | null;
   descuentoNombre: string;
+  /**
+   * El que el renglón traía por su cuenta, antes del nombrado. Se guarda para
+   * que reabrir el borrador no confunda un porcentaje autorizado con uno
+   * tipeado a mano — ver el comentario de `descuentoBase` en el esquema.
+   */
+  descuentoBase: number;
 };
 
 /** Un descuento con nombre ya validado y listo para aplicar. */
@@ -1111,6 +1117,17 @@ export class VentasService {
      * descuento de Fontana no se cuela por un ticket sin sucursal. */
     sucursalId: number | null,
     puedeAdmin: boolean,
+    /**
+     * Los que YA estaban en el ticket antes de esta edición.
+     *
+     * El permiso se pide para APLICAR, no para convivir. La escena que esto
+     * habilita es la única para la que `requiereAdmin` existe: el encargado se
+     * acerca, autoriza el 25% por la demora, y se va; la cajera sigue con el
+     * ticket. Sin esta excepción, ese ticket le queda radiactivo — no puede
+     * agregar un producto ni guardar, porque cada autoguardado reenvía el
+     * descuento y se lo rebota su propio permiso.
+     */
+    yaAplicados: Set<number> = new Set(),
   ): Promise<Map<number, DescuentoResuelto>> {
     const porLista = new Map<number, DescuentoResuelto>();
     const unicos = [...new Set((ids ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0))];
@@ -1129,7 +1146,7 @@ export class VentasService {
       if (d.sucursalId != null && d.sucursalId !== sucursalId) {
         throw new BadRequestException(`El descuento "${d.nombre}" no es de esta sucursal.`);
       }
-      if (d.requiereAdmin && !puedeAdmin) {
+      if (d.requiereAdmin && !puedeAdmin && !yaAplicados.has(d.id)) {
         throw new BadRequestException(`El descuento "${d.nombre}" lo tiene que aplicar un administrador.`);
       }
       const ya = porLista.get(d.listaId);
@@ -1435,6 +1452,9 @@ export class VentasService {
        */
       let descuentoId: number | null = null;
       let descuentoNombre = '';
+      /* Lo que el renglón traía por su cuenta, capturado ANTES de que el
+       * nombrado lo pise. Es lo único que permite volver atrás sin adivinar. */
+      const descuentoBase = desc;
       if (ofertaDesc === 0) {
         const dNom = descuentosPorLista.get(elegida.fila.listaId as number);
         if (dNom && dNom.porcentaje > desc + 1e-9) {
@@ -1448,6 +1468,7 @@ export class VentasService {
         ...it,
         descuentoId,
         descuentoNombre,
+        descuentoBase,
         cantidad,
         listaId: elegida.fila.listaId,
         lista: elegida.lista.etiqueta || elegida.lista.nombre || '',
@@ -1565,6 +1586,10 @@ export class VentasService {
          */
         descuentoId: (it as any).descuentoId ?? null,
         descuentoNombre: ((it as any).descuentoNombre ?? '').trim(),
+        /* Y sin ESTA, reabrir el borrador devolvería el porcentaje autorizado
+         * como si lo hubiera tipeado el vendedor: el autoguardado siguiente lo
+         * rebotaría contra el tope y el ticket quedaría trabado. */
+        descuentoBase: (it as any).descuentoBase ?? desc,
         iva: ivaP,
         subtotal: money(neto),
       };
@@ -1687,7 +1712,11 @@ export class VentasService {
     items: any[],
     condicionPago: string,
     pagos: VentaPagoDto[],
-    descuentosPorLista: Map<number, DescuentoResuelto>,
+    /* Iterable y no el Map por lista: el alta lo tiene armado, pero la
+     * CONFIRMACIÓN —que es por donde cobra la caja— parte de renglones ya
+     * guardados y los lee de la base. Los dos caminos tienen que pasar por
+     * este mismo candado. */
+    aplicables: Iterable<{ id: number; nombre: string; medioPago: string | null }>,
   ) {
     // Solo los que de verdad GANARON en algún renglón: uno que quedó tapado por
     // el descuento del cliente no bajó un peso, y no tiene por qué condicionar
@@ -1695,7 +1724,7 @@ export class VentasService {
     const aplicados = new Set(items.map((it: any) => it.descuentoId).filter(Boolean) as number[]);
     if (!aplicados.size) return;
 
-    for (const d of descuentosPorLista.values()) {
+    for (const d of aplicables) {
       if (!d.medioPago || !aplicados.has(d.id)) continue;
       if (condicionPago !== 'contado') {
         throw new BadRequestException(
@@ -1711,6 +1740,37 @@ export class VentasService {
         );
       }
     }
+  }
+
+  /**
+   * LO QUE SE REVISA DE LOS DESCUENTOS CON NOMBRE AL COBRAR UN BORRADOR.
+   *
+   * Las seis validaciones de `resolverDescuentos` ya corrieron al guardar. Acá
+   * se miran las dos cosas que solo se pueden saber ahora:
+   *
+   *   · EL MEDIO DE PAGO, que se elige recién en el modal de cobro.
+   *   · LA VIGENCIA, porque un ticket puede quedar abierto horas. Sin esto, un
+   *     ticket armado a las 23:50 y cobrado a las 00:10 se lleva el descuento de
+   *     ayer con el porcentaje ya congelado en el renglón.
+   *
+   * El mensaje del vencido dice qué hacer, y el POS acompaña: en su desplegable
+   * ese descuento ya figura vencido, así que quitarlo es un clic y el
+   * autoguardado devuelve los renglones a su precio.
+   */
+  private async validarDescuentosAlCobrar(items: any[], condicionPago: string, pagos: VentaPagoDto[]) {
+    const ids = [...new Set(items.map((it: any) => it.descuentoId).filter(Boolean) as number[])];
+    if (!ids.length) return;
+    const filas = await this.db.select().from(descuentos).where(inArray(descuentos.id, ids));
+    const ahora = Date.now();
+    for (const d of filas) {
+      if (d.vence && d.vence.getTime() < ahora) {
+        throw new BadRequestException(
+          `El descuento "${d.nombre}" venció y este ticket todavía lo tiene aplicado. `
+          + 'Quitalo del ticket y volvé a cobrar.',
+        );
+      }
+    }
+    this.validarMediosPagoDescuentos(items, condicionPago, pagos, filas);
   }
 
   private async validarCredito(cliente: any, config: any, condicionPago: string, total: number) {
@@ -1877,7 +1937,7 @@ export class VentasService {
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
     this.validarMediosPagoMonto(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
-    this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista);
+    this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista.values());
     await this.validarCredito(cliente, config, condicionPago, tot.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 
@@ -2010,6 +2070,9 @@ export class VentasService {
      * descuento de Centro. */
     const descuentosPorLista = await this.resolverDescuentos(
       dto.descuentos, actual.sucursalId, !!opciones.puedePisarPrecio,
+      /* Los que el ticket YA traía: el permiso se pide para aplicar, no para
+       * seguir trabajando sobre un ticket que un admin autorizó recién. */
+      new Set((actual.items ?? []).map((it: any) => it.descuentoId).filter(Boolean) as number[]),
     );
     const items = await this.resolverRenglones(
       dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista,
@@ -2060,6 +2123,20 @@ export class VentasService {
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], borrador.total);
     this.validarMediosPagoMonto(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
+    /*
+     * LOS DESCUENTOS CON NOMBRE, RELEÍDOS DE LA BASE.
+     *
+     * Este es EL camino de la caja: el POS guarda el borrador y después cobra
+     * por acá. El candado del medio de pago tiene que correr en los dos lados —
+     * si viviera solo en el alta, la regla que pidió el dueño ("si exige un
+     * medio, se bloquea ese medio y se avisa") no se aplicaría nunca donde de
+     * verdad se cobra.
+     *
+     * Y se releen en vez de creerle al renglón porque entre el último
+     * autoguardado y el cobro pueden pasar horas: el descuento pudo vencer, o el
+     * dueño pudo agregarle una forma de pago. Lo que vale es lo de ahora.
+     */
+    await this.validarDescuentosAlCobrar(borrador.items, condicionPago, pagos);
     await this.validarCredito(cliente, config, condicionPago, borrador.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 

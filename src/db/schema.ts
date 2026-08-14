@@ -1516,6 +1516,22 @@ export const ventaItems = pgTable('venta_items', {
    */
   descuentoId: integer('descuento_id').references(() => descuentos.id, { onDelete: 'set null' }),
   descuentoNombre: text('descuento_nombre').notNull().default(''),
+  /**
+   * EL DESCUENTO PROPIO DEL RENGLÓN, antes de que el nombrado se lo pise.
+   *
+   * `descuento` guarda el que se COBRÓ; este, el que decidió una persona: el del
+   * cliente, o el que puso el vendedor a mano. Cuando no hay nombrado los dos
+   * valen lo mismo, y por eso parece redundante. No lo es.
+   *
+   * Sin esto, reabrir un borrador es una trampa: el 25% de "Atención por
+   * tardanza" volvería al POS como si lo hubiera tipeado el vendedor, y el
+   * autoguardado siguiente lo mandaría de vuelta como descuento manual — que el
+   * servidor rebota contra `descuentoMaxVendedor` antes de llegar a aplicar el
+   * nombrado. El ticket quedaría sin poder guardarse, con un error sobre un
+   * número que nadie escribió. Y quitar el nombrado en pantalla dejaría el
+   * renglón en 0 en vez de volver al 10% que el cliente tiene por contrato.
+   */
+  descuentoBase: doublePrecision('descuento_base').notNull().default(0),
   subtotal: doublePrecision('subtotal').notNull().default(0),
   refItemId: integer('ref_item_id'),                      // NC parcial → ítem original
 }, (t) => ({
