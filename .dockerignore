@@ -1,0 +1,27 @@
+# Lo que NUNCA tiene que entrar a la imagen.
+#
+# Además de achicar el contexto de build, esto es seguridad: sin la primera
+# línea, un `.env` con la contraseña de la base y la clave de coffit se copiaría
+# adentro de la imagen y viajaría a donde vaya la imagen.
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+.git
+.gitignore
+
+# Salida de pruebas y basura del editor.
+coverage
+*.log
+.DS_Store
+.vscode
+.idea
+
+# Documentación y scripts que no hacen falta para ejecutar. `deploy/` se lee
+# desde el repo, no desde adentro del contenedor.
+deploy
+docs
+*.md
+!README.md

@@ -28,28 +28,51 @@ async function bootstrap() {
   app.use(json({ limit: '4mb' }));
 
   /*
-   * Detrás del proxy del hosting, la request llega "desde" el proxy: sin esto,
-   * el rate limit vería UNA sola IP para todos los visitantes y los bloquearía
-   * en conjunto. `trust proxy` hace que `req.ip` sea la IP real del visitante
+   * A QUIÉN LE CREE EXPRESS CUANDO DICE DE DÓNDE VIENE LA REQUEST.
+   *
+   * Detrás de un proxy, la request llega "desde" el proxy: sin esto, el rate
+   * limit vería UNA sola IP para todos los visitantes y los bloquearía en
+   * conjunto. `trust proxy` hace que `req.ip` sea la IP real del visitante
    * (X-Forwarded-For), y de ahí salen tanto el cupo de la tienda como el freno
    * de intentos del login.
    *
-   * Por qué `'loopback'` y NO `true`. Con `true`, Express se cree TODA la cadena
-   * de X-Forwarded-For y toma el PRIMER valor — que lo escribe el cliente. Un
+   * Lo que NO puede ser es `true`: ahí Express se cree TODA la cadena de
+   * X-Forwarded-For y toma el primer valor, que lo escribe el cliente. Un
    * atacante manda `X-Forwarded-For: 10.0.0.1` y su `req.ip` pasa a ser eso: se
    * hace pasar por infraestructura interna (que el cupo exime) y de paso diluye
-   * el freno del login cambiando de "IP" en cada intento. Con `'loopback'`,
-   * Express solo confía en un proxy que venga de 127.0.0.1 —o sea nginx, que
-   * está en la misma máquina— y toma el valor que NGINX puso ($remote_addr, la
-   * IP real). Si alguien llega a Node directo (no por loopback), su encabezado
-   * se ignora y `req.ip` es su socket verdadero: la falsificación no sirve.
+   * el freno del login cambiando de "IP" en cada intento.
    *
-   * CHECKLIST DEL DEPLOY: esto se apoya en dos patas que están en deploy/ —
-   * nginx pisa X-Forwarded-For con $remote_addr (no lo concatena), y Node
-   * escucha SOLO en localhost (HOST=127.0.0.1). Las tres juntas cierran la
-   * falsificación; sacar cualquiera la reabre.
+   * ES UNA VARIABLE PORQUE HAY DOS FORMAS DE PUBLICAR ESTO, y la respuesta
+   * correcta es distinta en cada una:
+   *
+   *   · `loopback` (el default) — Node como proceso del host, con nginx en la
+   *     MISMA máquina como única puerta. Express confía solo en un proxy que
+   *     venga de 127.0.0.1, o sea nginx, y toma el valor que nginx puso
+   *     ($remote_addr, la IP real). Se apoya en dos patas que están en deploy/:
+   *     nginx PISA X-Forwarded-For (no lo concatena) y Node escucha SOLO en
+   *     localhost (HOST=127.0.0.1).
+   *
+   *   · `1` — en Docker/Dokploy, donde el proxy es Traefik. Traefik es OTRO
+   *     CONTENEDOR de la red de Docker, así que su IP no es 127.0.0.1 y
+   *     `loopback` NO le cree: `req.ip` quedaría en la IP interna de la red,
+   *     idéntica para todos, y el freno del login pasaría a contar a todos los
+   *     visitantes como uno solo. Con `1`, Express confía en un solo salto —el
+   *     de Traefik— y devuelve la IP que Traefik escribió.
+   *
+   * Y ACÁ ESTÁ LA CONDICIÓN QUE HACE QUE `1` SEA SEGURO: el puerto del
+   * contenedor NO se publica al host. Si se publica, cualquiera puede hablarle
+   * a Node directo con un X-Forwarded-For inventado y Express se lo va a creer,
+   * porque para él ese cliente ES el primer salto. Con el puerto cerrado, el
+   * único que puede llegar es Traefik y la falsificación no tiene por dónde.
+   *
+   * Es la misma decisión de siempre —confiar en el proxy y en nadie más—, pero
+   * el "quién es el proxy" cambia con la forma de desplegar. Ver deploy/DEPLOY.md.
    */
-  app.getHttpAdapter().getInstance().set('trust proxy', 'loopback');
+  const trustProxyCrudo = (config.get<string>('TRUST_PROXY') ?? 'loopback').trim();
+  // Un `1` que llega como texto tiene que entrar como número: Express distingue
+  // el conteo de saltos (número) del nombre de una red (texto).
+  const trustProxy = /^\d+$/.test(trustProxyCrudo) ? Number(trustProxyCrudo) : trustProxyCrudo;
+  app.getHttpAdapter().getInstance().set('trust proxy', trustProxy);
 
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));

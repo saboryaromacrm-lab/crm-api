@@ -26,6 +26,10 @@ case "$ETAPA" in
   *) echo "uso: $0 prod|dev" >&2; exit 2 ;;
 esac
 
+# Con Dokploy el nombre de la base lo elegiste al crear el servicio y no tiene
+# por qué ser `crm_prod`: `PGDATABASE` lo pisa.
+BASE="${PGDATABASE:-$BASE}"
+
 DESTINO="/var/backups/crm/$ETAPA"
 mkdir -p "$DESTINO"
 # El umask solo alcanza a lo que se CREA: si los directorios venían de antes con
@@ -37,11 +41,31 @@ chmod 700 "$DESTINO" "$(dirname "$DESTINO")"
 SELLO="$(date -u +%Y%m%d-%H%M)"
 ARCHIVO="$DESTINO/$BASE-$SELLO.dump"
 
+# SE ESCRIBE CON OTRO NOMBRE Y RECIÉN AL FINAL SE RENOMBRA.
+#
+# Si `pg_dump` se corta a la mitad, lo que queda en el disco es un archivo con
+# nombre de dump bueno y contenido incompleto. Nadie lo mira hasta el día que
+# hace falta restaurar, y ahí ya es tarde. Con el sufijo `.parcial`, un corte
+# deja algo que no se puede confundir con un respaldo.
+PARCIAL="$ARCHIVO.parcial"
+
 # -Fc = formato custom: comprimido y restaurable con pg_restore tabla por tabla.
-pg_dump -Fc --no-owner --no-privileges "$BASE" -f "$ARCHIVO"
+#
+# DOS CAMINOS SEGÚN DÓNDE VIVA POSTGRES:
+#   · sin `DOCKER_DB` — Postgres instalado en el host (el modelo con systemd).
+#   · con `DOCKER_DB` — Postgres en un contenedor, que es el caso de Dokploy.
+#     Ahí `pg_dump` ni siquiera existe en el host: hay que ejecutarlo ADENTRO y
+#     traerse la salida por stdout.
+if [ -n "${DOCKER_DB:-}" ]; then
+  docker exec -i "$DOCKER_DB" \
+    pg_dump -Fc --no-owner --no-privileges -U "${PGUSER:-postgres}" "$BASE" > "$PARCIAL"
+else
+  pg_dump -Fc --no-owner --no-privileges "$BASE" -f "$PARCIAL"
+fi
 
 # Un dump de 0 bytes es peor que ninguno: da la sensación de estar cubierto.
-[ -s "$ARCHIVO" ] || { echo "!! El dump salió vacío: $ARCHIVO" >&2; exit 1; }
+[ -s "$PARCIAL" ] || { echo "!! El dump salió vacío: $PARCIAL" >&2; exit 1; }
+mv "$PARCIAL" "$ARCHIVO"
 echo "OK $ARCHIVO ($(du -h "$ARCHIVO" | cut -f1))"
 
 find "$DESTINO" -name "$BASE-*.dump" -mtime "+$GUARDAR_DIAS" -delete
@@ -52,7 +76,13 @@ find "$DESTINO" -name "$BASE-*.dump" -mtime "+$GUARDAR_DIAS" -delete
 #
 # El destino NO está escrito acá porque depende de la cuenta de cada uno: se
 # configura una vez con `rclone config` y se pone su nombre en la variable
-# BACKUP_REMOTO del entorno del cron. Ejemplo:
+# BACKUP_REMOTO del entorno del cron. Ejemplo con Postgres en un contenedor
+# (Dokploy), que es el caso de este servidor:
+#
+#   DOCKER_DB=mi-postgres PGUSER=crm PGDATABASE=crm_prod \
+#   BACKUP_REMOTO=drive:crm-backups   /ruta/al/backup.sh prod
+#
+# Y el equivalente con Postgres instalado en el host:
 #
 #   BACKUP_REMOTO=drive:crm-backups   /srv/crm/prod/crm-api/deploy/backup.sh prod
 #
