@@ -17,6 +17,7 @@
  *   npm run db:reconciliar
  */
 import 'dotenv/config';
+import { resolverDatabaseUrl } from './url';
 import { Pool } from 'pg';
 
 /** Los tres cachés, cada uno recalculado desde las imputaciones que existen. */
@@ -78,7 +79,7 @@ const ESTADOS = `
   RETURNING id, estado`;
 
 async function main() {
-  const url = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/crm';
+  const url = resolverDatabaseUrl();
   const pool = new Pool({ connectionString: url });
   try {
     for (const t of TOTALES) {

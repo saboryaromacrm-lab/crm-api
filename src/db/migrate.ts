@@ -1,11 +1,12 @@
 import 'dotenv/config';
+import { resolverDatabaseUrl } from './url';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 /** Aplica las migraciones generadas en ./drizzle contra DATABASE_URL. */
 async function main() {
-  const url = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/crm';
+  const url = resolverDatabaseUrl();
   const pool = new Pool({ connectionString: url });
   const db = drizzle(pool);
   await migrate(db, { migrationsFolder: './drizzle' });

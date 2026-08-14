@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { schema } from './schema';
 import { DRIZZLE } from './drizzle';
+import { resolverDatabaseUrl } from './url';
 
 /**
  * Módulo global que provee el cliente Drizzle (token DRIZZLE) a toda la app.
@@ -16,9 +17,7 @@ import { DRIZZLE } from './drizzle';
       provide: DRIZZLE,
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
-        const url =
-          config.get<string>('DATABASE_URL') ??
-          'postgres://postgres:postgres@localhost:5432/crm';
+        const url = resolverDatabaseUrl(config.get<string>('DATABASE_URL'));
         const pool = new Pool({ connectionString: url });
         return drizzle(pool, { schema, casing: 'snake_case' });
       },

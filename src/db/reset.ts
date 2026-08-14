@@ -1,10 +1,11 @@
 import 'dotenv/config';
+import { resolverDatabaseUrl } from './url';
 import { Pool } from 'pg';
 import { truncateAll } from './truncate';
 
 /** Vacía la base (sin insertar datos). */
 async function main() {
-  const url = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/crm';
+  const url = resolverDatabaseUrl();
   const pool = new Pool({ connectionString: url });
   await truncateAll(pool);
   await pool.end();

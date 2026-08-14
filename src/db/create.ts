@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { resolverDatabaseUrl } from './url';
 import { Client } from 'pg';
 
 /**
@@ -6,7 +7,7 @@ import { Client } from 'pg';
  * base de mantenimiento `postgres` con las mismas credenciales. No requiere psql.
  */
 async function main() {
-  const url = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/crm';
+  const url = resolverDatabaseUrl();
   const target = new URL(url);
   const dbName = decodeURIComponent(target.pathname.replace(/^\//, '')) || 'crm';
 

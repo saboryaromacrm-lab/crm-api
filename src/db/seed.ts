@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { resolverDatabaseUrl } from './url';
 import { Pool } from 'pg';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
@@ -27,7 +28,7 @@ import { hashPassword } from '../usuarios/usuarios.module';
  * transferencias, ventas, incidencia) con el motor de inventario.
  */
 async function main() {
-  const url = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/crm';
+  const url = resolverDatabaseUrl();
   const pool = new Pool({ connectionString: url });
   const db = drizzle(pool, { schema, casing: 'snake_case' });
   const cfgSvc = new ConfiguracionService(db as any);
