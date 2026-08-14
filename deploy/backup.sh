@@ -70,6 +70,12 @@ echo "OK $ARCHIVO ($(du -h "$ARCHIVO" | cut -f1))"
 
 find "$DESTINO" -name "$BASE-*.dump" -mtime "+$GUARDAR_DIAS" -delete
 
+# Y los restos de corridas que se cortaron. No los borra la línea de arriba
+# —solo mira `*.dump`— así que sin esto se van apilando de a uno por cada noche
+# que falle, hasta llenar el disco. Un día de gracia para poder mirarlos si la
+# falla fue reciente.
+find "$DESTINO" -name '*.parcial' -mtime +1 -delete
+
 # ---------------------------------------------------------------------------
 # SACARLO DE LA MÁQUINA. Un dump que vive en el mismo disco que la base no
 # protege del caso más probable: que el disco o el VPS se pierdan.
