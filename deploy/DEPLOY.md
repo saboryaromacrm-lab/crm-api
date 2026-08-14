@@ -7,7 +7,10 @@ como única puerta de entrada.
 | --- | --- | --- |
 | `crm-api` | NestJS + Postgres | contenedor Node (`Dockerfile` en la raíz) |
 | `crm-dashboard` | React + Vite | contenedor nginx con el `dist/` adentro |
-| `sitio-web` | Next.js (tienda) | **fuera de esta ronda** |
+| `saboryaroma-web` | Next.js (tienda) | contenedor Node, salida `standalone` |
+
+Los tres tienen `dev` y `main`, y los tres se despliegan desde **`main`** con el
+disparador *On Push*. Cómo se trabaja entre las dos ramas está en §7.
 
 > **Sobre los archivos vecinos.** `crm-api@.service`, `nginx-crm-prod.conf`,
 > `nginx-crm-dev.conf` y `deploy.sh` son del **otro** camino: Node como proceso
@@ -267,25 +270,82 @@ docker exec -i NOMBRE_DEL_CONTENEDOR psql -U USUARIO -d crm_prueba -c 'select co
 docker exec -i NOMBRE_DEL_CONTENEDOR dropdb -U USUARIO crm_prueba
 ```
 
-## 7. El día a día
+## 7. El día a día — cómo se trabaja entre `dev` y `main`
+
+Decidido el 14/8/2026: **un solo entorno**. Se programa y se prueba en la
+máquina local sobre `dev`; cuando está bien, se mergea a `main`. No hay ensayo
+intermedio.
+
+La consecuencia hay que tenerla presente: **`main` ES producción, y se
+despliega sola.** Cada repo tiene el disparador *On Push*, así que el `git push
+origin main` no es "guardar": es publicar, con las cajeras adentro. El merge es
+el momento de la verdad, y todo lo de abajo existe para eso.
+
+### Las tres reglas fijas
+
+1. **A `main` no se commitea nunca.** Solo se la hace avanzar desde `dev`.
+   (Pasó el 14/8 en `saboryaroma-web`: se commiteó directo a `main` y `dev`
+   quedó dos commits atrás. Se arregla mergeando `main` de vuelta a `dev`, pero
+   es la clase de desprolijidad que después revive un bug ya arreglado.)
+2. **Siempre `--ff-only`.** Si no puede avanzar derecho, alguien tocó `main`:
+   eso se mira, no se tapa con un merge automático.
+3. **Después de tocar `main`, `dev` vuelve a quedar igual.** Un arreglo urgente
+   hecho sobre `main` que no vuelve a `dev` lo revive el próximo merge.
+
+### La lista antes de mergear
 
 ```bash
-# 1. se trabaja en dev y se sube
-git push origin dev
+npm run build                 # en los tres repos: si no compila, no sale
+npm run lint                  # dashboard
+npx tsc --noEmit              # api
+```
 
-# 2. se libera — FUERA DEL HORARIO DE CAJA
+Y las dos que no son opcionales:
+
+- [ ] **¿Hay migraciones nuevas? Probalas DESDE CERO.** Es la única forma de ver
+      lo que va a ver el servidor; una base que creció de a una migración por
+      vez esconde errores (§5).
+
+      ```bash
+      createdb crm_cero && DATABASE_URL=postgres://…/crm_cero npm run db:migrate
+      ```
+
+- [ ] **¿Hay migraciones nuevas? Respaldo ANTES del merge.** Sin entorno de
+      ensayo, la base de producción es el primer lugar donde esa migración corre
+      contra datos reales. El código se revierte con un `git revert`; **una
+      columna borrada no vuelve sin el dump**.
+
+### Liberar
+
+```bash
 git checkout main && git merge --ff-only dev && git push origin main
 ```
 
-Dokploy despliega solo si tiene el webhook configurado; si no, el botón Deploy.
-**La API primero, el dashboard después.**
+**Fuera del horario de caja.** Publicar reinicia el contenedor: unos segundos
+sin servicio, y si hay migración, el arranque tarda más.
 
-`merge --ff-only`: si no puede avanzar derecho es porque alguien commiteó en
-`main`, y eso hay que mirarlo, no taparlo con un merge automático.
+**Y en este orden, siempre: API → dashboard → sitio.** El dashboard nuevo puede
+pedirle a la API vieja algo que no existe; al revés, la API nueva sigue
+contestando lo que el dashboard viejo pide. El orden inverso es una caída
+garantizada durante la ventana entre los dos deploys.
 
-**Si producción se rompe:** rama desde `main`, arreglo, merge a `main` **y de
-vuelta a `dev`**. Si te olvidás del segundo, el próximo merge de dev revive el
-bug.
+### Cuando el cambio toca más de un repo
+
+Si la API agrega un campo que el dashboard va a usar, **el cambio de la API
+tiene que poder convivir con el frontend viejo**. Se libera la API, se verifica
+que el sistema sigue andando como estaba, y recién entonces el frontend.
+
+Ojo con las variables: la API es cambiar un valor y reiniciar, pero el dashboard
+y el sitio tienen la URL de la API **horneada** (§3, §4). Cambiarles el dominio
+en Dokploy no alcanza: hay que **reconstruirlos**.
+
+### Si producción se rompe
+
+1. **Revertir el merge y pushear** — con *On Push*, eso redespliega la versión
+   anterior sola. Es lo más rápido y no requiere pensar.
+2. Si la que falló fue una **migración**, el revert del código no alcanza: el
+   esquema ya cambió. Ahí se restaura el dump (§6).
+3. El arreglo se hace en `dev`, se prueba, y vuelve por el camino de siempre.
 
 ## 8. Cuando algo no anda
 
