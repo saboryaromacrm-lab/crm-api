@@ -27,18 +27,34 @@ Con Dokploy, un **proyecto** agrupa los servicios. Para esta ronda son tres:
 | `crm-api` | Application → Git + Dockerfile | `main` | 3001 |
 | `crm-dashboard` | Application → Git + Dockerfile | `main` | 8080 |
 
-**Un solo dominio para los dos**, y el ruteo por path:
+**Un subdominio para cada uno** (decidido 14/8/2026):
 
 ```
-crm.TUDOMINIO.com/api   →  crm-api:3001
-crm.TUDOMINIO.com/      →  crm-dashboard:8080
+api.saboryaroma.com   →  crm-api:3001        (Path /, Strip Path apagado)
+crm.saboryaroma.com   →  crm-dashboard:8080  (Path /)
+saboryaroma.com       →  la tienda, cuando entre
 ```
 
-No es capricho: el dashboard pide la API en `/api` **relativo** (el default de
-`src/core/config/env.js`). Mismo origen significa cero CORS, y el token de
-sesión —que vive en el `localStorage` del navegador— nunca cruza a otro dominio.
-La API ya publica todas sus rutas bajo `/api` (`setGlobalPrefix`), así que
-Traefik no tiene que reescribir nada: el path que entra es el que la API espera.
+La alternativa era un solo dominio con la API en `/api`, que ahorra CORS. Se
+eligió el subdominio propio porque **la API va a servir a dos frentes**: el
+dashboard y, más adelante, la tienda — que vive en el dominio raíz y sería un
+origen distinto igual. Mejor una sola regla que dos casos.
+
+Ojo con dos consecuencias, que son las que rompen si se olvidan:
+
+1. **`CORS_ORIGINS` deja de ir vacía.** Tiene que listar el origen del
+   dashboard (y el de la tienda cuando entre), o el navegador bloquea cada
+   llamada. El token de sesión viaja en `Authorization`, no en una cookie, así
+   que cruzar orígenes es seguro; lo que hay que hacer es permitirlo.
+2. **El dashboard necesita la URL ABSOLUTA horneada en el build**, vía el Build
+   Arg `VITE_API_BASE_URL` (§4). Su default `/api` es relativo y apuntaría a sí
+   mismo.
+
+Y el detalle que confunde: la API publica todas sus rutas bajo `/api`
+(`setGlobalPrefix`), así que la URL de salud es `api.saboryaroma.com/**api**/health`.
+Se ve repetido y está bien. Por eso mismo, **Strip Path va APAGADO**: si Traefik
+recorta el prefijo, a la API le llega `/health` y todo devuelve 404, con el
+servicio sano y sin una línea de error en los logs.
 
 ## 2. Antes de publicar nada
 
@@ -74,9 +90,13 @@ PORT=3001
 HOST=0.0.0.0
 TZ=America/Argentina/Buenos_Aires
 TRUST_PROXY=1
-CORS_ORIGINS=
+CORS_ORIGINS=https://crm.saboryaroma.com
 # COFFIT_TOKEN=   (recién cuando se coordine con la cafetería)
 ```
+
+Cuando entre la tienda, se le suma su origen separado por coma y **sin espacios
+de más** (se recortan, pero es fácil equivocarse):
+`https://crm.saboryaroma.com,https://saboryaroma.com`
 
 `HOST_INTERNO` es el que muestra la ficha de la base en Dokploy: los servicios
 del proyecto se ven por nombre dentro de la red de Docker. **No** se usa
@@ -104,22 +124,33 @@ como vencido y el contador del sidebar cuenta de más. La imagen ya trae `tzdata
 y este default, porque alpine viene **sin** base de zonas horarias y sin ella la
 variable se ignora en silencio.
 
-**`CORS_ORIGINS` vacío.** Con dashboard y API en el mismo origen no hay cruce.
-Solo se llena si algún día un cliente externo consume la API desde otro dominio.
+**`CORS_ORIGINS`.** Con la API en su propio subdominio, cada llamada del
+dashboard es de origen cruzado y el navegador la bloquea salvo que la API diga
+que ese origen está permitido. Va el origen COMPLETO y con esquema
+(`https://crm.saboryaroma.com`), sin barra final.
 
-El dashboard **no lleva variables**: las `VITE_*` se hornean en el build, y el
-default `/api` es justamente lo correcto acá. Si alguna vez hiciera falta
-cambiarlo, no alcanza con reiniciar — hay que reconstruir la imagen.
+El dashboard no lleva variables de entorno, pero sí **un Build Arg**:
+`VITE_API_BASE_URL=https://api.saboryaroma.com/api`. Las `VITE_*` se hornean al
+compilar, así que cambiarlo no es reiniciar el contenedor: es reconstruirlo.
+Si el arg no se pasa, el valor queda en **cadena vacía** (el `ENV` del
+Dockerfile siempre define la variable), y por eso `env.js` usa `||` y no `??`:
+una cadena vacía tiene que contar como "no configurada" y caer al default.
 
 ## 4. Puesta en marcha
 
 1. **Base**: Database → PostgreSQL. Anotá host interno, usuario, clave y nombre.
 2. **`crm-api`**: Application → Git (`crm-api`, rama `main`), Build Type
-   **Dockerfile**. Cargá las variables de §3. Dominio `crm.TUDOMINIO.com` con
-   path `/api`, puerto `3001`, HTTPS con Let's Encrypt. **No** publiques el
-   puerto al host.
+   **Dockerfile**. Cargá las variables de §3. Dominio `api.saboryaroma.com`,
+   path `/`, **Strip Path apagado**, puerto `3001`, HTTPS con Let's Encrypt.
+   **No** publiques el puerto al host.
 3. **`crm-dashboard`**: Application → Git (`crm-dashboard`, rama `main`), Build
-   Type **Dockerfile**. Mismo dominio con path `/`, puerto `8080`, HTTPS.
+   Type **Dockerfile**, con el **Build Arg**
+   `VITE_API_BASE_URL=https://api.saboryaroma.com/api`. Dominio
+   `crm.saboryaroma.com`, path `/`, puerto `8080`, HTTPS.
+
+> **El DNS va antes que el deploy.** Cada subdominio necesita su registro **A**
+> apuntando a la IP del VPS *antes* de encender HTTPS: Let's Encrypt valida
+> contra el DNS real, y si no resuelve, el certificado no se emite.
 4. **Deploy de la API primero.** Al arrancar corre las migraciones sola (§5) y
    recién después escucha. Verificá `https://crm.TUDOMINIO.com/api/health` →
    `{"status":"ok",…}`.
