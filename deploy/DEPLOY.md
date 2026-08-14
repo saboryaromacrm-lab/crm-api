@@ -58,11 +58,21 @@ servicio sano y sin una línea de error en los logs.
 
 ## 2. Antes de publicar nada
 
-- [ ] **Las cuatro contraseñas de la semilla.** `db:seed` crea `Lucas`
-      (**superadmin**), `Ana`, `Bruno` y `Carla`, todos con **`1234`**. En un
-      sistema alcanzable desde internet eso no puede durar ni una hora. Dos
-      caminos: no correr la semilla en producción, o correrla y cambiar las
-      cuatro desde **Gerencia › Usuarios y roles** antes de publicar el dominio.
+- [ ] **La contraseña de `Lucas`. ES EL PRIMER PASO DESPUÉS DEL PRIMER DEPLOY,
+      antes que cualquier otra cosa.**
+
+      La migración `0019_usuarios_roles.sql` crea a **`Lucas`, superadmin, con
+      contraseña `1234`**. No es la semilla: es una migración, así que **toda
+      base nueva lo tiene**, se corra o no `db:seed`. Y el repositorio es
+      público, o sea que el hash y el comentario que dice la contraseña se leen
+      desde GitHub. El desplegable del login (`GET /auth/opciones`) es público
+      también, así que el nombre de usuario tampoco es secreto.
+
+      En criollo: desde el instante en que la API es alcanzable, cualquiera
+      entra como superadmin. Entrá vos primero y cambiala desde **Gerencia ›
+      Usuarios y roles**.
+
+      Si además corriste `db:seed`, sumá `Ana`, `Bruno` y `Carla`, con la misma.
 - [ ] **`TRUST_PROXY=1`** en la API (§3). Con el default `loopback`, Traefik no
       es reconocido como proxy y el freno del login contaría a todos los
       visitantes como uno solo.
@@ -180,8 +190,38 @@ Tres reglas que no se negocian:
 2. **Una migración ya aplicada en producción es inmutable.** Renumerarla o
    editarla rompe la cadena.
 3. **Todo corre en UNA transacción.** Bueno: si falla, la base queda intacta.
-   Consecuencia: no se puede agregar un valor a un enum y usarlo en la misma
-   migración — hay que recrear el tipo.
+   Consecuencia: un valor agregado a un enum con `ALTER TYPE … ADD VALUE` **no
+   se puede usar como literal de ese enum en ninguna migración posterior**, por
+   más que estén en archivos distintos. Para Postgres siguen siendo la misma
+   transacción y todavía no está confirmado.
+
+   **Esto no se ve en desarrollo.** Una base que creció migración por migración
+   aplicó cada una en su propia corrida, así que el valor sí estaba confirmado.
+   Solo aparece levantando la base **desde cero**, que es exactamente lo que
+   hace un deploy nuevo. Pasó en el primero (14/8/2026), con la 0046 usando
+   `tipo = 'envio_cafeteria'` que la 0035 había agregado.
+
+   La salida barata es comparar como texto (`tipo::text = 'envio_cafeteria'`):
+   el literal nunca se convierte al enum y el chequeo no se dispara. La cara es
+   recrear el tipo.
+
+   **Antes de cada deploy con migraciones nuevas, probalas desde cero:**
+
+   ```bash
+   createdb crm_cero && DATABASE_URL=postgres://…/crm_cero npm run db:migrate
+   ```
+
+   Es la única forma de ver lo que va a ver el servidor. Editar una migración
+   vieja para esto **no rompe las bases ya migradas**: drizzle decide qué correr
+   por la fecha del journal, no por el contenido del archivo (verificado: 63
+   migraciones antes y después de la corrección).
+
+4. **La versión de Postgres del servidor tiene que ser la misma que la de
+   desarrollo.** Hoy no lo es —18 en la máquina, 16 en el VPS— y esa diferencia
+   fue la que escondió el problema de arriba: PostgreSQL 18 permite usar un valor
+   de enum recién agregado dentro de la misma transacción, y 16 lo rechaza. Todo
+   pasaba en verde en local y fallaba en el deploy. Cualquier par de versiones
+   sirve mientras sean **la misma**.
 
 `db:reset` **no está en la imagen de producción**: el Dockerfile lo borra a
 propósito.

@@ -16,7 +16,25 @@
 
 DELETE FROM envio_cafeteria_items;
 --> statement-breakpoint
-DELETE FROM movimientos WHERE tipo = 'envio_cafeteria' OR descripcion ~ '^CAFD?[0-9]{4}:';
+-- `tipo::text` y NO `tipo = 'envio_cafeteria'`, que es lo que decía antes.
+--
+-- Ese valor del enum lo agrega la 0035 con ALTER TYPE ... ADD VALUE, y drizzle
+-- corre TODAS las migraciones en UNA sola transacción. En una base que ya venía
+-- migrada no se nota (la 0035 se aplicó y confirmó en otra corrida), pero
+-- levantando la base DESDE CERO el valor todavía no está confirmado cuando esta
+-- línea lo nombra, y PostgreSQL lo rechaza:
+--
+--   ERROR 55P04: unsafe use of new value "envio_cafeteria" of enum type
+--   HINT: New enum values must be committed before they can be used.
+--
+-- Comparando la columna como TEXTO, el literal nunca se convierte al enum y el
+-- chequeo no se dispara. El resultado es idéntico, y encima esta línea es un
+-- no-op en una base nueva: `movimientos` está vacía.
+--
+-- Ojo con la versión: PostgreSQL 18 (el del desarrollo) ya permite usar el valor
+-- en la misma transacción, así que este error NO aparece en local. El servidor
+-- corre 16, donde sí aparece. Lo encontró el primer deploy real (14/8/2026).
+DELETE FROM movimientos WHERE tipo::text = 'envio_cafeteria' OR descripcion ~ '^CAFD?[0-9]{4}:';
 --> statement-breakpoint
 DELETE FROM envios_cafeteria;
 --> statement-breakpoint
