@@ -158,8 +158,17 @@ export class TiendaService {
     };
 
     // Ofertas de vidriera vigentes: solo mecánicas de UN producto (combo/ticket no aplican al catálogo).
+    /*
+     * `sin listas` es la traducción EXACTA del viejo `!soloPrecioBase` (0065):
+     * el sitio publica las que corren en TODAS las listas, que son exactamente
+     * las mismas que publicaba antes del cambio. Se dejó igual a propósito
+     * (decisión del dueño, 15/8/2026), pero merece una segunda mirada: el
+     * precio que muestra el sitio ES el de mostrador, así que una promo acotada
+     * a esa lista debería verse acá y hoy no se ve. Está en Pendientes.
+     */
     const ofertasWeb = ofertasActivas.filter((o: any) =>
-      !o.soloPrecioBase && o.tipo !== 'combo' && o.tipo !== 'ticket' && ofertaVigente(o, suc?.id ?? null));
+      !String(o.listas ?? '').trim() && o.tipo !== 'combo' && o.tipo !== 'ticket'
+      && ofertaVigente(o, suc?.id ?? null));
     const reingresados = new Set(ingresosRecientes.map((m: any) => m.productoId));
 
     const nombreMarca = new Map(ms.map((m) => [m.id, m.nombre]));

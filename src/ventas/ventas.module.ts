@@ -1402,6 +1402,23 @@ export class VentasService {
           );
         }
         /*
+         * Y LA LISTA SOBRE LA QUE CORRE (0065), que tampoco se miraba: la
+         * restricción vivía únicamente en el motor del navegador, así que un
+         * pedido armado a mano le colgaba una promo de mostrador a un renglón
+         * cotizado a precio mayorista — que es exactamente el doble beneficio
+         * que esa restricción existe para impedir.
+         *
+         * Vacío = corre en todas. Y se compara contra la lista con la que el
+         * renglón quedó cotizado, no contra su origen.
+         */
+        const listasOferta = String((of as any).listas ?? '').split(',')
+          .map((x) => parseInt(x.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0);
+        if (listasOferta.length && !listasOferta.includes(elegida.fila.listaId as number)) {
+          throw new BadRequestException(
+            `${etiqueta}: la oferta "${of.nombre}" no corre sobre la lista ${elegida.lista.etiqueta || elegida.lista.nombre}.`,
+          );
+        }
+        /*
          * Y DESPUÉS EL TECHO, ahora por mecánica y no solo para las de
          * porcentaje. El importe exacto lo sigue calculando el motor del POS
          * (recalcula con cada tecla); acá se acota cuánto puede llegar a ser.

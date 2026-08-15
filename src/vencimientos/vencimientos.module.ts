@@ -37,7 +37,7 @@ import {
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, movimientos, presentaciones, productoEtiquetas, productoProveedores, productos,
+  categorias, configuracion, movimientos, presentaciones, productoEtiquetas, productoProveedores, productos,
   sucursales, usuarios, vencimientoSesiones, vencimientos,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -347,6 +347,18 @@ export class VencimientosService {
     const [suc] = await this.db.select({ nombre: sucursales.nombre })
       .from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1);
 
+    /*
+     * El borrador arranca acotado a la LISTA BASE —el precio de mostrador—, que
+     * es lo que hacía el viejo `soloPrecioBase: true` antes de la 0065. Rematar
+     * lo que vence no es motivo para bajarle además el precio a un mayorista,
+     * que ya tiene el suyo. Si no hay lista base configurada, va sin acotar
+     * (corre en todas) y el dueño lo ajusta en el formulario: el borrador se
+     * edita antes de guardarse.
+     */
+    const [cfgVentas] = await this.db.select({ valor: configuracion.valor })
+      .from(configuracion).where(eq(configuracion.clave, 'ventas')).limit(1);
+    const listaBaseId = Number((cfgVentas?.valor as any)?.listaBaseId) || 0;
+
     return {
       registro: {
         id: v.id,
@@ -376,7 +388,7 @@ export class VencimientosService {
          * regalar margen sin salvar nada. */
         sucursales: String(v.sucursalId),
         activa: true,
-        soloPrecioBase: true,
+        listas: listaBaseId ? String(listaBaseId) : '',
         /*
          * El alcance apunta a LO QUE VENCE. Si el registro es de un paquete
          * fraccionado, la oferta va al paquete (alcance `presentacion`, 0054) y

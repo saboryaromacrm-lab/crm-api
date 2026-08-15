@@ -771,11 +771,17 @@ export const ofertas = pgTable('ofertas', {
   mediosPago: text('medios_pago').notNull().default(''),
 
   /**
-   * true = solo aplica sobre renglones al precio de mostrador (origen 'base').
-   * Un cliente con lista mayorista ya tiene SU beneficio: sumarle la promo de
-   * vidriera es descontar dos veces sin que nadie lo haya decidido.
+   * SOBRE QUÉ LISTAS DE PRECIO CORRE. Ids en CSV, '' = todas (0065).
+   *
+   * Reemplazó a `solo_precio_base`, que era un sí/no y solo sabía decir "que no
+   * se sume al precio ya negociado de un mayorista". Esa protección sigue
+   * disponible —se tilda únicamente la lista de mostrador— y ahora además se
+   * puede lo que antes era imposible: una promo SOLO para Mayorista 1.
+   *
+   * Se compara contra la lista con la que el renglón quedó cotizado, no contra
+   * el origen: si alguien lo pasó a mano a esa lista, está en esa lista.
    */
-  soloPrecioBase: boolean('solo_precio_base').notNull().default(true),
+  listas: text('listas').notNull().default(''),
   /**
    * Cuando el alcance se resuelve por la MADRE (producto, marca, categoría o
    * etiqueta), ¿entran también sus paquetes fraccionados?

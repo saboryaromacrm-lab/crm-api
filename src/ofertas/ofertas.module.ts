@@ -97,7 +97,8 @@ class UpsertOfertaDto {
   @IsOptional() @IsString() dias?: string;
   @IsOptional() @IsString() sucursales?: string;
   @IsOptional() @IsString() mediosPago?: string;
-  @IsOptional() @IsBoolean() soloPrecioBase?: boolean;
+  /** Ids de lista en CSV. '' = corre en todas (0065, reemplazó soloPrecioBase). */
+  @IsOptional() @IsString() listas?: string;
   /** El alcance por la madre alcanza también a sus paquetes fraccionados. */
   @IsOptional() @IsBoolean() incluyeFraccionados?: boolean;
   @IsOptional() @IsBoolean() activa?: boolean;
@@ -132,6 +133,21 @@ export class OfertasService {
     return (await this.listar()).filter((o) => o.activa);
   }
 
+  /**
+   * CSV de ids: sin repetidos, sin basura y ordenado.
+   *
+   * Ordenar no es cosmético — es lo que hace que "2,1" y "1,2" sean la misma
+   * fila y que comparar dos ofertas no dependa del orden en que se tildaron los
+   * chips. Los no numéricos se descartan en silencio a propósito: el campo lo
+   * arma la pantalla y un id inventado no es un caso que valga un mensaje.
+   */
+  private idsCsv(csv?: string) {
+    const ids = [...new Set((csv ?? '').split(',')
+      .map((x) => parseInt(x.trim(), 10))
+      .filter((n) => Number.isFinite(n) && n > 0))];
+    return ids.sort((a, b) => a - b).join(',');
+  }
+
   /** Normaliza + valida según el tipo. Es la única puerta de escritura. */
   private normalizar(dto: UpsertOfertaDto) {
     const nombre = (dto.nombre || '').trim();
@@ -152,7 +168,7 @@ export class OfertasService {
       dias: (dto.dias ?? '').trim(),
       sucursales: (dto.sucursales ?? '').trim(),
       mediosPago: dto.tipo === 'ticket' ? (dto.mediosPago ?? '').trim() : '',
-      soloPrecioBase: dto.soloPrecioBase ?? true,
+      listas: this.idsCsv(dto.listas),
       incluyeFraccionados: dto.incluyeFraccionados ?? false,
       activa: dto.activa ?? true,
     };
