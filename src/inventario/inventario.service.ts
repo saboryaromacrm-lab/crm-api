@@ -1,5 +1,5 @@
 import { Inject, Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { and, asc, eq, gte, inArray, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
@@ -7,6 +7,7 @@ import {
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
+  conteos, conteoItems,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
@@ -1848,4 +1849,383 @@ export class InventarioService {
       configVentas: cfgVentas,
     };
   }
+
+  /* ==================================================================== *
+   * Control de stock (0066): el físico contra el virtual
+   * ==================================================================== */
+
+  /**
+   * El stock POR FORMA de todas las líneas de un conteo, en UNA query.
+   * Devuelve mapas `clave → cantidad` con clave `productoId:presentacionId`.
+   * Leer disponible y comprometido fila por fila sería una query por renglón
+   * en la pantalla que más renglones tiene del sistema.
+   */
+  private async stockDeConteo(tx: any, sucursalId: number, prodIds: number[]) {
+    if (!prodIds.length) return { disponible: new Map<string, number>(), comprometido: new Map<string, number>() };
+    const filas = await tx.select().from(stock).where(and(
+      eq(stock.sucursalId, sucursalId),
+      inArray(stock.productoId, prodIds),
+      inArray(stock.estado, ['disponible', 'comprometido'] as any),
+    ));
+    const disponible = new Map<string, number>();
+    const comprometido = new Map<string, number>();
+    for (const f of filas) {
+      const k = `${f.productoId}:${f.presentacionId ?? ''}`;
+      const m = f.estado === 'disponible' ? disponible : comprometido;
+      m.set(k, (m.get(k) ?? 0) + Number(f.cantidad));
+    }
+    return { disponible, comprometido };
+  }
+
+  async listarConteos(sucursalId?: number | null) {
+    const filas = await this.db.select().from(conteos)
+      .where(sucursalId ? eq(conteos.sucursalId, sucursalId) : undefined)
+      .orderBy(desc(conteos.id));
+    if (!filas.length) return [];
+    // Progreso por sesión en una sola pasada, no un COUNT por fila.
+    const items = await this.db.select({
+      conteoId: conteoItems.conteoId,
+      total: sql<number>`count(*)::int`,
+      contados: sql<number>`count(*) filter (where ${conteoItems.contado} is not null)::int`,
+      aRecontar: sql<number>`count(*) filter (where ${conteoItems.recontar})::int`,
+    }).from(conteoItems)
+      .where(inArray(conteoItems.conteoId, filas.map((f) => f.id)))
+      .groupBy(conteoItems.conteoId);
+    const porId = new Map(items.map((i) => [i.conteoId, i]));
+    return filas.map((f) => ({
+      ...f,
+      total: porId.get(f.id)?.total ?? 0,
+      contados: porId.get(f.id)?.contados ?? 0,
+      aRecontar: porId.get(f.id)?.aRecontar ?? 0,
+    }));
+  }
+
+  /**
+   * ABRE LA SESIÓN Y CONGELA SU LISTA. Los filtros se resuelven UNA vez, acá:
+   * la sesión nace con sus renglones en pendiente y se cuenta la góndola de
+   * esa noche, no el catálogo vivo — un alta a mitad del conteo no se cuela.
+   *
+   * EL CANDADO DE SOLAPAMIENTO es de forma física, no de sesión: un producto
+   * no puede estar en dos sesiones abiertas de la misma sucursal, porque dos
+   * conteos del mismo producto se aplicarían dos veces. El mensaje dice en
+   * cuál está, porque "no se puede" sin el porqué manda a buscar al que sabe.
+   */
+  async crearConteo(o: {
+    sucursalId: number; usuarioId?: number | null; nombre?: string; ciego?: boolean;
+    marcaId?: number | null; categoriaId?: number | null; proveedorId?: number | null;
+    tipo?: 'entero' | 'granel' | null; soloConStock?: boolean; incluirArchivados?: boolean;
+  }) {
+    return this.db.transaction(async (tx) => {
+      const conds: any[] = [];
+      if (!o.incluirArchivados) conds.push(ne(productos.estado, 'archivado' as any));
+      if (o.marcaId) conds.push(eq(productos.marcaId, o.marcaId));
+      if (o.categoriaId) conds.push(eq(productos.categoriaId, o.categoriaId));
+      if (o.tipo) conds.push(eq(productos.tipo, o.tipo));
+      let prods = await tx.select().from(productos).where(conds.length ? and(...conds) : undefined)
+        .orderBy(asc(productos.nombre));
+      if (o.proveedorId) {
+        const pp = await tx.select({ productoId: productoProveedores.productoId }).from(productoProveedores)
+          .where(eq(productoProveedores.proveedorId, o.proveedorId));
+        const del = new Set(pp.map((x: any) => x.productoId));
+        prods = prods.filter((p: any) => del.has(p.id));
+      }
+      if (!prods.length) throw new BadRequestException('Ningún producto entra en ese alcance. Aflojá los filtros.');
+
+      const press = await tx.select().from(presentaciones)
+        .where(inArray(presentaciones.productoId, prods.map((p: any) => p.id)));
+      const presDe = new Map<number, any[]>();
+      for (const pr of press) {
+        if (!presDe.has(pr.productoId)) presDe.set(pr.productoId, []);
+        presDe.get(pr.productoId)!.push(pr);
+      }
+
+      const { disponible } = await this.stockDeConteo(tx, o.sucursalId, prods.map((p: any) => p.id));
+
+      /* Una fila por FORMA física: la madre (kg para granel, unidades para
+       * entero) y cada tamaño de paquete aparte. Es como se cuenta de verdad:
+       * el 500 g en la góndola no es "medio kilo de la madre". */
+      const filas: any[] = [];
+      for (const p of prods) {
+        const conStock = (presId: number | null) =>
+          Math.abs(disponible.get(`${p.id}:${presId ?? ''}`) ?? 0) > 1e-9;
+        if (!o.soloConStock || conStock(null)) {
+          filas.push({
+            productoId: p.id, presentacionId: null, nombre: p.nombre,
+            presLabel: '', unidad: this.unidadDe(p.tipo, null),
+          });
+        }
+        for (const pr of presDe.get(p.id) ?? []) {
+          if (o.soloConStock && !conStock(pr.id)) continue;
+          filas.push({
+            productoId: p.id, presentacionId: pr.id, nombre: p.nombre,
+            presLabel: this.fmtTam(Number(pr.tamKg)), unidad: 'u',
+          });
+        }
+      }
+      if (!filas.length) throw new BadRequestException('Con "solo con stock" no queda nada para contar en ese alcance.');
+      if (filas.length > 5000) throw new BadRequestException('El alcance es demasiado grande: partilo con los filtros.');
+
+      /* El solapamiento se chequea contra TODO lo no terminado (en_curso y
+       * cerrado sin aplicar): un cerrado esperando aplicación también va a
+       * ajustar esas formas. */
+      const abiertos = await tx.select().from(conteos).where(and(
+        eq(conteos.sucursalId, o.sucursalId),
+        inArray(conteos.estado, ['en_curso', 'cerrado'] as any),
+      ));
+      if (abiertos.length) {
+        const ocupadas = await tx.select().from(conteoItems)
+          .where(inArray(conteoItems.conteoId, abiertos.map((a: any) => a.id)));
+        const enUso = new Map(ocupadas.map((x: any) => [`${x.productoId}:${x.presentacionId ?? ''}`, x.conteoId]));
+        const choque = filas.find((f) => enUso.has(`${f.productoId}:${f.presentacionId ?? ''}`));
+        if (choque) {
+          const s = abiertos.find((a: any) => a.id === enUso.get(`${choque.productoId}:${choque.presentacionId ?? ''}`));
+          throw new BadRequestException(
+            `"${choque.nombre}" ya está en el control "${s?.nombre || `#${s?.id}`}" (${s?.estado === 'cerrado' ? 'cerrado sin aplicar' : 'en curso'}). `
+            + 'Aplicalo o descartalo antes de abrir otro que lo incluya.',
+          );
+        }
+      }
+
+      const partes: string[] = [];
+      if (o.marcaId) partes.push(`Marca ${(await tx.select().from(marcas).where(eq(marcas.id, o.marcaId)).limit(1))[0]?.nombre ?? o.marcaId}`);
+      if (o.categoriaId) partes.push(`Categoría ${(await tx.select().from(categorias).where(eq(categorias.id, o.categoriaId)).limit(1))[0]?.nombre ?? o.categoriaId}`);
+      if (o.proveedorId) partes.push(`Proveedor ${(await tx.select().from(proveedores).where(eq(proveedores.id, o.proveedorId)).limit(1))[0]?.nombre ?? o.proveedorId}`);
+      if (o.tipo) partes.push(o.tipo === 'granel' ? 'Solo granel' : 'Solo enteros');
+      if (o.soloConStock) partes.push('solo con stock');
+      const alcance = partes.join(' · ') || 'Todo el catálogo';
+
+      const [c] = await tx.insert(conteos).values({
+        sucursalId: o.sucursalId,
+        nombre: (o.nombre || '').trim() || alcance,
+        alcance,
+        ciego: o.ciego ?? true,
+        usuarioId: o.usuarioId ?? null,
+      }).returning();
+      await tx.insert(conteoItems).values(filas.map((f) => ({ ...f, conteoId: c.id })));
+      return { ...c, total: filas.length, contados: 0 };
+    });
+  }
+
+  private async conteoVivo(tx: any, id: number, soloSuc?: number | null) {
+    const [c] = await tx.select().from(conteos).where(eq(conteos.id, id)).limit(1);
+    if (!c) throw new BadRequestException('Ese control de stock no existe.');
+    if (soloSuc && c.sucursalId !== soloSuc) throw new ForbiddenException('Ese control es de otra sucursal.');
+    return c;
+  }
+
+  /**
+   * LA SESIÓN CON SUS RENGLONES — y acá vive el CIEGO, del lado que manda.
+   *
+   * Mientras el conteo está ciego y el que mira no tiene `conteos_aplicar`,
+   * el payload NO trae el virtual: ni el vivo, ni el congelado, ni la
+   * diferencia. Ocultarlo en la pantalla y mandarlo igual sería un ciego de
+   * mentira — se lee con F12. El que cuenta ve qué contar y qué contó, nada
+   * más; las diferencias las ve el que revisa, en el reporte.
+   *
+   * Lo único del virtual que viaja siempre es `apartados` (comprometido > 0):
+   * sin ese aviso el contador suma al conteo la mercadería separada para
+   * envíos y la diferencia da sobrante fantasma. Dice cuánto apartar de la
+   * cuenta, no cuánto "debería haber" — no rompe el ciego.
+   */
+  async getConteo(id: number, opciones: { puedeVerVirtual?: boolean; soloSuc?: number | null } = {}) {
+    const c = await this.conteoVivo(this.db, id, opciones.soloSuc);
+    const items = await this.db.select().from(conteoItems)
+      .where(eq(conteoItems.conteoId, id)).orderBy(asc(conteoItems.nombre), asc(conteoItems.id));
+    const { disponible, comprometido } = await this.stockDeConteo(
+      this.db, c.sucursalId, [...new Set(items.map((i) => i.productoId))],
+    );
+
+    const oculto = c.ciego && c.estado === 'en_curso' && !opciones.puedeVerVirtual;
+    const conDiferencias = !oculto && (opciones.puedeVerVirtual || !c.ciego);
+
+    const filas = await Promise.all(items.map(async (i) => {
+      const k = `${i.productoId}:${i.presentacionId ?? ''}`;
+      const base: any = {
+        id: i.id, productoId: i.productoId, presentacionId: i.presentacionId,
+        nombre: i.nombre, presLabel: i.presLabel, unidad: i.unidad,
+        contado: i.contado, contadoPor: i.contadoPor, contadoEn: i.contadoEn, recontar: i.recontar,
+        apartados: comprometido.get(k) ?? 0,
+      };
+      if (!conDiferencias) return base;
+      const virtual = disponible.get(k) ?? 0;
+      const diferencia = i.contado == null ? null : Number((i.contado - (i.virtualAlContar ?? 0)).toFixed(3));
+      /* `seMovio` es LA ALARMA del local cerrado: si el disponible de ahora no
+       * es el del momento del conteo, alguien vendió o movió mercadería con el
+       * local supuestamente cerrado. No bloquea — señala. */
+      const seMovio = i.contado != null && Math.abs(virtual - (i.virtualAlContar ?? 0)) > 1e-9;
+      let costoUnitario = 0;
+      if (diferencia != null && Math.abs(diferencia) > 1e-9) {
+        const [prod] = await this.db.select().from(productos).where(eq(productos.id, i.productoId)).limit(1);
+        costoUnitario = prod ? await this.costoDePerdida(this.db, prod, i.presentacionId) : 0;
+      }
+      return {
+        ...base, virtual, virtualAlContar: i.virtualAlContar, diferencia, seMovio,
+        costoUnitario, diferenciaPlata: diferencia != null ? Number((diferencia * costoUnitario).toFixed(2)) : null,
+      };
+    }));
+
+    return {
+      ...c,
+      total: items.length,
+      contados: items.filter((i) => i.contado != null).length,
+      puedeVerVirtual: !!opciones.puedeVerVirtual,
+      items: filas,
+    };
+  }
+
+  /**
+   * REGISTRA UN CONTEO — y el snapshot lo toma el SERVIDOR, acá.
+   *
+   * `virtual_al_contar` es el disponible de ESTE instante, leído dentro de la
+   * misma operación. Con eso la diferencia queda clavada como hecho ("a las
+   * 22:14 había 8 y el sistema decía 10") y aplicar más tarde no la corrompe.
+   * `contado: null` devuelve la línea a pendiente — es el "me equivoqué de
+   * renglón", y borra el snapshot porque un pendiente no tiene instante.
+   */
+  async contarItem(conteoId: number, itemId: number, o: { contado: number | null; usuarioId?: number | null }, soloSuc?: number | null) {
+    return this.db.transaction(async (tx) => {
+      const c = await this.conteoVivo(tx, conteoId, soloSuc);
+      if (c.estado !== 'en_curso') {
+        throw new BadRequestException(c.estado === 'cerrado'
+          ? 'El control está cerrado: reabrilo para seguir contando.'
+          : 'Ese control ya no se puede contar.');
+      }
+      const [it] = await tx.select().from(conteoItems)
+        .where(and(eq(conteoItems.id, itemId), eq(conteoItems.conteoId, conteoId))).limit(1);
+      if (!it) throw new BadRequestException('Ese renglón no es de este control.');
+
+      /*
+       * LA RESPUESTA NO LLEVA EL SNAPSHOT, a propósito. `returning()` entero
+       * devolvería `virtual_al_contar` — y el ciego se impone acá, en la API:
+       * el que cuenta recibiría el virtual como premio por contar, en la
+       * respuesta del propio PUT. Se devuelve lo que la pantalla necesita
+       * para pintar la fila: nada más.
+       */
+      if (o.contado == null) {
+        await tx.update(conteoItems).set({
+          contado: null, virtualAlContar: null, contadoPor: null, contadoEn: null, recontar: false,
+        }).where(eq(conteoItems.id, itemId));
+        return { id: itemId, contado: null, contadoEn: null, recontar: false };
+      }
+
+      const virtual = await this.cant(tx, it.productoId, c.sucursalId, it.presentacionId, 'disponible');
+      const ahora = new Date();
+      await tx.update(conteoItems).set({
+        contado: o.contado,
+        virtualAlContar: virtual,
+        contadoPor: o.usuarioId ?? null,
+        contadoEn: ahora,
+        recontar: false,        // recontada: la marca ya cumplió su trabajo
+      }).where(eq(conteoItems.id, itemId));
+      return { id: itemId, contado: o.contado, contadoEn: ahora, recontar: false };
+    });
+  }
+
+  async cerrarConteo(id: number, soloSuc?: number | null) {
+    const c = await this.conteoVivo(this.db, id, soloSuc);
+    if (c.estado !== 'en_curso') throw new BadRequestException('Solo se cierra un control en curso.');
+    const [r] = await this.db.update(conteos).set({ estado: 'cerrado', cerradoEn: new Date() })
+      .where(eq(conteos.id, id)).returning();
+    return r;
+  }
+
+  async reabrirConteo(id: number, soloSuc?: number | null) {
+    const c = await this.conteoVivo(this.db, id, soloSuc);
+    if (c.estado !== 'cerrado') throw new BadRequestException('Solo se reabre un control cerrado sin aplicar.');
+    const [r] = await this.db.update(conteos).set({ estado: 'en_curso', cerradoEn: null })
+      .where(eq(conteos.id, id)).returning();
+    return r;
+  }
+
+  /** La marca del revisor: "esta diferencia es grande, volvé a la góndola". */
+  async marcarRecontar(conteoId: number, itemId: number, valor: boolean, soloSuc?: number | null) {
+    const c = await this.conteoVivo(this.db, conteoId, soloSuc);
+    if (c.estado === 'aplicado' || c.estado === 'descartado') {
+      throw new BadRequestException('Ese control ya está terminado.');
+    }
+    const [r] = await this.db.update(conteoItems).set({ recontar: valor })
+      .where(and(eq(conteoItems.id, itemId), eq(conteoItems.conteoId, conteoId))).returning();
+    if (!r) throw new BadRequestException('Ese renglón no es de este control.');
+    return r;
+  }
+
+  /**
+   * APLICA EL CONTEO: un lote atómico de ajustes POR DIFERENCIA.
+   *
+   * Cada renglón contado ajusta por `contado − virtual_al_contar`, sobre el
+   * stock ACTUAL. Nunca se pisa el stock con el contado: eso resucitaría lo
+   * legítimamente movido después del conteo. Y LO NO CONTADO NO SE TOCA — un
+   * pendiente no es un cero, es una pregunta sin responder.
+   *
+   * El costo viaja CONGELADO en cada movimiento (mismo criterio que las
+   * pérdidas): el reporte en pesos de este conteo no puede cambiar el mes que
+   * viene porque subió el catálogo.
+   *
+   * Devuelve los avisos de `seMovio` — con el local cerrado tendrían que ser
+   * cero, y cada uno es una pregunta para hacerle a alguien.
+   */
+  async aplicarConteo(id: number, usuarioId?: number | null, soloSuc?: number | null) {
+    return this.db.transaction(async (tx) => {
+      const c = await this.conteoVivo(tx, id, soloSuc);
+      if (c.estado === 'aplicado') throw new BadRequestException('Ese control ya se aplicó.');
+      if (c.estado === 'descartado') throw new BadRequestException('Ese control está descartado.');
+      if (c.estado !== 'cerrado') throw new BadRequestException('Cerrá el control antes de aplicarlo: el cierre es la foto final.');
+
+      const items = await tx.select().from(conteoItems)
+        .where(and(eq(conteoItems.conteoId, id), isNotNull(conteoItems.contado)));
+      const avisos: string[] = [];
+      let ajustes = 0;
+
+      for (const it of items) {
+        const delta = Number(((it.contado ?? 0) - (it.virtualAlContar ?? 0)).toFixed(3));
+        const virtualAhora = await this.cant(tx, it.productoId, c.sucursalId, it.presentacionId, 'disponible');
+        const etiqueta = it.presLabel ? `${it.nombre} · ${it.presLabel}` : it.nombre;
+        if (Math.abs(virtualAhora - (it.virtualAlContar ?? 0)) > 1e-9) {
+          avisos.push(`${etiqueta}: el stock se movió después de contarlo (era ${it.virtualAlContar}, ahora ${virtualAhora}). ¿Se vendió algo con el local cerrado?`);
+        }
+        if (Math.abs(delta) < 1e-9) continue;
+
+        const [prod] = await tx.select().from(productos).where(eq(productos.id, it.productoId)).limit(1);
+        if (!prod) continue;
+        await this.addDelta(tx, {
+          productoId: it.productoId, sucursalId: c.sucursalId,
+          presentacionId: it.presentacionId, estado: 'disponible',
+        }, delta);
+        await this.mov(tx, {
+          tipo: 'ajuste', productoId: it.productoId, sucursalId: c.sucursalId,
+          presentacionId: it.presentacionId, signo: delta > 0 ? 1 : -1, cantidad: Math.abs(delta),
+          unidad: it.unidad, estadoDesde: delta < 0 ? 'disponible' : null, estadoHacia: delta > 0 ? 'disponible' : null,
+          costoUnitario: await this.costoDePerdida(tx, prod, it.presentacionId),
+          usuarioId: usuarioId ?? null, refConteoId: id,
+          motivo: `Control de stock ${c.nombre || `#${id}`}`,
+          descripcion: `Conteo: había ${it.contado}, el sistema decía ${it.virtualAlContar} (${delta > 0 ? '+' : '−'}${Math.abs(delta)})`,
+        });
+        ajustes += 1;
+      }
+
+      const [r] = await tx.update(conteos).set({
+        estado: 'aplicado', aplicadoEn: new Date(), aplicadoPor: usuarioId ?? null,
+      }).where(eq(conteos.id, id)).returning();
+      return { ...r, ajustes, sinDiferencia: items.length - ajustes, avisos };
+    });
+  }
+
+  async descartarConteo(id: number, opciones: { puedeAplicar?: boolean; soloSuc?: number | null } = {}) {
+    const c = await this.conteoVivo(this.db, id, opciones.soloSuc);
+    if (c.estado === 'aplicado') throw new BadRequestException('Un control aplicado no se descarta: ya movió stock.');
+    if (c.estado === 'descartado') return c;
+    /* La cajera puede descartar SU sesión mal abierta mientras esté virgen;
+     * con renglones ya contados adentro, tirar ese trabajo lo decide quien
+     * puede aplicar. */
+    if (!opciones.puedeAplicar) {
+      const [con] = await this.db.select({ n: sql<number>`count(*)::int` }).from(conteoItems)
+        .where(and(eq(conteoItems.conteoId, id), isNotNull(conteoItems.contado)));
+      if (Number(con?.n) > 0) {
+        throw new ForbiddenException('Este control ya tiene renglones contados: descartarlo es tirar ese trabajo, y lo decide quien puede aplicar.');
+      }
+    }
+    const [r] = await this.db.update(conteos).set({ estado: 'descartado' }).where(eq(conteos.id, id)).returning();
+    return r;
+  }
 }
+

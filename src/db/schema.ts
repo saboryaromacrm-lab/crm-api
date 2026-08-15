@@ -872,8 +872,75 @@ export const movimientos = pgTable('movimientos', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   refTransferenciaId: integer('ref_transferencia_id'),
   refIncidenciaId: integer('ref_incidencia_id'),
+  /** El ajuste que nació de un control de stock apunta a su sesión (0066). */
+  refConteoId: integer('ref_conteo_id'),
   descripcion: text('descripcion').notNull().default(''),
 });
+
+/* ---------------- Control de stock (0066) ---------------- */
+/**
+ * El físico contra el virtual, como SESIÓN de trabajo: dura horas, se
+ * interrumpe y la siguen personas distintas — el mismo problema del pedido de
+ * mercadería y la misma solución. La sesión es DEL LOCAL, no de cada cajero.
+ *
+ * Las cuatro reglas que la forma sostiene (decisiones del dueño, 15/8/2026):
+ *
+ *  1. LA LISTA SE CONGELA AL ABRIR: la sesión nace con sus renglones (los de
+ *     los filtros elegidos) en pendiente. Se cuenta la góndola de esa noche,
+ *     no el catálogo vivo.
+ *  2. POR DIFERENCIA, NUNCA ABSOLUTO: cada línea guarda el disponible del
+ *     instante en que se contó. La discrepancia contado−virtual es un hecho
+ *     que no caduca; pisar el stock con el contado resucitaría lo vendido
+ *     entre contar y aplicar. Y como el control se hace con el local CERRADO,
+ *     cualquier movimiento en el medio es una alarma, no un caso normal.
+ *  3. CIEGO POR DEFECTO: se cuenta lo que hay, no lo que dice el sistema. Lo
+ *     impone la API — una columna escondida en pantalla se lee con F12.
+ *  4. LO NO CONTADO QUEDA COMO ESTÁ: jamás se pone en cero un pendiente.
+ */
+export const estadoConteoEnum = pgEnum('estado_conteo', ['en_curso', 'cerrado', 'aplicado', 'descartado']);
+
+export const conteos = pgTable('conteos', {
+  id: serial('id').primaryKey(),
+  // RESTRICT: un conteo aplicado es historia contable de la sucursal.
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  nombre: text('nombre').notNull().default(''),
+  /** Los filtros del alcance, congelados como texto humano ("Marca CUMANA"). */
+  alcance: text('alcance').notNull().default(''),
+  ciego: boolean('ciego').notNull().default(true),
+  estado: estadoConteoEnum('estado').notNull().default('en_curso'),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  cerradoEn: timestamp('cerrado_en', { withTimezone: true }),
+  aplicadoEn: timestamp('aplicado_en', { withTimezone: true }),
+  aplicadoPor: integer('aplicado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixSucursal: index('ix_conteos_sucursal').on(t.sucursalId, t.estado),
+}));
+
+export const conteoItems = pgTable('conteo_items', {
+  id: serial('id').primaryKey(),
+  conteoId: integer('conteo_id').notNull().references(() => conteos.id, { onDelete: 'cascade' }),
+  // RESTRICT: el conteo ES huella, y "eliminar" un producto existe solo para
+  // el que no dejó ninguna (criterio de 0051).
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'restrict' }),
+  /** Nombre y tamaño congelados al abrir: el reporte viejo se relee igual. */
+  nombre: text('nombre').notNull().default(''),
+  presLabel: text('pres_label').notNull().default(''),
+  unidad: text('unidad').notNull().default('u'),
+  /** NULL = pendiente. El 0 es un conteo real ("no hay ninguno"). */
+  contado: doublePrecision('contado'),
+  /** El disponible del instante del conteo: con esto la diferencia no caduca. */
+  virtualAlContar: doublePrecision('virtual_al_contar'),
+  contadoPor: integer('contado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  contadoEn: timestamp('contado_en', { withTimezone: true }),
+  /** Marcado desde el reporte: diferencia grande → volver a la góndola. */
+  recontar: boolean('recontar').notNull().default(false),
+}, (t) => ({
+  ixConteo: index('ix_conteo_items_conteo').on(t.conteoId),
+  // COALESCE porque dos NULL no chocan en un UNIQUE: la madre es UNA fila.
+  uqForma: uniqueIndex('uq_conteo_items_forma').on(t.conteoId, t.productoId, sql`COALESCE(${t.presentacionId}, 0)`),
+}));
 
 /* ---------------- Transferencias entre sucursales ---------------- */
 /**
@@ -2265,7 +2332,7 @@ export const schema = {
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   modalidadesVenta, listasVenta, productoListas, clienteListas, reglasMarca,
   ofertas, ofertaAlcances, ofertaComponentes, precioHistorial, descuentos,
-  productoProveedorCostos, stock, movimientos, transferencias, transferenciaItems, transferenciaHist,
+  productoProveedorCostos, stock, movimientos, conteos, conteoItems, transferencias, transferenciaItems, transferenciaHist,
   incidencias, comprobantes, comprobanteItems, facturaLecturas, facturaArchivos,
   clientes, cajaSesiones, cajaMovimientos, cajaControles, ventas, ventaItems, ventaExtras, ventaPagos,
   cobranzas, cobranzaPagos, cobranzaImputaciones, presupuestos, presupuestoItems, configuracion,

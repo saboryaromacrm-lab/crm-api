@@ -488,3 +488,134 @@ export class IncidenciasController {
     return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion));
   }
 }
+
+/* ==================================================================== *
+ * Control de stock (0066)
+ * ==================================================================== */
+
+class CrearConteoDto {
+  @IsOptional() @IsString() @MaxLength(120) nombre?: string;
+  /** Solo el jefe puede apagarlo: ciego por defecto es decisión del dueño. */
+  @IsOptional() @IsBoolean() ciego?: boolean;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() marcaId?: number;
+  @IsOptional() @IsInt() categoriaId?: number;
+  @IsOptional() @IsInt() proveedorId?: number;
+  @IsOptional() @IsIn(['entero', 'granel']) tipo?: 'entero' | 'granel';
+  @IsOptional() @IsBoolean() soloConStock?: boolean;
+  @IsOptional() @IsBoolean() incluirArchivados?: boolean;
+}
+
+class ContarItemDto {
+  /**
+   * `null` devuelve el renglón a pendiente ("me equivoqué de renglón").
+   * `@IsOptional()` saltea null a propósito — el reset es un valor legal.
+   */
+  @IsOptional() @IsNumber() @Min(0) @Max(MAX_CANT) contado?: number | null;
+}
+
+class RecontarDto {
+  @IsBoolean() recontar!: boolean;
+}
+
+/**
+ * La doble llave del conteo, calcada del resto del sistema: la SECCIÓN
+ * (`almacen.conteos`) deja abrir, contar y cerrar — registrar la realidad no
+ * mueve stock. La ACCIÓN (`conteos_aplicar`) es la que ajusta mercadería y
+ * plata, y arranca solo en admin: el dueño se la da a su encargado desde
+ * Usuarios y roles.
+ *
+ * `puedeAplicar` también decide QUÉ SE VE: el ciego lo impone el servicio y
+ * la llave del reporte es la misma que la del botón de aplicar — el que no
+ * puede tocar el stock tampoco ve las diferencias de una sesión ciega.
+ */
+@Controller('conteos')
+@Permiso('almacen.conteos')
+export class ConteosController {
+  constructor(private readonly inv: InventarioService) {}
+
+  private puedeAplicar(sesion: Sesion) {
+    const p = sesion.permisos ?? [];
+    return p.includes('*') || p.includes('conteos_aplicar');
+  }
+
+  @Get()
+  list(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
+    /* El jefe puede mirar cualquier sucursal; el resto, la suya. */
+    const pedida = sucursalId ? parseInt(sucursalId, 10) : undefined;
+    return this.inv.listarConteos(soloSuSucursal(sesion) ?? pedida ?? null);
+  }
+
+  @Get(':id')
+  get(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.getConteo(id, {
+      puedeVerVirtual: this.puedeAplicar(sesion),
+      soloSuc: soloSuSucursal(sesion),
+    });
+  }
+
+  @Post()
+  crear(@Body() dto: CrearConteoDto, @Auth() sesion: Sesion) {
+    return this.inv.crearConteo({
+      ...dto,
+      sucursalId: sucursalDeOperacion(sesion, dto.sucursalId)!,
+      /* Abrir un conteo NO ciego es decisión del que revisa, no del que
+       * cuenta: sin la llave de aplicar, el pedido de `ciego: false` se
+       * ignora y la sesión nace ciega igual. */
+      ciego: this.puedeAplicar(sesion) ? (dto.ciego ?? true) : true,
+      usuarioId: sesion.usuarioId,
+    });
+  }
+
+  @Put(':id/items/:itemId')
+  contar(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('itemId', ParseIntPipe) itemId: number,
+    @Body() dto: ContarItemDto,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.inv.contarItem(id, itemId, {
+      contado: dto.contado ?? null,
+      usuarioId: sesion.usuarioId,
+    }, soloSuSucursal(sesion));
+  }
+
+  @Post(':id/cerrar')
+  cerrar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.cerrarConteo(id, soloSuSucursal(sesion));
+  }
+
+  @Post(':id/reabrir')
+  reabrir(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.reabrirConteo(id, soloSuSucursal(sesion));
+  }
+
+  /** La marca "volvé a la góndola" la pone el que revisa el reporte. */
+  @Post(':id/items/:itemId/recontar')
+  @Permiso('conteos_aplicar')
+  recontar(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('itemId', ParseIntPipe) itemId: number,
+    @Body() dto: RecontarDto,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.inv.marcarRecontar(id, itemId, dto.recontar, soloSuSucursal(sesion));
+  }
+
+  @Post(':id/aplicar')
+  @Permiso('conteos_aplicar')
+  aplicar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.aplicarConteo(id, sesion.usuarioId, soloSuSucursal(sesion));
+  }
+
+  /* Sin @Permiso extra a propósito: la cajera descarta SU sesión mal abierta
+   * mientras esté virgen; el servicio exige la llave de aplicar en cuanto hay
+   * renglones contados adentro — tirar trabajo lo decide el que revisa. */
+  @Delete(':id')
+  descartar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.descartarConteo(id, {
+      puedeAplicar: this.puedeAplicar(sesion),
+      soloSuc: soloSuSucursal(sesion),
+    });
+  }
+}

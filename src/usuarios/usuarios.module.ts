@@ -122,6 +122,8 @@ export const CATALOGO_PERMISOS = [
     modulo: 'almacen',
     secciones: [
       { clave: 'almacen.existencias', nombre: 'Existencias' },
+      /* El físico contra el virtual (0066): abrir sesiones, contar y cerrar. */
+      { clave: 'almacen.conteos', nombre: 'Control de stock (contar)' },
       { clave: 'almacen.fraccionamiento', nombre: 'Fraccionamiento' },
       { clave: 'almacen.transferencias', nombre: 'Transferencias' },
       { clave: 'almacen.operaciones', nombre: 'Operaciones' },
@@ -148,6 +150,9 @@ export const CATALOGO_PERMISOS = [
       { clave: 'preparar', nombre: 'Preparar envíos (lista Enteros)' },
       { clave: 'fraccionar', nombre: 'Fraccionar granel (y su lista en envíos)' },
       { clave: 'inventario', nombre: 'Ajustes de inventario' },
+      /* La llave del que revisa: ver diferencias, marcar recontar y APLICAR.
+       * Es la del encargado — contar puede cualquiera con la sección. */
+      { clave: 'conteos_aplicar', nombre: 'Control de stock: revisar y aplicar ajustes' },
       { clave: 'merma', nombre: 'Registrar mermas' },
       { clave: 'defectuoso', nombre: 'Marcar defectuosos' },
       { clave: 'incidencia_crear', nombre: 'Crear incidencias' },
