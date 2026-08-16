@@ -23,6 +23,12 @@ class UpsertProveedorDto {
    */
   @IsOptional() @IsBoolean() proveeMercaderia?: boolean;
   @IsOptional() @IsBoolean() proveeGastos?: boolean;
+  /**
+   * La letra que factura (0067): se pregunta UNA vez acá y la carga de gastos
+   * la precarga, editable. `''` = borrarla (vuelve a "sin definir"), ausente =
+   * conservar la que tenía.
+   */
+  @IsOptional() @IsIn(['A', 'B', 'C', 'X', '']) letraGasto?: string;
 }
 
 @Injectable()
@@ -56,6 +62,7 @@ export class ProveedoresService {
       // Sin indicar nada se asume el proveedor clásico: el que trae mercadería.
       proveeMercaderia: dto.proveeMercaderia ?? true,
       proveeGastos: dto.proveeGastos ?? false,
+      letraGasto: (dto.letraGasto || null) as any,
     }).returning();
     return p;
   }
@@ -69,6 +76,8 @@ export class ProveedoresService {
       // proveedor sin querer: si no vienen, se conserva lo que ya tenía.
       proveeMercaderia: dto.proveeMercaderia ?? actual.proveeMercaderia,
       proveeGastos: dto.proveeGastos ?? actual.proveeGastos,
+      // '' borra a propósito; ausente conserva (mismo criterio que los flags).
+      letraGasto: (dto.letraGasto === undefined ? actual.letraGasto : (dto.letraGasto || null)) as any,
     }).where(eq(proveedores.id, id)).returning();
     return p;
   }

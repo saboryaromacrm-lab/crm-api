@@ -74,6 +74,10 @@ export const condicionIvaEnum = pgEnum('condicion_iva', [
   'responsable_inscripto', 'monotributo', 'consumidor_final', 'exento', 'no_categorizado',
 ]);
 export const tipoDocEnum = pgEnum('tipo_doc', ['cuit', 'cuil', 'dni', 'sin_identificar']);
+/* Declarado acá arriba (y no en la zona de comprobantes, donde nació) porque
+ * desde la 0067 también lo usa `proveedores.letraGasto` — y en JS usar la
+ * const antes de su línea es un ReferenceError, no una referencia adelantada. */
+export const letraComprobanteEnum = pgEnum('letra_comprobante', ['A', 'B', 'C', 'X']);
 
 /* ---------------- Catálogo base ---------------- */
 export const sucursales = pgTable('sucursales', {
@@ -116,6 +120,12 @@ export const proveedores = pgTable('proveedores', {
   proveeMercaderia: boolean('provee_mercaderia').notNull().default(true),
   /** Factura gastos de la empresa (servicios, fletes, honorarios, alquiler…). */
   proveeGastos: boolean('provee_gastos').notNull().default(false),
+  /**
+   * La letra que este proveedor factura (0067). Edesur hace siempre la misma:
+   * se pregunta UNA vez acá y la carga de gastos la precarga, editable.
+   * NULL = sin definir — el formulario usa su default de siempre.
+   */
+  letraGasto: letraComprobanteEnum('letra_gasto'),
 });
 
 /**
@@ -1059,7 +1069,6 @@ export const incidencias = pgTable('incidencias', {
 export const tipoComprobanteEnum = pgEnum('tipo_comprobante', [
   'orden_compra', 'remito', 'factura', 'liquidacion', 'nota_credito', 'nota_debito',
 ]);
-export const letraComprobanteEnum = pgEnum('letra_comprobante', ['A', 'B', 'C', 'X']);
 export const estadoComprobanteEnum = pgEnum('estado_comprobante', ['borrador', 'confirmado', 'anulado']);
 export const condicionPagoEnum = pgEnum('condicion_pago', ['contado', 'cuenta_corriente']);
 
@@ -1937,6 +1946,22 @@ export const gastos = pgTable('gastos', {
   ixRecurrente: index('ix_gastos_recurrente').on(t.recurrenteId),
 }));
 
+/**
+ * LOS RENGLONES DEL GASTO (0067): concepto + monto FINAL, como se lee del
+ * papel ("abono $45.000, reconexión $8.000"). El total del gasto es la suma.
+ * Reemplazaron a la descripción libre en la carga — `gastos.descripcion` se
+ * escribe sola con los conceptos para que listados y búsquedas sigan andando,
+ * y los gastos viejos (sin renglones) conservan la suya.
+ */
+export const gastoItems = pgTable('gasto_items', {
+  id: serial('id').primaryKey(),
+  gastoId: integer('gasto_id').notNull().references(() => gastos.id, { onDelete: 'cascade' }),
+  concepto: text('concepto').notNull().default(''),
+  monto: doublePrecision('monto').notNull().default(0),
+}, (t) => ({
+  ixGasto: index('ix_gasto_items_gasto').on(t.gastoId),
+}));
+
 /* ============================================================================
  * ENVÍOS A CAFETERÍA — el puente con coffit
  * ============================================================================
@@ -2337,6 +2362,6 @@ export const schema = {
   clientes, cajaSesiones, cajaMovimientos, cajaControles, ventas, ventaItems, ventaExtras, ventaPagos,
   cobranzas, cobranzaPagos, cobranzaImputaciones, presupuestos, presupuestoItems, configuracion,
   webImagenes, webEventos,
-  gastoCategorias, gastos, gastosRecurrentes, gastoAdjuntos,
+  gastoCategorias, gastos, gastoItems, gastosRecurrentes, gastoAdjuntos,
   proveedorPagos, proveedorImputaciones,
 };

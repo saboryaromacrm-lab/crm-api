@@ -23,14 +23,14 @@ import {
 import type { Response } from 'express';
 import { Type } from 'class-transformer';
 import {
-  IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { mimeReal, nombreSeguro } from '../common/archivos';
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  gastoAdjuntos, gastoCategorias, gastos, gastosRecurrentes, proveedores, sucursales, usuarios,
+  gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
@@ -133,6 +133,12 @@ class PagoDto {
   @IsOptional() @IsInt() usuarioId?: number;
 }
 
+/** Un renglón del gasto: concepto + importe FINAL, como se lee del papel. */
+class GastoItemDto {
+  @IsString() @MaxLength(200) concepto!: string;
+  @IsNumber() @Min(0.01) @Max(TOPE_IMPORTE) monto!: number;
+}
+
 class GastoDto {
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
   @IsOptional() @IsIn(TIPOS_DOC as unknown as string[]) tipoDoc?: string;
@@ -150,6 +156,14 @@ class GastoDto {
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) neto?: number;
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) iva?: number;
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) otros?: number;
+  /**
+   * LOS RENGLONES (0067). Si vienen, mandan: el total es su suma, `iva` pasa a
+   * ser el "IVA incluido" informativo de la factura A (neto = total − iva) y
+   * la descripción se arma sola con los conceptos. Sin renglones vale el
+   * camino de siempre (gastos viejos, fijos generados, API externa).
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true })
+  @Type(() => GastoItemDto) items?: GastoItemDto[];
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
   /**
@@ -258,6 +272,10 @@ export class GastosService {
         // Las dos banderas separan, en el selector, quién factura gastos de
         // quién vende mercadería. Ver el comentario de arriba sobre el resto.
         proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos,
+        // La letra que factura (0067): el formulario de gasto la precarga al
+        // elegir el proveedor. Sin ella en ESTE select el modal no la ve —
+        // el selector se alimenta del bootstrap, no del padrón completo.
+        letraGasto: proveedores.letraGasto,
       }).from(proveedores).orderBy(asc(proveedores.nombre)),
       this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
         .from(sucursales).orderBy(asc(sucursales.id)),
@@ -363,15 +381,17 @@ export class GastosService {
   async get(id: number) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
-    const [pagos, adjuntos] = await Promise.all([
+    const [pagos, adjuntos, items] = await Promise.all([
       this.pagos.pagosDe({ gastoId: id }),
       // Sin `data`: los bytes se piden aparte, por su endpoint.
       this.db.select({
         id: gastoAdjuntos.id, nombre: gastoAdjuntos.nombre, mime: gastoAdjuntos.mime,
         subidoEn: gastoAdjuntos.subidoEn,
       }).from(gastoAdjuntos).where(eq(gastoAdjuntos.gastoId, id)).orderBy(asc(gastoAdjuntos.id)),
+      // Los renglones (0067). Un gasto viejo no tiene: el array vacío es válido.
+      this.db.select().from(gastoItems).where(eq(gastoItems.gastoId, id)).orderBy(asc(gastoItems.id)),
     ]);
-    return { ...g, saldo: money(g.total - g.pagado), pagos, adjuntos };
+    return { ...g, saldo: money(g.total - g.pagado), pagos, adjuntos, items };
   }
 
   /**
@@ -505,6 +525,41 @@ export class GastosService {
   }
 
   /**
+   * LOS IMPORTES DEL GASTO, con o sin renglones (0067).
+   *
+   * Con renglones, mandan ellos: el TOTAL es la suma de los montos (finales,
+   * como se leen del papel), `iva` pasa a ser el "IVA incluido" informativo de
+   * la factura A —se acota al total, porque un IVA mayor que el total es un
+   * error de tipeo, no un dato—, y el neto se DERIVA (total − IVA). Así los
+   * reportes que suman neto/iva siguen diciendo la verdad sin que nadie
+   * cargue un desglose.
+   *
+   * La descripción se escribe sola con los conceptos: es lo que muestran el
+   * listado, la búsqueda y el concepto del pago — todo lo que ya existía sigue
+   * andando sin enterarse del cambio.
+   *
+   * Sin renglones vale el camino de siempre: gastos viejos al editarse, los
+   * fijos generados y cualquier consumidor externo de la API.
+   */
+  private importesDe(dto: GastoDto) {
+    const renglones = (dto.items ?? [])
+      .map((i) => ({ concepto: (i.concepto ?? '').trim(), monto: money(i.monto) }))
+      .filter((i) => i.concepto && i.monto > 0);
+    if (!renglones.length) return { ...this.totalesDe(dto), items: null, descripcion: null };
+
+    const total = money(renglones.reduce((a, i) => a + i.monto, 0));
+    const iva = Math.min(money(dto.iva ?? 0), total);
+    return {
+      total,
+      iva,
+      neto: money(total - iva),
+      otros: 0,
+      items: renglones,
+      descripcion: renglones.map((i) => i.concepto).join(' · '),
+    };
+  }
+
+  /**
    * Guard de duplicado: cargar dos veces la misma factura es EL error clásico
    * de un módulo de gastos, y se detecta tarde (cuando el resumen del mes da
    * más de lo que da el banco). Con proveedor y número, la combinación tiene
@@ -568,7 +623,7 @@ export class GastosService {
       proveedorId = p.id;
     }
 
-    const { neto, iva, otros, total } = this.totalesDe(dto);
+    const { neto, iva, otros, total, items, descripcion } = this.importesDe(dto);
     if (total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
 
     const numero = (dto.numero ?? '').trim();
@@ -586,7 +641,7 @@ export class GastosService {
         proveedorTexto: proveedorId ? '' : (dto.proveedorTexto ?? '').trim(),
         categoriaId: cat.id,
         sucursalId,
-        descripcion: (dto.descripcion ?? '').trim(),
+        descripcion: descripcion ?? (dto.descripcion ?? '').trim(),
         condicionPago: (dto.condicionPago ?? 'contado') as any,
         negocio: (dto.negocio ?? 'distribuidora') as any,
         vencimiento: fechaLocal(dto.vencimiento),
@@ -596,6 +651,9 @@ export class GastosService {
         observaciones: (dto.observaciones ?? '').trim(),
         usuarioId: dto.usuarioId ?? null,
     }).returning();
+    if (items?.length) {
+      await this.db.insert(gastoItems).values(items.map((i) => ({ ...i, gastoId: creado.id })));
+    }
 
     /*
      * "Lo pagué y lo cargo": el pago se registra como pago al proveedor y se
@@ -615,7 +673,7 @@ export class GastosService {
         medio: dto.pagoInmediato.medio,
         fecha: dto.pagoInmediato.fecha,
         referencia: dto.pagoInmediato.referencia,
-        concepto: (dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
+        concepto: (descripcion ?? dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
         sucursalId: sucursalId ?? undefined,
         cajaSesionId: dto.pagoInmediato.cajaSesionId,
         // `dto.usuarioId` y NO el del objeto anidado: el interceptor que pone el
@@ -675,7 +733,21 @@ export class GastosService {
         if (dto.proveedorId) patch.proveedorTexto = '';
       }
       if (dto.proveedorTexto != null && !patch.proveedorId) patch.proveedorTexto = String(dto.proveedorTexto).trim();
-      if (dto.neto != null || dto.iva != null || dto.otros != null) {
+      /*
+       * Con RENGLONES en la edición (0067), mandan ellos: total, IVA acotado,
+       * neto derivado y la descripción rearmada — mismo criterio que el alta.
+       * Se reemplazan enteros (delete + insert): los renglones no tienen
+       * identidad propia que valga conservar, son el detalle del papel.
+       */
+      const conRenglones = this.importesDe(dto);
+      if (conRenglones.items) {
+        Object.assign(patch, {
+          neto: conRenglones.neto, iva: conRenglones.iva, otros: conRenglones.otros,
+          total: conRenglones.total, descripcion: conRenglones.descripcion,
+        });
+        await this.db.delete(gastoItems).where(eq(gastoItems.gastoId, id));
+        await this.db.insert(gastoItems).values(conRenglones.items.map((i) => ({ ...i, gastoId: id })));
+      } else if (dto.neto != null || dto.iva != null || dto.otros != null) {
         const t = this.totalesDe({
           neto: dto.neto ?? g.neto, iva: dto.iva ?? g.iva, otros: dto.otros ?? g.otros,
         } as GastoDto);
@@ -690,7 +762,7 @@ export class GastosService {
       );
     } else if (
       dto.neto != null || dto.iva != null || dto.otros != null
-      || dto.numero != null || dto.proveedorId !== undefined
+      || dto.numero != null || dto.proveedorId !== undefined || dto.items != null
     ) {
       throw new BadRequestException(
         'El gasto ya tiene pagos registrados: revertí el pago antes de cambiar importes, número o proveedor.',

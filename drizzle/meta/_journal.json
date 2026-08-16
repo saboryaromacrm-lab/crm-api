@@ -470,6 +470,13 @@
       "when": 1787785200000,
       "tag": "0066_control_de_stock",
       "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1787871600000,
+      "tag": "0067_gasto_simple",
+      "breakpoints": true
     }
   ]
 }
