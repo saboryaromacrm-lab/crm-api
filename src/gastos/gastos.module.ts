@@ -23,7 +23,8 @@ import {
 import type { Response } from 'express';
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min,
+  ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { mimeReal, nombreSeguro } from '../common/archivos';
@@ -164,6 +165,13 @@ class GastoDto {
    */
   @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true })
   @Type(() => GastoItemDto) items?: GastoItemDto[];
+  /**
+   * Cómo vienen los montos de los renglones. `false` (defecto): finales, con
+   * el IVA adentro. `true`: la factura A — los renglones son NETOS tal como
+   * los lista el papel, y el IVA se copia del pie y SE SUMA al total. Sin
+   * renglones el flag no significa nada y se ignora.
+   */
+  @IsOptional() @IsBoolean() ivaAparte?: boolean;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
   /**
@@ -527,19 +535,27 @@ export class GastosService {
   /**
    * LOS IMPORTES DEL GASTO, con o sin renglones (0067).
    *
-   * Con renglones, mandan ellos: el TOTAL es la suma de los montos (finales,
-   * como se leen del papel), `iva` pasa a ser el "IVA incluido" informativo de
-   * la factura A —se acota al total, porque un IVA mayor que el total es un
-   * error de tipeo, no un dato—, y el neto se DERIVA (total − IVA). Así los
-   * reportes que suman neto/iva siguen diciendo la verdad sin que nadie
-   * cargue un desglose.
+   * Con renglones, mandan ellos — y `ivaAparte` dice cómo leerlos:
    *
-   * La descripción se escribe sola con los conceptos: es lo que muestran el
-   * listado, la búsqueda y el concepto del pago — todo lo que ya existía sigue
-   * andando sin enterarse del cambio.
+   *  · SIN el flag (defecto): montos FINALES, como se leen de un ticket o una
+   *    factura B. El total es la suma, `iva` es el "IVA incluido" informativo
+   *    —se acota al total, porque un IVA mayor que el total es un error de
+   *    tipeo, no un dato— y el neto se DERIVA (total − IVA).
+   *  · CON el flag: la factura A. Los renglones son NETOS tal como los lista
+   *    el papel, el IVA se copia del pie y SE SUMA: total = neto + IVA. Acá
+   *    neto e IVA dejan de ser derivados: son los del comprobante. Un IVA
+   *    mayor que el neto se RECHAZA en vez de acotarse — en este modo el IVA
+   *    cambia el total, y corregirlo en silencio le mentiría al que está
+   *    mirando el papel.
+   *
+   * En los dos modos la descripción se escribe sola con los conceptos: es lo
+   * que muestran el listado, la búsqueda y el concepto del pago — todo lo que
+   * ya existía sigue andando sin enterarse del cambio.
    *
    * Sin renglones vale el camino de siempre: gastos viejos al editarse, los
-   * fijos generados y cualquier consumidor externo de la API.
+   * fijos generados y cualquier consumidor externo de la API. Y no hay columna
+   * nueva: al editar, el modo se deduce (si el neto guardado coincide con la
+   * suma de los renglones y hay IVA, eran netos).
    */
   private importesDe(dto: GastoDto) {
     const renglones = (dto.items ?? [])
@@ -547,15 +563,28 @@ export class GastosService {
       .filter((i) => i.concepto && i.monto > 0);
     if (!renglones.length) return { ...this.totalesDe(dto), items: null, descripcion: null };
 
-    const total = money(renglones.reduce((a, i) => a + i.monto, 0));
-    const iva = Math.min(money(dto.iva ?? 0), total);
+    const suma = money(renglones.reduce((a, i) => a + i.monto, 0));
+    const descripcion = renglones.map((i) => i.concepto).join(' · ');
+
+    if (dto.ivaAparte) {
+      const iva = money(dto.iva ?? 0);
+      if (iva < 0) throw new BadRequestException('El IVA no puede ser negativo.');
+      // La alícuota más alta es 27%: un IVA que supera el neto entero no salió
+      // de ninguna factura. Se corta acá, antes de que infle el total.
+      if (iva > suma) {
+        throw new BadRequestException('El IVA supera el neto de los conceptos: revisá el pie de la factura.');
+      }
+      return { total: money(suma + iva), iva, neto: suma, otros: 0, items: renglones, descripcion };
+    }
+
+    const iva = Math.min(money(dto.iva ?? 0), suma);
     return {
-      total,
+      total: suma,
       iva,
-      neto: money(total - iva),
+      neto: money(suma - iva),
       otros: 0,
       items: renglones,
-      descripcion: renglones.map((i) => i.concepto).join(' · '),
+      descripcion,
     };
   }
 
@@ -734,10 +763,11 @@ export class GastosService {
       }
       if (dto.proveedorTexto != null && !patch.proveedorId) patch.proveedorTexto = String(dto.proveedorTexto).trim();
       /*
-       * Con RENGLONES en la edición (0067), mandan ellos: total, IVA acotado,
-       * neto derivado y la descripción rearmada — mismo criterio que el alta.
-       * Se reemplazan enteros (delete + insert): los renglones no tienen
-       * identidad propia que valga conservar, son el detalle del papel.
+       * Con RENGLONES en la edición (0067), mandan ellos — en cualquiera de los
+       * dos modos de `importesDe` (finales o netos con `ivaAparte`), mismo
+       * criterio que el alta. Se reemplazan enteros (delete + insert): los
+       * renglones no tienen identidad propia que valga conservar, son el
+       * detalle del papel.
        */
       const conRenglones = this.importesDe(dto);
       if (conRenglones.items) {
