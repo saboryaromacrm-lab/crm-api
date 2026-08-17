@@ -83,8 +83,14 @@ export class ProveedoresService {
   async update(id: number, dto: UpsertProveedorDto) {
     const actual = await this.get(id);
     const [p] = await this.db.update(proveedores).set({
-      nombre: dto.nombre.trim(), cuit: dto.cuit ?? '', condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
-      telefono: dto.telefono ?? '', email: dto.email ?? '',
+      nombre: dto.nombre.trim(),
+      // TODO el update es "ausente conserva, '' borra" — también la identidad:
+      // un PATCH parcial (solo la ficha comercial) no puede volar el CUIT.
+      cuit: dto.cuit === undefined ? actual.cuit : dto.cuit.trim(),
+      condicionIva: (dto.condicionIva ?? actual.condicionIva) as any,
+      direccion: dto.direccion === undefined ? actual.direccion : dto.direccion.trim(),
+      telefono: dto.telefono === undefined ? actual.telefono : dto.telefono.trim(),
+      email: dto.email === undefined ? actual.email : dto.email.trim(),
       // Un formulario viejo que no manda los flags no puede reclasificar al
       // proveedor sin querer: si no vienen, se conserva lo que ya tenía.
       proveeMercaderia: dto.proveeMercaderia ?? actual.proveeMercaderia,

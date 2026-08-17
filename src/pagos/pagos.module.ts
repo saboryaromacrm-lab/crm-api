@@ -783,7 +783,9 @@ export class PagosProveedorService {
       }
 
       const [pago] = await tx.insert(proveedorPagos).values({
-        fecha: dto.fecha ? new Date(dto.fecha) : undefined,
+        // T00:00:00 = hora LOCAL: 'AAAA-MM-DD' pelado se parsea UTC y el día
+        // se corre uno para atrás en UTC−3 (el pago de hoy figuraba ayer).
+        fecha: dto.fecha ? new Date(`${dto.fecha.slice(0, 10)}T00:00:00`) : undefined,
         proveedorId,
         medio,
         destino,

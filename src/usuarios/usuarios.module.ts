@@ -57,7 +57,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'compras.dashboard', nombre: 'Dashboard de compras' },
       { clave: 'compras.productos', nombre: 'Productos' },
       { clave: 'compras.catalogos', nombre: 'Catálogos' },
-      { clave: 'compras.proveedores', nombre: 'Proveedores' },
+      { clave: 'compras.proveedores', nombre: 'Costos y percepciones (lo operativo del proveedor; la ficha vive en Proveedores)' },
       { clave: 'compras.lecturas', nombre: 'Facturas por procesar (bandeja de papeles subidos)' },
       { clave: 'compras.facturacion', nombre: 'Facturación' },
       { clave: 'compras.pagos', nombre: 'Pagos en sucursal (plata a cuenta de proveedores)' },

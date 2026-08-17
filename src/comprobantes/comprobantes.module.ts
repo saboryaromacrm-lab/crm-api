@@ -742,10 +742,16 @@ export class ComprobantesService {
           throw new BadRequestException('La fecha de vencimiento del compromiso va como AAAA-MM-DD.');
         }
       }
+      /* Las cuotas cubren LO QUE QUEDA EN CUENTA CORRIENTE: el total menos lo
+       * que se paga en el mismo acto (contado + pagos de sucursal tomados).
+       * Comprometer plata que ya se pagó infla el saldo proyectado. */
       const sumaComp = r2(compromisosNorm.reduce((a, k) => a + k.importe, 0));
-      if (Math.abs(sumaComp - total) > 0.009) {
+      const contadoPrevisto = r2((Number(dto.pagoContado?.importe) || 0)
+        + (dto.tomarPagos ?? []).reduce((a, t) => a + (Number(t.importe) || 0), 0));
+      const saldoPrevisto = r2(total - contadoPrevisto);
+      if (Math.abs(sumaComp - saldoPrevisto) > 0.009) {
         throw new BadRequestException(
-          `Los compromisos suman ${sumaComp} y ${NOMBRE_TIPO[dto.tipo]} dice ${r2(total)}: las cuotas tienen que cubrir el total exacto.`,
+          `Los compromisos suman ${sumaComp} y lo que queda en cuenta corriente es ${saldoPrevisto}: las cuotas tienen que cubrir ese saldo exacto.`,
         );
       }
     }
@@ -778,10 +784,13 @@ export class ComprobantesService {
         letra: fiscal ? (dto.letra ?? 'A') : 'X',
         puntoVenta,
         numero: dto.numero ?? null,
-        fecha: dto.fecha ? new Date(dto.fecha) : undefined,
-        fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga) : undefined, proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
+        /* 'AAAA-MM-DD' pelado se parsea UTC y el día retrocede uno en UTC−3;
+         * si ya viene con hora (el store la agrega) se respeta tal cual. */
+        fecha: dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : undefined,
+        fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga.length <= 10 ? `${dto.fechaCarga}T00:00:00` : dto.fechaCarga) : undefined,
+        proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
         estado, condicionPago: dto.condicionPago ?? 'cuenta_corriente',
-        vencimientoPago: dto.vencimientoPago ? new Date(dto.vencimientoPago) : null,
+        vencimientoPago: dto.vencimientoPago ? new Date(dto.vencimientoPago.length <= 10 ? `${dto.vencimientoPago}T00:00:00` : dto.vencimientoPago) : null,
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
         subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
