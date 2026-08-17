@@ -40,7 +40,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
 import {
   comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
-  proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores,
+  proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { FormaPagoDto, PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 
@@ -567,6 +567,7 @@ export class FinanzasProveedorService {
         id: proveedores.id, nombre: proveedores.nombre, diasPago: proveedores.diasPago,
         modoCuenta: proveedores.modoCuenta, medioHabitual: proveedores.medioHabitual,
         conciliadoHasta: proveedores.conciliadoHasta,
+        proveeMercaderia: proveedores.proveeMercaderia,
       }).from(proveedores).orderBy(proveedores.nombre),
     ]);
 
@@ -584,6 +585,16 @@ export class FinanzasProveedorService {
       const ajustes = money(Number(mAjuste.get(p.id)?.ajustes) || 0);
       const pendientes = money(Number(mComprom.get(p.id)?.pendiente) || 0);
       if (!mercaderia && !gastosTot && !pagado && !ajustes && !pendientes) continue;
+      /*
+       * ESTA VITRINA ES LA CUENTA POR PAGAR DE LA MERCADERÍA (decisión del
+       * dueño, 17/8): el proveedor que SOLO factura gastos —el plomero, la
+       * imprenta— no va acá; su cuenta se mira en Gastos. Se lo deja fuera por
+       * la marca del padrón, pero con una salvaguarda: si igual tiene algún
+       * comprobante de compra confirmado, entra. Filtrar solo por la marca
+       * escondería deuda real el día que alguien le destilde "provee
+       * mercadería" a un proveedor que ya tiene facturas cargadas.
+       */
+      if (!p.proveeMercaderia && !mComp.has(p.id)) continue;
       const saldo = money(mercaderia + gastosTot + ajustes - pagado);
 
       let estado: 'a_favor' | 'al_dia' | 'pendiente' | 'vencido' = 'al_dia';
@@ -625,7 +636,7 @@ export class FinanzasProveedorService {
       .where(eq(proveedores.id, proveedorId)).limit(1);
     if (!prov) throw new NotFoundException('Proveedor inexistente.');
 
-    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas] = await Promise.all([
+    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes] = await Promise.all([
       this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -634,9 +645,27 @@ export class FinanzasProveedorService {
       this.db.select().from(gastos).where(and(
         eq(gastos.proveedorId, proveedorId), ne(gastos.estado, 'anulado'),
       )),
-      this.db.select().from(proveedorPagos).where(and(
-        eq(proveedorPagos.proveedorId, proveedorId), eq(proveedorPagos.estado, 'activo'),
-      )),
+      /* Explícito y con los dos join: la pantalla del mayor muestra QUIÉN
+       * registró cada pago, de qué turno salió y cuánto quedó sin aplicar —
+       * con `select()` pelado no venía nada de eso. */
+      this.db.select({
+        id: proveedorPagos.id,
+        fecha: proveedorPagos.fecha,
+        medio: proveedorPagos.medio,
+        importe: proveedorPagos.importe,
+        aplicado: proveedorPagos.aplicado,
+        destino: proveedorPagos.destino,
+        concepto: proveedorPagos.concepto,
+        referencia: proveedorPagos.referencia,
+        cajaSesionId: proveedorPagos.cajaSesionId,
+        usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
+        sucursalNombre: sql<string>`coalesce(${sucursales.nombre}, '')`,
+      }).from(proveedorPagos)
+        .leftJoin(usuarios, eq(usuarios.id, proveedorPagos.usuarioId))
+        .leftJoin(sucursales, eq(sucursales.id, proveedorPagos.sucursalId))
+        .where(and(
+          eq(proveedorPagos.proveedorId, proveedorId), eq(proveedorPagos.estado, 'activo'),
+        )),
       this.db.select().from(proveedorAjustes).where(eq(proveedorAjustes.proveedorId, proveedorId)),
       this.db.select().from(pagoFormas)
         .where(inArray(pagoFormas.pagoId,
@@ -649,6 +678,11 @@ export class FinanzasProveedorService {
         .where(and(eq(proveedorCompromisos.proveedorId, proveedorId), eq(proveedorCompromisos.pagado, false)))
         .orderBy(proveedorCompromisos.fechaVenc),
       this.db.select().from(proveedorCuentas).where(eq(proveedorCuentas.proveedorId, proveedorId)),
+      /* Lo que TODAVÍA se le debe, documento por documento y con el saldo real
+       * (las notas ya descontadas). Es la misma lista que ofrece la bandeja de
+       * pago: la pantalla paga desde acá y no puede ofrecer algo distinto de lo
+       * que la aplicación va a aceptar. */
+      this.pagos.documentosPendientes(proveedorId),
     ]);
 
     const formasPorPago = new Map<number, any[]>();
@@ -697,6 +731,17 @@ export class FinanzasProveedorService {
         debe: 0,
         haber: money(p.importe),
         formas,
+        /* El pago se puede ANULAR desde el mayor, y solo si no tiene nada
+         * aplicado: `sinAplicar` es lo que la pantalla mira para no ofrecer un
+         * botón que la API va a rechazar. */
+        medio: p.medio,
+        destino: p.destino,
+        aplicado: money(p.aplicado),
+        sinAplicar: money(p.importe - p.aplicado),
+        referencia: p.referencia || '',
+        cajaSesionId: p.cajaSesionId,
+        usuarioNombre: p.usuarioNombre || '',
+        sucursalNombre: p.sucursalNombre || '',
       });
     }
     for (const a of ajs) {
@@ -736,10 +781,33 @@ export class FinanzasProveedorService {
       }
     }
 
+    /*
+     * DE QUÉ ESTÁ HECHO EL SALDO. El total DEBE/HABER solo dice cuánto entró y
+     * salió; la pantalla necesita poder decir "de esto, tanto es mercadería y
+     * tanto son gastos" — y así queda a la vista que el saldo de un proveedor
+     * que también factura gastos los incluye (es UNA cuenta, la del proveedor).
+     */
+    const sumar = (pred: (m: any) => boolean, campo: 'debe' | 'haber') =>
+      money(movs.filter(pred).reduce((a, m) => a + m[campo], 0));
+    const totales = {
+      mercaderia: sumar((m) => m.kind === 'comprobante', 'debe'),
+      notasCredito: sumar((m) => m.kind === 'nc', 'haber'),
+      gastos: sumar((m) => m.kind === 'gasto', 'debe'),
+      ajustesDebe: sumar((m) => m.kind === 'ajuste_debe', 'debe'),
+      ajustesHaber: sumar((m) => m.kind === 'ajuste_haber', 'haber'),
+      pagos: sumar((m) => m.kind === 'pago', 'haber'),
+    };
+    /** Plata ya pagada que todavía no se imputó a ningún documento: baja el
+     *  saldo del proveedor pero deja facturas figurando impagas. */
+    const pagosSinAplicar = money(pgs.reduce((a, p) => a + (p.importe - p.aplicado), 0));
+
     return {
       proveedor: {
         id: prov.id, nombre: prov.nombre, cuit: prov.cuit,
         modoCuenta: prov.modoCuenta, medioHabitual: prov.medioHabitual, diasPago: prov.diasPago,
+        condicionCompra: prov.condicionCompra,
+        proveeMercaderia: prov.proveeMercaderia, proveeGastos: prov.proveeGastos,
+        telefono: prov.telefono, email: prov.email,
         conciliadoHasta: prov.conciliadoHasta, conciliadoAt: prov.conciliadoAt,
       },
       movs,
@@ -747,6 +815,9 @@ export class FinanzasProveedorService {
       totHaber,
       saldo,
       deudaDesde,
+      totales,
+      pagosSinAplicar,
+      docsPendientes,
       compromisos: compromisos.map((k) => this.mapCompromiso(k)),
       cuentas,
     };
