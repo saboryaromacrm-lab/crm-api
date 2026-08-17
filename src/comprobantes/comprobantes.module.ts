@@ -11,7 +11,8 @@ import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
-  productoProveedores, productos, proveedores, proveedorImputaciones, proveedorPagos, sucursales, usuarios,
+  productoProveedores, productos, proveedores, proveedorCompromisos, proveedorEcheqs,
+  proveedorImputaciones, proveedorPagos, sucursales, usuarios,
 } from '../db/schema';
 /* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
  * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
@@ -146,6 +147,19 @@ class TomarPagoDto {
   @IsNumber() importe!: number;
 }
 
+/**
+ * Un compromiso de pago (0068): "esta factura se paga el día X". Uno solo, o
+ * varios como CUOTAS que tienen que sumar el total. El formulario los ofrece
+ * prellenados (fecha + días de pago del proveedor) y editables — nunca nacen
+ * en silencio.
+ */
+class CompromisoNuevoDto {
+  @IsNumber() @Min(0.01) importe!: number;
+  /** 'AAAA-MM-DD'. */
+  @IsString() fechaVenc!: string;
+  @IsOptional() @IsString() @MaxLength(300) obs?: string;
+}
+
 class CreateComprobanteDto {
   @IsIn(TIPOS as unknown as string[]) tipo!: (typeof TIPOS)[number];
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
@@ -200,6 +214,10 @@ class CreateComprobanteDto {
    */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => TomarPagoDto)
   tomarPagos?: TomarPagoDto[];
+
+  /** Compromisos de pago (0068): cuotas que suman el total. Ver `CompromisoNuevoDto`. */
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => CompromisoNuevoDto)
+  compromisos?: CompromisoNuevoDto[];
 }
 
 @Injectable()
@@ -703,6 +721,35 @@ export class ComprobantesService {
       }
     }
 
+    /*
+     * LOS COMPROMISOS DE PAGO (0068). Solo un documento confirmado que GENERA
+     * deuda puede traerlos, y la suma tiene que dar el total exacto: el
+     * compromiso es la promesa de pagar ESTA factura, no un número suelto.
+     */
+    const puedeComprometer = estado === 'confirmado'
+      && (dto.tipo === 'factura' || dto.tipo === 'liquidacion');
+    const compromisosNorm = (dto.compromisos ?? []).map((k) => ({
+      importe: r2(k.importe),
+      fechaVenc: new Date(`${String(k.fechaVenc).slice(0, 10)}T00:00:00`),
+      obs: String(k.obs ?? '').trim().slice(0, 300),
+    }));
+    if (compromisosNorm.length) {
+      if (!puedeComprometer) {
+        throw new BadRequestException('Los compromisos de pago son de una factura o liquidación confirmada.');
+      }
+      for (const k of compromisosNorm) {
+        if (Number.isNaN(k.fechaVenc.getTime())) {
+          throw new BadRequestException('La fecha de vencimiento del compromiso va como AAAA-MM-DD.');
+        }
+      }
+      const sumaComp = r2(compromisosNorm.reduce((a, k) => a + k.importe, 0));
+      if (Math.abs(sumaComp - total) > 0.009) {
+        throw new BadRequestException(
+          `Los compromisos suman ${sumaComp} y ${NOMBRE_TIPO[dto.tipo]} dice ${r2(total)}: las cuotas tienen que cubrir el total exacto.`,
+        );
+      }
+    }
+
     /**
      * El mismo comprobante no se carga dos veces. El índice único de la base es
      * la garantía real (dos pestañas en paralelo se pasan por arriba de este
@@ -788,6 +835,44 @@ export class ComprobantesService {
         await tx.insert(comprobantePercepciones).values(
           percepciones.map((p) => ({ comprobanteId: c.id, ...p })),
         );
+      }
+
+      /*
+       * EL COMPROMISO NACE CON LA FACTURA (0068), en la misma transacción: si
+       * la factura no queda, la promesa tampoco. Si el proveedor cobra con
+       * ECHEQ, nace también el echeq con número y banco "a completar" — el
+       * papel del echeq se emite después, y la cartera lo espera con nombre.
+       */
+      if (compromisosNorm.length) {
+        const esEcheq = prov.medioHabitual === 'echeq';
+        const n = compromisosNorm.length;
+        for (let i = 0; i < n; i++) {
+          const k = compromisosNorm[i];
+          const [comp] = await tx.insert(proveedorCompromisos).values({
+            proveedorId: prov.id,
+            comprobanteId: c.id,
+            importe: k.importe,
+            fechaEmision: c.fecha,
+            fechaVenc: k.fechaVenc,
+            origen: 'factura',
+            esEcheq,
+            cuota: n > 1 ? i + 1 : null,
+            cuotas: n > 1 ? n : null,
+            obs: k.obs,
+          }).returning();
+          if (esEcheq) {
+            await tx.insert(proveedorEcheqs).values({
+              numero: `PEND-${comp.id}`,
+              banco: 'A definir',
+              importe: k.importe,
+              fechaEmision: c.fecha,
+              fechaVenc: k.fechaVenc,
+              proveedorId: prov.id,
+              compromisoId: comp.id,
+              obs: `Auto-creado con ${NOMBRE_TIPO[dto.tipo]} ${c.puntoVenta}-${c.numero ?? c.id} — completar número y banco reales.`,
+            });
+          }
+        }
       }
 
       if (ingresaStock) {
@@ -954,6 +1039,15 @@ export class ComprobantesService {
           .set({ condicionPago: saldado ? 'contado' : 'cuenta_corriente' })
           .where(eq(comprobantes.id, id));
       }
+    }
+    /*
+     * Si esta nota ajusta una factura, el saldo de ESA factura acaba de
+     * cambiar: el puente de compromisos (0068) corre para cerrarlos — la NC
+     * que salda el resto de una factura en cuenta corriente tiene que apagar
+     * su compromiso igual que lo apagaría un pago.
+     */
+    if (esNota && dto.refComprobanteId && estado === 'confirmado') {
+      await this.pagos.sincronizarComprobante(dto.refComprobanteId);
     }
     return this.get(id);
   }

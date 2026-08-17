@@ -30,7 +30,7 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  IsArray, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
+  ArrayMaxSize, IsArray, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
   MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
@@ -39,15 +39,16 @@ import { esJefe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import {
-  cajaMovimientos, cajaSesiones, comprobantes, gastos, proveedorImputaciones,
-  proveedorPagos, proveedores, sucursales, usuarios,
+  cajaMovimientos, cajaSesiones, comprobantes, gastos, pagoFormas, proveedorCompromisos,
+  proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Tolerancia de centavo: los importes son double y no hay que pelearse con eso. */
 const EPS = 0.009;
 
-const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
+// 0068: se suman 'deposito' y 'echeq' (los medios del módulo Proveedores).
+const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'deposito', 'echeq'] as const;
 
 /* --------------------------------- DTOs --------------------------------- */
 
@@ -65,6 +66,18 @@ export class ImputacionDto {
   @IsOptional() @IsInt() gastoId?: number;
   @IsOptional() @IsInt() comprobanteId?: number;
   @IsNumber() @Min(0.01, { message: 'El importe a aplicar tiene que ser mayor a 0.' }) importe!: number;
+}
+
+/**
+ * Una parte del pago MULTI-FORMA (0068): "mitad transferencia, mitad echeq".
+ * `fecha` propia opcional — "transferí una parte hace 10 días y el resto hoy";
+ * sin ella vale la fecha del pago. El mismo medio puede repetirse (dos
+ * transferencias en fechas distintas son dos filas).
+ */
+export class FormaPagoDto {
+  @IsIn(MEDIOS as unknown as string[]) medio!: string;
+  @IsNumber() @Min(0.01, { message: 'Cada parte del pago tiene que ser mayor a 0.' }) importe!: number;
+  @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'La fecha de la parte va como AAAA-MM-DD.' }) fecha?: string;
 }
 
 export class CrearPagoDto {
@@ -88,6 +101,14 @@ export class CrearPagoDto {
   /** Imputación en el mismo acto (pagar una factura que ya está cargada). */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionDto)
   imputaciones?: ImputacionDto[];
+  /**
+   * MULTI-FORMA (0068). Si viene, manda: la suma tiene que dar el importe del
+   * pago, `medio` pasa a ser la PRIMERA forma (la "principal", para listados
+   * simples) y el egreso de caja sale solo por la parte en EFECTIVO. Sin
+   * `formas` vale el camino de siempre: un solo medio por el total.
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(10) @ValidateNested({ each: true }) @Type(() => FormaPagoDto)
+  formas?: FormaPagoDto[];
 }
 
 export class ImputarDto {
@@ -186,6 +207,85 @@ export class PagosProveedorService {
   }
 
   /* ==================================================================== *
+   * El puente con los COMPROMISOS (0068 · módulo Proveedores)
+   * ==================================================================== */
+
+  /**
+   * La versión nativa del `sincronizarProximos()` de la app vieja de
+   * proveedores — pero DENTRO de la transacción del pago: allá era
+   * best-effort después de escribir (y tuvo que nacer un auto-reparador de
+   * fantasmas históricos); acá, si el puente falla, falla el pago entero y
+   * nunca queda medio mundo actualizado.
+   *
+   * Un compromiso es la promesa "esta factura se paga el día X". Dos caminos
+   * la cumplen: el botón Pagar del compromiso, o un pago aplicado a la
+   * factura desde cualquier otra pantalla. Sin este puente, el segundo camino
+   * dejaría compromisos fantasma inflando el saldo proyectado y los avisos.
+   *
+   * Reglas, en las dos direcciones (se autocorrige):
+   *  · Factura SALDADA (total + notas − pagado ≤ centavo) → se cierran todos
+   *    sus compromisos pendientes firmados por el pago que la saldó, y sus
+   *    echeqs pasan a cobrados en cascada.
+   *  · Factura CON SALDO → se reabren los compromisos cuyo cerrador ya no
+   *    está: pago anulado/desaplicado, o una NC (pagoId null) ahora anulada.
+   *    El compromiso cerrado por un pago QUE SIGUE APLICADO no se toca — es
+   *    una CUOTA pagada de verdad aunque el resto de la factura deba.
+   */
+  async sincronizarCompromisos(tx: any, comprobanteId: number, pagoCerradorId: number | null) {
+    const comps = await tx.select().from(proveedorCompromisos)
+      .where(eq(proveedorCompromisos.comprobanteId, comprobanteId));
+    if (!comps.length) return;
+    const [c] = await tx.select().from(comprobantes)
+      .where(eq(comprobantes.id, comprobanteId)).limit(1);
+    // Anulada no tiene saldo que sincronizar: sus pendientes los borra el
+    // servicio de comprobantes al anular.
+    if (!c || c.estado !== 'confirmado') return;
+    const ajuste = await this.ajusteDe(tx, comprobanteId);
+    const saldo = money(c.total + ajuste - c.pagado);
+
+    if (saldo <= EPS) {
+      for (const k of comps.filter((x: any) => !x.pagado)) {
+        await tx.update(proveedorCompromisos)
+          .set({ pagado: true, pagoId: pagoCerradorId })
+          .where(eq(proveedorCompromisos.id, k.id));
+        await tx.update(proveedorEcheqs)
+          .set({ estado: 'cobrado', pagoId: pagoCerradorId })
+          .where(and(
+            eq(proveedorEcheqs.compromisoId, k.id),
+            inArray(proveedorEcheqs.estado, ['emitido', 'entregado']),
+          ));
+      }
+      return;
+    }
+
+    const cerrados = comps.filter((x: any) => x.pagado);
+    if (!cerrados.length) return;
+    const vivos = await tx.select({ pagoId: proveedorImputaciones.pagoId })
+      .from(proveedorImputaciones)
+      .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
+      .where(and(
+        eq(proveedorImputaciones.comprobanteId, comprobanteId),
+        eq(proveedorPagos.estado, 'activo'),
+      ));
+    const setVivos = new Set(vivos.map((v: any) => v.pagoId));
+    for (const k of cerrados) {
+      if (k.pagoId != null && setVivos.has(k.pagoId)) continue; // cuota pagada de verdad
+      await tx.update(proveedorCompromisos)
+        .set({ pagado: false, pagoId: null })
+        .where(eq(proveedorCompromisos.id, k.id));
+      await tx.update(proveedorEcheqs)
+        .set({ estado: 'emitido', pagoId: null })
+        .where(and(eq(proveedorEcheqs.compromisoId, k.id), eq(proveedorEcheqs.estado, 'cobrado')));
+    }
+  }
+
+  /** El puente con transacción propia: lo llama Comprobantes cuando una NC/ND
+   *  confirmada o anulada cambia el saldo de la factura que ajusta. */
+  async sincronizarComprobante(comprobanteId: number) {
+    await this.db.transaction(async (tx) => this.sincronizarCompromisos(tx, comprobanteId, null));
+  }
+
+  /* ==================================================================== *
    * Lectura
    * ==================================================================== */
 
@@ -250,11 +350,28 @@ export class PagosProveedorService {
      * qué comprobante lo explica, y si quedó partido entre varios.
      */
     const destinos = await this.destinosDe(filas.map((p) => p.id));
+    const formasPorPago = await this.formasDe(filas.map((p) => p.id));
     return filas.map((p) => ({
       ...p,
       saldo: money(p.importe - p.aplicado),
       imputadoA: destinos.get(p.id) ?? [],
+      formas: formasPorPago.get(p.id) ?? [],
     }));
+  }
+
+  /** `{ pagoId => [{medio, importe, fecha}] }` — el split multi-forma, en una consulta. */
+  private async formasDe(ids: number[]) {
+    const porId = new Map<number, Array<{ medio: string; importe: number; fecha: Date | null }>>();
+    if (!ids.length) return porId;
+    const filas = await this.db.select().from(pagoFormas)
+      .where(inArray(pagoFormas.pagoId, ids))
+      .orderBy(pagoFormas.id);
+    for (const f of filas) {
+      const arr = porId.get(f.pagoId) ?? [];
+      arr.push({ medio: f.medio, importe: f.importe, fecha: f.fecha });
+      porId.set(f.pagoId, arr);
+    }
+    return porId;
   }
 
   /** `{ pagoId => [{ etiqueta, importe }] }` en una sola consulta. */
@@ -293,7 +410,12 @@ export class PagosProveedorService {
   async get(id: number) {
     const [p] = await this.baseQuery().where(eq(proveedorPagos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Pago inexistente.');
-    return { ...p, saldo: money(p.importe - p.aplicado), imputaciones: await this.imputacionesDe(id) };
+    return {
+      ...p,
+      saldo: money(p.importe - p.aplicado),
+      imputaciones: await this.imputacionesDe(id),
+      formas: (await this.formasDe([id])).get(id) ?? [],
+    };
   }
 
   /** Imputaciones del pago con la identidad del documento al que fueron. */
@@ -559,7 +681,32 @@ export class PagosProveedorService {
         : dto.imputaciones?.some((x) => x.comprobanteId) ? 'mercaderia'
           : (provSoloGastos || !proveedorId) ? 'gastos' : 'mercaderia');
 
-    const medio = (dto.medio ?? 'efectivo') as any;
+    /*
+     * MULTI-FORMA (0068): si vienen partes, la suma TIENE que dar el importe
+     * del pago — un split que no cuadra con la cabecera es el bug clásico de
+     * los reportes por medio. El medio "principal" pasa a ser la primera
+     * parte, para que los listados simples sigan teniendo qué mostrar sin
+     * agregar sobre el split.
+     */
+    const formas = (dto.formas ?? []).map((f) => ({
+      medio: f.medio as any,
+      importe: money(f.importe),
+      fecha: f.fecha ? new Date(`${f.fecha}T00:00:00`) : null,
+    }));
+    if (formas.length) {
+      const suma = money(formas.reduce((a, f) => a + f.importe, 0));
+      if (Math.abs(suma - importe) > EPS) {
+        throw new BadRequestException(
+          `Las partes del pago suman ${suma.toFixed(2)} pero el pago dice ${importe.toFixed(2)}: tienen que coincidir.`,
+        );
+      }
+    }
+    const medio = (formas[0]?.medio ?? dto.medio ?? 'efectivo') as any;
+    /** Lo que sale del CAJÓN: la parte en efectivo del split — o todo, si el
+     *  pago es simple y en efectivo. Es lo único que el arqueo tiene que ver. */
+    const importeEfectivo = formas.length
+      ? money(formas.filter((f) => f.medio === 'efectivo').reduce((a, f) => a + f.importe, 0))
+      : (medio === 'efectivo' ? importe : 0);
     const id = await this.db.transaction(async (tx) => {
       let cajaMovimientoId: number | null = null;
       let cajaSesionId: number | null = null;
@@ -569,8 +716,10 @@ export class PagosProveedorService {
        * Efectivo desde un turno abierto: la plata sale del cajón, así que el
        * arqueo lo tiene que ver. El egreso se crea en la MISMA transacción —
        * un pago registrado sin su egreso descuadraría la caja de esa noche.
+       * Con multi-forma, el egreso es SOLO la parte en efectivo: la
+       * transferencia no salió de ningún cajón.
        */
-      if (medio === 'efectivo' && dto.cajaSesionId) {
+      if (importeEfectivo > EPS && dto.cajaSesionId) {
         /*
          * EL TURNO SE LEE CON CANDADO, y no es por el saldo: es contra el CIERRE.
          *
@@ -624,8 +773,9 @@ export class PagosProveedorService {
         const [mov] = await tx.insert(cajaMovimientos).values({
           cajaSesionId: sesion.id,
           tipo: 'egreso',
-          importe,
-          motivo: `Pago a proveedor${nombreProv ? ` · ${nombreProv}` : ''}${dto.concepto ? ` · ${dto.concepto.trim()}` : ''}`,
+          importe: importeEfectivo,
+          motivo: `Pago a proveedor${nombreProv ? ` · ${nombreProv}` : ''}${dto.concepto ? ` · ${dto.concepto.trim()}` : ''}`
+            + (formas.length && importeEfectivo < importe - EPS ? ` · efectivo de un pago mixto de ${importe.toFixed(2)}` : ''),
           usuarioId: dto.usuarioId ?? null,
         }).returning();
         cajaMovimientoId = mov.id;
@@ -648,6 +798,13 @@ export class PagosProveedorService {
         estado: 'activo',
         observaciones: (dto.observaciones ?? '').trim(),
       }).returning();
+
+      // El split del pago, en la misma transacción que su cabecera.
+      if (formas.length) {
+        await tx.insert(pagoFormas).values(formas.map((f) => ({
+          pagoId: pago.id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined,
+        })));
+      }
 
       if (dto.imputaciones?.length) {
         await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales);
@@ -778,6 +935,35 @@ export class PagosProveedorService {
             `${etiqueta} ajusta a otra factura: se paga dentro del saldo de esa factura, no por separado.`,
           );
         }
+
+        /*
+         * EL MODO DE CUENTA DEL PROVEEDOR (0068). En modo 'facturas' —el
+         * default, y la regla de la app vieja de proveedores— la factura se
+         * paga COMPLETA: aplicar montos sueltos deja saldos de centavos que
+         * nadie reconcilia. La excepción son las CUOTAS pactadas: un importe
+         * que coincide con un compromiso pendiente de esta factura es
+         * exactamente el pago acordado. En modo 'libre' se aplica lo que sea
+         * (proveedores a los que se les va pagando a cuenta).
+         */
+        if (pago.proveedorId && Math.abs(importe - saldoDoc) > EPS) {
+          const [provModo] = await tx.select({ modoCuenta: proveedores.modoCuenta })
+            .from(proveedores).where(eq(proveedores.id, pago.proveedorId)).limit(1);
+          if (provModo?.modoCuenta === 'facturas') {
+            const cuotas = await tx.select({ importe: proveedorCompromisos.importe })
+              .from(proveedorCompromisos)
+              .where(and(
+                eq(proveedorCompromisos.comprobanteId, c.id),
+                eq(proveedorCompromisos.pagado, false),
+              ));
+            const esCuota = cuotas.some((q: any) => Math.abs(money(q.importe) - importe) <= EPS);
+            if (!esCuota) {
+              throw new BadRequestException(
+                `${etiqueta} se paga por su saldo completo (${saldoDoc.toFixed(2)}) o por una cuota pactada: `
+                + 'el proveedor está en modo "por facturas". Para pagos parciales a cuenta, pasalo a modo "libre" en su ficha.',
+              );
+            }
+          }
+        }
       }
 
       // El pago de Coca-Cola no puede pagar la factura de otro proveedor.
@@ -826,7 +1012,12 @@ export class PagosProveedorService {
 
       await this.recalcularPago(tx, pagoId);
       if (item.gastoId) await this.recalcularGasto(tx, item.gastoId);
-      else await this.recalcularComprobante(tx, item.comprobanteId!);
+      else {
+        await this.recalcularComprobante(tx, item.comprobanteId!);
+        // El puente (0068): si esta aplicación saldó la factura, sus
+        // compromisos se cierran acá mismo, firmados por este pago.
+        await this.sincronizarCompromisos(tx, item.comprobanteId!, pagoId);
+      }
     }
   }
 
@@ -906,7 +1097,12 @@ export class PagosProveedorService {
       await tx.delete(proveedorImputaciones).where(eq(proveedorImputaciones.id, imputacionId));
       await this.recalcularPago(tx, imp.pagoId);
       if (imp.gastoId) await this.recalcularGasto(tx, imp.gastoId);
-      if (imp.comprobanteId) await this.recalcularComprobante(tx, imp.comprobanteId);
+      if (imp.comprobanteId) {
+        await this.recalcularComprobante(tx, imp.comprobanteId);
+        // El puente (0068): la factura recupera saldo → sus compromisos
+        // cerrados por ESTE pago se reabren (y el echeq vuelve a emitido).
+        await this.sincronizarCompromisos(tx, imp.comprobanteId, null);
+      }
       return imp.pagoId;
     });
     return this.get(pagoId);
@@ -975,6 +1171,20 @@ export class PagosProveedorService {
         cajaMovimientoId: null,
         observaciones: nota ? `${p.observaciones ? `${p.observaciones}\n` : ''}Anulado: ${nota}` : p.observaciones,
       }).where(eq(proveedorPagos.id, id));
+
+      /*
+       * El puente (0068), rama de los compromisos MANUALES: los de factura ya
+       * se reabrieron al desaplicar (anular exige aplicado = 0), pero el
+       * compromiso manual se cerró con este pago SIN imputación — se reabre
+       * acá, y su echeq cobrado vuelve a emitido. El echeq cobrado "suelto"
+       * (sin compromiso) también revierte por su pagoId.
+       */
+      await tx.update(proveedorCompromisos)
+        .set({ pagado: false, pagoId: null })
+        .where(eq(proveedorCompromisos.pagoId, id));
+      await tx.update(proveedorEcheqs)
+        .set({ estado: 'emitido', pagoId: null })
+        .where(and(eq(proveedorEcheqs.pagoId, id), eq(proveedorEcheqs.estado, 'cobrado')));
     });
     return this.get(id);
   }

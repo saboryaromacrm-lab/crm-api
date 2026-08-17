@@ -2,11 +2,11 @@ import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { and, eq } from 'drizzle-orm';
 import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { proveedorPercepciones, proveedores } from '../db/schema';
+import { proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
 
 class UpsertProveedorDto {
   @IsString() nombre!: string;
@@ -29,6 +29,15 @@ class UpsertProveedorDto {
    * conservar la que tenía.
    */
   @IsOptional() @IsIn(['A', 'B', 'C', 'X', '']) letraGasto?: string;
+  /* ---- La ficha comercial (0068, módulo Proveedores) ---- */
+  /** Qué emite: factura / liquidación (la mitad sin factura) / mixto. */
+  @IsOptional() @IsIn(['factura', 'liquidacion', 'mixto']) condicionCompra?: string;
+  /** Cómo cobra habitualmente. '' = sin definir; cta_cte/echeq generan compromiso. */
+  @IsOptional() @IsIn(['efectivo', 'transferencia', 'deposito', 'echeq', 'cta_cte', ''])
+  medioHabitual?: string;
+  /** Plazo en días del diferido ("Cta cte 15"). null/0 = sin plazo cargado. */
+  @IsOptional() @IsInt() @Min(0) @Max(365) diasPago?: number | null;
+  @IsOptional() @IsIn(['facturas', 'libre']) modoCuenta?: string;
 }
 
 @Injectable()
@@ -63,6 +72,10 @@ export class ProveedoresService {
       proveeMercaderia: dto.proveeMercaderia ?? true,
       proveeGastos: dto.proveeGastos ?? false,
       letraGasto: (dto.letraGasto || null) as any,
+      condicionCompra: (dto.condicionCompra ?? 'factura') as any,
+      medioHabitual: (dto.medioHabitual || null) as any,
+      diasPago: dto.diasPago || null,
+      modoCuenta: (dto.modoCuenta ?? 'facturas') as any,
     }).returning();
     return p;
   }
@@ -78,6 +91,13 @@ export class ProveedoresService {
       proveeGastos: dto.proveeGastos ?? actual.proveeGastos,
       // '' borra a propósito; ausente conserva (mismo criterio que los flags).
       letraGasto: (dto.letraGasto === undefined ? actual.letraGasto : (dto.letraGasto || null)) as any,
+      /* La ficha comercial sigue el mismo contrato: ausente conserva, '' borra.
+       * OJO con el medio habitual: cambiarlo NO toca compromisos ya generados
+       * (el plazo pactado quedó congelado en cada compromiso, como en la app). */
+      condicionCompra: (dto.condicionCompra ?? actual.condicionCompra) as any,
+      medioHabitual: (dto.medioHabitual === undefined ? actual.medioHabitual : (dto.medioHabitual || null)) as any,
+      diasPago: dto.diasPago === undefined ? actual.diasPago : (dto.diasPago || null),
+      modoCuenta: (dto.modoCuenta ?? actual.modoCuenta) as any,
     }).where(eq(proveedores.id, id)).returning();
     return p;
   }
@@ -87,6 +107,34 @@ export class ProveedoresService {
     // Los costos por proveedor se borran en cascada; el proveedor_activo_id queda en null.
     await this.db.delete(proveedores).where(eq(proveedores.id, id));
     return { ok: true };
+  }
+
+  /* -------------------------- CUENTAS BANCARIAS -------------------------- *
+   * CBU o alias para transferirle, con su descripción ("Galicia, del titular").
+   * Full-replace como las percepciones: el formulario manda la lista entera.
+   * Dato de referencia puro — sin historia, sin soft-delete.
+   */
+  cuentas(proveedorId: number) {
+    return this.db.select().from(proveedorCuentas)
+      .where(eq(proveedorCuentas.proveedorId, proveedorId))
+      .orderBy(proveedorCuentas.id);
+  }
+
+  async setCuentas(proveedorId: number, filas: any[]) {
+    await this.get(proveedorId);
+    const validas = (filas || [])
+      .filter((f) => (f?.cbuAlias ?? '').trim())
+      .map((f) => ({
+        proveedorId,
+        cbuAlias: String(f.cbuAlias).trim().slice(0, 120),
+        descripcion: String(f.descripcion ?? '').trim().slice(0, 100),
+      }));
+    if (validas.length > 5) throw new BadRequestException('Hasta 5 cuentas bancarias por proveedor.');
+    await this.db.transaction(async (tx) => {
+      await tx.delete(proveedorCuentas).where(eq(proveedorCuentas.proveedorId, proveedorId));
+      if (validas.length) await tx.insert(proveedorCuentas).values(validas);
+    });
+    return this.cuentas(proveedorId);
   }
 
   /* ---------------------------- PERCEPCIONES ---------------------------- *
@@ -138,6 +186,13 @@ export class ProveedoresController {
   @Get(':id/percepciones') percepciones(@Param('id', ParseIntPipe) id: number) {
     return this.svc.percepciones(id);
   }
+  @Get(':id/cuentas') cuentas(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.cuentas(id);
+  }
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
+  @Put(':id/cuentas') setCuentas(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.svc.setCuentas(id, body?.cuentas ?? body);
+  }
   /*
    * LAS LECTURAS QUEDAN ABIERTAS Y LAS ESCRITURAS PIDEN PERMISO.
    *
@@ -150,16 +205,16 @@ export class ProveedoresController {
    * Las dos claves son un OR porque es UN padrón con flags mercadería/gastos:
    * lo administran los dos mundos.
    */
-  @Permiso('compras.proveedores', 'gastos.proveedores')
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Put(':id/percepciones') setPercepciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
     return this.svc.setPercepciones(id, body?.percepciones ?? body);
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
-  @Permiso('compras.proveedores', 'gastos.proveedores')
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
-  @Permiso('compras.proveedores', 'gastos.proveedores')
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto) { return this.svc.update(id, dto); }
-  @Permiso('compras.proveedores', 'gastos.proveedores')
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
 }
 

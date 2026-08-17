@@ -193,6 +193,18 @@ export const CATALOGO_PERMISOS = [
     ],
   },
   {
+    grupo: 'Proveedores',
+    modulo: 'proveedores',
+    secciones: [
+      { clave: 'proveedores.pedidos', nombre: 'Pedidos (kanban)' },
+      { clave: 'proveedores.ctasctes', nombre: 'Cuentas corrientes' },
+      { clave: 'proveedores.echeqs', nombre: 'Echeqs' },
+      { clave: 'proveedores.edoc', nombre: 'Estados de cuenta' },
+      { clave: 'proveedores.padron', nombre: 'Ficha de proveedores' },
+    ],
+    acciones: [],
+  },
+  {
     grupo: 'Gerencia',
     modulo: 'gerencia',
     secciones: [

@@ -97,6 +97,23 @@ export const sucursales = pgTable('sucursales', {
     .where(sql`${t.tipo} = 'distribuidora'`),
 }));
 
+/* Los enums de la FICHA COMERCIAL (0068) van acá arriba y no junto al resto
+ * del módulo por la misma trampa TDZ que letraComprobanteEnum: `proveedores`
+ * los usa y usar un pgEnum antes de su línea de declaración es ReferenceError
+ * al cargar el módulo. */
+/** Qué documento emite: la "liquidación" es la mitad sin factura (el "remito"
+ *  de la app vieja de proveedores). 'mixto' emite las dos. */
+export const condicionCompraProvEnum = pgEnum('condicion_compra_prov', ['factura', 'liquidacion', 'mixto']);
+/** El medio habitual con el que cobra. 'cta_cte' y 'echeq' son los DIFERIDOS:
+ *  la factura confirmada les genera compromiso. NULL = sin definir. */
+export const medioHabitualProvEnum = pgEnum('medio_habitual_prov', [
+  'efectivo', 'transferencia', 'deposito', 'echeq', 'cta_cte',
+]);
+/** 'facturas' = cada pago se imputa a facturas puntuales POR EL TOTAL.
+ *  'libre' = pagos a cuenta contra la deuda global (proveedores que entregan
+ *  y se les va pagando; la antigüedad se calcula por FIFO en el EDOC). */
+export const modoCuentaProvEnum = pgEnum('modo_cuenta_prov', ['facturas', 'libre']);
+
 /**
  * Proveedor. UNA sola tabla para el que trae mercadería y para el que factura
  * gastos (la luz, el contador, el seguro): es la misma persona jurídica, con un
@@ -126,6 +143,16 @@ export const proveedores = pgTable('proveedores', {
    * NULL = sin definir — el formulario usa su default de siempre.
    */
   letraGasto: letraComprobanteEnum('letra_gasto'),
+  /* ---- La ficha comercial (0068, del módulo Proveedores) ---- */
+  condicionCompra: condicionCompraProvEnum('condicion_compra').notNull().default('factura'),
+  medioHabitual: medioHabitualProvEnum('medio_habitual'),
+  /** Plazo en días cuando el medio habitual es diferido ("Cta cte 15"). */
+  diasPago: integer('dias_pago'),
+  modoCuenta: modoCuentaProvEnum('modo_cuenta').notNull().default('facturas'),
+  /** "Cuadré contra el resumen del proveedor hasta esta fecha" — con quién y cuándo. */
+  conciliadoHasta: timestamp('conciliado_hasta', { withTimezone: true }),
+  conciliadoPor: integer('conciliado_por'),
+  conciliadoAt: timestamp('conciliado_at', { withTimezone: true }),
 });
 
 /**
@@ -1432,6 +1459,9 @@ export const estadoVentaEnum = pgEnum('estado_venta', [
 ]);
 export const medioPagoEnum = pgEnum('medio_pago', [
   'efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro',
+  // 0068 · para PAGOS A PROVEEDOR (el POS no los ofrece — cada DTO whitelistea
+  // sus medios): el depósito bancario y el echeq de la cartera propia.
+  'deposito', 'echeq',
 ]);
 
 /* ============================================================================
@@ -2351,6 +2381,145 @@ export const configuracion = pgTable('configuracion', {
   uqClave: uniqueIndex('uq_configuracion_clave').on(t.clave),
 }));
 
+/* ============================================================================
+ * MÓDULO PROVEEDORES (0068) — lo que la app externa de cuentas por pagar
+ * tenía y este sistema no: la relación con el proveedor ALREDEDOR de la
+ * factura. La deuda misma NO vive acá — nace en `comprobantes` y se cancela
+ * en `proveedor_pagos`, como siempre. Este bloque agrega el vencimiento como
+ * entidad (compromisos), la cartera de echeqs, los ajustes manuales del
+ * estado de cuenta, el kanban de pedidos y las cuentas bancarias.
+ * ============================================================================ */
+
+/** Cuentas bancarias del proveedor (CBU o alias + descripción). Dato de
+ *  referencia puro: borrado físico, sin historia. */
+export const proveedorCuentas = pgTable('proveedor_cuentas', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  cbuAlias: text('cbu_alias').notNull().default(''),
+  descripcion: text('descripcion').notNull().default(''),
+}, (t) => ({
+  ixProv: index('ix_proveedor_cuentas_prov').on(t.proveedorId),
+}));
+
+export const estadoPedidoProvEnum = pgEnum('estado_pedido_prov', ['solicitado', 'pedido', 'recibido', 'retomar']);
+
+/**
+ * El kanban de pedidos al proveedor: pizarra interna admin ↔ encargado de
+ * compras. NO toca stock ni deuda (eso pasa al confirmar la factura). Los
+ * ítems van en `notas` a propósito: son notas informales, no renglones.
+ * `pedidoEnviado` y `revisadoAt` solo significan algo en 'solicitado' y se
+ * resetean en cada cambio de estado (regla de la app original).
+ */
+export const pedidosProveedor = pgTable('pedidos_proveedor', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  estado: estadoPedidoProvEnum('estado').notNull().default('solicitado'),
+  notas: text('notas').notNull().default(''),
+  fechaAlta: timestamp('fecha_alta', { withTimezone: true }).notNull().defaultNow(),
+  fechaPedido: timestamp('fecha_pedido', { withTimezone: true }),
+  fechaRecepcion: timestamp('fecha_recepcion', { withTimezone: true }),
+  pedidoEnviado: boolean('pedido_enviado').notNull().default(false),
+  /** Fecha y no booleano: la tarjeta dice "lo viste hace N días". */
+  revisadoAt: timestamp('revisado_at', { withTimezone: true }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixEstado: index('ix_pedidos_proveedor_estado').on(t.estado, t.proveedorId),
+  ixRecepcion: index('ix_pedidos_proveedor_recepcion').on(t.fechaRecepcion),
+}));
+
+export const origenCompromisoEnum = pgEnum('origen_compromiso', ['factura', 'manual']);
+
+/**
+ * COMPROMISOS — el vencimiento como entidad (las "Ctas Ctes" de la app).
+ * Nace de la factura confirmada de un proveedor diferido (editable, en cuotas
+ * si la factura viene partida) o a mano. `pagado` NO se tipea: lo administra
+ * el puente de pagos — el pago que salda la factura lo cierra en la misma
+ * transacción, y anular/desaplicar ese pago lo reabre. `esEcheq` decide la
+ * vitrina (los echeq viven en su sección): en la app era un LIKE sobre el
+ * nombre de la forma; acá es un dato.
+ */
+export const proveedorCompromisos = pgTable('proveedor_compromisos', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  /* SET NULL como red ante un DELETE manual; el camino real es que anular la
+   * factura borre sus compromisos pendientes en el servicio. */
+  comprobanteId: integer('comprobante_id').references(() => comprobantes.id, { onDelete: 'set null' }),
+  importe: doublePrecision('importe').notNull().default(0),
+  fechaEmision: timestamp('fecha_emision', { withTimezone: true }).notNull().defaultNow(),
+  fechaVenc: timestamp('fecha_venc', { withTimezone: true }).notNull(),
+  origen: origenCompromisoEnum('origen').notNull().default('manual'),
+  esEcheq: boolean('es_echeq').notNull().default(false),
+  /** "Cuota 2 de 3" cuando la factura vino partida. NULL = único. */
+  cuota: integer('cuota'),
+  cuotas: integer('cuotas'),
+  pagado: boolean('pagado').notNull().default(false),
+  /** Qué pago lo cerró — la llave para REABRIRLO si ese pago muere. */
+  pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'set null' }),
+  obs: text('obs').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixPendientes: index('ix_compromisos_pendientes').on(t.pagado, t.fechaVenc),
+  ixComprobante: index('ix_compromisos_comprobante').on(t.comprobanteId),
+  ixProveedor: index('ix_compromisos_proveedor').on(t.proveedorId, t.pagado),
+}));
+
+export const estadoEcheqEnum = pgEnum('estado_echeq', ['emitido', 'entregado', 'cobrado', 'anulado']);
+
+/**
+ * Cartera de ECHEQS propios. Nace junto al compromiso cuando el proveedor
+ * cobra así (número/banco "a completar") o a mano. 'cobrado' no es etiqueta:
+ * ejecuta el pago real imputado a la factura. 'vencido' no es estado — se
+ * deriva de fechaVenc (un estado tipeable de algo derivable termina mintiendo).
+ */
+export const proveedorEcheqs = pgTable('proveedor_echeqs', {
+  id: serial('id').primaryKey(),
+  numero: text('numero').notNull().default(''),
+  banco: text('banco').notNull().default(''),
+  importe: doublePrecision('importe').notNull().default(0),
+  fechaEmision: timestamp('fecha_emision', { withTimezone: true }).notNull().defaultNow(),
+  fechaVenc: timestamp('fecha_venc', { withTimezone: true }).notNull(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  compromisoId: integer('compromiso_id').references(() => proveedorCompromisos.id, { onDelete: 'set null' }),
+  pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'set null' }),
+  estado: estadoEcheqEnum('estado').notNull().default('emitido'),
+  obs: text('obs').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixEstado: index('ix_echeqs_estado').on(t.estado, t.fechaVenc),
+  ixCompromiso: index('ix_echeqs_compromiso').on(t.compromisoId),
+}));
+
+/** Ajustes manuales del estado de cuenta. Importe CON SIGNO (+debe / −haber)
+ *  y motivo obligatorio: un ajuste sin explicación es inauditable. */
+export const proveedorAjustes = pgTable('proveedor_ajustes', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  importe: doublePrecision('importe').notNull(),
+  motivo: text('motivo').notNull(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixProv: index('ix_proveedor_ajustes_prov').on(t.proveedorId),
+}));
+
+/**
+ * PAGO MULTI-FORMA: el split de un pago a proveedor en N medios. Invariante
+ * del servicio: SUM(importe) == pago.importe, dentro de la transacción del
+ * pago. La parte en efectivo es la que genera el egreso de caja. `fecha`
+ * propia por parte ("transferí una parte hace 10 días y el resto hoy");
+ * NULL = la fecha del pago.
+ */
+export const pagoFormas = pgTable('pago_formas', {
+  id: serial('id').primaryKey(),
+  pagoId: integer('pago_id').notNull().references(() => proveedorPagos.id, { onDelete: 'cascade' }),
+  medio: medioPagoEnum('medio').notNull().default('efectivo'),
+  importe: doublePrecision('importe').notNull().default(0),
+  fecha: timestamp('fecha', { withTimezone: true }),
+}, (t) => ({
+  ixPago: index('ix_pago_formas_pago').on(t.pagoId),
+}));
+
 /** Todas las tablas para pasar al cliente de Drizzle. */
 export const schema = {
   sucursales, proveedores, roles, usuarios, sesiones, productos, presentaciones, productoProveedores,
@@ -2364,4 +2533,5 @@ export const schema = {
   webImagenes, webEventos,
   gastoCategorias, gastos, gastoItems, gastosRecurrentes, gastoAdjuntos,
   proveedorPagos, proveedorImputaciones,
+  proveedorCuentas, pedidosProveedor, proveedorCompromisos, proveedorEcheqs, proveedorAjustes, pagoFormas,
 };

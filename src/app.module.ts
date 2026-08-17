@@ -9,6 +9,8 @@ import { FacturasModule } from './facturas/facturas.module';
 import { ProductosModule } from './productos/productos.module';
 import { CatalogosModule } from './catalogos/catalogos.module';
 import { ProveedoresModule } from './proveedores/proveedores.module';
+import { PedidosProveedorModule } from './proveedores/pedidos.module';
+import { FinanzasProveedorModule } from './proveedores/finanzas.module';
 import { PreciosModule } from './precios/precios.module';
 import { ListasModule } from './listas/listas.module';
 import { SucursalesModule } from './sucursales/sucursales.module';
@@ -41,6 +43,8 @@ import { ChatModule } from './chat/chat.module';
     ProductosModule,
     CatalogosModule,
     ProveedoresModule,
+    PedidosProveedorModule,
+    FinanzasProveedorModule,
     PreciosModule,
     ListasModule,
     SucursalesModule,
