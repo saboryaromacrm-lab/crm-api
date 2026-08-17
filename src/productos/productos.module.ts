@@ -3,7 +3,7 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import {
-  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min,
 } from 'class-validator';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
@@ -96,6 +96,18 @@ class UpsertProductoDto {
   @IsOptional() @IsInt() proveedorId?: number;
   /** Costo de lista de ese proveedor, si ya se conoce (opcional). */
   @IsOptional() @IsNumber() costoInicial?: number;
+  /**
+   * La ficha comercial del formato inicial (solo alta, con proveedorId): el
+   * código con el que ESE proveedor llama al producto, su escala de descuentos
+   * en cascada y su flete. Son los mismos campos del Formato de Compra — el
+   * alta en dos etapas los pide de entrada para que el producto nazca completo.
+   */
+  @IsOptional() @IsString() @MaxLength(60) codigoProveedor?: string;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento2?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento3?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento4?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) flete?: number;
 }
 
 /**
@@ -545,6 +557,12 @@ export class ProductosService {
         proveedorId: prov.id,
         cantidad: 1,
         costo: Number(dto.costoInicial) || 0,
+        descuento: Number(dto.descuento) || 0,
+        descuento2: Number(dto.descuento2) || 0,
+        descuento3: Number(dto.descuento3) || 0,
+        descuento4: Number(dto.descuento4) || 0,
+        flete: Number(dto.flete) || 0,
+        codigoProveedor: (dto.codigoProveedor ?? '').trim(),
         usarParaPrecio: true,
       });
     }
