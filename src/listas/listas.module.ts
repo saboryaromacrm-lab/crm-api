@@ -115,6 +115,14 @@ export class ListasService {
       listas: lists.map((l) => ({
         ...l,
         modalidad: porModalidad.get(l.modalidadId)?.nombre ?? '',
+        /*
+         * El orden de la MODALIDAD viaja pegado a la lista. Sin esto, quien
+         * quiera mostrar las listas agrupadas por modalidad (la búsqueda del
+         * POS: primero todo Minorista, después Mayorista) tendría que cruzar
+         * dos catálogos, o peor, ordenar por `modalidadId` — que es el orden
+         * en que se crearon, no el que el dueño configuró.
+         */
+        modalidadOrden: porModalidad.get(l.modalidadId)?.orden ?? 0,
         etiqueta: etiquetaLista(l, porModalidad.get(l.modalidadId)),
       })),
       reglasMarca: reglas.map((r) => ({

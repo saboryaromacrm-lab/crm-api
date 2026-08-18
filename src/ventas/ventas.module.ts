@@ -947,6 +947,8 @@ export class VentasService {
         listaId: l.id,
         modalidadId: l.modalidadId,
         modalidad: l.modalidad,
+        // Para agrupar por modalidad sin adivinar (búsqueda masiva del POS).
+        modalidadOrden: l.modalidadOrden ?? 0,
         numero: l.numero,
         nombre: l.nombre,
         etiqueta: l.etiqueta,
