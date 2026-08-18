@@ -54,7 +54,9 @@ export const CATALOGO_PERMISOS = [
     grupo: 'Compras',
     modulo: 'compras',
     secciones: [
-      { clave: 'compras.dashboard', nombre: 'Dashboard de compras' },
+      /* Sin 'compras.dashboard' (0070, 18/8/2026): el resumen del inventario se
+       * mudó al Dashboard del menú principal y esa pestaña ya no existe. Lo que
+       * lo habilita ahora es tener alguna sección de Compras o Almacén. */
       { clave: 'compras.productos', nombre: 'Productos' },
       { clave: 'compras.catalogos', nombre: 'Catálogos' },
       { clave: 'compras.proveedores', nombre: 'Costos y percepciones (lo operativo del proveedor; la ficha vive en Proveedores)' },
