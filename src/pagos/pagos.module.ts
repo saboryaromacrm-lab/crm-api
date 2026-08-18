@@ -80,6 +80,25 @@ export class FormaPagoDto {
   @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'La fecha de la parte va como AAAA-MM-DD.' }) fecha?: string;
 }
 
+/**
+ * UN FLETE YA PAGADO QUE ESTE PAGO DESCUENTA (0069).
+ * ----------------------------------------------------------------------------
+ * La cajera le pagó $20.000 al fletero por cuenta del proveedor. La factura de
+ * mercadería se cargó tal cual dice el papel: $100.000. Cuando se le paga la
+ * cuenta corriente se transfieren $80.000, porque esos $20.000 ya se le
+ * adelantaron — y para que la factura quede saldada, el flete se imputa contra
+ * ella en el mismo acto.
+ *
+ * Es un pago que YA existe (por eso `pagoId`), no plata nueva: acá solo se dice
+ * a qué documento se aplica y por cuánto.
+ */
+export class DescuentoFleteDto {
+  @IsInt() pagoId!: number;
+  @IsOptional() @IsInt() gastoId?: number;
+  @IsOptional() @IsInt() comprobanteId?: number;
+  @IsNumber() @Min(0.01, { message: 'El flete a descontar tiene que ser mayor a 0.' }) importe!: number;
+}
+
 export class CrearPagoDto {
   @IsOptional() @IsInt() proveedorId?: number;
   /**
@@ -115,6 +134,13 @@ export class CrearPagoDto {
    */
   @IsOptional() @IsArray() @ArrayMaxSize(10) @ValidateNested({ each: true }) @Type(() => FormaPagoDto)
   formas?: FormaPagoDto[];
+  /**
+   * FLETES QUE ESTE PAGO DESCUENTA (0069). Se aplican DENTRO de la misma
+   * transacción y ANTES que el pago propio: bajan el saldo del documento, así
+   * el pago nuevo cae por el saldo exacto que queda.
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => DescuentoFleteDto)
+  fletes?: DescuentoFleteDto[];
 }
 
 export class ImputarDto {
@@ -145,6 +171,28 @@ export class ListarPagosDto {
 
 export class AnularPagoDto {
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
+/**
+ * EL PAPEL DEL PAGO, completado después (0069).
+ * ----------------------------------------------------------------------------
+ * La cajera paga el flete con el camión en la puerta y no siempre tiene el
+ * remito a mano; el que lo tiene es el administrativo, al día siguiente. Esto
+ * deja completar el número de remito y el concepto SIN tocar un solo peso: no
+ * cambia el importe, ni el medio, ni la fecha, ni a qué está aplicado. Es la
+ * única edición que un pago admite, y por eso es un endpoint aparte.
+ */
+export class PapelPagoDto {
+  @IsOptional() @IsString() @MaxLength(200) referencia?: string;
+  @IsOptional() @IsString() @MaxLength(300) concepto?: string;
+}
+
+/** Solo fletes, sin pago nuevo (ver `descontarFletes`). */
+export class DescontarFletesDto {
+  @IsInt() proveedorId!: number;
+  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => DescuentoFleteDto)
+  fletes!: DescuentoFleteDto[];
+  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 export class CambiarDestinoDto {
@@ -849,12 +897,77 @@ export class PagosProveedorService {
         })));
       }
 
+      /*
+       * LOS FLETES SE APLICAN PRIMERO, y el orden no es un detalle.
+       * ----------------------------------------------------------------------
+       * La factura dice $100.000 y se le transfieren $80.000 porque ya se le
+       * adelantaron $20.000 de flete. Si el pago propio entrara primero, sería
+       * un pago PARCIAL contra una factura que todavía debe $100.000 — y el
+       * candado del modo "por facturas" lo rechazaría con razón. Aplicando el
+       * flete antes, el saldo queda en $80.000 y el pago cae por el saldo
+       * exacto: pasa el candado sin ninguna excepción.
+       *
+       * Todo dentro de la MISMA transacción: si el pago falla, el flete vuelve
+       * a estar disponible. Quedarse a mitad de camino sería lo peor —el flete
+       * imputado a una factura que nadie terminó de pagar.
+       */
+      await this.aplicarFletes(tx, dto.fletes ?? [], proveedorId, dto.usuarioId, cruzaSucursales);
+
       if (dto.imputaciones?.length) {
         await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante);
       }
       return pago.id;
     });
     return this.get(id);
+  }
+
+  /**
+   * DESCONTAR FLETES: imputar pagos de flete YA HECHOS contra los documentos
+   * que se están pagando. No mueve plata nueva — esa salió del cajón el día que
+   * la cajera le pagó al fletero.
+   *
+   * Se valida que cada uno sea de verdad un flete y del mismo proveedor: sin
+   * eso, este camino sería una puerta lateral para imputar cualquier pago ajeno
+   * salteándose el candado del modo de cuenta.
+   */
+  private async aplicarFletes(
+    tx: any, fletes: DescuentoFleteDto[], proveedorId: number | null,
+    usuarioId?: number, cruzaSucursales = false,
+  ) {
+    for (const f of fletes) {
+      const [fp] = await tx.select().from(proveedorPagos)
+        .where(eq(proveedorPagos.id, Number(f.pagoId))).limit(1);
+      if (!fp) throw new BadRequestException('El flete que se quiere descontar no existe.');
+      if (!fp.esFlete) {
+        throw new BadRequestException(
+          'Ese pago no está marcado como flete: los pagos comunes se aplican desde el documento, no descontándolos de otro pago.',
+        );
+      }
+      if (!proveedorId || fp.proveedorId !== proveedorId) {
+        throw new BadRequestException('Ese flete es de otro proveedor: no se puede descontar acá.');
+      }
+      await this.aplicar(
+        tx, fp.id,
+        [{ gastoId: f.gastoId, comprobanteId: f.comprobanteId, importe: money(f.importe) }],
+        usuarioId, cruzaSucursales,
+      );
+    }
+  }
+
+  /**
+   * SOLO FLETES, sin pago nuevo: pasa cuando lo adelantado alcanza para cubrir
+   * el documento entero (la factura es de $20.000 y el flete fue de $20.000).
+   * No hay plata que transferir, pero la factura tiene que quedar saldada — y
+   * todo en una transacción, como cuando hay pago.
+   */
+  async descontarFletes(
+    proveedorId: number, fletes: DescuentoFleteDto[], usuarioId?: number, cruzaSucursales = false,
+  ) {
+    if (!fletes?.length) throw new BadRequestException('No indicaste ningún flete a descontar.');
+    await this.db.transaction(
+      async (tx) => this.aplicarFletes(tx, fletes, proveedorId, usuarioId, cruzaSucursales),
+    );
+    return { ok: true, descontados: fletes.length };
   }
 
   /**
@@ -1208,6 +1321,29 @@ export class PagosProveedorService {
   }
 
   /**
+   * Completar el PAPEL del pago: el número de remito y el concepto. No toca
+   * plata —ni importe, ni medio, ni fecha, ni imputaciones—, así que se permite
+   * con el pago ya aplicado y con el turno de caja cerrado. El caso: la cajera
+   * pagó el flete con el camión en la puerta y el remito lo tiene el
+   * administrativo al otro día.
+   *
+   * Un pago ANULADO no se toca: su historia quedó cerrada.
+   */
+  async actualizarPapel(id: number, dto: { referencia?: string; concepto?: string }) {
+    const [p] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, id)).limit(1);
+    if (!p) throw new NotFoundException('Pago inexistente.');
+    if (p.estado !== 'activo') throw new BadRequestException('El pago está anulado: no se le cambian los datos.');
+    const set: any = {};
+    // "Ausente conserva": mandar solo el campo que se está corrigiendo no puede
+    // borrar el otro (el contrato que ya rige en `proveedores.update`).
+    if (dto.referencia !== undefined) set.referencia = String(dto.referencia).trim();
+    if (dto.concepto !== undefined) set.concepto = String(dto.concepto).trim();
+    if (!Object.keys(set).length) return this.get(id);
+    await this.db.update(proveedorPagos).set(set).where(eq(proveedorPagos.id, id));
+    return this.get(id);
+  }
+
+  /**
    * Anular el pago. Dos candados:
    *   · Si tiene imputaciones, primero se desaplican — anular por arriba
    *     dejaría facturas figurando como pagadas sin pago detrás.
@@ -1363,11 +1499,17 @@ export class PagosProveedorController {
   ) {
     return this.svc.imputar(id, dto, esJefe(auth));
   }
+  @Post('descontar-fletes') descontarFletes(@Body() dto: DescontarFletesDto, @Auth() auth: Sesion) {
+    return this.svc.descontarFletes(dto.proveedorId, dto.fletes, dto.usuarioId, esJefe(auth));
+  }
   @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPagoDto) {
     return this.svc.anular(id, dto?.motivo);
   }
   @Patch(':id/destino') destino(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarDestinoDto) {
     return this.svc.cambiarDestino(id, dto.destino);
+  }
+  @Patch(':id/papel') papel(@Param('id', ParseIntPipe) id: number, @Body() dto: PapelPagoDto) {
+    return this.svc.actualizarPapel(id, dto);
   }
 }
 
