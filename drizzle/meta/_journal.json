@@ -498,6 +498,13 @@
       "when": 1788048000000,
       "tag": "0070_sin_dashboard_de_compras",
       "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1788051600000,
+      "tag": "0071_pie_del_gasto",
+      "breakpoints": true
     }
   ]
 }

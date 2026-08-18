@@ -1955,8 +1955,21 @@ export const gastos = pgTable('gastos', {
   vencimiento: timestamp('vencimiento', { withTimezone: true }),
   neto: doublePrecision('neto').notNull().default(0),
   iva: doublePrecision('iva').notNull().default(0),
-  /** Percepciones, impuestos internos y todo lo que suma sin ser IVA. */
+  /**
+   * TODO lo que suma abajo del IVA, junto. Se mantiene porque es lo que leen
+   * el resumen y los listados; su DETALLE son las tres columnas de abajo
+   * (0071) y la diferencia, si la hay, es lo que se cargó sin detallar.
+   */
   otros: doublePrecision('otros').notNull().default(0),
+  /*
+   * El pie abierto (0071). No es cosmética: cada uno termina en un lugar
+   * distinto — la percepción de D.G.R. se computa contra Ingresos Brutos, la
+   * de D.G.I. contra el impuesto nacional, y los impuestos internos no se
+   * recuperan (son costo). En una sola bolsa eso no se puede reclamar.
+   */
+  impInternos: doublePrecision('imp_internos').notNull().default(0),
+  percDgi: doublePrecision('perc_dgi').notNull().default(0),
+  percDgr: doublePrecision('perc_dgr').notNull().default(0),
   total: doublePrecision('total').notNull().default(0),
   pagado: doublePrecision('pagado').notNull().default(0),
   estado: estadoGastoEnum('estado').notNull().default('pendiente'),

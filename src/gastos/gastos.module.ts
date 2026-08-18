@@ -156,7 +156,17 @@ class GastoDto {
   @IsOptional() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vencimiento?: string;
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) neto?: number;
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) iva?: number;
+  /**
+   * Lo que suma abajo del IVA y NO se detalló en los tres de abajo. Sin
+   * detalle, `otros` es todo (es como venía antes de 0071 y como lo mandan los
+   * gastos fijos); con detalle, la columna `gastos.otros` guarda la SUMA de
+   * los cuatro y estos tres guardan de qué está hecha.
+   */
   @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) otros?: number;
+  /* El pie abierto (0071): cada uno se computa después contra otro impuesto. */
+  @IsOptional() @IsNumber() @Min(0) @Max(TOPE_IMPORTE) impInternos?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(TOPE_IMPORTE) percDgi?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(TOPE_IMPORTE) percDgr?: number;
   /**
    * LOS RENGLONES (0067). Si vienen, mandan: el total es su suma, `iva` pasa a
    * ser el "IVA incluido" informativo de la factura A (neto = total − iva) y
@@ -180,6 +190,17 @@ class GastoDto {
    * también el permiso de pagar (ver `PERMISOS_PAGO`).
    */
   @IsOptional() @ValidateNested() @Type(() => PagoDto) pagoInmediato?: PagoDto;
+}
+
+/**
+ * ¿Este patch toca PLATA? Lo usan los dos lados de la edición: reconstruir el
+ * pie, y el candado del gasto ya pagado. Está acá y no repetido en cada `if`
+ * porque los campos del pie crecieron (0071) y la lista olvidada del candado
+ * sería un total editable con pagos atrás — la puerta de atrás clásica.
+ */
+function tocaImportes(dto: GastoDto) {
+  return dto.neto != null || dto.iva != null || dto.otros != null
+    || dto.impInternos != null || dto.percDgi != null || dto.percDgr != null;
 }
 
 class AplicarPagoDto {
@@ -525,11 +546,27 @@ export class GastosService {
 
   /* ---------------- Gastos: escritura ---------------- */
 
+  /**
+   * EL PIE ABIERTO (0071). Los tres del papel, más lo que se cargó sin
+   * detallar; `otros` sale siendo la SUMA de los cuatro porque es la columna
+   * que ya leen el resumen y los listados.
+   */
+  private extrasDe(dto: GastoDto) {
+    const impInternos = money(dto.impInternos ?? 0);
+    const percDgi = money(dto.percDgi ?? 0);
+    const percDgr = money(dto.percDgr ?? 0);
+    const sinDetallar = money(dto.otros ?? 0);
+    return {
+      impInternos, percDgi, percDgr,
+      otros: money(sinDetallar + impInternos + percDgi + percDgr),
+    };
+  }
+
   private totalesDe(dto: GastoDto) {
     const neto = money(dto.neto ?? 0);
     const iva = money(dto.iva ?? 0);
-    const otros = money(dto.otros ?? 0);
-    return { neto, iva, otros, total: money(neto + iva + otros) };
+    const extras = this.extrasDe(dto);
+    return { neto, iva, ...extras, total: money(neto + iva + extras.otros) };
   }
 
   /**
@@ -565,6 +602,13 @@ export class GastosService {
 
     const suma = money(renglones.reduce((a, i) => a + i.monto, 0));
     const descripcion = renglones.map((i) => i.concepto).join(' · ');
+    /*
+     * El pie SIEMPRE se suma, en los dos modos (0071). Los impuestos internos
+     * y las percepciones se liquidan abajo del subtotal, así que están fuera
+     * del importe de los renglones vengan netos o finales — hasta un ticket
+     * puede traer percepción de Ingresos Brutos.
+     */
+    const extras = this.extrasDe(dto);
 
     if (dto.ivaAparte) {
       const iva = money(dto.iva ?? 0);
@@ -574,15 +618,18 @@ export class GastosService {
       if (iva > suma) {
         throw new BadRequestException('El IVA supera el neto de los conceptos: revisá el pie de la factura.');
       }
-      return { total: money(suma + iva), iva, neto: suma, otros: 0, items: renglones, descripcion };
+      return {
+        total: money(suma + iva + extras.otros), iva, neto: suma, ...extras,
+        items: renglones, descripcion,
+      };
     }
 
     const iva = Math.min(money(dto.iva ?? 0), suma);
     return {
-      total: suma,
+      total: money(suma + extras.otros),
       iva,
       neto: money(suma - iva),
-      otros: 0,
+      ...extras,
       items: renglones,
       descripcion,
     };
@@ -652,7 +699,9 @@ export class GastosService {
       proveedorId = p.id;
     }
 
-    const { neto, iva, otros, total, items, descripcion } = this.importesDe(dto);
+    const {
+      neto, iva, otros, impInternos, percDgi, percDgr, total, items, descripcion,
+    } = this.importesDe(dto);
     if (total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
 
     const numero = (dto.numero ?? '').trim();
@@ -674,7 +723,7 @@ export class GastosService {
         condicionPago: (dto.condicionPago ?? 'contado') as any,
         negocio: (dto.negocio ?? 'distribuidora') as any,
         vencimiento: fechaLocal(dto.vencimiento),
-        neto, iva, otros, total,
+        neto, iva, otros, impInternos, percDgi, percDgr, total,
         pagado: 0,
         estado: 'pendiente',
         observaciones: (dto.observaciones ?? '').trim(),
@@ -773,13 +822,27 @@ export class GastosService {
       if (conRenglones.items) {
         Object.assign(patch, {
           neto: conRenglones.neto, iva: conRenglones.iva, otros: conRenglones.otros,
+          impInternos: conRenglones.impInternos, percDgi: conRenglones.percDgi, percDgr: conRenglones.percDgr,
           total: conRenglones.total, descripcion: conRenglones.descripcion,
         });
         await this.db.delete(gastoItems).where(eq(gastoItems.gastoId, id));
         await this.db.insert(gastoItems).values(conRenglones.items.map((i) => ({ ...i, gastoId: id })));
-      } else if (dto.neto != null || dto.iva != null || dto.otros != null) {
+      } else if (tocaImportes(dto)) {
+        /*
+         * Sin renglones se parchea campo a campo, y el pie se reconstruye
+         * ENTERO: `otros` es la suma de los tres más lo no detallado, así que
+         * mandar solo `percDgr` con el resto tomado de la fila guardada sería
+         * sumar dos veces lo que ya estaba adentro. Lo no detallado se
+         * despeja de la fila vieja.
+         */
+        const sinDetallarGuardado = money(g.otros - g.impInternos - g.percDgi - g.percDgr);
         const t = this.totalesDe({
-          neto: dto.neto ?? g.neto, iva: dto.iva ?? g.iva, otros: dto.otros ?? g.otros,
+          neto: dto.neto ?? g.neto,
+          iva: dto.iva ?? g.iva,
+          otros: dto.otros ?? Math.max(0, sinDetallarGuardado),
+          impInternos: dto.impInternos ?? g.impInternos,
+          percDgi: dto.percDgi ?? g.percDgi,
+          percDgr: dto.percDgr ?? g.percDgr,
         } as GastoDto);
         if (t.total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
         Object.assign(patch, t);
@@ -791,7 +854,7 @@ export class GastosService {
         id,
       );
     } else if (
-      dto.neto != null || dto.iva != null || dto.otros != null
+      tocaImportes(dto)
       || dto.numero != null || dto.proveedorId !== undefined || dto.items != null
     ) {
       throw new BadRequestException(
