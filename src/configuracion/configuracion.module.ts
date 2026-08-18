@@ -146,6 +146,10 @@ export const IMPRESION_DEFAULTS = {
   // El remito a Cafetería se imprime todos los días y NO estaba en este
   // catálogo: caía al A4 por defecto y no había forma de mandarlo al rollo.
   remitoCafeteria: 'a4' as string,
+  // La planilla del control de stock: la hoja que se lleva a la góndola para
+  // anotar a lápiz lo que hay. Papel grande — en un rollo de 80 mm el renglón
+  // no entra y no queda lugar para escribir.
+  planillaConteo: 'a4' as string,
   etiquetaFraccionado: 'etiqueta50x30' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
@@ -260,6 +264,7 @@ const REGLAS: Record<string, {
   'impresion.hojaArmado': { opciones: FORMATOS_PAPEL },
   'impresion.listaPreparacion': { opciones: FORMATOS_PAPEL },
   'impresion.remitoCafeteria': { opciones: FORMATOS_PAPEL },
+  'impresion.planillaConteo': { opciones: FORMATOS_PAPEL },
   'impresion.etiquetaFraccionado': { opciones: FORMATOS_ETIQUETA },
 
   /* Los redondeos son una LISTA CERRADA, no un rango: son las monedas con las
