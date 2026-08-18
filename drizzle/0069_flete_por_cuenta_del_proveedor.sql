@@ -1,0 +1,14 @@
+-- 0069 · EL FLETE QUE SE PAGA EN EFECTIVO Y EL PROVEEDOR DESCUENTA
+-- ---------------------------------------------------------------------------
+-- Llega la mercadería por $100.000 y el flete sale $20.000. La cajera se lo
+-- paga al fletero del cajón, y el proveedor —que es el dueño de ese flete— lo
+-- reconoce descontándolo de su factura: se le terminan pagando $80.000.
+--
+-- Esa plata NO es un gasto nuestro: es un pago de la cuenta del proveedor
+-- hecho a un tercero. Ya se registraba como pago a cuenta; lo único que
+-- faltaba era poder DECIR que es un flete, y de ahí cuelgan tres cosas:
+--   · queda exento del candado del modo "por facturas" (un flete nunca es el
+--     saldo completo ni una cuota pactada, así que ese candado lo rechazaba);
+--   · se lo reconoce en el mayor, en la bandeja y al tomarlo en la factura;
+--   · se puede responder "¿cuánto pagué de fletes este mes?".
+ALTER TABLE "proveedor_pagos" ADD COLUMN "es_flete" boolean DEFAULT false NOT NULL;

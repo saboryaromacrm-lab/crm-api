@@ -30,8 +30,8 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize, IsArray, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
-  MaxLength, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsBoolean, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString,
+  Matches, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
@@ -93,6 +93,12 @@ export class CrearPagoDto {
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
   @IsOptional() @IsString() @MaxLength(300) concepto?: string;
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
+  /**
+   * EL FLETE QUE EL PROVEEDOR DESCUENTA (0069). Lo tilda quien paga: "esto es
+   * el flete de la entrega, se lo descuenta de su factura". Ver el comentario
+   * de la columna en el schema y la exención en `aplicar`.
+   */
+  @IsOptional() @IsBoolean() esFlete?: boolean;
   @IsOptional() @IsInt() sucursalId?: number;
   /** Turno del que sale el efectivo: genera el egreso en esa caja. */
   @IsOptional() @IsInt() cajaSesionId?: number;
@@ -132,6 +138,8 @@ export class ListarPagosDto {
   @IsOptional() @Matches(SOLO_FECHA, { message: 'El desde va como AAAA-MM-DD.' }) desde?: string;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'El hasta va como AAAA-MM-DD.' }) hasta?: string;
   @IsOptional() @IsBooleanString() sinAplicar?: string;
+  /** Solo los fletes: es lo que responde "¿cuánto pagué de fletes este mes?". */
+  @IsOptional() @IsBooleanString() esFlete?: string;
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
@@ -300,6 +308,7 @@ export class PagosProveedorService {
       destino: proveedorPagos.destino,
       importe: proveedorPagos.importe,
       aplicado: proveedorPagos.aplicado,
+      esFlete: proveedorPagos.esFlete,
       concepto: proveedorPagos.concepto,
       referencia: proveedorPagos.referencia,
       sucursalId: proveedorPagos.sucursalId,
@@ -332,6 +341,7 @@ export class PagosProveedorService {
      * las 21:00 del día anterior y el filtro se comía tres horas de más. */
     if (q.desde) conds.push(sql`${proveedorPagos.fecha} >= ${new Date(`${String(q.desde).slice(0, 10)}T00:00:00`).toISOString()}`);
     if (q.hasta) conds.push(sql`${proveedorPagos.fecha} <= ${new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`).toISOString()}`);
+    if (q.esFlete === 'true' || q.esFlete === true) conds.push(eq(proveedorPagos.esFlete, true));
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
       conds.push(eq(proveedorPagos.estado, 'activo'));
@@ -640,7 +650,9 @@ export class PagosProveedorService {
    * no como sesión entera porque este servicio no debe conocer el modelo de
    * permisos: le alcanza con saber si esta operación puede cruzar o no.
    */
-  async crear(dto: CrearPagoDto, sucursalSesion: number, cruzaSucursales = false) {
+  async crear(
+    dto: CrearPagoDto, sucursalSesion: number, cruzaSucursales = false, enAltaComprobante = false,
+  ) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
 
@@ -680,6 +692,33 @@ export class PagosProveedorService {
       ?? (dto.imputaciones?.some((x) => x.gastoId) ? 'gastos'
         : dto.imputaciones?.some((x) => x.comprobanteId) ? 'mercaderia'
           : (provSoloGastos || !proveedorId) ? 'gastos' : 'mercaderia');
+
+    /*
+     * EL FLETE (0069) ES SIEMPRE DE LA CUENTA DE MERCADERÍA.
+     * ----------------------------------------------------------------------
+     * Marcarlo dice "esta plata la puso el proveedor y él la descuenta de su
+     * factura", y de ahí sale la exención del candado del modo "por facturas"
+     * en `aplicar`. Dejar que se marque un pago de GASTOS abriría esa exención
+     * a un mundo donde no aplica; y sin proveedor no hay cuenta de la cual
+     * descontarlo, así que el flete no tendría a quién pertenecer.
+     *
+     * El flete que se le paga a un fletero propio —el que factura a nombre
+     * nuestro y nadie nos reintegra— es un gasto de verdad y va por Gastos.
+     */
+    const esFlete = dto.esFlete === true;
+    if (esFlete && destino !== 'mercaderia') {
+      throw new BadRequestException(
+        'El flete que el proveedor descuenta se registra contra su cuenta de MERCADERÍA. '
+        + 'Si es un flete propio que nadie te reintegra, va como gasto.',
+      );
+    }
+    if (esFlete && !proveedorId) {
+      throw new BadRequestException(
+        'Elegí el proveedor: el flete se descuenta de la factura de alguien.',
+      );
+    }
+    // Que el mayor y el arqueo digan "Flete" aunque nadie haya escrito nada.
+    const concepto = ((dto.concepto ?? '').trim() || (esFlete ? 'Flete de la entrega' : ''));
 
     /*
      * MULTI-FORMA (0068): si vienen partes, la suma TIENE que dar el importe
@@ -774,7 +813,8 @@ export class PagosProveedorService {
           cajaSesionId: sesion.id,
           tipo: 'egreso',
           importe: importeEfectivo,
-          motivo: `Pago a proveedor${nombreProv ? ` · ${nombreProv}` : ''}${dto.concepto ? ` · ${dto.concepto.trim()}` : ''}`
+          motivo: `${esFlete ? 'Flete a cuenta del proveedor' : 'Pago a proveedor'}`
+            + `${nombreProv ? ` · ${nombreProv}` : ''}${concepto ? ` · ${concepto}` : ''}`
             + (formas.length && importeEfectivo < importe - EPS ? ` · efectivo de un pago mixto de ${importe.toFixed(2)}` : ''),
           usuarioId: dto.usuarioId ?? null,
         }).returning();
@@ -791,7 +831,8 @@ export class PagosProveedorService {
         destino,
         importe,
         aplicado: 0,
-        concepto: (dto.concepto ?? '').trim(),
+        esFlete,
+        concepto,
         referencia: (dto.referencia ?? '').trim(),
         sucursalId,
         cajaSesionId,
@@ -809,7 +850,7 @@ export class PagosProveedorService {
       }
 
       if (dto.imputaciones?.length) {
-        await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales);
+        await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante);
       }
       return pago.id;
     });
@@ -842,6 +883,7 @@ export class PagosProveedorService {
    */
   private async aplicar(
     tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number, cruzaSucursales = false,
+    enAltaComprobante = false,
   ) {
     for (const item of items) {
       const importe = money(item.importe);
@@ -947,7 +989,31 @@ export class PagosProveedorService {
          * exactamente el pago acordado. En modo 'libre' se aplica lo que sea
          * (proveedores a los que se les va pagando a cuenta).
          */
-        if (pago.proveedorId && Math.abs(importe - saldoDoc) > EPS) {
+        /*
+         * LAS DOS EXCEPCIONES AL CANDADO (0069).
+         *
+         * 1) EL FLETE. La cajera le pagó $20.000 al fletero del cajón y el
+         *    proveedor lo reconoce descontándolo de su factura de $100.000.
+         *    Ese pago NO puede ser el saldo completo ni una cuota pactada: es
+         *    un adelanto por cuenta del proveedor, y su naturaleza está
+         *    declarada en el pago. Rechazarlo no evitaba nada —la plata ya
+         *    salió del cajón igual— y forzaba lo peor de los dos mundos: el
+         *    flete quedaba sin aplicar y la factura figuraba debiendo $100.000
+         *    cuando en los hechos se le iban a pagar $80.000.
+         *
+         * 2) EL ALTA DE LA FACTURA. Ahí el total ya se valida por otra vía y
+         *    más fuerte: contado + pagos tomados + cuotas tienen que sumar el
+         *    total EXACTO del comprobante (ver `comprobantes.module`), así que
+         *    no puede quedar el saldo suelto que este candado previene. Pedir
+         *    además que cada pago tomado sea el saldo entero convertía en
+         *    imposible lo más común del mostrador: "le adelanté algo al
+         *    repartidor y el resto queda en cuenta corriente".
+         *
+         * Fuera de estos dos casos el modo 'facturas' sigue mandando: pagar
+         * sueltos contra una factura abierta se sigue rechazando.
+         */
+        const exentoDelModo = pago.esFlete || enAltaComprobante;
+        if (!exentoDelModo && pago.proveedorId && Math.abs(importe - saldoDoc) > EPS) {
           const [provModo] = await tx.select({ modoCuenta: proveedores.modoCuenta })
             .from(proveedores).where(eq(proveedores.id, pago.proveedorId)).limit(1);
           if (provModo?.modoCuenta === 'facturas') {
@@ -1023,7 +1089,13 @@ export class PagosProveedorService {
     }
   }
 
-  async imputar(pagoId: number, dto: ImputarDto, cruzaSucursales = false) {
+  /**
+   * `enAltaComprobante` lo pone SOLO `comprobantes.module` cuando la factura se
+   * está creando: ahí el total ya se valida completo por otra vía y el candado
+   * del modo "por facturas" no corresponde. No viaja por el DTO a propósito —
+   * un cliente no puede declararse a sí mismo exento.
+   */
+  async imputar(pagoId: number, dto: ImputarDto, cruzaSucursales = false, enAltaComprobante = false) {
     if (!dto?.imputaciones?.length) throw new BadRequestException('No indicaste ninguna imputación.');
     const [p] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, pagoId)).limit(1);
     if (!p) throw new NotFoundException('Pago inexistente.');
@@ -1033,7 +1105,9 @@ export class PagosProveedorService {
       throw new BadRequestException('Ese pago se registró sin proveedor: solo vale para el documento con el que nació.');
     }
     await this.db.transaction(
-      async (tx) => this.aplicar(tx, pagoId, dto.imputaciones, dto.usuarioId, cruzaSucursales),
+      async (tx) => this.aplicar(
+        tx, pagoId, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante,
+      ),
     );
     return this.get(pagoId);
   }
@@ -1206,6 +1280,9 @@ export class PagosProveedorService {
       fecha: proveedorPagos.fecha,
       pagoId: proveedorPagos.id,
       medio: proveedorPagos.medio,
+      // Para que el detalle de la factura pueda decir "de esto, $20.000 fue el
+      // flete que se le adelantó al fletero", y no solo "un pago".
+      esFlete: proveedorPagos.esFlete,
       concepto: proveedorPagos.concepto,
       referencia: proveedorPagos.referencia,
       cajaSesionId: proveedorPagos.cajaSesionId,

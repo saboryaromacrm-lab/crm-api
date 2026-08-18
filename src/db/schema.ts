@@ -2219,6 +2219,21 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
   destino: destinoPagoProvEnum('destino').notNull().default('mercaderia'),
   /** Suma de las imputaciones. Desnormalizado: la bandeja lo filtra siempre. */
   aplicado: doublePrecision('aplicado').notNull().default(0),
+  /**
+   * EL FLETE QUE EL PROVEEDOR DESCUENTA (0069). La mercadería vino con flete,
+   * la cajera se lo pagó al fletero en efectivo y el proveedor lo reconoce
+   * restándolo de su factura: no es un gasto nuestro, es plata de la cuenta
+   * del proveedor pagada a un tercero.
+   *
+   * Solo tiene sentido con `destino = 'mercaderia'`: el flete que se le paga
+   * a un fletero propio —el que factura a nombre nuestro y nadie descuenta—
+   * es un GASTO y va por su módulo, no por acá.
+   *
+   * La consecuencia importante está en la aplicación: un flete nunca es el
+   * saldo completo de la factura ni una cuota pactada, así que el candado del
+   * modo "por facturas" lo rechazaba. Marcado, queda exento de ese candado.
+   */
+  esFlete: boolean('es_flete').notNull().default(false),
   /** Qué se pagó, en palabras del cajero: "pedido Coca-Cola", "plomero baño". */
   concepto: text('concepto').notNull().default(''),
   /** Nº de remito, de transferencia, quién lo recibió. */

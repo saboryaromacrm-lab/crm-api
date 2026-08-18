@@ -1008,10 +1008,15 @@ export class ComprobantesService {
       // Primero los pagos que ya existían: es plata que ya salió del cajón y
       // la factura viene a explicarla.
       for (const t of dto.tomarPagos ?? []) {
+        /* El `true` final: esta imputación pasa DENTRO del alta, donde el total
+         * ya se validó completo (contado + tomados + cuotas = total exacto).
+         * Sin él, el candado del modo "por facturas" rechazaba lo más común —
+         * el flete adelantado, el vuelto que se le dejó al repartidor— por ser
+         * un importe menor al saldo de la factura. */
         await this.pagos.imputar(Number(t.pagoId), {
           imputaciones: [{ comprobanteId: id, importe: Number(t.importe) }],
           usuarioId: dto.usuarioId,
-        }, opciones.cruzaSucursales);
+        }, opciones.cruzaSucursales, true);
       }
       // Y después el resto que se paga en el acto.
       const contado = Number(dto.pagoContado?.importe) || 0;
@@ -1028,7 +1033,9 @@ export class ComprobantesService {
           cajaSesionId: dto.pagoContado?.cajaSesionId,
           usuarioId: dto.usuarioId,
           imputaciones: [{ comprobanteId: id, importe: contado }],
-        }, opciones.sucursalSesion, opciones.cruzaSucursales);
+          // Mismo motivo que arriba: el contado puede ser una entrega parcial
+          // con el resto en cuotas, y el total ya se validó completo.
+        }, opciones.sucursalSesion, opciones.cruzaSucursales, true);
       }
 
       /*

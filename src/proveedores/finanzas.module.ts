@@ -658,6 +658,7 @@ export class FinanzasProveedorService {
         concepto: proveedorPagos.concepto,
         referencia: proveedorPagos.referencia,
         cajaSesionId: proveedorPagos.cajaSesionId,
+        esFlete: proveedorPagos.esFlete,
         usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
         sucursalNombre: sql<string>`coalesce(${sucursales.nombre}, '')`,
       }).from(proveedorPagos)
@@ -724,12 +725,18 @@ export class FinanzasProveedorService {
         kind: 'pago',
         id: p.id,
         fecha: p.fecha,
-        etiqueta: formas.length > 1
-          ? `Pago mixto (${formas.map((f) => f.medio).join(' + ')})`
-          : `Pago (${p.medio})`,
+        /* El flete se nombra por lo que es. En el mayor no es un detalle
+         * cosmético: leído de arriba abajo tiene que poder explicar por qué a
+         * una factura de $100.000 se le terminaron pagando $80.000. */
+        etiqueta: p.esFlete
+          ? `Flete (${p.medio})`
+          : formas.length > 1
+            ? `Pago mixto (${formas.map((f) => f.medio).join(' + ')})`
+            : `Pago (${p.medio})`,
         detalle: p.concepto || '',
         debe: 0,
         haber: money(p.importe),
+        esFlete: p.esFlete,
         formas,
         /* El pago se puede ANULAR desde el mayor, y solo si no tiene nada
          * aplicado: `sinAplicar` es lo que la pantalla mira para no ofrecer un
@@ -796,6 +803,10 @@ export class FinanzasProveedorService {
       ajustesDebe: sumar((m) => m.kind === 'ajuste_debe', 'debe'),
       ajustesHaber: sumar((m) => m.kind === 'ajuste_haber', 'haber'),
       pagos: sumar((m) => m.kind === 'pago', 'haber'),
+      /* Cuánto de lo pagado fue flete adelantado. Va DENTRO de `pagos` (no se
+       * suma aparte, sería contarlo dos veces): es el desglose que responde
+       * "¿por qué a una factura de $100.000 se le pagaron $80.000?". */
+      fletes: sumar((m) => m.kind === 'pago' && m.esFlete, 'haber'),
     };
     /** Plata ya pagada que todavía no se imputó a ningún documento: baja el
      *  saldo del proveedor pero deja facturas figurando impagas. */
