@@ -78,15 +78,12 @@ const LLAVE_DE_TIPO: Record<string, string> = {
   defectuoso: 'defectuoso',
 };
 
-class CompraDto {
-  @IsInt() productoId!: number;
-  @IsOptional() @IsInt() sucursalId?: number;
-  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
-  @IsOptional() @IsInt() proveedorId?: number;
-  @IsOptional() @IsString() fechaVencimiento?: string;
-  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
-  @IsOptional() @IsInt() usuarioId?: number;
-}
+/*
+ * SIN CompraDto: el ingreso de mercadería a mano se cerró el 18/8/2026 (pedido
+ * del dueño). La mercadería entra por la FACTURA de Compras, que es la que trae
+ * el costo, el proveedor y la deuda; el motor (`inv.opCompra`) sigue existiendo
+ * porque lo usan la factura y los seeds, pero ya no hay puerta HTTP propia.
+ */
 
 class VentaDto {
   @IsInt() productoId!: number;
@@ -290,12 +287,11 @@ export class OperacionesController {
     return this.inv.operacionesAlmacen({ sucursalId: mia ?? Number(sucursalId), desde, hasta });
   }
 
-  /** Ingreso a mano. El camino normal es la factura de compra; este es la excepción. */
-  @Post('compra')
-  @Permiso('inventario')
-  compra(@Body() dto: CompraDto, @Auth() sesion: Sesion) {
-    return this.inv.opCompra({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
-  }
+  /*
+   * Sin `POST /operaciones/compra`: el ingreso a mano quedó cerrado. La entrada
+   * de mercadería es la factura (Compras › Facturación); el faltante o sobrante
+   * que aparece contando la góndola se resuelve en Control de stock.
+   */
 
   @Post('venta')
   @Permiso('inventario')

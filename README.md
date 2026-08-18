@@ -152,7 +152,6 @@ Base: `http://localhost:3001/api`
 | GET/POST | `/usuarios` | Listar / crear usuarios |
 | GET | `/stock` | Existencias (Producto × Sucursal × Presentación × Estado) |
 | GET | `/movimientos?productoId=&sucursalId=&tipo=&limit=` | Historial paginado (ya NO viaja en /bootstrap) |
-| POST | `/operaciones/compra` | Ingreso de mercadería (suma stock) |
 | POST | `/operaciones/venta` | Venta (descuenta stock) |
 | POST | `/operaciones/fraccionar` | Granel → paquetes |
 | POST | `/operaciones/movimiento` | Devolución / ajuste / merma / vencido / defectuoso |
