@@ -823,7 +823,10 @@ export class VentasService {
     const items: any[] = [];
     for (const p of prods) {
       const costoNeto = costoPorProd.get(p.id) ?? 0;
-      const opts = { iva: p.iva, redondeo };
+      // El redondeo del producto pisa al de configuración — mismo criterio que
+      // la ficha y el historial: si acá difiriera, el POS mostraría un final
+      // que ninguna etiqueta imprimió.
+      const opts = { iva: p.iva, redondeo: p.redondeo ?? redondeo };
 
       /*
        * El formato de venta, ordenado por preferencia de lista. Solo esto llega
@@ -836,11 +839,20 @@ export class VentasService {
        */
       const efectivasDe = (presId: number | null, costo: number) => formatos
         .filter((f) => f.productoId === p.id && (f.presentacionId ?? null) === presId && porLista.has(f.listaId))
-        .map((f) => ({
-          ...f,
-          orden: porLista.get(f.listaId)!.orden,
-          netoUnitario: precioVentaFila(costo, f, opts).netoUnitario,
-        }))
+        .map((f) => {
+          /* Los DOS precios de la fila: el neto es la moneda del motor (el
+           * renglón del ticket trabaja en neto y el IVA se suma al total); el
+           * FINAL es el que ve el cliente — todo lo que MUESTRA un precio de
+           * lista (Alt+F3, buscadores del POS) usa el final, porque acá los
+           * precios al público llevan el IVA adentro (19/8/2026). */
+          const pv = precioVentaFila(costo, f, opts);
+          return {
+            ...f,
+            orden: porLista.get(f.listaId)!.orden,
+            netoUnitario: pv.netoUnitario,
+            finalUnitario: pv.finalUnitario,
+          };
+        })
         .sort((a, b) => a.orden - b.orden);
 
       const efectivas = efectivasDe(null, costoNeto);
@@ -877,9 +889,12 @@ export class VentasService {
         iva: p.iva,
         codigoBarras: p.codigoBarras,
         precio: money(filaBase?.netoUnitario ?? 0),
+        /** El de la etiqueta: lo que paga el cliente. Solo para MOSTRAR. */
+        precioFinal: money(filaBase?.finalUnitario ?? 0),
         precios: efectivas.map((ef) => ({
           listaId: ef.listaId,
           precio: money(ef.netoUnitario),
+          precioFinal: money(ef.finalUnitario),
           unidadesMinimas: ef.unidadesMinimas,
           unidades: ef.unidades,
         })),
@@ -924,11 +939,13 @@ export class VentasService {
           iva: p.iva,
           codigoBarras: pres.codigoBarras,
           precio: pisoPres ? money(pisoPres.netoUnitario) : 0,
+          precioFinal: pisoPres ? money(pisoPres.finalUnitario) : 0,
           /** Sin formato de venta cargado: el POS lo muestra y explica por qué no se puede vender. */
           sinFormato: suyas.length === 0,
           precios: suyas.map((ef) => ({
             listaId: ef.listaId,
             precio: money(ef.netoUnitario),
+            precioFinal: money(ef.finalUnitario),
             unidadesMinimas: ef.unidadesMinimas,
             unidades: ef.unidades,
           })),
