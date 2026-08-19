@@ -33,8 +33,8 @@
  * dueño es el de la Cafetería, y ese va por otro circuito (`cafeteria/`).
  */
 import {
-  Body, Controller, Delete, ForbiddenException, Get, Param, ParseIntPipe,
-  Patch, Post, Put, Query,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Param,
+  ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
@@ -325,6 +325,13 @@ export class OperacionesController {
     const llave = LLAVE_DE_TIPO[dto.tipo] ?? 'inventario';
     if (!sesion.permisos.includes('*') && !sesion.permisos.includes(llave)) {
       throw new ForbiddenException(`Tu rol no puede cargar un movimiento de tipo "${dto.tipo}".`);
+    }
+    /* El AJUSTE exige el motivo (19/8/2026): es la corrección a mano de un
+     * número, y en el historial "Ajuste −1" sin porqué es el movimiento que
+     * nadie puede explicar después. Los demás tipos ya se explican solos
+     * (una merma ES el motivo); el ajuste no. */
+    if (dto.tipo === 'ajuste' && !dto.motivo?.trim()) {
+      throw new BadRequestException('Un ajuste necesita su motivo: es lo que queda en el historial.');
     }
     return this.inv.opSimple({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
