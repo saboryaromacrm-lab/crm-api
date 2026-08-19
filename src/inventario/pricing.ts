@@ -96,9 +96,9 @@ export interface CostosFormato {
   ivaAbsorbido: number;
   ivaAbsorbidoUnitario: number;
   /**
-   * Lo que se le PAGA al proveedor por el bulto: la parte facturada con su IVA
-   * (que después se recupera) + la parte sin factura tal cual. Con 0% coincide
-   * con el costo final de siempre.
+   * Lo que se le PAGA AL PROVEEDOR por el bulto: la parte facturada con su IVA
+   * (que después se recupera) + la parte sin factura tal cual. SIN el flete:
+   * ese se paga aparte, a un tercero — no es plata del proveedor.
    */
   desembolso: number;
   desembolsoUnitario: number;
@@ -132,15 +132,23 @@ export function descuentoEfectivo(e?: CostoEntry | null): number {
  *
  *   costoNeto    ¿cuánto cuesta de verdad? La parte facturada en neto (su IVA
  *                se recupera como crédito) + la parte sin factura entera (no
- *                hay nada que recuperar). Valúa stock, pérdidas y envíos.
+ *                hay nada que recuperar) + el flete. Valúa stock y pérdidas.
  *   costoPrecio  ¿sobre qué se calcula el markup? A la parte sin factura se le
  *                quita el IVA que la venta va a generar (÷ factor), porque ese
  *                IVA lo absorbe el negocio y no se le traslada al cliente. Es
  *                el "descuento del 17,36%" del sistema viejo, hecho cuenta.
  *
- * La diferencia entre los dos es `ivaAbsorbido`: plata que sale del margen al
- * vender. Con `porcSinFactura: 0` las dos columnas coinciden y todo queda
- * exactamente como siempre.
+ * EL % CORRE SOLO SOBRE LA MERCADERÍA, NUNCA SOBRE EL FLETE (19/8/2026, el
+ * dueño lo corrigió el mismo día): el flete es un costo PROPIO — lo paga el
+ * negocio, a un tercero, ajeno al proveedor de la liquidación — así que no
+ * hay IVA que absorber ahí. Aplicarle el ÷factor al flete regalaba 17,36
+ * centavos por cada peso de flete en cada venta. Por eso `partir()` recibe la
+ * mercadería y el flete POR SEPARADO: la cuenta corre sobre la primera y el
+ * segundo entra entero a la base.
+ *
+ * La diferencia entre los dos costos es `ivaAbsorbido`: plata que sale del
+ * margen al vender. Con `porcSinFactura: 0` las dos columnas coinciden y todo
+ * queda exactamente como siempre.
  */
 export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const vacio: CostosFormato = {
@@ -158,22 +166,28 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const q = Math.min(Math.max(Number(e.porcSinFactura) || 0, 0), 100) / 100;
 
   /**
-   * Con el costo real X en la mano, el resto es una sola cuenta:
-   *   base del precio = X·(1−q) + X·q/factor   ← la parte negra, sin su IVA
-   *   IVA absorbido   = X − base               ← lo que el margen pierde
-   *   desembolso      = X·(1−q)·factor + X·q   ← lo que se le paga
-   * y vale la identidad `base × factor = desembolso`: comprar en negro y
-   * vender "sin IVA" al costo devuelve el mismo peso que salió.
+   * `M` es la MERCADERÍA (post descuentos, sin flete) y `flete` el importe del
+   * flete propio. La cuenta corre solo sobre M:
+   *   base del precio = M·(1−q) + M·q/factor + flete  ← la parte negra sin su
+   *                                                     IVA; el flete entero
+   *   IVA absorbido   = M·q·(1 − 1/factor)            ← lo que el margen pierde
+   *   desembolso      = M·(1−q)·factor + M·q          ← lo que se le paga AL
+   *                                                     PROVEEDOR (el flete se
+   *                                                     paga aparte, a otro)
+   * La identidad de control es de la mercadería: `(base − flete) × factor =
+   * desembolso` — comprar en negro y vender "sin IVA" al costo devuelve el
+   * mismo peso que salió.
    */
-  const partir = (costoNeto: number) => {
-    const costoPrecio = costoNeto * ((1 - q) + q / factorIva);
-    const desembolso = costoNeto * ((1 - q) * factorIva + q);
+  const partir = (mercaderia: number, flete: number) => {
+    const baseMercaderia = mercaderia * ((1 - q) + q / factorIva);
+    const costoPrecio = baseMercaderia + flete;
+    const desembolso = mercaderia * ((1 - q) * factorIva + q);
     return {
       porcSinFactura: q * 100,
       costoPrecio,
       costoPrecioUnitario: costoPrecio / cantidad,
-      ivaAbsorbido: costoNeto - costoPrecio,
-      ivaAbsorbidoUnitario: (costoNeto - costoPrecio) / cantidad,
+      ivaAbsorbido: mercaderia - baseMercaderia,
+      ivaAbsorbidoUnitario: (mercaderia - baseMercaderia) / cantidad,
       desembolso,
       desembolsoUnitario: desembolso / cantidad,
     };
@@ -197,7 +211,8 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
       costoFinal,
       costoNetoUnitario: costoNeto / cantidad,
       costoFinalUnitario: costoFinal / cantidad,
-      ...partir(costoNeto),
+      // En modo final no hay flete (queda fuera del cálculo): todo es mercadería.
+      ...partir(costoNeto, 0),
     };
   }
 
@@ -216,7 +231,8 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     costoFinal,
     costoNetoUnitario: costoNeto / cantidad,
     costoFinalUnitario: costoFinal / cantidad,
-    ...partir(costoNeto),
+    // La mercadería es el bruto (post descuentos); el flete, la diferencia.
+    ...partir(costoBruto, costoNeto - costoBruto),
   };
 }
 
