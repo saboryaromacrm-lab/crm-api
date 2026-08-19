@@ -29,6 +29,7 @@ import { PagosModule } from './pagos/pagos.module';
 import { CafeteriaModule } from './cafeteria/cafeteria.module';
 import { VencimientosModule } from './vencimientos/vencimientos.module';
 import { ChatModule } from './chat/chat.module';
+import { GerenciaModule } from './gerencia/gerencia.module';
 
 @Module({
   imports: [
@@ -65,6 +66,8 @@ import { ChatModule } from './chat/chat.module';
     CafeteriaModule,
     VencimientosModule,
     ChatModule,
+    // El tablero de gestión: Rentabilidad (0072).
+    GerenciaModule,
   ],
   controllers: [HealthController],
 })

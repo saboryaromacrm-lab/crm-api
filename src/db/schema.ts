@@ -145,6 +145,13 @@ export const proveedores = pgTable('proveedores', {
   letraGasto: letraComprobanteEnum('letra_gasto'),
   /* ---- La ficha comercial (0068, del módulo Proveedores) ---- */
   condicionCompra: condicionCompraProvEnum('condicion_compra').notNull().default('factura'),
+  /**
+   * Qué parte del valor de la mercadería vende SIN factura, habitualmente
+   * (0–100). Es el DEFAULT que precarga el campo homónimo de cada formato de
+   * compra nuevo; el que manda para el costo es el del formato. Solo tiene
+   * sentido con `condicionCompra` liquidación (100) o mixto (el arreglo real).
+   */
+  porcSinFactura: doublePrecision('porc_sin_factura').notNull().default(0),
   medioHabitual: medioHabitualProvEnum('medio_habitual'),
   /** Plazo en días cuando el medio habitual es diferido ("Cta cte 15"). */
   diasPago: integer('dias_pago'),
@@ -443,6 +450,14 @@ export const productoProveedores = pgTable('producto_proveedores', {
   modoCosto: modoCostoEnum('modo_costo').notNull().default('lista'),
   /** Solo en modo 'final': costo del bulto CON IVA, tal como lo factura el proveedor. */
   costoFinal: doublePrecision('costo_final').notNull().default(0),
+  /**
+   * Qué parte del valor viene SIN FACTURA (0–100, 0072). 100 = liquidación
+   * pura, 50 = mitad y mitad. Parte el costo en dos: el real (valúa stock y
+   * pérdidas) y la base del precio, a la que la parte sin factura entra sin el
+   * IVA que el negocio absorbe al vender — el "17,36%" del sistema viejo,
+   * calculado por alícuota en vez de tipeado. Ver `costosFormato` en pricing.
+   */
+  porcSinFactura: doublePrecision('porc_sin_factura').notNull().default(0),
   /**
    * Este formato es el que define el costo con el que se calcula el precio de
    * venta. Uno solo por producto: el servicio lo garantiza al guardar.
@@ -1645,6 +1660,23 @@ export const ventaItems = pgTable('venta_items', {
    */
   descuentoBase: doublePrecision('descuento_base').notNull().default(0),
   subtotal: doublePrecision('subtotal').notNull().default(0),
+  /*
+   * EL COSTO CONGELADO AL VENDER (0072) — sin esto no hay margen posible: el
+   * costo de hoy no es el de la venta de marzo. Los tres son NULL en los
+   * renglones anteriores a la migración ("sin dato" no es "costó cero": las
+   * métricas los saltean y dicen cuántos son).
+   *
+   *   costoUnitario         el costo REAL por unidad (neto facturado + parte
+   *                         sin factura entera). margen real = neto − esto.
+   *   ivaAbsorbidoUnitario  la parte de ese costo que es IVA que el negocio
+   *                         absorbe al vender (0 si vino todo facturado).
+   *                         margen aparente = margen real + esto.
+   *   porcSinFactura        el % del formato al momento de vender — congelado
+   *                         para agrupar sin que el pasado cambie de bando.
+   */
+  costoUnitario: doublePrecision('costo_unitario'),
+  ivaAbsorbidoUnitario: doublePrecision('iva_absorbido_unitario'),
+  porcSinFactura: doublePrecision('porc_sin_factura'),
   refItemId: integer('ref_item_id'),                      // NC parcial → ítem original
 }, (t) => ({
   ixVenta: index('ix_venta_items_venta').on(t.ventaId),

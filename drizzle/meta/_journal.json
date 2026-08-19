@@ -505,6 +505,13 @@
       "when": 1788051600000,
       "tag": "0071_pie_del_gasto",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1788138000000,
+      "tag": "0072_mercaderia_sin_factura",
+      "breakpoints": true
     }
   ]
 }

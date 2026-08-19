@@ -816,7 +816,7 @@ export class FinanzasProveedorService {
       proveedor: {
         id: prov.id, nombre: prov.nombre, cuit: prov.cuit,
         modoCuenta: prov.modoCuenta, medioHabitual: prov.medioHabitual, diasPago: prov.diasPago,
-        condicionCompra: prov.condicionCompra,
+        condicionCompra: prov.condicionCompra, porcSinFactura: prov.porcSinFactura,
         proveeMercaderia: prov.proveeMercaderia, proveeGastos: prov.proveeGastos,
         telefono: prov.telefono, email: prov.email,
         conciliadoHasta: prov.conciliadoHasta, conciliadoAt: prov.conciliadoAt,

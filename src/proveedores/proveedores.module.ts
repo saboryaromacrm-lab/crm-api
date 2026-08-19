@@ -2,7 +2,7 @@ import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 import { and, eq } from 'drizzle-orm';
 import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -38,6 +38,12 @@ class UpsertProveedorDto {
   /** Plazo en días del diferido ("Cta cte 15"). null/0 = sin plazo cargado. */
   @IsOptional() @IsInt() @Min(0) @Max(365) diasPago?: number | null;
   @IsOptional() @IsIn(['facturas', 'libre']) modoCuenta?: string;
+  /**
+   * Qué parte del valor vende SIN factura, habitualmente (0–100, 0072). Es el
+   * default que precarga los formatos de compra nuevos de este proveedor; el
+   * que manda para el costo es siempre el del formato.
+   */
+  @IsOptional() @IsNumber() @Min(0) @Max(100) porcSinFactura?: number;
 }
 
 @Injectable()
@@ -76,6 +82,8 @@ export class ProveedoresService {
       medioHabitual: (dto.medioHabitual || null) as any,
       diasPago: dto.diasPago || null,
       modoCuenta: (dto.modoCuenta ?? 'facturas') as any,
+      // Sin número explícito, "emite liquidación" solo puede querer decir 100.
+      porcSinFactura: dto.porcSinFactura ?? (dto.condicionCompra === 'liquidacion' ? 100 : 0),
     }).returning();
     return p;
   }
@@ -104,6 +112,7 @@ export class ProveedoresService {
       medioHabitual: (dto.medioHabitual === undefined ? actual.medioHabitual : (dto.medioHabitual || null)) as any,
       diasPago: dto.diasPago === undefined ? actual.diasPago : (dto.diasPago || null),
       modoCuenta: (dto.modoCuenta ?? actual.modoCuenta) as any,
+      porcSinFactura: dto.porcSinFactura ?? actual.porcSinFactura,
     }).where(eq(proveedores.id, id)).returning();
     return p;
   }

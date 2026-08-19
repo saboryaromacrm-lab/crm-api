@@ -11,7 +11,7 @@ import {
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
-import { costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioLista, precioVentaFila } from './pricing';
+import { costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioLista, precioVentaFila } from './pricing';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
 /**
@@ -217,7 +217,9 @@ export class InventarioService {
         return ob - oa;
       })[0] ?? null;
     const active = formatoActivo(provs as any[]);
-    const cn = costoNetoEntry(active, prod.iva);
+    // La BASE del precio, no el costo real: la parte sin factura entra sin el
+    // IVA que el negocio absorbe (0072) — mismo número que usa el POS.
+    const cn = costoPrecioEntry(active, prod.iva);
     // Markup EQUIVALENTE de la fila: con precio definido el markup no manda,
     // así que se deriva desde el neto unitario del formato.
     const pv = fila ? precioVentaFila(cn, fila as any, { iva: prod.iva, redondeo: cfg.redondeoPrecio }) : null;
@@ -1751,7 +1753,11 @@ export class InventarioService {
     const productosFull = prods.map((p) => {
       const pp = provCostos.filter((x) => x.productoId === p.id);
       const active = formatoActivo(pp);
+      /* Dos costos, dos preguntas (0072): `cn` es el REAL (valúa el stock que
+       * muestra la pantalla), `cnPrecio` la base que multiplica el markup. Con
+       * todo facturado son el mismo número. */
       const cn = costoNetoEntry(active, p.iva);
+      const cnPrecio = costoPrecioEntry(active, p.iva);
       const mias = formatos.filter((x) => x.productoId === p.id);
       // El redondeo propio del producto pisa al de configuración; null = heredar.
       const opts = { iva: p.iva, redondeo: p.redondeo ?? redondeo };
@@ -1793,7 +1799,7 @@ export class InventarioService {
         .filter(Boolean)
         .sort((a: any, b: any) => a.orden - b.orden) as any[];
 
-      const listasProd = armarFormato(null, cn);
+      const listasProd = armarFormato(null, cnPrecio);
       /** El piso: lo que se paga sin que el ticket habilite nada. */
       const piso = (ls: any[]) => ls.find((l) => l.listaId === listaBase?.id) ?? ls[ls.length - 1] ?? null;
       const misEtq = etiquetasDe.get(p.id) ?? [];
@@ -1808,8 +1814,9 @@ export class InventarioService {
         /* Cada paquete con SU formato de venta. `precio` null = todavía no tiene
          * ninguna lista cargada, que no es lo mismo que valer cero. */
         presentaciones: pres.filter((x) => x.productoId === p.id).map((pr) => {
+          // El paquete hereda los DOS costos de la madre, escalados a su tamaño.
           const costoPaquete = costoNetoPresentacion(cn, pr.tamKg);
-          const suyas = armarFormato(pr.id, costoPaquete);
+          const suyas = armarFormato(pr.id, costoNetoPresentacion(cnPrecio, pr.tamKg));
           const pisoPres = piso(suyas);
           return {
             ...pr,

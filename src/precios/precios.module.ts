@@ -33,7 +33,7 @@ import {
   productoProveedorCostos, productoProveedores, productos, proveedores, roles, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { costoNetoEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoPrecioEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -70,7 +70,9 @@ export class HistorialPreciosService {
     const listasVivas = new Set(listas.map((l) => l.id));
     const out: { productoId: number; listaId: number; precio: number }[] = [];
     for (const p of prods) {
-      const cn = costoNetoEntry(formatoActivo(formatos.filter((f) => f.productoId === p.id)), p.iva);
+      // La BASE del precio (0072), no el costo real: el historial registra el
+      // precio que la etiqueta mostró, y la etiqueta se arma con esta base.
+      const cn = costoPrecioEntry(formatoActivo(formatos.filter((f) => f.productoId === p.id)), p.iva);
       // Mismo criterio que las pantallas: el redondeo del producto pisa al de
       // configuración. Si acá difiriera, el historial registraría un precio
       // que ninguna etiqueta mostró jamás.

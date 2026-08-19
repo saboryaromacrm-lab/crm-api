@@ -45,6 +45,12 @@ export interface CostoEntry {
   /** 'final' ignora descuentos y flete: el costo se carga ya cerrado y con IVA. */
   modoCosto?: 'lista' | 'final';
   costoFinal?: number;
+  /**
+   * Qué parte de la mercadería viene SIN FACTURA (0–100). 0 = todo facturado,
+   * 100 = liquidación pura, 50 = mitad y mitad. Ver `costosFormato`: separa el
+   * costo real del que alimenta el precio.
+   */
+  porcSinFactura?: number;
   usarParaPrecio?: boolean;
 }
 
@@ -56,11 +62,46 @@ export interface CostosFormato {
   /** El de la cascada, en %. Es el número que nadie calcula bien de cabeza. */
   descuentoEfectivo: number;
   costoBruto: number;
+  /**
+   * EL COSTO ECONÓMICO REAL del bulto: lo que la mercadería cuesta de verdad
+   * (el IVA facturado no cuenta, se recupera como crédito; la parte sin factura
+   * cuenta entera, no hay nada que recuperar). Es el que valúa stock, pérdidas
+   * y transferencias — y con `porcSinFactura: 0` coincide con el de siempre.
+   */
   costoNeto: number;
   costoFinal: number;
-  /** El que alimenta el precio de venta. */
   costoNetoUnitario: number;
   costoFinalUnitario: number;
+
+  /* ---- Mercadería sin factura (0072) ---- */
+  /** Qué parte del valor de la mercadería viene sin factura (0–100). */
+  porcSinFactura: number;
+  /**
+   * LA BASE DEL PRECIO DE VENTA. A la parte sin factura se le "descuenta" el
+   * IVA que la venta va a generar (÷ 1,21), porque ese IVA no se traslada al
+   * cliente: lo absorbe el negocio. Es el 17,36% del sistema viejo, calculado
+   * en vez de tipeado — y vale para cualquier alícuota, no solo el 21.
+   *
+   * La prueba de que la cuenta es la del negocio: `costoPrecio × (1+IVA)` da
+   * exactamente el desembolso — comprar a $100 en negro y vender "sin IVA"
+   * al costo devuelve los $100 clavados.
+   */
+  costoPrecio: number;
+  costoPrecioUnitario: number;
+  /**
+   * El IVA que el negocio ABSORBE al vender este bulto: la diferencia entre el
+   * costo real y la base del precio. No desaparece — se paga a ARCA como
+   * débito sin crédito que lo compense. Es EL dato de las métricas.
+   */
+  ivaAbsorbido: number;
+  ivaAbsorbidoUnitario: number;
+  /**
+   * Lo que se le PAGA al proveedor por el bulto: la parte facturada con su IVA
+   * (que después se recupera) + la parte sin factura tal cual. Con 0% coincide
+   * con el costo final de siempre.
+   */
+  desembolso: number;
+  desembolsoUnitario: number;
 }
 
 /**
@@ -82,28 +123,70 @@ export function descuentoEfectivo(e?: CostoEntry | null): number {
  *
  *   lista → descuentos en cascada → flete → NETO → IVA → final
  *
- * En modo 'final' se entra por el otro extremo: se carga el costo con IVA tal
- * como lo factura el proveedor y el neto se deriva hacia atrás. Los descuentos
+ * En modo 'final' se entra por el otro extremo: se carga lo que se PAGA tal
+ * como lo cobra el proveedor y el neto se deriva hacia atrás. Los descuentos
  * y el flete quedan fuera del cálculo (ya están dentro de ese número).
  *
- * El **costo neto unitario** es el único que alimenta el precio de venta. El
- * final es informativo: sirve para conciliar contra la factura, y usarlo para
- * calcular el precio contaría el IVA dos veces.
+ * MERCADERÍA SIN FACTURA (`porcSinFactura`, 0072). Con una parte comprada en
+ * liquidación el costo se PARTE EN DOS, porque hay dos preguntas distintas:
+ *
+ *   costoNeto    ¿cuánto cuesta de verdad? La parte facturada en neto (su IVA
+ *                se recupera como crédito) + la parte sin factura entera (no
+ *                hay nada que recuperar). Valúa stock, pérdidas y envíos.
+ *   costoPrecio  ¿sobre qué se calcula el markup? A la parte sin factura se le
+ *                quita el IVA que la venta va a generar (÷ factor), porque ese
+ *                IVA lo absorbe el negocio y no se le traslada al cliente. Es
+ *                el "descuento del 17,36%" del sistema viejo, hecho cuenta.
+ *
+ * La diferencia entre los dos es `ivaAbsorbido`: plata que sale del margen al
+ * vender. Con `porcSinFactura: 0` las dos columnas coinciden y todo queda
+ * exactamente como siempre.
  */
 export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const vacio: CostosFormato = {
     cantidad: 1, costoLista: 0, costoListaUnitario: 0, descuentoEfectivo: 0,
     costoBruto: 0, costoNeto: 0, costoFinal: 0, costoNetoUnitario: 0, costoFinalUnitario: 0,
+    porcSinFactura: 0, costoPrecio: 0, costoPrecioUnitario: 0,
+    ivaAbsorbido: 0, ivaAbsorbidoUnitario: 0, desembolso: 0, desembolsoUnitario: 0,
   };
   if (!e) return vacio;
 
   // Una cantidad en 0 dividiría por cero y dejaría precios en Infinity.
   const cantidad = Math.max(Number(e.cantidad) || 1, 1e-9);
   const factorIva = 1 + (Number(iva) || 0) / 100;
+  /** Fracción sin factura (0–1), acotada: fuera de 0–100 no significa nada. */
+  const q = Math.min(Math.max(Number(e.porcSinFactura) || 0, 0), 100) / 100;
+
+  /**
+   * Con el costo real X en la mano, el resto es una sola cuenta:
+   *   base del precio = X·(1−q) + X·q/factor   ← la parte negra, sin su IVA
+   *   IVA absorbido   = X − base               ← lo que el margen pierde
+   *   desembolso      = X·(1−q)·factor + X·q   ← lo que se le paga
+   * y vale la identidad `base × factor = desembolso`: comprar en negro y
+   * vender "sin IVA" al costo devuelve el mismo peso que salió.
+   */
+  const partir = (costoNeto: number) => {
+    const costoPrecio = costoNeto * ((1 - q) + q / factorIva);
+    const desembolso = costoNeto * ((1 - q) * factorIva + q);
+    return {
+      porcSinFactura: q * 100,
+      costoPrecio,
+      costoPrecioUnitario: costoPrecio / cantidad,
+      ivaAbsorbido: costoNeto - costoPrecio,
+      ivaAbsorbidoUnitario: (costoNeto - costoPrecio) / cantidad,
+      desembolso,
+      desembolsoUnitario: desembolso / cantidad,
+    };
+  };
 
   if (e.modoCosto === 'final') {
+    /*
+     * Lo cargado es el DESEMBOLSO del bulto (lo que se paga, papeles sumados).
+     * El costo real se deriva hacia atrás: solo la parte facturada trae IVA
+     * adentro. Con q=0 es el ÷1,21 de siempre; con q=100 no hay IVA que sacar.
+     */
     const costoFinal = Number(e.costoFinal) || 0;
-    const costoNeto = costoFinal / factorIva;
+    const costoNeto = costoFinal / ((1 - q) * factorIva + q);
     return {
       cantidad,
       costoLista: 0,
@@ -114,6 +197,7 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
       costoFinal,
       costoNetoUnitario: costoNeto / cantidad,
       costoFinalUnitario: costoFinal / cantidad,
+      ...partir(costoNeto),
     };
   }
 
@@ -132,6 +216,7 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     costoFinal,
     costoNetoUnitario: costoNeto / cantidad,
     costoFinalUnitario: costoFinal / cantidad,
+    ...partir(costoNeto),
   };
 }
 
@@ -219,13 +304,27 @@ export interface OpcionesPrecio {
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
 /**
- * El costo con el que se calcula el precio de venta: **neto y unitario**.
+ * El COSTO REAL unitario: lo que la mercadería cuesta de verdad. Es el que
+ * valúa stock, pérdidas, transferencias y envíos a costo — todo lo que mide
+ * plata que ya se gastó.
  *
- * Neto porque el markup se aplica sobre el neto y el IVA se suma al final;
- * unitario porque el precio es por unidad aunque se compre por caja.
+ * NO es la base del precio de venta: eso es `costoPrecioEntry`. Con mercadería
+ * 100% facturada los dos coinciden; con parte sin factura difieren, y usar el
+ * equivocado o infla el precio (trasladarle al cliente un IVA que no se pagó)
+ * o achica la pérdida (valuar a menos de lo que se pagó).
  */
 export function costoNetoEntry(e?: CostoEntry | null, iva = 0): number {
   return costosFormato(e, iva).costoNetoUnitario;
+}
+
+/**
+ * La BASE DEL PRECIO DE VENTA: neta, unitaria y con la parte sin factura ya
+ * despojada del IVA que el negocio va a absorber. Es lo único que puede
+ * multiplicar el markup — todos los caminos que derivan un precio (POS,
+ * ficha, sitio, historial) entran por acá.
+ */
+export function costoPrecioEntry(e?: CostoEntry | null, iva = 0): number {
+  return costosFormato(e, iva).costoPrecioUnitario;
 }
 
 /** Redondea a la unidad pedida. `redondeo <= 0` deja el valor a 2 decimales. */

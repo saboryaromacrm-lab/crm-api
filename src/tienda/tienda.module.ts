@@ -30,7 +30,7 @@ import {
   categorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
-import { costoNetoEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoPrecioEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
 import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -250,7 +250,8 @@ export class TiendaService {
       const filaTienda = filaTiendaPorProducto.get(p.id);
       if (!filaTienda) continue;
 
-      const costoNeto = costoNetoEntry(formatoActivo(provsPorProducto.get(p.id) ?? []), p.iva);
+      // La BASE del precio (0072): el sitio publica el mismo precio que el POS.
+      const costoNeto = costoPrecioEntry(formatoActivo(provsPorProducto.get(p.id) ?? []), p.iva);
       const pv = precioVentaFila(costoNeto, filaTienda, { iva: p.iva, redondeo: cfg.redondeoPrecio });
       /*
        * Sin precio real no hay publicación: una fila mayorista con el costo a

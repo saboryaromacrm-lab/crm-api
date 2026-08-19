@@ -21,8 +21,8 @@ import {
   transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import {
-  costoNetoEntry, costoNetoPresentacion, costosFormato, formatoActivo, precioVentaFila,
-  type OpcionesPrecio,
+  costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo,
+  precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
 
@@ -237,14 +237,18 @@ export class ProductosService {
     return prods.map((prod) => {
       const mios = provsDe.get(prod.id) ?? [];
       const active = formatoActivo(mios);
+      /* Dos costos (0072): `costoNeto` es el REAL (pantallas y valuación);
+       * `costoPrecio` la base del markup, con la parte sin factura ya sin el
+       * IVA que el negocio absorbe. Todo facturado = el mismo número. */
       const costoNeto = costoNetoEntry(active, prod.iva);
+      const costoPrecio = costoPrecioEntry(active, prod.iva);
       // El redondeo del producto pisa al de configuración; null = heredar.
       const opts = { iva: prod.iva, redondeo: prod.redondeo ?? cfg.redondeoPrecio };
 
       // FORMATO DE VENTA del producto SUELTO: las filas sin presentación. Las de
       // sus paquetes van con cada paquete — si entraran acá, la madre mostraría
       // como propios los precios de sus hijos.
-      const listas = armarFormato((formatoDe.get(prod.id) ?? []).filter((f: any) => !f.presentacionId), costoNeto, opts);
+      const listas = armarFormato((formatoDe.get(prod.id) ?? []).filter((f: any) => !f.presentacionId), costoPrecio, opts);
 
       const misEtq = (etqsDe.get(prod.id) ?? []).map((e: any) => e.etiquetaId);
 
@@ -265,8 +269,9 @@ export class ProductosService {
          * la etiqueta avisa antes de imprimir. Un cero se vendería.
          */
         presentaciones: (presDe.get(prod.id) ?? []).map((pr: any) => {
+          // Los DOS costos de la madre, escalados: el real muestra, el otro cotiza.
           const costoPaquete = costoNetoPresentacion(costoNeto, pr.tamKg);
-          const suyas = armarFormato(formatoPresDe.get(pr.id) ?? [], costoPaquete, opts);
+          const suyas = armarFormato(formatoPresDe.get(pr.id) ?? [], costoNetoPresentacion(costoPrecio, pr.tamKg), opts);
           const piso = filaPiso(suyas);
           return {
             ...pr,
@@ -1264,6 +1269,9 @@ export class ProductosService {
       flete: plata(f.flete),
       modoCosto: (f.modoCosto === 'final' ? 'final' : 'lista') as 'lista' | 'final',
       costoFinal: plata(f.costoFinal),
+      // Qué parte viene sin factura (0072). `pct` la acota a 0–100: un 170
+      // tipeado dejaría la base del precio negativa.
+      porcSinFactura: pct(f.porcSinFactura),
       usarParaPrecio: i === activo,
       codigoProveedor: (f.codigoProveedor ?? '').trim(),
     });

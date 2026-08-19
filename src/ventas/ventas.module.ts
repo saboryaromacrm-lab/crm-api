@@ -42,7 +42,7 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, costoNetoPresentacion, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
 
 const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
@@ -220,6 +220,10 @@ type RenglonResuelto = VentaItemDto & {
    * tipeado a mano — ver el comentario de `descuentoBase` en el esquema.
    */
   descuentoBase: number;
+  /** El costo congelado al resolver (0072) — ver el comentario en el esquema. */
+  costoUnitario: number;
+  ivaAbsorbidoUnitario: number;
+  porcSinFactura: number;
 };
 
 /** Un descuento con nombre ya validado y listo para aplicar. */
@@ -797,7 +801,9 @@ export class VentasService {
     const costoPorProd = new Map<number, number>();
     for (const p of prods) {
       const suyos = provs.filter((x) => x.productoId === p.id);
-      costoPorProd.set(p.id, costoNetoEntry(formatoActivo(suyos), p.iva));
+      // La BASE del precio (0072): la parte sin factura entra sin el IVA que
+      // el negocio absorbe. El costo real no viaja al POS — acá se cotiza.
+      costoPorProd.set(p.id, costoPrecioEntry(formatoActivo(suyos), p.iva));
     }
 
     /** Stock por (producto, presentación, sucursal); presentación `null` = suelto. */
@@ -1272,8 +1278,20 @@ export class VentasService {
 
       /* -- El costo con el que se cotiza, igual que en el catálogo del POS -- */
       const suyos = provs.filter((x) => x.productoId === prod.id);
-      const costoBase = costoNetoEntry(formatoActivo(suyos), prod.iva);
-      const costo = pres ? costoNetoPresentacion(costoBase, pres.tamKg) : costoBase;
+      const cf = costosFormato(formatoActivo(suyos) as any, prod.iva);
+      const costo = pres
+        ? costoNetoPresentacion(cf.costoPrecioUnitario, pres.tamKg)
+        : cf.costoPrecioUnitario;
+      /*
+       * Y EL COSTO QUE SE CONGELA EN EL RENGLÓN (0072), que es OTRO: el real,
+       * con la parte sin factura entera. Se escribe acá —el único momento en
+       * que el costo y la venta coinciden en el tiempo— porque el margen de
+       * marzo no puede cambiar porque en julio subió el catálogo. El paquete
+       * hereda el del kilo por su tamaño, igual que su precio.
+       */
+      const escala = pres ? Number(pres.tamKg) || 0 : 1;
+      const costoCongelado = cf.costoNetoUnitario * escala;
+      const ivaAbsorbidoCongelado = cf.ivaAbsorbidoUnitario * escala;
 
       /* -- El formato de venta del artículo, ordenado por preferencia -- */
       const suyas = filas
@@ -1512,6 +1530,11 @@ export class VentasService {
         ofertaId,
         ofertaDescuento: ofertaDesc,
         iva: prod.iva,
+        /* El costo congelado (0072): margen real = neto − costo; el aparente
+         * le devuelve el IVA absorbido. El % viaja para agrupar después. */
+        costoUnitario: costoCongelado,
+        ivaAbsorbidoUnitario: ivaAbsorbidoCongelado,
+        porcSinFactura: cf.porcSinFactura,
       } as RenglonResuelto;
     });
 
@@ -1609,6 +1632,12 @@ export class VentasService {
          * como si lo hubiera tipeado el vendedor: el autoguardado siguiente lo
          * rebotaría contra el tope y el ticket quedaría trabado. */
         descuentoBase: (it as any).descuentoBase ?? desc,
+        /* El costo congelado (0072). `?? null`, no `?? 0`: si un camino no lo
+         * resolvió, "sin dato" tiene que quedar como NULL — un cero acá es un
+         * margen del 100% inventado en los reportes. */
+        costoUnitario: (it as any).costoUnitario ?? null,
+        ivaAbsorbidoUnitario: (it as any).ivaAbsorbidoUnitario ?? null,
+        porcSinFactura: (it as any).porcSinFactura ?? null,
         iva: ivaP,
         subtotal: money(neto),
       };
