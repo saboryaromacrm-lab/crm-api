@@ -1707,6 +1707,29 @@ export class VentasService {
    * cantidad o por regla de marca se ganaron el precio con volumen y no dependen
    * de cómo se pague.
    */
+  /**
+   * MEDIOS QUE EXIGEN FACTURA (19/8/2026, pedido del dueño). Si un peso del
+   * cobro entra por un medio tildado en la configuración, la venta no puede
+   * salir como ticket interno: se factura o se cambia el medio. Corre sobre el
+   * TIPO ya resuelto y mira solo los pagos con importe — un renglón de
+   * transferencia en $0 no obliga a nada.
+   *
+   * El POS bloquea "Liquidar" con el motivo a la vista; esto es el candado del
+   * lado que manda, para el ticket armado por API o un POS desactualizado.
+   */
+  private validarMediosFacturar(tipo: string, pagos: VentaPagoDto[], config: any) {
+    if (tipo !== 'ticket') return;                                   // factura/NC/ND: nada que exigir
+    const exigen: string[] = config.mediosFacturar ?? [];
+    if (!exigen.length) return;
+    const usado = (pagos ?? []).find((p) => Number(p.importe) > 0 && exigen.includes(p.medio));
+    if (usado) {
+      throw new BadRequestException(
+        `El medio "${usado.medio.replace(/_/g, ' ')}" exige factura: esta venta no puede salir como ticket. `
+        + 'Facturala (F8) o cobrala con otro medio.',
+      );
+    }
+  }
+
   private validarMediosPagoMonto(items: any[], condicionPago: string, pagos: VentaPagoDto[], config: any) {
     const permitidos: string[] = config.mediosPagoMonto ?? [];
     if (!permitidos.length) return;                                  // sin restricción
@@ -2000,6 +2023,7 @@ export class VentasService {
 
     /* -- Confirmada de una: el camino de la API y del seed -- */
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
+    this.validarMediosFacturar(tipo, pagos, config);
     this.validarMediosPagoMonto(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
     this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista.values());
@@ -2215,6 +2239,9 @@ export class VentasService {
     const tipo = dto.tipo === 'factura'
       ? (letraFacturaPara(cliente, config) as any)
       : dto.tipo === 'ticket' ? 'ticket' : borrador.tipo;
+    // Con el tipo ya resuelto: un medio marcado "exige factura" no puede salir
+    // en ticket. Este es EL camino de la caja — el candado tiene que vivir acá.
+    this.validarMediosFacturar(tipo, pagos, config);
 
     await this.db.transaction(async (tx) => {
       const numero = await this.siguienteNumero(tx, tipo, borrador.puntoVenta);

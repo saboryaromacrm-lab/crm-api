@@ -106,6 +106,14 @@ export const VENTAS_DEFAULTS = {
   cajaObligatoria: true as boolean,     // exigir turno de caja abierto para vender
   permitirStockNegativo: false as boolean,
   mediosPago: ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'qr'] as string[],
+  /**
+   * Medios que EXIGEN factura (19/8/2026, pedido del dueño): una venta cobrada
+   * —aunque sea en parte— con uno de estos no puede salir como ticket interno.
+   * El POS bloquea "Liquidar" con el motivo a la vista y la API lo revalida al
+   * confirmar. El caso típico: lo bancarizado (transferencia, tarjetas) deja
+   * rastro y tiene que estar facturado sí o sí.
+   */
+  mediosFacturar: [] as string[],
 
   /* Lector de códigos / balanza ----------------------------------------- */
   lectorHabilitado: true as boolean,
