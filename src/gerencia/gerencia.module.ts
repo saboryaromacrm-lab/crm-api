@@ -214,17 +214,26 @@ export class RentabilidadService {
       inArray(ventas.estado, ['confirmada', 'pendiente_cae'] as any),
     ];
     if (sucursalId) conds.push(eq(ventas.sucursalId, sucursalId));
+    /* UNA DEVOLUCIÓN RESTA. Los renglones de una nota de crédito se guardan en
+     * positivo (es un comprobante que dice "$X"), así que acá entran con signo
+     * negativo: sin eso, devolver mercadería aparecería como haberla vendido
+     * DOS veces —unidades, venta y costo inflados— y el margen del producto
+     * quedaría medido sobre plata que volvió al cliente. */
+    const signo = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)`;
+    const noEsNota = sql`${ventas.tipo}::text not like 'nota_credito%'`;
     return this.db.select({
       productoId: ventaItems.productoId,
-      unidades: sql<number>`sum(${ventaItems.cantidad})`,
-      ventaNeta: sql<number>`sum(${ventaItems.subtotal})`,
+      unidades: sql<number>`sum(${ventaItems.cantidad} * ${signo})`,
+      ventaNeta: sql<number>`sum(${ventaItems.subtotal} * ${signo})`,
       /* El margen solo puede medirse donde hay costo congelado: la venta de
        * ESOS renglones va aparte para que el % no mezcle peras con nada. */
-      ventaCosteada: sql<number>`coalesce(sum(${ventaItems.subtotal}) filter (where ${ventaItems.costoUnitario} is not null), 0)`,
-      costo: sql<number | null>`sum(${ventaItems.cantidad} * ${ventaItems.costoUnitario})`,
-      ivaAbsorbido: sql<number>`coalesce(sum(${ventaItems.cantidad} * ${ventaItems.ivaAbsorbidoUnitario}), 0)`,
-      renglones: sql<number>`count(*)::int`,
-      conCosto: sql<number>`count(${ventaItems.costoUnitario})::int`,
+      ventaCosteada: sql<number>`coalesce(sum(${ventaItems.subtotal} * ${signo}) filter (where ${ventaItems.costoUnitario} is not null), 0)`,
+      costo: sql<number | null>`sum(${ventaItems.cantidad} * ${ventaItems.costoUnitario} * ${signo})`,
+      ivaAbsorbido: sql<number>`coalesce(sum(${ventaItems.cantidad} * ${ventaItems.ivaAbsorbidoUnitario} * ${signo}), 0)`,
+      /* Los CONTEOS solo miran la venta: un renglón devuelto no es un renglón
+       * más, y restarlo daría conteos negativos sin significado. */
+      renglones: sql<number>`count(*) filter (where ${noEsNota})::int`,
+      conCosto: sql<number>`count(${ventaItems.costoUnitario}) filter (where ${noEsNota})::int`,
       sinFactura: sql<boolean>`bool_or(coalesce(${ventaItems.porcSinFactura}, 0) > 0)`,
     }).from(ventaItems)
       .innerJoin(ventas, eq(ventaItems.ventaId, ventas.id))
@@ -237,14 +246,21 @@ export class RentabilidadService {
     const conds = [
       gte(ventas.fecha, desde), lt(ventas.fecha, hastaEx),
       inArray(ventas.estado, ['confirmada', 'pendiente_cae'] as any),
-      inArray(ventas.tipo, ['factura_a', 'factura_b', 'factura_c'] as any),
+      /* Las notas de crédito entran acá a propósito: el débito fiscal del
+       * período es el IVA facturado MENOS el de lo que se devolvió. Dejarlas
+       * afuera sería pagarle a ARCA el IVA de una venta que se deshizo. */
+      inArray(ventas.tipo, [
+        'factura_a', 'factura_b', 'factura_c',
+        'nota_credito_a', 'nota_credito_b', 'nota_credito_c',
+      ] as any),
     ];
     if (sucursalId) conds.push(eq(ventas.sucursalId, sucursalId));
     const [r] = await this.db.select({
-      debito: sql<number>`coalesce(sum(${ventas.ivaTotal}), 0)`,
-      cantidad: sql<number>`count(*)::int`,
+      debito: sql<number>`coalesce(sum(${ventas.ivaTotal} * (case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)), 0)`,
+      cantidad: sql<number>`count(*) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+      notas: sql<number>`count(*) filter (where ${ventas.tipo}::text like 'nota_credito%')::int`,
     }).from(ventas).where(and(...conds));
-    return r ?? { debito: 0, cantidad: 0 };
+    return r ?? { debito: 0, cantidad: 0, notas: 0 };
   }
 
   /**

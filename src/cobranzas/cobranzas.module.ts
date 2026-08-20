@@ -22,7 +22,7 @@ import {
   ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
@@ -189,9 +189,29 @@ export class CobranzasService {
       .where(and(eq(cobranzas.estado, 'confirmada'), inArray(cobranzaImputaciones.ventaId, ventaIds)))
       .groupBy(cobranzaImputaciones.ventaId);
 
+    /*
+     * LAS NOTAS DE CRÉDITO TAMBIÉN BAJAN EL SALDO, y tienen que entrar en el
+     * MISMO candado: si no, se le podría cobrar al cliente una factura que ya
+     * se le acreditó entera. Se leen después del `for update` de las ventas, y
+     * como una nota nueva se inserta apuntando a una fila que esta transacción
+     * tiene bloqueada, no se puede colar una en el medio.
+     */
+    const notas = await tx
+      .select({
+        refVentaId: ventas.refVentaId,
+        importe: sql<number>`coalesce(sum(${ventas.total}), 0)`,
+      })
+      .from(ventas)
+      .where(and(inArray(ventas.refVentaId, ventaIds), ne(ventas.estado, 'anulada')))
+      .groupBy(ventas.refVentaId);
+
     const cobrado = new Map<number, number>(imput.map((i: any) => [i.ventaId, Number(i.importe) || 0]));
+    const acreditado = new Map<number, number>(notas.map((n: any) => [n.refVentaId, Number(n.importe) || 0]));
     return new Map<number, { doc: any; saldo: number }>(
-      docs.map((d: any) => [d.id, { doc: d, saldo: money(d.total - (cobrado.get(d.id) ?? 0)) }]),
+      docs.map((d: any) => [
+        d.id,
+        { doc: d, saldo: money(d.total - (cobrado.get(d.id) ?? 0) - (acreditado.get(d.id) ?? 0)) },
+      ]),
     );
   }
 
@@ -279,6 +299,15 @@ export class CobranzasService {
           const { doc, saldo } = entry;
           if (doc.clienteId !== cliente.id) throw new BadRequestException('Un comprobante no pertenece a este cliente.');
           if (doc.estado !== 'confirmada') throw new BadRequestException('Solo se imputa a comprobantes confirmados.');
+          /* A UNA NOTA DE CRÉDITO NO SE LE COBRA NADA: es plata que la casa
+           * devolvió. `cuenta()` ya no la ofrece, pero una imputación mandada
+           * a mano llegaría acá — y su "saldo" (total menos nada) daría
+           * positivo, o sea: cobrarle al cliente su propia devolución. */
+          if (String(doc.tipo ?? '').startsWith('nota_credito')) {
+            throw new BadRequestException(
+              'No se le imputa una cobranza a una nota de crédito: la nota ya descuenta de la cuenta del cliente.',
+            );
+          }
           if (i.importe > saldo + EPS) {
             throw new BadRequestException(
               `El comprobante ${doc.puntoVenta}-${String(doc.numero).padStart(8, '0')} debe $${saldo.toFixed(2)} y estás imputando $${i.importe.toFixed(2)}.`,

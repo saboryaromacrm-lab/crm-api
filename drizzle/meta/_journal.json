@@ -533,6 +533,13 @@
       "when": 1788228000000,
       "tag": "0075_arca_numero_reservado",
       "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1788231600000,
+      "tag": "0076_notas_de_credito_por_letra",
+      "breakpoints": true
     }
   ]
 }

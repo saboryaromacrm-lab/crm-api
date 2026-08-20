@@ -22,11 +22,13 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
+  Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
+  cajaMovimientos, cajaSesiones,
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
@@ -46,7 +48,18 @@ import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, 
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 
-const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
+const TIPOS = [
+  'ticket', 'factura_a', 'factura_b', 'factura_c',
+  'nota_credito_a', 'nota_credito_b', 'nota_credito_c',
+  'nota_debito_a', 'nota_debito_b', 'nota_debito_c',
+] as const;
+
+/**
+ * Lo que se puede PEDIR al crear una venta. Una nota de crédito no se crea a
+ * mano: nace de la venta que ajusta (`POST /ventas/:id/nota-credito`), que es
+ * lo único que sabe qué se está devolviendo y por cuánto.
+ */
+const TIPOS_CREABLES = ['ticket', 'factura_a', 'factura_b', 'factura_c'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
 
 /**
@@ -200,6 +213,29 @@ export function letraFacturaPara(cliente: { condicionIva: string }, config: Reco
 
 /* ------------------------------- DTOs ------------------------------- */
 
+/** ¿Este comprobante RESTA en vez de sumar? Las notas de crédito, y solo ellas. */
+export const esNotaCredito = (tipo: string) => String(tipo ?? '').startsWith('nota_credito');
+
+/** La letra de un comprobante del sistema: 'factura_b' → 'B'. */
+const letraDe = (tipo: string) => {
+  const m = /_([abc])$/.exec(String(tipo ?? ''));
+  return m ? (m[1].toUpperCase() as 'A' | 'B' | 'C') : null;
+};
+
+/**
+ * Lo mismo que `esNotaCredito` pero del lado de Postgres, para las sumas: una
+ * nota de crédito entra con signo negativo. Se compara sobre `::text` porque
+ * `tipo` es un enum y los enums no tienen `like`.
+ */
+const SIGNO_NC = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)`;
+
+/** "Factura B 0003-00000042", para mensajes y rastros. */
+const etiquetaVenta = (v: { tipo: string; puntoVenta: string; numero: number | null }) => {
+  const nombre = v.tipo === 'ticket' ? 'Ticket'
+    : `${esNotaCredito(v.tipo) ? 'Nota de crédito' : 'Factura'} ${letraDe(v.tipo) ?? ''}`.trim();
+  return `${nombre} ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
+};
+
 const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto', 'presupuesto'] as const;
 
 /**
@@ -309,7 +345,7 @@ export class CreateVentaDto {
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
   @IsOptional() @IsInt() cajaSesionId?: number;
-  @IsOptional() @IsIn(TIPOS as unknown as string[]) tipo?: (typeof TIPOS)[number];
+  @IsOptional() @IsIn(TIPOS_CREABLES as unknown as string[]) tipo?: (typeof TIPOS)[number];
   /** 'borrador' deja la venta abierta en el punto de venta. */
   @IsOptional() @IsIn(['borrador', 'confirmada']) estado?: 'borrador' | 'confirmada';
   @IsOptional() @IsIn(['contado', 'cuenta_corriente']) condicionPago?: 'contado' | 'cuenta_corriente';
@@ -369,6 +405,31 @@ class DelegarVentaDto {
  */
 class AnularVentaDto {
   @IsString() @MaxLength(300) motivo!: string;
+}
+
+/** Un renglón que se devuelve, con cuánto de él. */
+class NotaCreditoItemDto {
+  @IsInt() itemId!: number;
+  @IsNumber() @Min(0) @Max(1_000_000) cantidad!: number;
+}
+
+/**
+ * LA NOTA DE CRÉDITO. Sin `items`, es TOTAL (todos los renglones completos más
+ * los extras); con `items`, devuelve solo eso.
+ *
+ * `devuelveMercaderia` y `devolverEfectivo` son dos cosas distintas y por eso
+ * son dos campos: una nota por un error de precio no mueve stock, y una
+ * devolución de un cliente de cuenta corriente no saca plata de la caja.
+ */
+class NotaCreditoDto {
+  @IsString() @MaxLength(300) motivo!: string;
+  @IsOptional() @IsArray() @ArrayMaxSize(500) @ValidateNested({ each: true }) @Type(() => NotaCreditoItemDto)
+  items?: NotaCreditoItemDto[];
+  /** Default `true`: lo normal es que la mercadería vuelva al depósito. */
+  @IsOptional() @IsBoolean() devuelveMercaderia?: boolean;
+  /** Default `false`: sacar plata de la caja se pide explícito. */
+  @IsOptional() @IsBoolean() devolverEfectivo?: boolean;
+  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 /**
@@ -531,14 +592,20 @@ export class VentasService {
         .orderBy(desc(ventas.fecha), desc(ventas.id))
         .limit(limit).offset(offset),
 
+      /* Las notas de crédito viven en la misma tabla y en el mismo filtro, pero
+       * NO son venta: entran con signo negativo en la plata (devolvieron) y no
+       * cuentan como ticket (nadie vendió nada). Su cantidad viaja aparte, que
+       * es el número que el dueño mira cuando pregunta "¿cuánto se devolvió?". */
       this.db.select({
         registros: sql<number>`count(*)::int`,
         anuladas: sql<number>`count(*) filter (where ${ventas.estado} = 'anulada')::int`,
-        tickets: sql<number>`count(*) filter (where ${ventas.estado} <> 'anulada')::int`,
-        plata: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
-        neto: sql<number>`coalesce(sum(${ventas.subtotalNeto}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
-        iva: sql<number>`coalesce(sum(${ventas.ivaTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
-        descuentos: sql<number>`coalesce(sum(${ventas.descuentoTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        tickets: sql<number>`count(*) filter (where ${ventas.estado} <> 'anulada' and ${ventas.tipo}::text not like 'nota_credito%')::int`,
+        notasCredito: sql<number>`count(*) filter (where ${ventas.estado} <> 'anulada' and ${ventas.tipo}::text like 'nota_credito%')::int`,
+        plataAcreditada: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} <> 'anulada' and ${ventas.tipo}::text like 'nota_credito%'), 0)`,
+        plata: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        neto: sql<number>`coalesce(sum(${ventas.subtotalNeto} * ${SIGNO_NC}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        iva: sql<number>`coalesce(sum(${ventas.ivaTotal} * ${SIGNO_NC}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
+        descuentos: sql<number>`coalesce(sum(${ventas.descuentoTotal} * ${SIGNO_NC}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
         plataAnulada: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} = 'anulada'), 0)`,
         // Tickets provisorios esperando ARCA, DEL FILTRO: alimenta la pestaña.
         sinFacturar: sql<number>`count(*) filter (where ${ventas.facturarPendiente} and ${ventas.estado} <> 'anulada')::int`,
@@ -565,7 +632,7 @@ export class VentasService {
     ]);
 
     const ids = filas.map((f) => f.v.id);
-    const [pagos, agg, imput] = ids.length
+    const [pagos, agg, imput, notas] = ids.length
       ? await Promise.all([
         this.db.select().from(ventaPagos).where(inArray(ventaPagos.ventaId, ids)),
         this.db.select({
@@ -579,23 +646,41 @@ export class VentasService {
           listas: sql<string[]>`array_remove(array_agg(distinct nullif(${ventaItems.lista}, '')), null)`,
         }).from(ventaItems).where(inArray(ventaItems.ventaId, ids)).groupBy(ventaItems.ventaId),
         this.imputadoPorVenta(ids),
+        /* Lo que las notas de crédito le sacaron a cada venta de la página.
+         * Se consulta aparte porque las notas pueden ser de OTRA página o de
+         * otro filtro: el saldo de la fila no puede depender de si la nota
+         * entró o no en la misma consulta. */
+        this.db.select({
+          refVentaId: ventas.refVentaId,
+          total: sql<number>`coalesce(sum(${ventas.total}), 0)`,
+        }).from(ventas)
+          .where(and(inArray(ventas.refVentaId, ids), ne(ventas.estado, 'anulada')))
+          .groupBy(ventas.refVentaId),
       ])
-      : [[], [], new Map<number, number>()];
+      : [[], [], new Map<number, number>(), []];
 
     const registros = Number(tot?.registros) || 0;
     const tickets = Number(tot?.tickets) || 0;
     const plata = money(Number(tot?.plata));
+    const acreditadoDe = new Map<number, number>(
+      (notas as any[]).map((n) => [Number(n.refVentaId), Number(n.total) || 0]),
+    );
     return {
       filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre }) => {
         const a = agg.find((x: any) => x.ventaId === v.id);
         const cobrado = imput.get(v.id) ?? 0;
+        const acreditado = acreditadoDe.get(v.id) ?? 0;
         return {
           ...v,
           clienteNombre,
           sucursalNombre: sucursalNombre ?? '—',
           cajeroNombre: cajeroNombre ?? '—',
           cobrado,
-          saldo: money(v.total - cobrado),
+          acreditado: money(acreditado),
+          /* UNA NOTA DE CRÉDITO NO TIENE SALDO: no se cobra. Poner acá su
+           * total la haría ver como deuda del cliente, que es exactamente lo
+           * contrario de lo que dice el comprobante. */
+          saldo: esNotaCredito(v.tipo) ? 0 : money(v.total - cobrado - acreditado),
           medios: pagos.filter((p: any) => p.ventaId === v.id).map((p: any) => ({ medio: p.medio, importe: p.importe })),
           renglones: Number(a?.renglones) || 0,
           unidades: money(Number(a?.unidades)),
@@ -619,6 +704,8 @@ export class VentasService {
         iva: money(Number(tot?.iva)),
         descuentos: money(Number(tot?.descuentos)),
         plataAnulada: money(Number(tot?.plataAnulada)),
+        notasCredito: Number(tot?.notasCredito) || 0,
+        plataAcreditada: money(Number(tot?.plataAcreditada)),
         promedio: tickets ? money(plata / tickets) : 0,
         sinFacturar: Number(tot?.sinFacturar) || 0,
         ofertas: { plata: money(Number(ofe?.plata)), ventas: Number(ofe?.ventas) || 0 },
@@ -630,13 +717,23 @@ export class VentasService {
   async get(id: number) {
     const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
     if (!v) throw new NotFoundException('Venta inexistente.');
-    const [items, extras, pagos, imput] = await Promise.all([
+    const [items, extras, pagos, imput, nc] = await Promise.all([
       this.db.select().from(ventaItems).where(eq(ventaItems.ventaId, id)).orderBy(ventaItems.id),
       this.db.select().from(ventaExtras).where(eq(ventaExtras.ventaId, id)).orderBy(ventaExtras.id),
       this.db.select().from(ventaPagos).where(eq(ventaPagos.ventaId, id)),
       this.imputadoPorVenta([id]),
+      this.acreditado(id),
     ]);
     const cobrado = imput.get(id) ?? 0;
+
+    /* Si ESTE comprobante es una nota, de quién viene: el detalle y el impreso
+     * tienen que decir a qué factura ajusta. */
+    const [origen] = v.refVentaId
+      ? await this.db.select({
+        id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta,
+        numero: ventas.numero, fecha: ventas.fecha, total: ventas.total,
+      }).from(ventas).where(eq(ventas.id, v.refVentaId)).limit(1)
+      : [];
 
     /*
      * Los NOMBRES, que hasta acá no venían: el ticket se reimprime desde el
@@ -681,6 +778,36 @@ export class VentasService {
       : [];
     const tam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
 
+    const itemsSalida = items.map((it) => {
+      const p = prods.get(it.productoId);
+      const kg = it.presentacionId ? tamDe.get(it.presentacionId) : undefined;
+      const base = p?.nombre ?? `#${it.productoId}`;
+      /* Cuánto de ESTE renglón ya volvió por una nota anterior. Sale del mismo
+       * cálculo que valida la nota nueva (`acreditado()`), así que la pantalla
+       * no puede ofrecer una cantidad que la API vaya a rechazar. */
+      const devuelto = nc.porClave.get(`${it.productoId}:${it.presentacionId ?? ''}`) ?? 0;
+      return {
+        ...it,
+        nombre: kg !== undefined ? `${base} · ${tam(kg)}` : base,
+        unidad: kg !== undefined ? 'paq.' : (p?.tipo === 'granel' ? 'kg' : 'u.'),
+        devuelto: money(devuelto),
+        devolvible: money(Number(it.cantidad) - devuelto),
+      };
+    });
+
+    /* ¿Queda MERCADERÍA sin acreditar? Es la pregunta que decide si se puede
+     * emitir otra nota — ver el comentario de `acreditable` más abajo. */
+    const quedaAlgo = itemsSalida.some((it) => it.devolvible > 0.0001)
+      || (extras.length > 0 && !nc.extras);
+
+    /* El mismo perdón del centavo que hace `cuenta()`, y por la misma razón:
+     * si ya no queda nada que devolver, lo que sobra es redondeo del IVA, no
+     * deuda. Hasta un centavo por nota emitida. */
+    const saldoCrudo = money(v.total - cobrado - nc.total);
+    const saldoReal = !quedaAlgo && saldoCrudo > 0 && saldoCrudo <= 0.01 * nc.notas.length + 1e-9
+      ? 0
+      : saldoCrudo;
+
     return {
       ...v,
       clienteNombre: cli?.nombre ?? '—',
@@ -697,31 +824,89 @@ export class VentasService {
       codigoComprobante: codigoComprobante(v.tipo),
       sucursalNombre: suc?.nombre ?? '—',
       cajeroNombre: usr?.nombre ?? '—',
-      items: items.map((it) => {
-        const p = prods.get(it.productoId);
-        const kg = it.presentacionId ? tamDe.get(it.presentacionId) : undefined;
-        const base = p?.nombre ?? `#${it.productoId}`;
-        return {
-          ...it,
-          nombre: kg !== undefined ? `${base} · ${tam(kg)}` : base,
-          unidad: kg !== undefined ? 'paq.' : (p?.tipo === 'granel' ? 'kg' : 'u.'),
-        };
-      }),
+      items: itemsSalida,
       extras,
       pagos,
       cobrado,
-      saldo: money(v.total - cobrado),
+      /* El saldo descuenta las notas, igual que `cuenta()` y que el listado:
+       * si la mitad de la venta volvió, el cliente no debe el total. Una nota
+       * no tiene saldo propio — no se cobra. */
+      saldo: esNotaCredito(v.tipo) ? 0 : saldoReal,
+      /* Las notas de crédito de esta venta y lo que queda por acreditar: es lo
+       * que decide si el botón "Nota de crédito" se puede apretar. */
+      notas: nc.notas,
+      acreditado: money(nc.total),
+      /*
+       * LO QUE QUEDA POR ACREDITAR SE MIDE EN MERCADERÍA, NO EN PLATA.
+       *
+       * Partir un comprobante en dos notas redondea el IVA dos veces, así que
+       * la suma de las notas puede quedar un centavo abajo del total. Ese
+       * centavo NO es algo que se pueda devolver: no hay renglón que lo
+       * respalde, y una nota de un centavo la rechazaría ARCA. Cuando no queda
+       * ni una unidad ni un cargo sin acreditar, esto es cero y el botón se
+       * apaga.
+       */
+      acreditable: quedaAlgo ? money(v.total - nc.total) : 0,
+      /* Si los otros cargos ya se devolvieron: la pantalla de la nota no los
+       * tiene que volver a sumar en su vista previa. */
+      extrasAcreditados: nc.extras,
+      origen: origen ?? null,
     };
+  }
+
+  /**
+   * Lo que las notas de crédito de una venta ya devolvieron: cuánta plata en
+   * total y cuántas unidades de cada renglón.
+   *
+   * Vive en un solo lugar a propósito. Lo usan el detalle (para mostrar cuánto
+   * queda) y `notaCredito()` (para no dejar acreditar de más): si fueran dos
+   * cuentas distintas, la pantalla ofrecería devolver algo que la API rechaza.
+   * Las notas ANULADAS no cuentan — nunca existieron.
+   */
+  private async acreditado(ventaId: number) {
+    const notas = await this.db.select({
+      id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta, numero: ventas.numero,
+      fecha: ventas.fecha, total: ventas.total, cae: ventas.cae,
+      facturarPendiente: ventas.facturarPendiente, observaciones: ventas.observaciones,
+    }).from(ventas)
+      .where(and(eq(ventas.refVentaId, ventaId), ne(ventas.estado, 'anulada')))
+      .orderBy(ventas.id);
+
+    const porClave = new Map<string, number>();
+    let total = 0;
+    let extras = false;
+    for (const n of notas) total += n.total;
+    if (notas.length) {
+      const ids = notas.map((n) => n.id);
+      const [its, exs] = await Promise.all([
+        this.db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids)),
+        this.db.select({ id: ventaExtras.id }).from(ventaExtras)
+          .where(inArray(ventaExtras.ventaId, ids)).limit(1),
+      ]);
+      for (const it of its) {
+        const k = `${it.productoId}:${it.presentacionId ?? ''}`;
+        porClave.set(k, (porClave.get(k) ?? 0) + Number(it.cantidad));
+      }
+      /* Los otros cargos se devuelven UNA sola vez: el envío no se cobró por
+       * renglón. Si ya viajaron en una nota anterior, no vuelven a viajar. */
+      extras = exs.length > 0;
+    }
+    return { notas, porClave, total: money(total), extras };
   }
 
   /**
    * Cuenta corriente del cliente: saldo global + los comprobantes que todavía
    * deben algo. Es lo que consume la pantalla de cobranzas para imputar.
+   *
+   * LAS NOTAS DE CRÉDITO NO SON UN COMPROBANTE MÁS: no se cobran, se
+   * DESCUENTAN. Por eso no aparecen en la lista para imputarles un pago —
+   * bajan el saldo del comprobante que ajustan, exactamente igual que una
+   * cobranza. Si se las dejara sumar, devolver mercadería aumentaría la deuda.
    */
   async cuenta(clienteId: number) {
     const cliente = await this.cli.get(clienteId);
 
-    const pendientes = await this.db.select().from(ventas)
+    const todos = await this.db.select().from(ventas)
       .where(and(
         eq(ventas.clienteId, clienteId),
         eq(ventas.estado, 'confirmada'),
@@ -729,11 +914,44 @@ export class VentasService {
       ))
       .orderBy(ventas.fecha, ventas.id);
 
+    /* Lo acreditado por notas, agrupado por la venta que ajustan. */
+    const notas = todos.filter((v) => esNotaCredito(v.tipo));
+    const pendientes = todos.filter((v) => !esNotaCredito(v.tipo));
+    const acreditado = new Map<number, number>();
+    const cuantasNotas = new Map<number, number>();
+    let acreditadoTotal = 0;
+    for (const n of notas) {
+      acreditadoTotal += n.total;
+      if (n.refVentaId) {
+        acreditado.set(n.refVentaId, (acreditado.get(n.refVentaId) ?? 0) + n.total);
+        cuantasNotas.set(n.refVentaId, (cuantasNotas.get(n.refVentaId) ?? 0) + 1);
+      }
+    }
+
     const imput = await this.imputadoPorVenta(pendientes.map((v) => v.id));
 
+    /*
+     * EL CENTAVO DEL REDONDEO NO ES UNA DEUDA.
+     *
+     * El IVA se redondea comprobante por comprobante. Partir una factura en
+     * dos notas lo redondea DOS veces, así que la suma de las notas puede
+     * quedar hasta un centavo por nota abajo del total —y esa diferencia no se
+     * puede acreditar: no hay mercadería que la respalde y ARCA no toma una
+     * nota de un centavo. Sin este perdón, una factura devuelta ENTERA se
+     * quedaría para siempre en Cobranzas pidiendo $0,01.
+     *
+     * Se perdona solo lo que el redondeo puede explicar. Un peso de verdad
+     * sigue siendo un peso de verdad.
+     */
+    let perdonado = 0;
     const comprobantes = pendientes.map((v) => {
       const cobrado = imput.get(v.id) ?? 0;
-      return { ...v, cobrado, saldo: money(v.total - cobrado) };
+      const nc = acreditado.get(v.id) ?? 0;
+      const crudo = money(v.total - cobrado - nc);
+      const tolerancia = 0.01 * (cuantasNotas.get(v.id) ?? 0);
+      const saldo = crudo > 0 && crudo <= tolerancia + 1e-9 ? 0 : crudo;
+      if (saldo === 0 && crudo > 0) perdonado = money(perdonado + crudo);
+      return { ...v, cobrado, acreditado: money(nc), saldo };
     });
 
     // El saldo global incluye lo cobrado "a cuenta" (no imputado a un documento),
@@ -745,13 +963,16 @@ export class VentasService {
 
     const facturado = pendientes.reduce((a, v) => a + v.total, 0);
     const cobradoTotal = Number(agg?.t) || 0;
-    const saldo = money(facturado - cobradoTotal);
+    // `perdonado` sale también del global: si no, el encabezado diría que el
+    // cliente debe un centavo que ningún comprobante de la lista reclama.
+    const saldo = money(facturado - acreditadoTotal - cobradoTotal - perdonado);
     const disponible = cliente.limiteCredito > 0 ? money(cliente.limiteCredito - saldo) : null;
 
     return {
       clienteId,
       saldo,
       facturado: money(facturado),
+      acreditado: money(acreditadoTotal),
       cobrado: money(cobradoTotal),
       limiteCredito: cliente.limiteCredito,
       disponible,
@@ -2572,6 +2793,258 @@ export class VentasService {
     return this.get(id);
   }
 
+  /* ---------------------- Notas de crédito (0076) ---------------------- */
+
+  /**
+   * EMITE UNA NOTA DE CRÉDITO de una venta — total o parcial.
+   *
+   * Es la ÚNICA forma de corregir un comprobante ya emitido: la factura existe
+   * para ARCA y no se borra. La nota de crédito es otro comprobante, con su
+   * propia letra y numeración, que declara "de aquella factura, esto vuelve".
+   *
+   * TOTAL Y PARCIAL SON EL MISMO CIRCUITO. Devolver todo es devolver todos los
+   * renglones completos — no hay dos caminos que mantener, y por lo tanto no
+   * hay uno de los dos que se olvide de hacer algo.
+   *
+   * CUATRO EFECTOS, y los cuatro pasan o no pasa ninguno (una sola transacción):
+   *
+   *  1. **El comprobante**: una venta nueva, tipo `nota_credito_X` con la letra
+   *     de la original, apuntándola con `refVentaId`.
+   *  2. **El stock vuelve** — solo lo devuelto, y solo si `devuelveMercaderia`.
+   *     Una NC por un error de precio no mueve un gramo de mercadería.
+   *  3. **La cuenta corriente baja**: `cuenta()` resta las notas de crédito.
+   *  4. **La plata**, si se pide: un egreso del turno abierto. Opcional a
+   *     propósito — devolver efectivo es una decisión de mostrador, y hacerlo
+   *     automático descuadraría el arqueo de quien no lo esperaba.
+   *
+   * LO QUE NO SE PUEDE DEVOLVER DOS VECES: se suma lo ya acreditado por notas
+   * anteriores y se descuenta del tope. Sin eso, tres notas de crédito del 50%
+   * devolverían el 150% de la venta.
+   */
+  async notaCredito(
+    ventaId: number,
+    dto: NotaCreditoDto,
+    opciones: OpcionesVenta = {},
+  ) {
+    const original = await this.get(ventaId);
+    if (original.estado !== 'confirmada') {
+      throw new BadRequestException('Solo se le hace nota de crédito a una venta confirmada.');
+    }
+    if (esNotaCredito(original.tipo)) {
+      throw new BadRequestException('No se le puede hacer una nota de crédito a otra nota de crédito.');
+    }
+    if (original.tipo === 'ticket') {
+      throw new BadRequestException(
+        'Esta venta es un ticket interno, no un comprobante fiscal: no lleva nota de crédito. '
+        + (original.facturarPendiente
+          ? 'Está pendiente de facturar — facturala primero, o anulala si la venta no va.'
+          : 'Anulala.'),
+      );
+    }
+    if (opciones.soloSuSucursal && original.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Esa venta es de otra sucursal.');
+    }
+    const motivo = (dto.motivo ?? '').trim();
+    if (!motivo) throw new BadRequestException('Indicá por qué se emite la nota de crédito.');
+
+    /* -- Lo ya acreditado por notas anteriores, renglón por renglón -- */
+    const previo = await this.acreditado(ventaId);
+    const acreditado = previo.porClave;
+    const acreditadoTotal = previo.total;
+
+    /* -- Los renglones que se devuelven -- */
+    const pedidos = new Map<number, number>();
+    for (const l of dto.items ?? []) pedidos.set(Number(l.itemId), Number(l.cantidad) || 0);
+
+    /* SIN `items` = LA NOTA POR TODO LO QUE QUEDA, no por lo que decía la
+     * factura. Si ya volvió una unidad, "toda la venta" son las tres que
+     * siguen en poder del cliente: pedir las cuatro sería acreditar de más y
+     * la propia validación de abajo lo rechazaría. */
+    const elegidos = !!dto.items?.length;
+
+    const renglones: RenglonResuelto[] = [];
+    for (const it of original.items) {
+      const clave = `${it.productoId}:${it.presentacionId ?? ''}`;
+      const yaVuelto = acreditado.get(clave) ?? 0;
+      const disponible = money(Number(it.cantidad) - yaVuelto);
+      const cant = elegidos ? (pedidos.get(it.id) ?? 0) : disponible;
+      if (!(cant > 0)) continue;
+      if (cant > disponible + 1e-9) {
+        throw new BadRequestException(
+          `De "${it.nombre}" la venta lleva ${it.cantidad} y ya se acreditaron ${yaVuelto}: `
+          + `no se pueden devolver ${cant}, quedan ${disponible}.`,
+        );
+      }
+      renglones.push({
+        ...it,
+        cantidad: cant,
+        /* El precio y el IVA son LOS DE LA VENTA ORIGINAL, no los de hoy: la
+         * nota de crédito devuelve exactamente lo que se cobró. Si el producto
+         * subió la semana pasada, eso no es problema del cliente. */
+        precioUnitario: it.precioUnitario,
+        precioLista: it.precioLista,
+        descuento: it.descuento,
+        ofertaDescuento: money((Number(it.ofertaDescuento) || 0) * (cant / Number(it.cantidad))),
+        iva: it.iva,
+      } as RenglonResuelto);
+    }
+    if (!renglones.length) {
+      throw new BadRequestException(
+        elegidos
+          ? 'No hay nada para devolver: elegí al menos un renglón.'
+          : 'De esta venta ya se devolvió todo: no queda nada para acreditar.',
+      );
+    }
+
+    /* Los extras (envío, packaging) solo viajan en la nota TOTAL: devolver
+     * medio envío no significa nada, y prorratearlo sería inventar un número.
+     * Y solo si no viajaron ya en una nota anterior. */
+    const llevaExtras = !elegidos && !previo.extras;
+    const tot = this.calcularTotales(renglones, llevaExtras ? (original.extras ?? []) : []);
+
+    const tope = money(original.total - acreditadoTotal);
+    if (tot.total > tope + 0.01) {
+      throw new BadRequestException(
+        `La nota de crédito da ${money(tot.total)} y de esta venta quedan ${tope} por acreditar `
+        + `(total ${original.total}, ya acreditado ${money(acreditadoTotal)}).`,
+      );
+    }
+
+    /* -- El comprobante fiscal, ANTES de la transacción (igual que la venta) -- */
+    const config = await this.cfg.get('ventas');
+    const cliente = await this.cli.get(original.clienteId);
+    const letra = letraDe(original.tipo);
+    const tipoNc = `nota_credito_${(letra ?? 'b').toLowerCase()}`;
+
+    const fiscal = await this.resolverFiscalNota(
+      tipoNc, cliente, config, original,
+      { total: tot.total, neto: tot.subtotalNeto, iva: tot.ivaTotal, items: tot.items, extras: tot.extras },
+    );
+
+    const fecha = new Date();
+    const sucursalId = original.sucursalId!;
+    const puntoVentaFinal = fiscal.puntoVenta ?? original.puntoVenta;
+
+    /* -- El turno, solo si se va a devolver efectivo -- */
+    let turnoId: number | null = null;
+    if (dto.devolverEfectivo) {
+      const turno = await this.caja.actual(sucursalId);
+      if (!turno) {
+        throw new BadRequestException(
+          'No hay un turno de caja abierto en esta sucursal: no se puede devolver el efectivo. '
+          + 'Abrí la caja, o emití la nota de crédito sin devolución y entregá la plata aparte.',
+        );
+      }
+      turnoId = turno.id;
+    }
+
+    const id = await this.db.transaction(async (tx) => {
+      const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipoNc, puntoVentaFinal);
+      const [nc] = await tx.insert(ventas).values({
+        tipo: tipoNc as any, puntoVenta: puntoVentaFinal, numero, fecha,
+        clienteId: original.clienteId, sucursalId,
+        usuarioId: dto.usuarioId ?? null,
+        cajaSesionId: turnoId,
+        estado: 'confirmada',
+        condicionPago: original.condicionPago,
+        refVentaId: ventaId,
+        listaPrecio: original.listaPrecio,
+        subtotalNeto: tot.subtotalNeto, descuentoTotal: tot.descuentoTotal,
+        ivaTotal: tot.ivaTotal, total: tot.total,
+        cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
+        facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
+        facturarCbteNro: fiscal.facturarPendiente ? fiscal.facturarCbteNro : null,
+        facturarCbteTipo: fiscal.facturarPendiente ? fiscal.facturarCbteTipo : null,
+        observaciones: `${motivo}\n[Nota de crédito de ${etiquetaVenta(original)}]`,
+      }).returning();
+
+      await tx.insert(ventaItems).values(tot.items.map((it) => ({ ...it, ventaId: nc.id })));
+      if (tot.extras.length) await tx.insert(ventaExtras).values(tot.extras.map((e) => ({ ...e, ventaId: nc.id })));
+
+      /* LA MERCADERÍA VUELVE — solo si volvió de verdad. Una nota de crédito
+       * por un error de precio no mueve stock. */
+      if (dto.devuelveMercaderia !== false) {
+        await this.inv.reingresarStockItems(tx, {
+          sucursalId,
+          usuarioId: dto.usuarioId,
+          descripcion: `NC ${puntoVentaFinal}-${String(numero).padStart(8, '0')} de ${etiquetaVenta(original)}: ${motivo}`,
+          items: tot.items,
+        });
+      }
+
+      /* LA PLATA, si se pide. Se inserta acá y no vía `CajaService.movimiento`
+       * porque ese método abre su propia transacción: la nota de crédito y su
+       * egreso tienen que pasar juntos o no pasar. Mismo candado que allá — el
+       * turno se toma `for update` para no colarse en un cierre en curso. */
+      if (turnoId) {
+        const [sesion] = await tx.select().from(cajaSesiones)
+          .where(eq(cajaSesiones.id, turnoId)).limit(1).for('update');
+        if (!sesion || sesion.estado !== 'abierta') {
+          throw new BadRequestException('El turno de caja se cerró mientras se emitía la nota de crédito.');
+        }
+        await tx.insert(cajaMovimientos).values({
+          cajaSesionId: turnoId,
+          tipo: 'egreso',
+          importe: money(tot.total),
+          motivo: `Devolución NC ${puntoVentaFinal}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
+          usuarioId: dto.usuarioId ?? null,
+        });
+      }
+      return nc.id;
+    });
+
+    return this.get(id);
+  }
+
+  /**
+   * El CAE de una NOTA. Igual que el de la factura pero con el comprobante
+   * ASOCIADO — ARCA exige saber qué comprobante ajusta, y sin eso la nota
+   * queda huérfana en el libro de IVA.
+   */
+  private async resolverFiscalNota(tipoNc: string, cliente: any, config: any, original: any, tot: any) {
+    const vacio = {
+      cae: '', caeVencimiento: null as Date | null,
+      cbteNro: null as number | null, puntoVenta: null as string | null,
+      facturarPendiente: false, facturarMotivo: '',
+      facturarCbteNro: null as number | null, facturarCbteTipo: null as number | null,
+    };
+    if (!config.arcaHabilitado) return vacio;
+    if (!this.arca.disponible()) {
+      return {
+        ...vacio, facturarPendiente: true,
+        facturarMotivo: this.arca.motivo() ?? 'La facturación electrónica no está configurada.',
+      };
+    }
+    /* Sin CAE en la original no hay comprobante asociado que declarar: la nota
+     * no se puede emitir contra un número que ARCA no conoce. */
+    if (!original.cae || !original.numero) {
+      return {
+        ...vacio, facturarPendiente: true,
+        facturarMotivo: 'La venta original todavía no tiene CAE: facturala primero y después emití la nota.',
+      };
+    }
+
+    const r = await this.arca.emitir({
+      tipo: tipoNc,
+      receptor: {
+        tipoDoc: cliente.tipoDoc, numeroDoc: cliente.numeroDoc,
+        condicionIva: cliente.condicionIva, esConsumidorFinal: !!cliente.esConsumidorFinal,
+      },
+      renglones: this.renglonesFiscales(tot.items, tot.extras),
+      neto: tot.neto, iva: tot.iva, total: tot.total,
+      asociado: { tipo: original.tipo, ptoVta: original.puntoVenta, numero: original.numero },
+    });
+
+    if (r.ok) {
+      return {
+        ...vacio,
+        cae: r.cae, caeVencimiento: r.caeVencimiento,
+        cbteNro: r.cbteNro, puntoVenta: r.puntoVenta,
+      };
+    }
+    return { ...vacio, facturarPendiente: true, facturarMotivo: r.motivo };
+  }
+
   /**
    * Pasa la venta abierta a otro vendedor (cambio de turno, mostrador ocupado).
    *
@@ -2644,6 +3117,28 @@ export class VentasService {
     const v = await this.get(id);
     if (v.estado === 'anulada') throw new BadRequestException('La venta ya está anulada.');
     if (v.estado === 'borrador') throw new BadRequestException('Es una venta abierta: descartala en vez de anularla.');
+    /*
+     * UN COMPROBANTE CON CAE NO SE ANULA. NUNCA.
+     *
+     * Existe para ARCA: está en su base, en el libro de IVA y en Mis
+     * Comprobantes, y borrarlo de acá no lo borra de allá. Lo único que hace
+     * es que los dos sistemas dejen de coincidir — y el que no coincide es el
+     * nuestro. La corrección de un comprobante emitido es una NOTA DE CRÉDITO,
+     * que es otro comprobante y también se declara.
+     *
+     * Este candado faltaba: hasta ahora anular una factura con CAE la marcaba
+     * anulada y le devolvía el stock sin decir una palabra.
+     */
+    if (v.cae) {
+      throw new BadRequestException(
+        `Esta venta tiene CAE de ARCA (${v.cae}) y no se puede anular: el comprobante existe para ellos `
+        + 'y borrarlo acá solo haría que los dos sistemas dejen de coincidir. '
+        + 'Corregila con una NOTA DE CRÉDITO.',
+      );
+    }
+    if (esNotaCredito(v.tipo)) {
+      throw new BadRequestException('Una nota de crédito no se anula: si está mal, se corrige con una nota de débito.');
+    }
     if (v.cobrado > 0.009) throw new BadRequestException('Tiene cobranzas imputadas. Anulá primero la cobranza.');
     if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Esa venta es de otra sucursal.');
@@ -2928,6 +3423,19 @@ export class VentasController {
   @Permiso('devoluciones')
   anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularVentaDto, @Auth() sesion: Sesion) {
     return this.svc.anular(id, dto.motivo, sesion.usuarioId, this.opciones(sesion));
+  }
+
+  /**
+   * NOTA DE CRÉDITO (0076): la única forma de deshacer una factura con CAE.
+   *
+   * Mismo permiso que anular —`devoluciones`— porque es la misma decisión de
+   * negocio: mercadería que vuelve y plata que se devuelve. El usuario sale de
+   * la sesión, igual que allá: el body no puede firmar por otro.
+   */
+  @Post(':id/nota-credito')
+  @Permiso('devoluciones')
+  notaCredito(@Param('id', ParseIntPipe) id: number, @Body() dto: NotaCreditoDto, @Auth() sesion: Sesion) {
+    return this.svc.notaCredito(id, { ...dto, usuarioId: sesion.usuarioId }, this.opciones(sesion));
   }
 
   @Delete(':id')

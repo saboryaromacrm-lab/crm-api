@@ -141,9 +141,14 @@ export class CajaService {
     const efectivo = medios.efectivo ?? { ventas: 0, cobranzas: 0, total: 0 };
     const esperadoEfectivo = money(sesion.montoInicial + efectivo.total + ingresos - egresos);
 
-    // Ventas en cuenta corriente: no entran a la caja, pero el cajero necesita verlas.
+    /* Ventas en cuenta corriente: no entran a la caja, pero el cajero necesita
+     * verlas. Las notas de crédito del turno RESTAN — son deuda que se borró,
+     * no venta nueva (la plata devuelta, si la hubo, ya viajó como egreso). */
     const [ctaCte] = await this.db
-      .select({ total: sql<number>`coalesce(sum(${ventas.total}), 0)`, n: sql<number>`count(*)::int` })
+      .select({
+        total: sql<number>`coalesce(sum(${ventas.total} * (case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)), 0)`,
+        n: sql<number>`count(*) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+      })
       .from(ventas)
       .where(and(
         eq(ventas.cajaSesionId, id), eq(ventas.estado, 'confirmada'),

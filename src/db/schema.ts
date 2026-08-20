@@ -1466,8 +1466,17 @@ export const cajaControles = pgTable('caja_controles', {
   ixSesion: index('ix_caja_controles_sesion').on(t.cajaSesionId),
 }));
 
+/**
+ * Los comprobantes que emite el sistema. Las notas van POR LETRA (0076): ARCA
+ * no tiene "nota de crédito" a secas — tiene una por letra, con su código y su
+ * numeración propia (3/8/13 para las de crédito), y la letra tiene que ser la
+ * misma que la del comprobante que ajusta.
+ */
 export const tipoVentaEnum = pgEnum('tipo_venta', [
-  'ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito',
+  'ticket',
+  'factura_a', 'factura_b', 'factura_c',
+  'nota_credito_a', 'nota_credito_b', 'nota_credito_c',
+  'nota_debito_a', 'nota_debito_b', 'nota_debito_c',
 ]);
 export const estadoVentaEnum = pgEnum('estado_venta', [
   'borrador', 'confirmada', 'anulada', 'pendiente_cae',
