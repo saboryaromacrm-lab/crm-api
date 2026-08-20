@@ -139,15 +139,27 @@ export async function feDummy(): Promise<EstadoServicio> {
 }
 
 /**
+ * EL PUNTO DE VENTA VIAJA EN CADA LLAMADA (0077), no sale de la configuración.
+ *
+ * Cada local tiene el suyo declarado en ARCA contra su domicilio, y cada uno
+ * lleva **su propia numeración correlativa**. Cuando no viene —una instalación
+ * de un solo local, que no necesita cargar nada— cae al de la variable de
+ * entorno, que es el comportamiento de siempre.
+ */
+const pv = (ptoVta?: number | null) => Number(ptoVta) || ARCA.ptoVta;
+
+/**
  * El último número autorizado para (punto de venta, tipo). **El próximo es
  * este + 1** — así lleva ARCA la numeración, y por eso no puede haber un
  * contador local que compita con ella.
  *
  * Devuelve 0 si nunca se emitió nada por webservice en ese punto de venta.
  */
-export async function ultimoAutorizado(db: Database, cbteTipo: number): Promise<number> {
+export async function ultimoAutorizado(
+  db: Database, cbteTipo: number, ptoVta?: number | null,
+): Promise<number> {
   const xml = await llamar('FECompUltimoAutorizado',
-    `${await auth(db)}<ar:PtoVta>${ARCA.ptoVta}</ar:PtoVta><ar:CbteTipo>${cbteTipo}</ar:CbteTipo>`);
+    `${await auth(db)}<ar:PtoVta>${pv(ptoVta)}</ar:PtoVta><ar:CbteTipo>${cbteTipo}</ar:CbteTipo>`);
   const errores = mensajesDe(xml, 'Errors');
   if (errores.length) throw new ErrorArca(errores.join(' · '), false);
   return Number(tag(xml, 'CbteNro')) || 0;
@@ -156,6 +168,8 @@ export async function ultimoAutorizado(db: Database, cbteTipo: number): Promise<
 export interface PedidoCae {
   cbteTipo: number;
   cbteNro: number;
+  /** El punto de venta del local que emite. Sin él, el de la configuración. */
+  ptoVta?: number | null;
   /** Fecha del comprobante; si se omite, hoy en hora argentina. */
   fecha?: Date;
   docTipo: number;
@@ -234,7 +248,7 @@ export async function solicitarCae(db: Database, p: PedidoCae): Promise<Respuest
   const cuerpo = `${await auth(db)}<ar:FeCAEReq>`
     + '<ar:FeCabReq>'
     + '<ar:CantReg>1</ar:CantReg>'
-    + `<ar:PtoVta>${ARCA.ptoVta}</ar:PtoVta>`
+    + `<ar:PtoVta>${pv(p.ptoVta)}</ar:PtoVta>`
     + `<ar:CbteTipo>${p.cbteTipo}</ar:CbteTipo>`
     + '</ar:FeCabReq>'
     + `<ar:FeDetReq>${detalle}</ar:FeDetReq>`
@@ -295,13 +309,13 @@ export interface ComprobanteEmitido {
  * `null` = ese número no está emitido (quedó libre).
  */
 export async function consultarComprobante(
-  db: Database, cbteTipo: number, cbteNro: number,
+  db: Database, cbteTipo: number, cbteNro: number, ptoVta?: number | null,
 ): Promise<ComprobanteEmitido | null> {
   const xml = await llamar('FECompConsultar',
     `${await auth(db)}<ar:FeCompConsReq>`
     + `<ar:CbteTipo>${cbteTipo}</ar:CbteTipo>`
     + `<ar:CbteNro>${cbteNro}</ar:CbteNro>`
-    + `<ar:PtoVta>${ARCA.ptoVta}</ar:PtoVta>`
+    + `<ar:PtoVta>${pv(ptoVta)}</ar:PtoVta>`
     + '</ar:FeCompConsReq>');
 
   const errores = mensajesDe(xml, 'Errors');

@@ -11,7 +11,24 @@ import { incidencias, stock, sucursales } from '../db/schema';
 class UpsertSucursalDto {
   @IsString() @MaxLength(80) nombre!: string;
   @IsOptional() @IsIn(['distribuidora', 'express']) tipo?: 'distribuidora' | 'express';
+  /** El punto de venta de ARCA de este local. Vacío = todavía no se cargó. */
+  @IsOptional() @IsString() @MaxLength(5) puntoVenta?: string;
+  /** El domicilio comercial declarado para ese punto de venta. */
+  @IsOptional() @IsString() @MaxLength(200) direccion?: string;
 }
+
+/**
+ * CINCO DÍGITOS, y no reutiliza `normalizarPuntoVenta` de compras a propósito:
+ * aquella normaliza a CUATRO y así están guardadas las facturas de proveedor
+ * desde siempre — cambiarla dejaría de reconocer como duplicada una factura ya
+ * cargada. Esta es para los NUESTROS, que nacen hoy y nacen de cinco.
+ *
+ * El vacío se respeta: es "todavía no cargado", no un cero.
+ */
+export const normalizarPuntoVentaFiscal = (v: unknown) => {
+  const d = String(v ?? '').replace(/\D/g, '').replace(/^0+/, '');
+  return d ? d.padStart(5, '0') : '';
+};
 
 @Injectable()
 export class SucursalesService {
@@ -25,14 +42,44 @@ export class SucursalesService {
     return s;
   }
 
+  /**
+   * Lo que se guarda de una sucursal, con el punto de venta normalizado y el
+   * candado contra el duplicado.
+   *
+   * EL DUPLICADO SE ATAJA ACÁ ADEMÁS DEL ÍNDICE porque el mensaje importa: dos
+   * sucursales con el mismo punto de venta pedirían el mismo próximo número a
+   * ARCA y se pisarían, y un error de índice único no explica nada de eso.
+   */
+  private async normalizar(dto: UpsertSucursalDto, idPropio?: number) {
+    const puntoVenta = normalizarPuntoVentaFiscal(dto.puntoVenta);
+    if (puntoVenta) {
+      const dueño = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
+        .from(sucursales).where(eq(sucursales.puntoVenta, puntoVenta)).limit(1);
+      if (dueño.length && dueño[0].id !== idPropio) {
+        throw new BadRequestException(
+          `El punto de venta ${puntoVenta} ya es el de ${dueño[0].nombre}. `
+          + 'Cada local tiene el suyo: compartirlo haría que las dos sucursales le pidan '
+          + 'el mismo número a ARCA y una de las dos rebote.',
+        );
+      }
+    }
+    return {
+      nombre: dto.nombre.trim(),
+      tipo: dto.tipo ?? ('express' as const),
+      puntoVenta,
+      direccion: (dto.direccion ?? '').trim(),
+    };
+  }
+
   async create(dto: UpsertSucursalDto) {
-    const [s] = await this.db.insert(sucursales).values({ nombre: dto.nombre.trim(), tipo: dto.tipo ?? 'express' }).returning();
+    const [s] = await this.db.insert(sucursales).values(await this.normalizar(dto)).returning();
     return s;
   }
 
   async update(id: number, dto: UpsertSucursalDto) {
     await this.get(id);
-    const [s] = await this.db.update(sucursales).set({ nombre: dto.nombre.trim(), tipo: dto.tipo ?? 'express' }).where(eq(sucursales.id, id)).returning();
+    const [s] = await this.db.update(sucursales)
+      .set(await this.normalizar(dto, id)).where(eq(sucursales.id, id)).returning();
     return s;
   }
 

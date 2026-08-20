@@ -84,7 +84,28 @@ export const sucursales = pgTable('sucursales', {
   id: serial('id').primaryKey(),
   nombre: text('nombre').notNull(),
   tipo: tipoSucursalEnum('tipo').notNull().default('express'),
+  /*
+   * EL PUNTO DE VENTA DE ARCA DE ESTE LOCAL (0077), cinco dígitos.
+   *
+   * ARCA declara los puntos de venta contra un DOMICILIO y cada uno lleva su
+   * numeración correlativa independiente, así que es de la sucursal y no de la
+   * empresa. Vacío = todavía no cargado (cae al de la variable de entorno).
+   *
+   * `text` y no un número: los ceros a la izquierda son parte del dato.
+   */
+  puntoVenta: text('punto_venta').notNull().default(''),
+  /*
+   * El domicilio COMERCIAL de este local, el que ARCA tiene declarado para su
+   * punto de venta. Va impreso en la factura: la de Belgrano 728 tiene que
+   * decir Belgrano 728, no el domicilio fiscal de la empresa.
+   */
+  direccion: text('direccion').notNull().default(''),
 }, (t) => ({
+  /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
+   * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
+  uqPuntoVenta: uniqueIndex('uq_sucursal_punto_venta')
+    .on(t.puntoVenta)
+    .where(sql`${t.puntoVenta} <> ''`),
   /*
    * UNA SOLA DISTRIBUIDORA (0062). `distribuidoraId()` toma la primera con ese
    * tipo, y ese id decide a qué depósito entra una compra sin sucursal y de cuál

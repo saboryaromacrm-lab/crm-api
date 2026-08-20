@@ -48,6 +48,19 @@ import {
 } from './wsfe';
 import { obtenerTicket } from './wsaa';
 
+/** Una fila del diagnóstico: un punto de venta y qué contestó ARCA por él. */
+interface DiagnosticoPunto {
+  sucursalId: number | null;
+  /** El local, o los locales que comparten el de la variable de entorno. */
+  sucursal: string;
+  /** Cinco dígitos, como sale impreso. */
+  puntoVenta: string;
+  numero: number;
+  /** `false` = no tiene el suyo cargado y usa el de la configuración. */
+  propio: boolean;
+  tipos: Array<{ tipo: string; ultimo: number | null; error?: string }>;
+}
+
 /** Lo que el negocio le pasa a ARCA para emitir. */
 export interface PedidoEmision {
   /** Tipo del sistema: 'factura_a' | 'factura_b' | 'nota_credito_b' … */
@@ -57,6 +70,13 @@ export interface PedidoEmision {
   neto: number;
   iva: number;
   total: number;
+  /**
+   * EL PUNTO DE VENTA DEL LOCAL QUE EMITE (0077). Cada sucursal tiene el suyo
+   * declarado en ARCA contra su domicilio, con numeración independiente. Sin
+   * él, se usa el de la variable de entorno — que es lo correcto para una
+   * instalación de un solo local.
+   */
+  ptoVta?: number | null;
   fecha?: Date;
   /** Notas de crédito/débito: el comprobante que ajustan. */
   asociado?: { tipo: string; ptoVta: string; numero: number };
@@ -118,13 +138,20 @@ export class ArcaService implements OnApplicationBootstrap {
    * Factura A y una Factura B pueden salir a la vez sin pisarse. Serializar
    * todo junto sería frenar de más.
    */
-  private cadenas = new Map<number, Promise<unknown>>();
+  private cadenas = new Map<string, Promise<unknown>>();
 
-  private enFila<T>(cbteTipo: number, fn: () => Promise<T>): Promise<T> {
-    const previa = this.cadenas.get(cbteTipo) ?? Promise.resolve();
+  /**
+   * La clave lleva el PUNTO DE VENTA además del tipo (0077). Las numeraciones
+   * son independientes por punto de venta, así que Fontana y la Distribuidora
+   * pueden facturar en el mismo segundo sin pisarse — y encolarlas juntas sería
+   * hacer esperar a una por la otra sin ninguna razón.
+   */
+  private enFila<T>(ptoVta: number, cbteTipo: number, fn: () => Promise<T>): Promise<T> {
+    const clave = `${ptoVta}:${cbteTipo}`;
+    const previa = this.cadenas.get(clave) ?? Promise.resolve();
     // `.catch` para que un fallo no rompa la cadena de los que vienen atrás.
     const mia = previa.catch(() => {}).then(fn);
-    this.cadenas.set(cbteTipo, mia.catch(() => {}));
+    this.cadenas.set(clave, mia.catch(() => {}));
     return mia;
   }
 
@@ -136,9 +163,18 @@ export class ArcaService implements OnApplicationBootstrap {
     return motivoNoDisponible();
   }
 
-  /** El punto de venta de web services, con el formato del sistema ('0003'). */
-  puntoVenta(): string {
-    return String(ARCA.ptoVta).padStart(4, '0');
+  /**
+   * El punto de venta con el formato del comprobante: **CINCO dígitos**.
+   *
+   * Eran cuatro, y con el 0001 de la etapa de prueba nunca se notó. Los puntos
+   * de venta reales de la casa son 00028 a 00032: recortados a cuatro, la
+   * factura impresa diría `0028-00000001` mientras ARCA registra
+   * `00028-00000001`. Es el mismo comprobante y dos números distintos, y ese
+   * número es justo por donde se lo coteja contra Mis Comprobantes.
+   */
+  puntoVenta(ptoVta?: number | null): string {
+    const n = Number(ptoVta) || ARCA.ptoVta;
+    return n ? String(n).padStart(5, '0') : '';
   }
 
   /**
@@ -180,25 +216,30 @@ export class ArcaService implements OnApplicationBootstrap {
     }
 
     const asociado = p.asociado
-      ? { tipo: CBTE_TIPO[p.asociado.tipo], ptoVta: Number(p.asociado.ptoVta) || ARCA.ptoVta, nro: p.asociado.numero }
+      ? { tipo: CBTE_TIPO[p.asociado.tipo], ptoVta: Number(p.asociado.ptoVta) || Number(p.ptoVta) || ARCA.ptoVta, nro: p.asociado.numero }
       : undefined;
 
-    return this.enFila(cbteTipo, async () => {
+    /* El punto de venta del LOCAL que emite: cada uno tiene el suyo declarado
+     * en ARCA y su propia numeración. Sin él, el de la configuración. */
+    const ptoVta = Number(p.ptoVta) || ARCA.ptoVta;
+
+    return this.enFila(ptoVta, cbteTipo, async () => {
       try {
         /* ---- 1. ¿Quedó algo en vuelo de un intento anterior? ---- */
         if (p.reservado && p.reservado.cbteTipo === cbteTipo) {
-          const previo = await this.adoptarSiExiste(p.reservado.cbteNro, cbteTipo, p.total, receptor.docNro);
+          const previo = await this.adoptarSiExiste(p.reservado.cbteNro, cbteTipo, p.total, receptor.docNro, ptoVta);
           if (previo) return previo;
         }
 
         /* ---- 2. El número lo dice ARCA ---- */
-        let numero = (await ultimoAutorizado(this.db, cbteTipo)) + 1;
+        let numero = (await ultimoAutorizado(this.db, cbteTipo, ptoVta)) + 1;
         if (p.reservar) await p.reservar(numero, cbteTipo);
 
         /* ---- 3. Emitir ---- */
         const pedido = {
           cbteTipo,
           cbteNro: numero,
+          ptoVta,
           fecha: p.fecha,
           docTipo: receptor.docTipo,
           docNro: receptor.docNro,
@@ -212,7 +253,7 @@ export class ArcaService implements OnApplicationBootstrap {
 
         try {
           const r = await solicitarCae(this.db, pedido);
-          return this.exito(r.cae, r.caeVencimiento, r.cbteNro, r.observaciones);
+          return this.exito(r.cae, r.caeVencimiento, r.cbteNro, r.observaciones, ptoVta);
         } catch (e) {
           const err = e as ErrorArca;
 
@@ -223,10 +264,10 @@ export class ArcaService implements OnApplicationBootstrap {
            * sería quedarse dando vueltas con la caja esperando.
            */
           if (/10016|no se corresponde con el pr[oó]ximo/i.test(err.message)) {
-            numero = (await ultimoAutorizado(this.db, cbteTipo)) + 1;
+            numero = (await ultimoAutorizado(this.db, cbteTipo, ptoVta)) + 1;
             if (p.reservar) await p.reservar(numero, cbteTipo);
             const r = await solicitarCae(this.db, { ...pedido, cbteNro: numero });
-            return this.exito(r.cae, r.caeVencimiento, r.cbteNro, r.observaciones);
+            return this.exito(r.cae, r.caeVencimiento, r.cbteNro, r.observaciones, ptoVta);
           }
 
           /*
@@ -236,7 +277,7 @@ export class ArcaService implements OnApplicationBootstrap {
            * más tarde emitiría una segunda factura de la misma venta.
            */
           if (err.reintentable) {
-            const rescatado = await this.adoptarSiExiste(numero, cbteTipo, p.total, receptor.docNro)
+            const rescatado = await this.adoptarSiExiste(numero, cbteTipo, p.total, receptor.docNro, ptoVta)
               .catch(() => null);
             if (rescatado) return rescatado;
           }
@@ -250,14 +291,14 @@ export class ArcaService implements OnApplicationBootstrap {
     });
   }
 
-  private exito(cae: string, vto: string, nro: number, obs: string[]): ResultadoEmision {
+  private exito(cae: string, vto: string, nro: number, obs: string[], ptoVta?: number): ResultadoEmision {
     return {
       ok: true,
       conCae: true,
       cae,
       caeVencimiento: parsearFechaArca(vto),
       cbteNro: nro,
-      puntoVenta: this.puntoVenta(),
+      puntoVenta: this.puntoVenta(ptoVta),
       observaciones: obs,
     };
   }
@@ -271,14 +312,14 @@ export class ArcaService implements OnApplicationBootstrap {
    * ponerle a esta venta el número de otra.
    */
   private async adoptarSiExiste(
-    cbteNro: number, cbteTipo: number, total: number, docNro: string,
+    cbteNro: number, cbteTipo: number, total: number, docNro: string, ptoVta?: number,
   ): Promise<ResultadoEmision | null> {
-    const previo = await consultarComprobante(this.db, cbteTipo, cbteNro);
+    const previo = await consultarComprobante(this.db, cbteTipo, cbteNro, ptoVta);
     if (!previo) return null;
     const mismoImporte = Math.abs(previo.impTotal - total) <= 0.01;
     const mismoDoc = String(previo.docNro || '0') === String(docNro || '0');
     if (!mismoImporte || !mismoDoc) return null;
-    return { ...(this.exito(previo.cae, previo.caeVencimiento, previo.cbteNro, []) as any), adoptado: true };
+    return { ...(this.exito(previo.cae, previo.caeVencimiento, previo.cbteNro, [], ptoVta) as any), adoptado: true };
   }
 
   /* ------------------------- Diagnóstico ------------------------- */
@@ -295,6 +336,53 @@ export class ArcaService implements OnApplicationBootstrap {
    * quedó como `.crt.crt`). Se corrige el nombre, se recarga esta pantalla y
    * el estado se relee del disco sin reiniciar la API.
    */
+  /**
+   * LOS PUNTOS DE VENTA EN USO, uno por sucursal (0077).
+   *
+   * Una sucursal sin el suyo cargado **cae al de la variable de entorno** —lo
+   * correcto en una instalación de un solo local, donde no hay nada que
+   * elegir— y viaja marcada con `propio: false` para que el panel lo muestre:
+   * con varios locales, eso significa que sus facturas saldrían por la boca de
+   * expendio de otro, y hay que verlo.
+   *
+   * Las que caen al mismo número se agrupan en una fila: preguntarle dos veces
+   * a ARCA por el mismo punto de venta daría la misma respuesta dos veces.
+   */
+  private async puntosDeVenta() {
+    const filas = await this.db.select({
+      id: sucursales.id, nombre: sucursales.nombre, pv: sucursales.puntoVenta,
+    }).from(sucursales).orderBy(sucursales.id);
+
+    const salida: Array<{
+      sucursalId: number | null; sucursal: string; puntoVenta: string;
+      numero: number; propio: boolean;
+    }> = [];
+    const sinPropio: string[] = [];
+
+    for (const f of filas) {
+      const numero = Number(String(f.pv ?? '').replace(/\D/g, '')) || 0;
+      if (numero) {
+        salida.push({
+          sucursalId: f.id, sucursal: f.nombre, puntoVenta: this.puntoVenta(numero),
+          numero, propio: true,
+        });
+      } else {
+        sinPropio.push(f.nombre);
+      }
+    }
+
+    if (sinPropio.length && ARCA.ptoVta) {
+      salida.push({
+        sucursalId: null,
+        sucursal: sinPropio.join(', '),
+        puntoVenta: this.puntoVenta(),
+        numero: ARCA.ptoVta,
+        propio: false,
+      });
+    }
+    return salida;
+  }
+
   estado() {
     resetDisponible();
     return {
@@ -386,21 +474,50 @@ export class ArcaService implements OnApplicationBootstrap {
       })}.`;
     });
 
-    /* 4. ¿El punto de venta existe y está autorizado? Un certificado válido
-     *    con el punto de venta equivocado falla ACÁ y en ningún lado antes. */
-    const numeracion: Array<{ tipo: string; ultimo: number | null; error?: string }> = [];
+    /*
+     * 4. ¿CADA PUNTO DE VENTA EXISTE Y ESTÁ AUTORIZADO? Un certificado válido
+     *    con el punto de venta equivocado falla ACÁ y en ningún lado antes.
+     *
+     * Se pregunta POR SUCURSAL (0077), porque cada local tiene el suyo y uno
+     * puede estar mal mientras los otros cuatro andan — que es exactamente el
+     * caso que hay que poder ver.
+     *
+     * EN PARALELO: son lecturas independientes y no tocan numeración, así que
+     * la cadena que serializa las emisiones no aplica. En serie, cinco locales
+     * por dos comprobantes serían veinte segundos de botón apretado; así es lo
+     * que tarde la más lenta.
+     */
+    const numeracion: DiagnosticoPunto[] = [];
     if (autenticado) {
-      await paso('numeracion', `El punto de venta ${base.puntoVenta} está autorizado`, async () => {
-        for (const tipo of ['factura_a', 'factura_b', 'nota_credito_a', 'nota_credito_b']) {
-          try {
-            numeracion.push({ tipo, ultimo: await ultimoAutorizado(this.db, CBTE_TIPO[tipo]) });
-          } catch (e) {
-            numeracion.push({ tipo, ultimo: null, error: (e as Error).message });
-          }
+      const puntos = await this.puntosDeVenta();
+      await paso('numeracion', puntos.length > 1
+        ? `Los ${puntos.length} puntos de venta están autorizados`
+        : `El punto de venta ${puntos[0]?.puntoVenta ?? base.puntoVenta} está autorizado`, async () => {
+        const TIPOS_SONDA = ['factura_a', 'factura_b'];
+        const filas = await Promise.all(puntos.map(async (p) => {
+          const tipos = await Promise.all(TIPOS_SONDA.map(async (tipo) => {
+            try {
+              return { tipo, ultimo: await ultimoAutorizado(this.db, CBTE_TIPO[tipo], p.numero) };
+            } catch (e) {
+              return { tipo, ultimo: null, error: (e as Error).message };
+            }
+          }));
+          return { ...p, tipos };
+        }));
+        numeracion.push(...filas);
+
+        /* Falla el paso solo si NINGUNO contesta: si cuatro andan y uno no, el
+         * problema es de ese punto de venta y se ve en su fila, no en el
+         * veredicto general. */
+        const mudos = numeracion.filter((n) => n.tipos.every((t) => t.error));
+        if (mudos.length === numeracion.length && numeracion.length) {
+          throw new Error(mudos[0].tipos[0].error!);
         }
-        const falla = numeracion.find((n) => n.error);
-        if (falla && numeracion.every((n) => n.error)) throw new Error(falla.error!);
-        return 'Contesta el último número autorizado de cada comprobante.';
+        if (mudos.length) {
+          return `${numeracion.length - mudos.length} de ${numeracion.length} contestan. `
+            + `Sin autorizar: ${mudos.map((m) => `${m.sucursal} (${m.puntoVenta})`).join(', ')}.`;
+        }
+        return `Los ${numeracion.length === 1 ? 'comprobantes contestan' : `${numeracion.length} contestan`} con su último número.`;
       });
     }
 
@@ -451,13 +568,30 @@ export class ArcaController {
   @Permiso('ventas.configuracion')
   async estado() {
     const base = this.svc.estado();
-    const empresa = await this.cfg.get('empresa');
+    const [empresa, locales] = await Promise.all([
+      this.cfg.get('empresa'),
+      /* Los puntos de venta de cada local (0077). Salen del estado barato y no
+       * de la prueba porque son un dato nuestro, no de ARCA: la tabla se ve
+       * apenas se abre la pantalla, y "Probar conexión" le agrega el último
+       * número autorizado de cada uno. */
+      this.db.select({
+        id: sucursales.id,
+        nombre: sucursales.nombre,
+        tipo: sucursales.tipo,
+        puntoVenta: sucursales.puntoVenta,
+        direccion: sucursales.direccion,
+      }).from(sucursales).orderBy(sucursales.id),
+    ]);
     return {
       ...base,
       /* El CUIT del certificado manda, pero si el del membrete es otro, el
        * papel y el comprobante dicen cosas distintas — y eso no lo nota nadie
        * hasta que lo mira un inspector. */
       avisos: diferenciasConEmpresa(empresa),
+      sucursales: locales,
+      /* Cuántos locales facturarían por la boca de expendio de otro. Con un
+       * solo local es lo normal y no dice nada; con cinco, es un problema. */
+      sinPuntoVenta: locales.filter((s) => !s.puntoVenta).length,
       trabadas: await this.trabadas(),
     };
   }

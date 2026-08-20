@@ -768,9 +768,15 @@ export class VentasService {
       direccion: clientes.direccion,
       localidad: clientes.localidad,
     }).from(clientes).where(eq(clientes.id, v.clienteId)).limit(1);
+    /* El domicilio va junto al nombre porque la FACTURA lleva el domicilio
+     * comercial del punto de venta que la emitió (0077), no uno solo de la
+     * empresa: la de Belgrano 728 tiene que decir Belgrano 728. */
     const [suc] = v.sucursalId
-      ? await this.db.select({ nombre: sucursales.nombre })
-        .from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
+      ? await this.db.select({
+        nombre: sucursales.nombre,
+        direccion: sucursales.direccion,
+        puntoVenta: sucursales.puntoVenta,
+      }).from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
       : [];
     const [usr] = v.usuarioId
       ? await this.db.select({ nombre: usuarios.nombre })
@@ -823,6 +829,9 @@ export class VentasService {
       }),
       codigoComprobante: codigoComprobante(v.tipo),
       sucursalNombre: suc?.nombre ?? '—',
+      /* Vacío si la sucursal no lo tiene cargado: el impreso cae al de la
+       * empresa, que es lo correcto mientras haya un solo local. */
+      sucursalDireccion: suc?.direccion ?? '',
       cajeroNombre: usr?.nombre ?? '—',
       items: itemsSalida,
       extras,
@@ -1993,6 +2002,28 @@ export class VentasService {
    * Corre ANTES de la transacción de stock, a propósito: un web service lento
    * adentro de una transacción abierta es veneno para toda la caja.
    */
+  /**
+   * EL PUNTO DE VENTA FISCAL DEL LOCAL QUE VENDE (0077).
+   *
+   * ARCA declara los puntos de venta contra un DOMICILIO, y cada uno lleva su
+   * numeración correlativa independiente. Por eso es de la sucursal y no de la
+   * empresa: la factura de Belgrano 728 sale por el punto de venta declarado
+   * en Belgrano 728, y su correlativo no tiene nada que ver con el de la
+   * Distribuidora.
+   *
+   * `null` = esta sucursal no tiene el suyo cargado. NO es un error acá: el
+   * emisor cae al de la variable de entorno, que es exactamente lo correcto en
+   * una instalación de un solo local (donde no hay nada que elegir). Lo que sí
+   * hace ruido es el caso de varios locales con uno sin cargar, y de eso avisa
+   * el panel de diagnóstico, que los lista uno por uno.
+   */
+  private async ptoVtaFiscal(sucursalId?: number | null): Promise<number | null> {
+    if (!sucursalId) return null;
+    const [s] = await this.db.select({ pv: sucursales.puntoVenta })
+      .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
+    return Number(String(s?.pv ?? '').replace(/\D/g, '')) || null;
+  }
+
   private async resolverFiscal(
     quiereFactura: boolean,
     cliente: any,
@@ -2001,6 +2032,8 @@ export class VentasService {
     opciones: {
       reservado?: { cbteNro: number; cbteTipo: number } | null;
       reservar?: (nro: number, tipo: number) => Promise<void>;
+      /** El punto de venta del local que emite (0077). Ver `ptoVtaFiscal`. */
+      ptoVta?: number | null;
     } = {},
   ) {
     const vacio = {
@@ -2054,6 +2087,7 @@ export class VentasService {
       neto: venta.neto,
       iva: venta.iva,
       total: venta.total,
+      ptoVta: opciones.ptoVta ?? null,
       fecha: venta.fecha,
       reservado: opciones.reservado ?? null,
       reservar: opciones.reservar,
@@ -2414,7 +2448,7 @@ export class VentasService {
     const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, config, {
       total: tot.total, neto: tot.subtotalNeto, iva: tot.ivaTotal,
       items: tot.items, extras: tot.extras, fecha,
-    });
+    }, { ptoVta: await this.ptoVtaFiscal(sucursalId) });
     const tipoFinal = (fiscal.tipo ?? tipo) as (typeof TIPOS)[number];
     const puntoVentaFinal = fiscal.puntoVenta ?? puntoVenta;
 
@@ -2647,6 +2681,7 @@ export class VentasService {
       total: borrador.total, neto: borrador.subtotalNeto, iva: borrador.ivaTotal,
       items: borrador.items, extras: borrador.extras, fecha,
     }, {
+      ptoVta: await this.ptoVtaFiscal(sucursalId),
       reservar: async (nro, cbteTipo) => {
         await this.db.update(ventas)
           .set({ facturarCbteNro: nro, facturarCbteTipo: cbteTipo })
@@ -2749,6 +2784,7 @@ export class VentasService {
        * — sigue en `fecha`, y el rastro queda en observaciones. */
       fecha: new Date(),
     }, {
+      ptoVta: await this.ptoVtaFiscal(v.sucursalId),
       /* LA RECUPERACIÓN: si quedó un número reservado de un intento anterior,
        * se consulta ANTES de emitir. Si ese comprobante ya salió con nuestros
        * importes, se adopta su CAE en vez de emitir una segunda factura. */
@@ -3053,6 +3089,18 @@ export class VentasService {
       },
       renglones: this.renglonesFiscales(tot.items, tot.extras),
       neto: tot.neto, iva: tot.iva, total: tot.total,
+      /*
+       * LA NOTA SALE POR EL MISMO PUNTO DE VENTA QUE LA FACTURA QUE AJUSTA, y
+       * eso se toma de la factura, no de la sucursal de hoy (0077).
+       *
+       * Es la única forma de que el comprobante asociado cierre: ARCA guarda
+       * la nota apuntando a (tipo, punto de venta, número) de la original, y
+       * una nota emitida desde otra boca de expendio quedaría declarando un
+       * comprobante que en su propio punto de venta no existe. Además protege
+       * el caso real: la venta se hizo en Fontana y la devolución la toma la
+       * Distribuidora — la nota sigue siendo de Fontana.
+       */
+      ptoVta: Number(String(original.puntoVenta ?? '').replace(/\D/g, '')) || null,
       asociado: { tipo: original.tipo, ptoVta: original.puntoVenta, numero: original.numero },
     });
 
