@@ -554,6 +554,13 @@
       "when": 1788238800000,
       "tag": "0078_gastos_anular_rescatada",
       "breakpoints": true
+    },
+    {
+      "idx": 79,
+      "version": "7",
+      "when": 1788242400000,
+      "tag": "0079_pedidos_y_preparar_a_quien_los_hace",
+      "breakpoints": true
     }
   ]
 }
