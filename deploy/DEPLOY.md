@@ -149,6 +149,48 @@ Si el arg no se pasa, el valor queda en **cadena vacía** (el `ENV` del
 Dockerfile siempre define la variable), y por eso `env.js` usa `||` y no `??`:
 una cadena vacía tiene que contar como "no configurada" y caer al default.
 
+### Facturación electrónica (ARCA)
+
+Van aparte porque **sin ellas la facturación queda dormida y el sistema opera
+igual que hoy** — que es exactamente lo que se quiere hasta tener el
+certificado. Sin `ARCA_CERT_PATH` y `ARCA_KEY_PATH` la pantalla del certificado
+(Ventas › Configuración) **no aparece**: no hay dónde escribir, así que no se
+ofrece el botón.
+
+```env
+ARCA_ENV=homologacion          # produccion recién cuando esté probado
+ARCA_CUIT=23356782429          # 11 dígitos, sin guiones
+ARCA_PTO_VTA=28                # fallback; cada sucursal tiene el suyo cargado
+ARCA_CERT_PATH=/certs/arca.crt
+ARCA_KEY_PATH=/certs/arca.key
+```
+
+> **PRIMERO EL VOLUMEN, DESPUÉS LAS VARIABLES.** En Dokploy → `crm-api` →
+> Advanced → **Volumes**, montar un volumen persistente en `/certs`. Sin eso,
+> `/certs` es filesystem del contenedor y **el contenedor se reconstruye entero
+> en cada deploy**, que acá es automático *On Push* a `main`.
+>
+> El escenario concreto: generás la clave, subís el pedido a ARCA, esperás dos
+> días a que te den el certificado — y en el medio alguien mergea a `main`. El
+> deploy se dispara solo, el contenedor se rehace, **la clave privada
+> desaparece** y el certificado que estaban por darte queda inservible, porque
+> la clave no se recupera de ninguna parte. Hay que empezar el trámite de nuevo.
+>
+> Un volumen montado no lo toca la reconstrucción. Es la única razón por la que
+> las rutas **no tienen default dentro del proyecto**: un default tipo
+> `./certs` habría puesto la clave adentro del artefacto de deploy, que es la
+> trampa §9.3 de la guía de facturación.
+
+El `.crt` y el `.key` **nunca van a git ni a la imagen**: `.gitignore` y
+`.dockerignore` bloquean `*.key`, `*.crt`, `*.pem` y `certs/`. Una clave
+commiteada no se borra con un `git rm` — queda en el historial y la única salida
+real es dar de baja el certificado en ARCA y sacar otro.
+
+**Homologación y producción son dos certificados distintos**, con puntos de
+venta y numeración propios; el de uno no sirve en el otro. Y cada máquina tiene
+su clave: la del entorno de desarrollo no se copia al servidor, se hace el
+trámite de nuevo (es gratis y evita mover un archivo secreto).
+
 ## 4. Puesta en marcha
 
 1. **Base**: Database → PostgreSQL. Anotá host interno, usuario, clave y nombre.
