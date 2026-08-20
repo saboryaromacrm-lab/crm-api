@@ -27,9 +27,10 @@
  *        reintento consulta antes de emitir.
  */
 import {
-  Controller, Get, Inject, Injectable, Logger, Module, Post,
+  BadRequestException, Body, Controller, Get, Inject, Injectable, Logger, Module, Post,
   type OnApplicationBootstrap,
 } from '@nestjs/common';
+import { IsString, MaxLength } from 'class-validator';
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
@@ -47,6 +48,9 @@ import {
   consultarComprobante, feDummy, solicitarCae, ultimoAutorizado, ErrorArca,
 } from './wsfe';
 import { obtenerTicket } from './wsaa';
+import {
+  ErrorCertificado, certificadoInstalado, generarPedido, hayClave, instalarCertificado,
+} from './certificado';
 
 /** Una fila del diagnóstico: un punto de venta y qué contestó ARCA por él. */
 interface DiagnosticoPunto {
@@ -543,6 +547,18 @@ export class ArcaService implements OnApplicationBootstrap {
 /** El techo de la lista del panel: para mirar más está el listado de Ventas. */
 const TRABADAS_EN_PANEL = 20;
 
+class PedidoCertificadoDto {
+  /** Como figura en ARCA, no el nombre de fantasía. */
+  @IsString() @MaxLength(120) razonSocial!: string;
+  /** El nombre del certificado dentro del CUIT. */
+  @IsString() @MaxLength(60) alias!: string;
+}
+
+class InstalarCertificadoDto {
+  /** El `.crt` en PEM, tal como lo devuelve ARCA. */
+  @IsString() @MaxLength(20_000) certificado!: string;
+}
+
 /**
  * DOS ENDPOINTS Y NO UNO, porque cuestan cosas muy distintas.
  *
@@ -588,6 +604,13 @@ export class ArcaController {
        * papel y el comprobante dicen cosas distintas — y eso no lo nota nadie
        * hasta que lo mira un inspector. */
       avisos: diferenciasConEmpresa(empresa),
+      /* Para prellenar el pedido: la razón social ANTE ARCA es la del membrete,
+       * no el nombre de fantasía — y es la que va adentro del certificado. */
+      empresaNombre: (empresa as any)?.nombre ?? '',
+      /* El trámite del certificado, sin exponer un solo byte de la clave: solo
+       * si existe y desde cuándo. */
+      clave: hayClave(),
+      certificado: certificadoInstalado(),
       sucursales: locales,
       /* Cuántos locales facturarían por la boca de expendio de otro. Con un
        * solo local es lo normal y no dice nada; con cinco, es un problema. */
@@ -600,6 +623,42 @@ export class ArcaController {
   @Permiso('ventas.configuracion')
   probar() {
     return this.svc.diagnostico();
+  }
+
+  /* --------------------- El trámite del certificado --------------------- */
+
+  /**
+   * GENERA LA CLAVE PRIVADA (si no está) Y DEVUELVE EL PEDIDO.
+   *
+   * **La clave no vuelve en la respuesta y no vuelve nunca**: se escribe en el
+   * servidor, donde apunta `ARCA_KEY_PATH`. Lo que viaja es el `.csr`, que es
+   * público — está hecho para dárselo a ARCA.
+   *
+   * Es `POST` porque escribe un archivo, aunque se sienta una consulta.
+   */
+  @Post('certificado/pedido')
+  @Permiso('ventas.configuracion')
+  pedido(@Body() dto: PedidoCertificadoDto) {
+    try {
+      return generarPedido({ razonSocial: dto.razonSocial, alias: dto.alias });
+    } catch (e) {
+      /* Los errores de acá están escritos para leerse en la pantalla: dicen qué
+       * falta y dónde se arregla. Se pasan tal cual. */
+      if (e instanceof ErrorCertificado) throw new BadRequestException(e.message);
+      throw e;
+    }
+  }
+
+  /** Guarda el `.crt` que devolvió ARCA, después de los tres controles. */
+  @Post('certificado/instalar')
+  @Permiso('ventas.configuracion')
+  instalar(@Body() dto: InstalarCertificadoDto) {
+    try {
+      return instalarCertificado(dto.certificado);
+    } catch (e) {
+      if (e instanceof ErrorCertificado) throw new BadRequestException(e.message);
+      throw e;
+    }
   }
 
   /**
