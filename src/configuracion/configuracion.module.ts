@@ -127,9 +127,19 @@ export const VENTAS_DEFAULTS = {
 /**
  * Identidad de la EMPRESA: la usan todos los documentos impresos (encabezado
  * con logo + nombre + CUIT). El logo viaja como data-URL (imagen chica).
+ *
+ * NOMBRE Y RAZÓN SOCIAL SON DOS COSAS, y separarlas no es un lujo. El nombre
+ * de fantasía es con el que el cliente conoce al negocio y es el que va grande
+ * en el membrete; la razón social es quién factura ante ARCA, y en una factura
+ * es obligatoria (RG 1415). Acá son distintas: se conoce "Sabor y Aroma" y
+ * factura "LORENZO LUCAS EMANUEL".
+ *
+ * Vacía cae al nombre, que es lo que valía hasta ahora: en un unipersonal donde
+ * los dos coinciden no hay nada que cargar.
  */
 export const EMPRESA_DEFAULTS = {
   nombre: 'Sabor y Aroma' as string,
+  razonSocial: '' as string,
   cuit: '' as string,
   direccion: '' as string,
   telefono: '' as string,

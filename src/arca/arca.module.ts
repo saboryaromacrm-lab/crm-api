@@ -604,9 +604,10 @@ export class ArcaController {
        * papel y el comprobante dicen cosas distintas — y eso no lo nota nadie
        * hasta que lo mira un inspector. */
       avisos: diferenciasConEmpresa(empresa),
-      /* Para prellenar el pedido: la razón social ANTE ARCA es la del membrete,
-       * no el nombre de fantasía — y es la que va adentro del certificado. */
-      empresaNombre: (empresa as any)?.nombre ?? '',
+      /* Para prellenar el pedido: adentro del certificado va la RAZÓN SOCIAL,
+       * no el nombre de fantasía. Si no está cargada cae al nombre, que es lo
+       * correcto cuando los dos coinciden. */
+      empresaNombre: (empresa as any)?.razonSocial || (empresa as any)?.nombre || '',
       /* El trámite del certificado, sin exponer un solo byte de la clave: solo
        * si existe y desde cuándo. */
       clave: hayClave(),
