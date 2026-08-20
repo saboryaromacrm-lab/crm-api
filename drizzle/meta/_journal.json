@@ -519,6 +519,13 @@
       "when": 1788141600000,
       "tag": "0073_ventas_sin_facturar",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1788224400000,
+      "tag": "0074_arca_ticket_de_acceso",
+      "breakpoints": true
     }
   ]
 }

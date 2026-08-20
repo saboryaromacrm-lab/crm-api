@@ -7,6 +7,25 @@
 .env.*
 !.env.example
 
+# LOS CERTIFICADOS DE ARCA, NUNCA (trampa §9.3 de la guía de facturación).
+#
+# La clave privada del certificado fiscal no puede viajar adentro de la imagen:
+# la imagen se sube a un registry, se copia entre máquinas y queda en capas que
+# no se borran. Y hay una razón operativa además de la de seguridad: la imagen
+# se RECONSTRUYE ENTERA en cada deploy, así que un certificado adentro se
+# perdería en el próximo — los certificados viven en un VOLUMEN MONTADO, fuera
+# de la imagen, y sobreviven a los despliegues.
+#
+# Antes de empaquetar, esto tiene que dar vacío:
+#   find . -name '*.key' -o -name '*.crt' -o -name '*.pem'
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+certs
+certificados
+
 node_modules
 dist
 .git

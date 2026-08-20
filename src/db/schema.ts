@@ -2451,6 +2451,30 @@ export const configuracion = pgTable('configuracion', {
   uqClave: uniqueIndex('uq_configuracion_clave').on(t.clave),
 }));
 
+/* ---------------- ARCA · el ticket de acceso (0074) ---------------- */
+/**
+ * EL TICKET DE ACCESO DEL WSAA, CACHEADO. No es una optimización: **ARCA
+ * rechaza pedir uno nuevo mientras haya otro vigente** ("Ya posee un TA
+ * válido"). Dura ~12 horas, así que sin esta tabla el primer reinicio de la
+ * API deja la facturación trabada hasta que el anterior venza.
+ *
+ * `service` incluye el ENTORNO (`wsfe` vs `wsfe@prod`) y esa es la trampa §9.7
+ * de la guía: un ticket de homologación no sirve en producción, pero con la
+ * misma clave de cache el sistema le manda al ARCA real el permiso de pruebas
+ * — lo rechaza, y como el viejo sigue vigente tampoco entrega uno nuevo. Doce
+ * horas de facturas trabadas el primer día en producción.
+ *
+ * NO guarda secretos propios: `token` y `sign` son credenciales EFÍMERAS que
+ * ARCA emite. La clave privada nunca toca la base.
+ */
+export const arcaTokens = pgTable('arca_tokens', {
+  service: text('service').primaryKey(),
+  token: text('token').notNull(),
+  sign: text('sign').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 /* ============================================================================
  * MÓDULO PROVEEDORES (0068) — lo que la app externa de cuentas por pagar
  * tenía y este sistema no: la relación con el proveedor ALREDEDOR de la
