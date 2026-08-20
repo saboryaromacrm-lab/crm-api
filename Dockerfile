@@ -63,6 +63,20 @@ COPY drizzle ./drizzle
 # a mirar algo. `migrate.js` sí queda — es lo que se ejecuta abajo.
 RUN rm -f dist/db/reset.js dist/db/reset.js.map
 
+# EL PUNTO DE MONTAJE DE LOS CERTIFICADOS DE ARCA — vacío, y a nombre de `node`.
+#
+# NO ES UN DETALLE DE PERMISOS, es lo que hace que el volumen funcione. Docker
+# crea un volumen nuevo copiando el dueño y el modo de la carpeta que encuentra
+# en la imagen; si la carpeta NO existe, el volumen nace de **root** — y el
+# proceso corre como `node`, así que generar la clave falla con EACCES. Con
+# `/certs` ya creada y de `node`, el volumen hereda eso al montarse la primera
+# vez y no hay nada que ajustar a mano en el servidor.
+#
+# Adentro no va ningún certificado: `.dockerignore` bloquea *.key, *.crt, *.pem
+# y `certs/`, y aunque no lo hiciera la imagen se reconstruye entera en cada
+# deploy y se los llevaría puestos. Lo único que aporta la imagen es la carpeta.
+RUN mkdir -p /certs && chown node:node /certs && chmod 700 /certs
+
 # Sin privilegios: la imagen de node ya trae el usuario `node`.
 USER node
 

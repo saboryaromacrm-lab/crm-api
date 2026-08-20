@@ -166,7 +166,25 @@ ARCA_KEY_PATH=/certs/arca.key
 ```
 
 > **PRIMERO EL VOLUMEN, DESPUÉS LAS VARIABLES.** En Dokploy → `crm-api` →
-> Advanced → **Volumes**, montar un volumen persistente en `/certs`. Sin eso,
+> pestaña **Advanced** → **Volumes** → *Add*:
+>
+> | Campo | Valor |
+> | --- | --- |
+> | Tipo | **Volume Mount** (volumen con nombre, no bind) |
+> | Volume Name | `arca-certs` |
+> | Mount Path | `/certs` |
+>
+> Y después **Redeploy**: guardar no aplica nada: ni el volumen ni las
+> variables entran hasta que el contenedor se rehace. Es el motivo más común de
+> "lo configuré y sigue igual".
+>
+> El `Dockerfile` crea `/certs` vacía y a nombre de `node`, y eso **hay que
+> dejarlo**: Docker le da a un volumen nuevo el dueño de la carpeta que
+> encuentra en la imagen, y si no existiera el volumen nacería de `root` — con
+> el proceso corriendo como `node`, generar la clave fallaría con un permiso
+> denegado que no dice nada de certificados.
+>
+> Sin eso,
 > `/certs` es filesystem del contenedor y **el contenedor se reconstruye entero
 > en cada deploy**, que acá es automático *On Push* a `main`.
 >
@@ -190,6 +208,18 @@ real es dar de baja el certificado en ARCA y sacar otro.
 venta y numeración propios; el de uno no sirve en el otro. Y cada máquina tiene
 su clave: la del entorno de desarrollo no se copia al servidor, se hace el
 trámite de nuevo (es gratis y evita mover un archivo secreto).
+
+> **La clave no está en ningún respaldo, y es lo único del sistema que no lo
+> está.** `backup.sh` (§6) hace `pg_dump`: cubre la base entera, y todo lo demás
+> vive en git. El par `arca.key` / `arca.crt` no está en ninguno de los dos —
+> por diseño, porque una clave privada en un dump o en el repo es peor que
+> perderla.
+>
+> Perderla **no se arregla restaurando**: se da de baja el certificado en ARCA y
+> se hace el trámite otra vez, con clave nueva. Es gratis, son unos minutos de
+> trámite y no se pierde ninguna factura ya emitida (el CAE vive en la venta) —
+> pero mientras tanto no se puede facturar, así que conviene saberlo antes y no
+> el día que pasa.
 
 ## 4. Puesta en marcha
 
