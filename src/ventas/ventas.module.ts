@@ -557,8 +557,22 @@ export class VentasService {
     if (q.conOferta) {
       conds.push(sql`exists (select 1 from venta_items vi where vi.venta_id = ${ventas.id} and vi.oferta_id is not null)`);
     }
-    // La pestaña "Sin facturar" (0073): tickets provisorios esperando ARCA.
-    if (q.sinFacturar) conds.push(eq(ventas.facturarPendiente, true));
+    /*
+     * La pestaña "Sin facturar" (0073): tickets provisorios esperando ARCA.
+     *
+     * EXCLUYE LAS ANULADAS, igual que el contador de la pestaña. Sin eso los
+     * dos no coincidían: el badge decía 0 y la lista mostraba filas, porque
+     * `facturarPendiente` queda en `true` en la venta anulada (es historia de
+     * por qué salió provisoria, no una tarea). La pestaña es una BANDEJA DE
+     * PENDIENTES —lo que hay que emitir— y una venta anulada no se emite nunca
+     * más. Importa de verdad al pasar a producción: la regla es "esta pestaña
+     * tiene que estar VACÍA antes de instalar el certificado", y si limpiar
+     * anulando la dejaba con filas, la regla no se podía cumplir mirando.
+     */
+    if (q.sinFacturar) {
+      conds.push(eq(ventas.facturarPendiente, true));
+      conds.push(ne(ventas.estado, 'anulada'));
+    }
     if (q.q) {
       // Un número de ticket o un pedazo del nombre del cliente: lo que uno
       // tiene a mano cuando alguien vuelve con una bolsa y un papel.
