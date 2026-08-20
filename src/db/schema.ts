@@ -1573,6 +1573,24 @@ export const ventas = pgTable('ventas', {
    */
   facturarPendiente: boolean('facturar_pendiente').notNull().default(false),
   facturarMotivo: text('facturar_motivo').notNull().default(''),
+  /*
+   * EL NÚMERO RESERVADO ANTES DE LLAMAR A ARCA (0075) — la pieza que evita
+   * facturas duplicadas.
+   *
+   * El caso que cubre: se manda `FECAESolicitar`, ARCA lo procesa y emite, y
+   * la respuesta se pierde (timeout, corte, el contenedor que se reinicia).
+   * Para nosotros falló; para ARCA la factura EXISTE. Sin este rastro, el
+   * reintento pediría el número siguiente y emitiría una SEGUNDA factura de la
+   * misma venta — y una factura con CAE no se borra, se corrige con nota de
+   * crédito.
+   *
+   * Con esto, antes de reintentar se consulta este número: si ya salió y los
+   * datos coinciden, se ADOPTA el CAE en vez de emitir de nuevo.
+   *
+   * Se escribe ANTES del pedido y se limpia cuando la emisión cierra bien.
+   */
+  facturarCbteNro: integer('facturar_cbte_nro'),
+  facturarCbteTipo: integer('facturar_cbte_tipo'),
   refVentaId: integer('ref_venta_id'),                    // NC/ND → venta que ajustan
   observaciones: text('observaciones').notNull().default(''),
   /*

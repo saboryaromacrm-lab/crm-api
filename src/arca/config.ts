@@ -66,9 +66,14 @@ export const ARCA = {
    * Cuánto se espera a ARCA antes de darlo por caído. Corto a propósito: hay
    * una cajera con un cliente enfrente, y el circuito de caída ya existe (sale
    * el ticket provisorio y la factura queda pendiente). Preferimos un
-   * provisorio a los 12 segundos que una caja congelada un minuto.
+   * provisorio a los 15 segundos que una caja congelada un minuto.
+   *
+   * POR QUÉ 15 Y NO 12: medido contra homologación, pedir el TICKET DE ACCESO
+   * tarda unos 10 segundos. Las llamadas de la venta (último número, CAE) son
+   * de uno o dos, y el ticket se pide al arrancar la API (ver `ArcaService`),
+   * así que la caja normalmente no lo paga — pero si le toca, 12 quedaba justo.
    */
-  timeoutMs: Number(process.env.ARCA_TIMEOUT_MS) || 12_000,
+  timeoutMs: Number(process.env.ARCA_TIMEOUT_MS) || 15_000,
 } as const;
 
 /* ------------------------------------------------------------------ *

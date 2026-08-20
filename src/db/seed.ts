@@ -16,6 +16,7 @@ import { ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { VentasService } from '../ventas/ventas.module';
 import { OfertasService } from '../ofertas/ofertas.module';
+import { ArcaService } from '../arca/arca.module';
 import { CobranzasService } from '../cobranzas/cobranzas.module';
 import { CajaService } from '../caja/caja.module';
 import { HistorialPreciosService, PreciosService } from '../precios/precios.module';
@@ -42,7 +43,10 @@ async function main() {
   const cli = new ClientesService(db as any);
   const caja = new CajaService(db as any);
   const ofertasSvc = new OfertasService(db as any);
-  const vtas = new VentasService(db as any, inv, cfg, cli, caja, listasSvc, ofertasSvc);
+  /* El seed nunca factura contra ARCA: sin certificado el servicio se declara
+   * no disponible y las ventas salen con la numeración local, como siempre. */
+  const arcaSvc = new ArcaService(db as any);
+  const vtas = new VentasService(db as any, inv, cfg, cli, caja, listasSvc, ofertasSvc, arcaSvc);
   const cobr = new CobranzasService(db as any, cli, cfg, vtas, caja);
 
   await truncateAll(pool);

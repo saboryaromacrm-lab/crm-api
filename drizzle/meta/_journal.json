@@ -526,6 +526,13 @@
       "when": 1788224400000,
       "tag": "0074_arca_ticket_de_acceso",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1788228000000,
+      "tag": "0075_arca_numero_reservado",
+      "breakpoints": true
     }
   ]
 }

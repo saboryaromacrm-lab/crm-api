@@ -43,6 +43,7 @@ import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { ArcaModule, ArcaService } from '../arca/arca.module';
 
 const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
@@ -392,6 +393,7 @@ export class VentasService {
     private readonly caja: CajaService,
     private readonly listas: ListasService,
     private readonly ofertas: OfertasService,
+    private readonly arca: ArcaService,
   ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
@@ -1715,55 +1717,121 @@ export class VentasService {
   /* ---------------------- Facturación electrónica ---------------------- */
 
   /**
-   * LA COSTURA CON ARCA — el único punto del sistema que habla (hablará) con
-   * el web service de facturación. Su contrato es lo que importa: puede
-   * fallar, y quien lo llama tiene que sobrevivir a ese fallo.
+   * LOS RENGLONES DE LA VENTA COMO LOS QUIERE ARCA: neto y alícuota.
    *
-   *   arcaHabilitado: false  →  ok sin CAE. La etapa actual: el comprobante
-   *                             interno se emite igual que siempre.
-   *   arcaHabilitado: true   →  acá va la llamada real al WSFE. Mientras no
-   *                             esté conectada, devuelve el fallo con su
-   *                             motivo — lo que convierte el flag en el
-   *                             ENSAYO del circuito de caída: prenderlo hoy
-   *                             ejercita el fallback completo de punta a
-   *                             punta (ticket provisorio, leyenda, pestaña
-   *                             Sin facturar, reintento).
-   *
-   * Cuando se integre el WSFE, el cuerpo de este método es lo ÚNICO que
-   * cambia: timeout corto, y cualquier excepción vuelve como `ok: false` —
-   * jamás como una venta caída.
+   * Los `extras` (envío, packaging) entran igual que la mercadería — son parte
+   * del comprobante y cada uno tiene su propia alícuota. Dejarlos afuera haría
+   * que las bases no sumen el neto y ARCA rechace todo.
    */
-  private async solicitarCae(_venta: { tipo: string; total: number }, config: any):
-    Promise<{ ok: true; cae: string; caeVencimiento: Date | null } | { ok: false; motivo: string }> {
-    if (!config.arcaHabilitado) return { ok: true, cae: '', caeVencimiento: null };
-    return { ok: false, motivo: 'La integración con ARCA todavía no está conectada.' };
+  private renglonesFiscales(items: any[], extras: any[]) {
+    return [
+      ...(items ?? []).map((it) => ({ neto: Number(it.subtotal) || 0, iva: Number(it.iva) ?? 21 })),
+      ...(extras ?? []).map((e) => ({ neto: Number(e.importe) || 0, iva: Number(e.iva) ?? 21 })),
+    ].filter((r) => Math.abs(r.neto) > 0.0001);
   }
 
   /**
-   * RESUELVE EL COMPROBANTE FISCAL, con el fallback de ARCA caído (0073).
+   * RESUELVE EL COMPROBANTE FISCAL, con el fallback de ARCA caído (0073/0075).
    *
    * Si lo pedido no es factura, pasa de largo. Si es factura, pide el CAE:
-   *   - ARCA contesta → la factura sale con su letra (y su CAE, cuando exista).
-   *   - ARCA no contesta → **la venta NO se cae**: sale como ticket provisorio
-   *     con `facturarPendiente` prendido y el motivo guardado. El cliente se
-   *     lleva su mercadería y el papel fiscal se emite después, desde la
-   *     pestaña Sin facturar.
+   *   - ARCA contesta → sale la factura con su letra, su CAE y **el número que
+   *     dio ARCA** (ver abajo).
+   *   - ARCA no contesta, o rechaza → **la venta NO se cae**: sale como ticket
+   *     provisorio con `facturarPendiente` y el motivo guardado. El cliente se
+   *     lleva su mercadería y el papel fiscal se emite después.
+   *   - ARCA apagado → factura interna sin CAE, numeración local, como hasta
+   *     hoy. Es la etapa previa y no cambia nada.
+   *
+   * **EL NÚMERO Y EL PUNTO DE VENTA VIENEN DE ARCA.** No es un detalle: la
+   * numeración fiscal la lleva ARCA y un contador local no puede competir con
+   * ella. Y el punto de venta de web services es OTRO que el de los tickets
+   * internos (tienen numeraciones independientes), así que el comprobante
+   * fiscal se guarda con el suyo.
    *
    * Corre ANTES de la transacción de stock, a propósito: un web service lento
    * adentro de una transacción abierta es veneno para toda la caja.
    */
-  private async resolverFiscal(quiereFactura: boolean, cliente: any, config: any, total: number) {
-    if (!quiereFactura) {
-      return { tipo: null, cae: '', caeVencimiento: null as Date | null, facturarPendiente: false, facturarMotivo: '' };
-    }
+  private async resolverFiscal(
+    quiereFactura: boolean,
+    cliente: any,
+    config: any,
+    venta: { total: number; neto: number; iva: number; items: any[]; extras: any[]; fecha?: Date },
+    opciones: {
+      reservado?: { cbteNro: number; cbteTipo: number } | null;
+      reservar?: (nro: number, tipo: number) => Promise<void>;
+    } = {},
+  ) {
+    const vacio = {
+      tipo: null as string | null,
+      cae: '', caeVencimiento: null as Date | null,
+      cbteNro: null as number | null, puntoVenta: null as string | null,
+      facturarPendiente: false, facturarMotivo: '',
+      facturarCbteNro: null as number | null, facturarCbteTipo: null as number | null,
+    };
+    if (!quiereFactura) return vacio;
+
     const letra = letraFacturaPara(cliente, config);
-    const r = await this.solicitarCae({ tipo: letra, total }, config);
+
+    /*
+     * DOS COSAS DISTINTAS, Y HACEN FALTA LAS DOS:
+     *
+     *   `arcaHabilitado`   la INTENCIÓN — el dueño quiere facturar
+     *                      electrónicamente. Vive en la configuración y se
+     *                      prende desde una pantalla.
+     *   `arca.disponible()` la CAPACIDAD — hay certificado, CUIT y punto de
+     *                      venta cargados. Vive en el entorno del servidor.
+     *
+     * Apagado el interruptor, el comprobante sale con la numeración local y
+     * sin CAE: es la etapa previa y no cambia nada de lo que ya funcionaba.
+     */
+    if (!config.arcaHabilitado) return { ...vacio, tipo: letra };
+
+    /*
+     * Prendido pero sin poder: NO se emite una factura sin CAE haciéndose la
+     * distraída. Sale el ticket provisorio y el motivo dice exactamente qué
+     * falta (`motivoNoDisponible` recorre las cinco causas). Es además el modo
+     * ENSAYO: prender el interruptor sin certificado ejercita el circuito de
+     * caída completo, que es como se probó.
+     */
+    if (!this.arca.disponible()) {
+      return {
+        ...vacio, tipo: 'ticket', facturarPendiente: true,
+        facturarMotivo: this.arca.motivo() ?? 'La facturación electrónica no está configurada.',
+      };
+    }
+
+    const r = await this.arca.emitir({
+      tipo: letra,
+      receptor: {
+        tipoDoc: cliente.tipoDoc,
+        numeroDoc: cliente.numeroDoc,
+        condicionIva: cliente.condicionIva,
+        esConsumidorFinal: !!cliente.esConsumidorFinal,
+      },
+      renglones: this.renglonesFiscales(venta.items, venta.extras),
+      neto: venta.neto,
+      iva: venta.iva,
+      total: venta.total,
+      fecha: venta.fecha,
+      reservado: opciones.reservado ?? null,
+      reservar: opciones.reservar,
+    });
+
     if (r.ok) {
-      return { tipo: letra, cae: r.cae, caeVencimiento: r.caeVencimiento, facturarPendiente: false, facturarMotivo: '' };
+      return {
+        ...vacio,
+        tipo: letra,
+        cae: r.cae,
+        caeVencimiento: r.caeVencimiento,
+        cbteNro: r.cbteNro,
+        puntoVenta: r.puntoVenta,
+      };
     }
     return {
-      tipo: 'ticket', cae: '', caeVencimiento: null as Date | null,
-      facturarPendiente: true, facturarMotivo: r.motivo,
+      ...vacio,
+      tipo: 'ticket',
+      facturarPendiente: true,
+      facturarMotivo: r.motivo,
     };
   }
 
@@ -2095,18 +2163,28 @@ export class VentasService {
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 
     /* ARCA, ANTES de la transacción (0073): si se pidió factura y el servicio
-     * no contesta, la venta sale como ticket provisorio pendiente — no se cae. */
-    const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, config, tot.total);
+     * no contesta, la venta sale como ticket provisorio pendiente — no se cae.
+     *
+     * Este camino (venta confirmada de una) es el de la API y el seed, NO el
+     * de la caja: acá no hay fila previa donde reservar el número, así que la
+     * red contra la respuesta perdida es la consulta inmediata que hace
+     * `ArcaService`. El camino del mostrador —`confirmar()`— sí reserva. */
+    const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, config, {
+      total: tot.total, neto: tot.subtotalNeto, iva: tot.ivaTotal,
+      items: tot.items, extras: tot.extras, fecha,
+    });
     const tipoFinal = (fiscal.tipo ?? tipo) as (typeof TIPOS)[number];
+    const puntoVentaFinal = fiscal.puntoVenta ?? puntoVenta;
 
     const vencimientoPago = condicionPago === 'cuenta_corriente' && cliente.diasPlazo > 0
       ? new Date(fecha.getTime() + cliente.diasPlazo * 86400000)
       : null;
 
     const id = await this.db.transaction(async (tx) => {
-      const numero = await this.siguienteNumero(tx, tipoFinal, puntoVenta);
+      // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
+      const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipoFinal, puntoVentaFinal);
       const [v] = await tx.insert(ventas).values({
-        tipo: tipoFinal, puntoVenta, numero, fecha, clienteId: cliente.id, sucursalId,
+        tipo: tipoFinal, puntoVenta: puntoVentaFinal, numero, fecha, clienteId: cliente.id, sucursalId,
         usuarioId: dto.usuarioId ?? null, cajaSesionId: turno?.id ?? null,
         estado: 'confirmada', condicionPago, vencimientoPago,
         presupuestoId: dto.presupuestoId ?? null,
@@ -2317,16 +2395,37 @@ export class VentasService {
 
     /* ARCA, ANTES de la transacción (0073): pedir el CAE con la caja esperando
      * es inevitable; hacerlo con la transacción de stock abierta, no. Si el
-     * servicio no contesta, la venta sale igual como ticket provisorio. */
-    const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, config, borrador.total);
+     * servicio no contesta, la venta sale igual como ticket provisorio.
+     *
+     * ESTE ES EL CAMINO DEL MOSTRADOR, y el único donde hay una fila previa
+     * (el borrador): por eso acá SÍ se reserva el número antes de pedir el
+     * CAE. Si el proceso muere con el pedido en vuelo, el rastro queda y el
+     * reintento consulta ese número en vez de emitir una segunda factura. */
+    const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, config, {
+      total: borrador.total, neto: borrador.subtotalNeto, iva: borrador.ivaTotal,
+      items: borrador.items, extras: borrador.extras, fecha,
+    }, {
+      reservar: async (nro, cbteTipo) => {
+        await this.db.update(ventas)
+          .set({ facturarCbteNro: nro, facturarCbteTipo: cbteTipo })
+          .where(eq(ventas.id, id));
+      },
+    });
     const tipo = (fiscal.tipo ?? pedido) as any;
+    const puntoVentaFinal = fiscal.puntoVenta ?? borrador.puntoVenta;
 
     await this.db.transaction(async (tx) => {
-      const numero = await this.siguienteNumero(tx, tipo, borrador.puntoVenta);
+      // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
+      const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
       await tx.update(ventas).set({
         tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago,
+        puntoVenta: puntoVentaFinal,
         cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
         facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
+        /* La reserva se limpia al cerrar bien: si quedó pendiente, el número
+         * SOBREVIVE para que el reintento pueda consultarlo. */
+        facturarCbteNro: fiscal.facturarPendiente ? undefined : null,
+        facturarCbteTipo: fiscal.facturarPendiente ? undefined : null,
         cajaSesionId: turno?.id ?? null,
         /*
          * LA VENTA ES DE QUIEN LA ARMÓ, y quien la cobró va aparte (0060).
@@ -2397,19 +2496,52 @@ export class VentasService {
 
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(v.clienteId);
-    const letra = letraFacturaPara(cliente, config) as any;
-    const r = await this.solicitarCae({ tipo: letra, total: v.total }, config);
-    if (!r.ok) {
-      throw new BadRequestException(`ARCA sigue sin responder: ${r.motivo} La venta queda en Sin facturar.`);
+    const completa = await this.get(id);
+
+    const fiscal = await this.resolverFiscal(true, cliente, config, {
+      total: v.total, neto: v.subtotalNeto, iva: v.ivaTotal,
+      items: completa.items, extras: completa.extras,
+      /* La fecha del comprobante es la de HOY, no la de la venta: ARCA solo
+       * acepta ±5 días para Concepto 1, y un provisorio de la semana pasada ya
+       * quedó fuera de esa ventana. La fecha real de la operación no se pierde
+       * — sigue en `fecha`, y el rastro queda en observaciones. */
+      fecha: new Date(),
+    }, {
+      /* LA RECUPERACIÓN: si quedó un número reservado de un intento anterior,
+       * se consulta ANTES de emitir. Si ese comprobante ya salió con nuestros
+       * importes, se adopta su CAE en vez de emitir una segunda factura. */
+      reservado: v.facturarCbteNro && v.facturarCbteTipo
+        ? { cbteNro: v.facturarCbteNro, cbteTipo: v.facturarCbteTipo }
+        : null,
+      reservar: async (nro, cbteTipo) => {
+        await this.db.update(ventas)
+          .set({ facturarCbteNro: nro, facturarCbteTipo: cbteTipo })
+          .where(eq(ventas.id, id));
+      },
+    });
+
+    if (fiscal.facturarPendiente) {
+      // Se guarda el motivo NUEVO: el de hace una hora puede no ser el de ahora.
+      await this.db.update(ventas)
+        .set({ facturarMotivo: fiscal.facturarMotivo })
+        .where(eq(ventas.id, id));
+      throw new BadRequestException(`No se pudo facturar: ${fiscal.facturarMotivo}`);
+    }
+    if (!fiscal.tipo || fiscal.tipo === 'ticket') {
+      throw new BadRequestException(
+        'La facturación electrónica está apagada: no hay con qué emitir el comprobante fiscal.',
+      );
     }
 
     const provisorio = `${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
+    const puntoVentaFinal = fiscal.puntoVenta ?? v.puntoVenta;
     await this.db.transaction(async (tx) => {
-      const numero = await this.siguienteNumero(tx, letra, v.puntoVenta);
+      const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, fiscal.tipo!, puntoVentaFinal);
       await tx.update(ventas).set({
-        tipo: letra, numero,
-        cae: r.cae, caeVencimiento: r.caeVencimiento,
+        tipo: fiscal.tipo as any, numero, puntoVenta: puntoVentaFinal,
+        cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
         facturarPendiente: false, facturarMotivo: '',
+        facturarCbteNro: null, facturarCbteTipo: null,
         /* El rastro del provisorio: sin esto, el ticket de papel que se llevó
          * el cliente apunta a un comprobante que ya no existe con ese número. */
         observaciones: `${v.observaciones ? `${v.observaciones}\n` : ''}`
@@ -2956,7 +3088,10 @@ export class DescuentosController {
 }
 
 @Module({
-  imports: [InventarioModule, ConfiguracionModule, ClientesModule, CajaModule, ListasModule, OfertasModule],
+  imports: [
+    InventarioModule, ConfiguracionModule, ClientesModule, CajaModule,
+    ListasModule, OfertasModule, ArcaModule,
+  ],
   controllers: [VentasController, DescuentosController],
   providers: [VentasService, DescuentosService],
   exports: [VentasService],
