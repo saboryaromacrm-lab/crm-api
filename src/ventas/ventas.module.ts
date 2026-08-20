@@ -2769,9 +2769,30 @@ export class VentasService {
         .where(eq(ventas.id, id));
       throw new BadRequestException(`No se pudo facturar: ${fiscal.facturarMotivo}`);
     }
-    if (!fiscal.tipo || fiscal.tipo === 'ticket') {
+    /*
+     * SIN CAE NO HAY FACTURA, Y ACÁ NO HAY EXCEPCIÓN QUE VALGA.
+     *
+     * Este candado decía `if (!fiscal.tipo || fiscal.tipo === 'ticket')`, que
+     * no cubría el caso real: con el interruptor de ARCA **apagado**,
+     * `resolverFiscal` devuelve la LETRA (es la etapa previa, donde el
+     * comprobante sale con numeración local y sin CAE) — o sea que no es
+     * 'ticket' y el candado no saltaba.
+     *
+     * Lo que pasaba entonces: apretar "Facturar" sobre un ticket provisorio
+     * con ARCA apagado lo convertía en `factura_b` sin CAE, le borraba el
+     * `facturarPendiente` y lo sacaba de la lista de Sin facturar. Los tres
+     * papeles dejaban de coincidir a la vez: el cliente con un ticket que dice
+     * "provisorio", el sistema diciendo Factura B 0001-00000001, y ARCA sin
+     * nada. Y la venta ya no aparecía en ningún lado para arreglarla.
+     *
+     * La regla es simple: este endpoint existe para conseguir el CAE que faltó.
+     * Si no vuelve con uno, la venta se queda pendiente, que es donde tiene que
+     * estar.
+     */
+    if (!fiscal.cae) {
       throw new BadRequestException(
-        'La facturación electrónica está apagada: no hay con qué emitir el comprobante fiscal.',
+        'La facturación electrónica está apagada: no hay con qué emitir el comprobante fiscal. '
+        + 'Prendela en Ventas › Configuración y revisá el panel de diagnóstico.',
       );
     }
 
@@ -3406,10 +3427,16 @@ export class VentasController {
    * FACTURAR UNA VENTA PENDIENTE (0073): el botón de la pestaña Sin facturar.
    * No toca plata ni stock — solo emite el comprobante fiscal que ARCA no dio
    * al cobrar. Reintentar es inocuo: si ARCA sigue caído, la venta queda como
-   * estaba. El permiso es el del listado, que es donde vive el botón.
+   * estaba.
+   *
+   * DOS PERMISOS porque el botón vive en dos lados: la pestaña Sin facturar
+   * del listado, y el panel de diagnóstico de ARCA (Ventas › Configuración),
+   * que es adonde va el que acaba de destrabar la conexión y quiere emitir lo
+   * que se acumuló. Quien administra la facturación tiene que poder reintentar
+   * sin pedirle permiso de listado a nadie.
    */
   @Post(':id/facturar')
-  @Permiso('ventas.listado')
+  @Permiso('ventas.listado', 'ventas.configuracion')
   facturar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     return this.svc.facturarAhora(id, this.opciones(sesion));
   }

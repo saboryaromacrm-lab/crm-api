@@ -30,37 +30,73 @@
  */
 import { existsSync } from 'node:fs';
 
-const PROD = String(process.env.ARCA_ENV || '').toLowerCase() === 'produccion';
-
 /** Solo los 11 dígitos: así lo quiere el bloque `Auth` del WSFE. */
 const soloDigitos = (v: unknown) => String(v ?? '').replace(/\D/g, '');
 
+/**
+ * TODO SE LEE CON GETTERS, Y NO ES UN DETALLE DE ESTILO.
+ *
+ * `ConfigModule.forRoot()` carga el `.env` cuando Nest instancia la
+ * aplicación — o sea DESPUÉS de que Node terminó de importar todos los
+ * módulos. Un `const cuit = process.env.ARCA_CUIT` a nivel de archivo corre en
+ * la importación, cuando el `.env` todavía no se leyó, y queda vacío para
+ * siempre.
+ *
+ * Lo peor es cómo se manifiesta: **en el servidor funciona**, porque ahí las
+ * variables las inyecta el contenedor y ya están en `process.env` antes de que
+ * Node arranque. En la máquina de desarrollo, con las mismas cinco variables
+ * escritas en el `.env`, la facturación queda muda y el panel de diagnóstico
+ * insiste con "Falta ARCA_CUIT" mientras el archivo lo tiene escrito. Es la
+ * trampa §9.4 de la guía en versión local, y se come una tarde.
+ *
+ * Con getters, cada lectura consulta `process.env` en el momento: no hay un
+ * "antes" en el que las variables no estén.
+ *
+ * (`resolverDatabaseUrl` no tiene el problema porque es una FUNCIÓN y se llama
+ * desde el factory del provider, que ya corre con el `.env` cargado.)
+ */
 export const ARCA = {
-  produccion: PROD,
+  get produccion(): boolean {
+    return String(process.env.ARCA_ENV || '').toLowerCase() === 'produccion';
+  },
 
   /** CUIT del emisor, 11 dígitos. Tiene que coincidir con el del certificado. */
-  cuit: soloDigitos(process.env.ARCA_CUIT),
+  get cuit(): string {
+    return soloDigitos(process.env.ARCA_CUIT);
+  },
 
   /** Punto de venta tipo "Web Services". Ver decisión 2 del encabezado. */
-  ptoVta: Number(process.env.ARCA_PTO_VTA) || 0,
+  get ptoVta(): number {
+    return Number(process.env.ARCA_PTO_VTA) || 0;
+  },
 
   /*
    * Los endpoints. Homologación no tiene ningún valor fiscal: es donde se
    * desarrolla y se prueba todo. Producción emite facturas de verdad.
    */
-  wsaaUrl: PROD
-    ? 'https://wsaa.afip.gov.ar/ws/services/LoginCms'
-    : 'https://wsaahomo.afip.gov.ar/ws/services/LoginCms',
-  wsfeUrl: PROD
-    ? 'https://servicios1.afip.gov.ar/wsfev1/service.asmx'
-    : 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx',
-  padronUrl: PROD
-    ? 'https://aws.afip.gov.ar/sr-padron/webservices/personaServiceA5'
-    : 'https://awshomo.afip.gov.ar/sr-padron/webservices/personaServiceA5',
+  get wsaaUrl(): string {
+    return this.produccion
+      ? 'https://wsaa.afip.gov.ar/ws/services/LoginCms'
+      : 'https://wsaahomo.afip.gov.ar/ws/services/LoginCms';
+  },
+  get wsfeUrl(): string {
+    return this.produccion
+      ? 'https://servicios1.afip.gov.ar/wsfev1/service.asmx'
+      : 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx';
+  },
+  get padronUrl(): string {
+    return this.produccion
+      ? 'https://aws.afip.gov.ar/sr-padron/webservices/personaServiceA5'
+      : 'https://awshomo.afip.gov.ar/sr-padron/webservices/personaServiceA5';
+  },
 
   /** Sin default a propósito: ver decisión 3 del encabezado. */
-  certPath: process.env.ARCA_CERT_PATH || '',
-  keyPath: process.env.ARCA_KEY_PATH || '',
+  get certPath(): string {
+    return process.env.ARCA_CERT_PATH || '';
+  },
+  get keyPath(): string {
+    return process.env.ARCA_KEY_PATH || '';
+  },
 
   /**
    * Cuánto se espera a ARCA antes de darlo por caído. Corto a propósito: hay
@@ -73,8 +109,10 @@ export const ARCA = {
    * de uno o dos, y el ticket se pide al arrancar la API (ver `ArcaService`),
    * así que la caja normalmente no lo paga — pero si le toca, 12 quedaba justo.
    */
-  timeoutMs: Number(process.env.ARCA_TIMEOUT_MS) || 15_000,
-} as const;
+  get timeoutMs(): number {
+    return Number(process.env.ARCA_TIMEOUT_MS) || 15_000;
+  },
+};
 
 /* ------------------------------------------------------------------ *
  * El interruptor general

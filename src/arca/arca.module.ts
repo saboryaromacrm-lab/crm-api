@@ -26,9 +26,18 @@
  *      · más tarde: la venta guardó el número reservado (0075), así que el
  *        reintento consulta antes de emitir.
  */
-import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap } from '@nestjs/common';
+import {
+  Controller, Get, Inject, Injectable, Logger, Module, Post,
+  type OnApplicationBootstrap,
+} from '@nestjs/common';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { ARCA, arcaDisponible, motivoNoDisponible, resetDisponible } from './config';
+import { Permiso } from '../auth/auth.decoradores';
+import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
+import { clientes, sucursales, ventas } from '../db/schema';
+import {
+  ARCA, arcaDisponible, diferenciasConEmpresa, motivoNoDisponible, resetDisponible,
+} from './config';
 import { parsearFechaArca } from './fecha';
 import {
   armarAlicuotas, armarReceptor, CBTE_TIPO, letraDe, esFiscal,
@@ -275,47 +284,240 @@ export class ArcaService implements OnApplicationBootstrap {
   /* ------------------------- Diagnóstico ------------------------- */
 
   /**
+   * EL ESTADO BARATO: lo que se sabe SIN salir a la red.
+   *
+   * Va separado de `diagnostico()` a propósito. Abrir la pantalla de
+   * Configuración no puede costar diez segundos de espera contra ARCA —y eso
+   * es lo que tarda pedir un ticket de acceso—, así que la pantalla carga esto
+   * y el viaje a la red lo dispara el usuario apretando "Probar conexión".
+   *
+   * `resetDisponible()` acá vale oro: es la trampa §9.8 (el certificado que
+   * quedó como `.crt.crt`). Se corrige el nombre, se recarga esta pantalla y
+   * el estado se relee del disco sin reiniciar la API.
+   */
+  estado() {
+    resetDisponible();
+    return {
+      produccion: ARCA.produccion,
+      cuit: ARCA.cuit,
+      puntoVenta: ARCA.ptoVta ? this.puntoVenta() : '',
+      disponible: arcaDisponible(),
+      motivo: motivoNoDisponible(),
+      certPath: ARCA.certPath,
+      keyPath: ARCA.keyPath,
+      timeoutMs: ARCA.timeoutMs,
+      /* La URL importa: es lo que distingue de un vistazo homologación de
+       * producción cuando alguien duda de qué está mirando. */
+      wsfeUrl: ARCA.wsfeUrl,
+    };
+  }
+
+  /**
    * Las tres preguntas del §2.4, en orden. El orden ES el diagnóstico: si
    * falla la primera el problema es de ARCA; si falla la segunda, del
    * certificado; si falla la tercera, del punto de venta o su autorización.
    */
   async diagnostico() {
-    resetDisponible();
-    const base = {
-      produccion: ARCA.produccion,
-      cuit: ARCA.cuit,
-      puntoVenta: ARCA.ptoVta,
-      disponible: arcaDisponible(),
-      motivo: motivoNoDisponible(),
-    };
-    if (!base.disponible) return { ...base, servicio: null, ticket: null, numeracion: [] };
-
-    let servicio: any = null;
-    try { servicio = await feDummy(); } catch (e) { servicio = { ok: false, error: (e as Error).message }; }
-
-    let ticket: any = null;
-    try {
-      const ta = await obtenerTicket(this.db, 'wsfe');
-      ticket = { ok: true, venceEn: ta.expiresAt };
-    } catch (e) {
-      ticket = { ok: false, error: (e as Error).message };
-    }
-
-    const numeracion: Array<{ tipo: string; ultimo: number | null; error?: string }> = [];
-    if (ticket?.ok) {
-      for (const tipo of ['factura_a', 'factura_b', 'nota_credito_a', 'nota_credito_b']) {
-        try {
-          numeracion.push({ tipo, ultimo: await ultimoAutorizado(this.db, CBTE_TIPO[tipo]) });
-        } catch (e) {
-          numeracion.push({ tipo, ultimo: null, error: (e as Error).message });
-        }
+    const base = this.estado();
+    const inicio = Date.now();
+    /*
+     * TRES PASOS QUE SE CORTAN EN EL PRIMER FALLO, y el corte es el
+     * diagnóstico: seguir preguntando después de que el certificado fue
+     * rechazado solo agrega tres errores más que dicen lo mismo, y el que mira
+     * la pantalla tiene que adivinar cuál es la causa y cuáles las
+     * consecuencias. El primero que falla ES la causa.
+     */
+    const pasos: Array<{
+      clave: string; titulo: string; ok: boolean; detalle: string; ms: number;
+    }> = [];
+    const paso = async (clave: string, titulo: string, fn: () => Promise<string>) => {
+      const t0 = Date.now();
+      try {
+        pasos.push({ clave, titulo, ok: true, detalle: await fn(), ms: Date.now() - t0 });
+        return true;
+      } catch (e) {
+        pasos.push({ clave, titulo, ok: false, detalle: (e as Error).message, ms: Date.now() - t0 });
+        return false;
       }
+    };
+
+    /*
+     * 1. ¿ESTÁ VIVO EL SERVICIO? Va primero y **corre siempre, incluso sin
+     *    certificado**: `FEDummy` no lleva credenciales. Es justo la pregunta
+     *    que uno quiere contestar cuando algo no anda —¿es ARCA o soy yo?— y
+     *    saltearla por no tener el certificado cargado sería tapar la única
+     *    respuesta que se podía dar en ese estado.
+     */
+    const vivo = await paso('servicio', 'El servicio de ARCA responde', async () => {
+      const d = await feDummy();
+      if (!d.ok) throw new Error(`ARCA contesta pero se declara caído (${JSON.stringify(d)}).`);
+      return 'appserver, dbserver y authserver en OK.';
+    });
+
+    /* 2. ¿Está la configuración? No es una llamada, es un chequeo local, pero
+     *    va como paso para que el corte se vea en el mismo lugar que los
+     *    demás en vez de aparecer como un cartel suelto. */
+    if (!base.disponible) {
+      pasos.push({
+        clave: 'config',
+        titulo: 'La configuración está completa',
+        ok: false,
+        detalle: base.motivo ?? 'La facturación electrónica no está configurada.',
+        ms: 0,
+      });
+      return {
+        ...base,
+        pasos,
+        numeracion: [],
+        ms: Date.now() - inicio,
+        veredicto: vivo
+          ? `ARCA está funcionando; lo que falta es de este lado. ${base.motivo}`
+          : `${base.motivo} Y además ARCA no está contestando.`,
+      };
     }
-    return { ...base, servicio, ticket, numeracion };
+
+    /* 3. ¿Nos reconoce el certificado? Es el paso que separa "ARCA no anda" de
+     *    "el certificado no sirve", que son dos llamados de teléfono muy
+     *    distintos. */
+    const autenticado = vivo && await paso('ticket', 'El certificado autentica (WSAA)', async () => {
+      const ta = await obtenerTicket(this.db, 'wsfe');
+      return `Ticket de acceso vigente hasta ${ta.expiresAt.toLocaleString('es-AR', {
+        timeZone: 'America/Argentina/Buenos_Aires',
+      })}.`;
+    });
+
+    /* 4. ¿El punto de venta existe y está autorizado? Un certificado válido
+     *    con el punto de venta equivocado falla ACÁ y en ningún lado antes. */
+    const numeracion: Array<{ tipo: string; ultimo: number | null; error?: string }> = [];
+    if (autenticado) {
+      await paso('numeracion', `El punto de venta ${base.puntoVenta} está autorizado`, async () => {
+        for (const tipo of ['factura_a', 'factura_b', 'nota_credito_a', 'nota_credito_b']) {
+          try {
+            numeracion.push({ tipo, ultimo: await ultimoAutorizado(this.db, CBTE_TIPO[tipo]) });
+          } catch (e) {
+            numeracion.push({ tipo, ultimo: null, error: (e as Error).message });
+          }
+        }
+        const falla = numeracion.find((n) => n.error);
+        if (falla && numeracion.every((n) => n.error)) throw new Error(falla.error!);
+        return 'Contesta el último número autorizado de cada comprobante.';
+      });
+    }
+
+    const roto = pasos.find((p) => !p.ok);
+    return {
+      ...base,
+      pasos,
+      numeracion,
+      ms: Date.now() - inicio,
+      /* El veredicto en una línea. La pantalla muestra el detalle igual, pero
+       * lo primero que alguien necesita saber es si puede facturar o no. */
+      veredicto: roto
+        ? `${roto.titulo}: NO. ${roto.detalle}`
+        : `Todo en orden: se puede facturar contra ${base.produccion ? 'PRODUCCIÓN' : 'homologación'}.`,
+    };
+  }
+}
+
+/* ==================================================================== *
+ * EL PANEL DE DIAGNÓSTICO (fase 6)
+ * ==================================================================== */
+
+/** El techo de la lista del panel: para mirar más está el listado de Ventas. */
+const TRABADAS_EN_PANEL = 20;
+
+/**
+ * DOS ENDPOINTS Y NO UNO, porque cuestan cosas muy distintas.
+ *
+ * `estado` no sale a la red: lee el entorno y mira el disco, así que la
+ * pantalla lo puede pedir al abrir. `probar` hace el viaje completo a ARCA
+ * —hasta ~10 segundos si hay que pedir un ticket de acceso nuevo— y lo dispara
+ * el usuario apretando el botón. Fundirlos en uno haría que abrir
+ * Configuración se cuelgue diez segundos contra un servicio ajeno.
+ *
+ * El permiso es `ventas.configuracion`: es la misma pantalla donde vive el
+ * interruptor de la facturación, y quien decide prenderlo tiene que poder ver
+ * si va a funcionar.
+ */
+@Controller('arca')
+export class ArcaController {
+  constructor(
+    private readonly svc: ArcaService,
+    private readonly cfg: ConfiguracionService,
+    @Inject(DRIZZLE) private readonly db: Database,
+  ) {}
+
+  @Get('estado')
+  @Permiso('ventas.configuracion')
+  async estado() {
+    const base = this.svc.estado();
+    const empresa = await this.cfg.get('empresa');
+    return {
+      ...base,
+      /* El CUIT del certificado manda, pero si el del membrete es otro, el
+       * papel y el comprobante dicen cosas distintas — y eso no lo nota nadie
+       * hasta que lo mira un inspector. */
+      avisos: diferenciasConEmpresa(empresa),
+      trabadas: await this.trabadas(),
+    };
+  }
+
+  @Post('probar')
+  @Permiso('ventas.configuracion')
+  probar() {
+    return this.svc.diagnostico();
+  }
+
+  /**
+   * LAS TRABADAS: las ventas que salieron como ticket provisorio porque ARCA
+   * no contestó, y sigue sin haber factura.
+   *
+   * Es la misma lista que la pestaña ⚠ Sin facturar del listado de Ventas,
+   * pero acotada y con el motivo adelante: acá no se viene a buscar una venta,
+   * se viene a entender por qué se trabaron. Se ordenan de la MÁS VIEJA
+   * primero — la que lleva tres días sin factura es la urgente, no la de
+   * recién.
+   */
+  private async trabadas() {
+    const donde = and(eq(ventas.facturarPendiente, true), ne(ventas.estado, 'anulada'));
+    const [agg] = await this.db.select({
+      cantidad: sql<number>`count(*)::int`,
+      plata: sql<number>`coalesce(sum(${ventas.total}), 0)`,
+      desde: sql<Date | null>`min(${ventas.fecha})`,
+    }).from(ventas).where(donde);
+
+    const filas = await this.db.select({
+      id: ventas.id,
+      tipo: ventas.tipo,
+      puntoVenta: ventas.puntoVenta,
+      numero: ventas.numero,
+      fecha: ventas.fecha,
+      total: ventas.total,
+      motivo: ventas.facturarMotivo,
+      clienteNombre: clientes.nombre,
+      sucursalNombre: sucursales.nombre,
+    }).from(ventas)
+      .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+      .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
+      .where(donde)
+      .orderBy(ventas.fecha, ventas.id)
+      .limit(TRABADAS_EN_PANEL);
+
+    return {
+      cantidad: Number(agg?.cantidad) || 0,
+      plata: Math.round((Number(agg?.plata) || 0) * 100) / 100,
+      desde: agg?.desde ?? null,
+      filas,
+      /* Cuántas quedaron afuera del techo. Un panel que muestra 20 de 300 sin
+       * decirlo miente por omisión. */
+      ocultas: Math.max(0, (Number(agg?.cantidad) || 0) - filas.length),
+    };
   }
 }
 
 @Module({
+  imports: [ConfiguracionModule],
+  controllers: [ArcaController],
   providers: [ArcaService],
   exports: [ArcaService],
 })
