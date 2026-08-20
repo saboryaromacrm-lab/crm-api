@@ -512,6 +512,13 @@
       "when": 1788138000000,
       "tag": "0072_mercaderia_sin_factura",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1788141600000,
+      "tag": "0073_ventas_sin_facturar",
+      "breakpoints": true
     }
   ]
 }

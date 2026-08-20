@@ -378,7 +378,7 @@ type ListadoVentasQ = {
   desde?: string; hasta?: string;
   sucursalId?: number; usuarioId?: number; clienteId?: number; cajaSesionId?: number;
   estado?: string; medioPago?: string; origen?: string;
-  conOferta?: boolean; q?: string;
+  conOferta?: boolean; sinFacturar?: boolean; q?: string;
   offset?: number; limit?: number;
 };
 
@@ -493,6 +493,8 @@ export class VentasService {
     if (q.conOferta) {
       conds.push(sql`exists (select 1 from venta_items vi where vi.venta_id = ${ventas.id} and vi.oferta_id is not null)`);
     }
+    // La pestaña "Sin facturar" (0073): tickets provisorios esperando ARCA.
+    if (q.sinFacturar) conds.push(eq(ventas.facturarPendiente, true));
     if (q.q) {
       // Un número de ticket o un pedazo del nombre del cliente: lo que uno
       // tiene a mano cuando alguien vuelve con una bolsa y un papel.
@@ -535,6 +537,8 @@ export class VentasService {
         iva: sql<number>`coalesce(sum(${ventas.ivaTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
         descuentos: sql<number>`coalesce(sum(${ventas.descuentoTotal}) filter (where ${ventas.estado} <> 'anulada'), 0)`,
         plataAnulada: sql<number>`coalesce(sum(${ventas.total}) filter (where ${ventas.estado} = 'anulada'), 0)`,
+        // Tickets provisorios esperando ARCA, DEL FILTRO: alimenta la pestaña.
+        sinFacturar: sql<number>`count(*) filter (where ${ventas.facturarPendiente} and ${ventas.estado} <> 'anulada')::int`,
       }).from(ventas)
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .where(donde),
@@ -613,6 +617,7 @@ export class VentasService {
         descuentos: money(Number(tot?.descuentos)),
         plataAnulada: money(Number(tot?.plataAnulada)),
         promedio: tickets ? money(plata / tickets) : 0,
+        sinFacturar: Number(tot?.sinFacturar) || 0,
         ofertas: { plata: money(Number(ofe?.plata)), ventas: Number(ofe?.ventas) || 0 },
         porMedio: porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) })),
       },
@@ -1707,12 +1712,69 @@ export class VentasService {
    * cantidad o por regla de marca se ganaron el precio con volumen y no dependen
    * de cómo se pague.
    */
+  /* ---------------------- Facturación electrónica ---------------------- */
+
+  /**
+   * LA COSTURA CON ARCA — el único punto del sistema que habla (hablará) con
+   * el web service de facturación. Su contrato es lo que importa: puede
+   * fallar, y quien lo llama tiene que sobrevivir a ese fallo.
+   *
+   *   arcaHabilitado: false  →  ok sin CAE. La etapa actual: el comprobante
+   *                             interno se emite igual que siempre.
+   *   arcaHabilitado: true   →  acá va la llamada real al WSFE. Mientras no
+   *                             esté conectada, devuelve el fallo con su
+   *                             motivo — lo que convierte el flag en el
+   *                             ENSAYO del circuito de caída: prenderlo hoy
+   *                             ejercita el fallback completo de punta a
+   *                             punta (ticket provisorio, leyenda, pestaña
+   *                             Sin facturar, reintento).
+   *
+   * Cuando se integre el WSFE, el cuerpo de este método es lo ÚNICO que
+   * cambia: timeout corto, y cualquier excepción vuelve como `ok: false` —
+   * jamás como una venta caída.
+   */
+  private async solicitarCae(_venta: { tipo: string; total: number }, config: any):
+    Promise<{ ok: true; cae: string; caeVencimiento: Date | null } | { ok: false; motivo: string }> {
+    if (!config.arcaHabilitado) return { ok: true, cae: '', caeVencimiento: null };
+    return { ok: false, motivo: 'La integración con ARCA todavía no está conectada.' };
+  }
+
+  /**
+   * RESUELVE EL COMPROBANTE FISCAL, con el fallback de ARCA caído (0073).
+   *
+   * Si lo pedido no es factura, pasa de largo. Si es factura, pide el CAE:
+   *   - ARCA contesta → la factura sale con su letra (y su CAE, cuando exista).
+   *   - ARCA no contesta → **la venta NO se cae**: sale como ticket provisorio
+   *     con `facturarPendiente` prendido y el motivo guardado. El cliente se
+   *     lleva su mercadería y el papel fiscal se emite después, desde la
+   *     pestaña Sin facturar.
+   *
+   * Corre ANTES de la transacción de stock, a propósito: un web service lento
+   * adentro de una transacción abierta es veneno para toda la caja.
+   */
+  private async resolverFiscal(quiereFactura: boolean, cliente: any, config: any, total: number) {
+    if (!quiereFactura) {
+      return { tipo: null, cae: '', caeVencimiento: null as Date | null, facturarPendiente: false, facturarMotivo: '' };
+    }
+    const letra = letraFacturaPara(cliente, config);
+    const r = await this.solicitarCae({ tipo: letra, total }, config);
+    if (r.ok) {
+      return { tipo: letra, cae: r.cae, caeVencimiento: r.caeVencimiento, facturarPendiente: false, facturarMotivo: '' };
+    }
+    return {
+      tipo: 'ticket', cae: '', caeVencimiento: null as Date | null,
+      facturarPendiente: true, facturarMotivo: r.motivo,
+    };
+  }
+
   /**
    * MEDIOS QUE EXIGEN FACTURA (19/8/2026, pedido del dueño). Si un peso del
    * cobro entra por un medio tildado en la configuración, la venta no puede
    * salir como ticket interno: se factura o se cambia el medio. Corre sobre el
-   * TIPO ya resuelto y mira solo los pagos con importe — un renglón de
-   * transferencia en $0 no obliga a nada.
+   * TIPO PEDIDO, no el emitido — si el cajero pidió factura y ARCA cayó, el
+   * ticket provisorio pendiente de facturar cumple el espíritu de la regla
+   * (la intención de facturar quedó registrada y el papel sale después).
+   * Mira solo los pagos con importe: una transferencia en $0 no obliga a nada.
    *
    * El POS bloquea "Liquidar" con el motivo a la vista; esto es el candado del
    * lado que manda, para el ticket armado por API o un POS desactualizado.
@@ -2023,6 +2085,8 @@ export class VentasService {
 
     /* -- Confirmada de una: el camino de la API y del seed -- */
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
+    // Sobre el tipo PEDIDO: si se pidió factura y ARCA cae, el ticket
+    // provisorio pendiente cumple la regla (la intención quedó registrada).
     this.validarMediosFacturar(tipo, pagos, config);
     this.validarMediosPagoMonto(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
@@ -2030,20 +2094,27 @@ export class VentasService {
     await this.validarCredito(cliente, config, condicionPago, tot.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 
+    /* ARCA, ANTES de la transacción (0073): si se pidió factura y el servicio
+     * no contesta, la venta sale como ticket provisorio pendiente — no se cae. */
+    const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, config, tot.total);
+    const tipoFinal = (fiscal.tipo ?? tipo) as (typeof TIPOS)[number];
+
     const vencimientoPago = condicionPago === 'cuenta_corriente' && cliente.diasPlazo > 0
       ? new Date(fecha.getTime() + cliente.diasPlazo * 86400000)
       : null;
 
     const id = await this.db.transaction(async (tx) => {
-      const numero = await this.siguienteNumero(tx, tipo, puntoVenta);
+      const numero = await this.siguienteNumero(tx, tipoFinal, puntoVenta);
       const [v] = await tx.insert(ventas).values({
-        tipo, puntoVenta, numero, fecha, clienteId: cliente.id, sucursalId,
+        tipo: tipoFinal, puntoVenta, numero, fecha, clienteId: cliente.id, sucursalId,
         usuarioId: dto.usuarioId ?? null, cajaSesionId: turno?.id ?? null,
         estado: 'confirmada', condicionPago, vencimientoPago,
         presupuestoId: dto.presupuestoId ?? null,
         listaPrecio: dto.listaPrecio ?? '',
         subtotalNeto: tot.subtotalNeto, descuentoTotal: tot.descuentoTotal,
         ivaTotal: tot.ivaTotal, total: tot.total,
+        cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
+        facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
         observaciones: dto.observaciones ?? '',
       }).returning();
 
@@ -2236,17 +2307,26 @@ export class VentasService {
 
     // Liquidar o facturar. Cada tipo lleva su propio correlativo (el índice
     // único es por tipo + punto de venta), que es como debe ser fiscalmente.
-    const tipo = dto.tipo === 'factura'
+    const pedido = dto.tipo === 'factura'
       ? (letraFacturaPara(cliente, config) as any)
       : dto.tipo === 'ticket' ? 'ticket' : borrador.tipo;
-    // Con el tipo ya resuelto: un medio marcado "exige factura" no puede salir
-    // en ticket. Este es EL camino de la caja — el candado tiene que vivir acá.
-    this.validarMediosFacturar(tipo, pagos, config);
+    // Sobre el tipo PEDIDO: un medio marcado "exige factura" no puede salir en
+    // ticket a propósito — pero si se pidió factura y ARCA cae, el provisorio
+    // pendiente cumple la regla. Este es EL camino de la caja.
+    this.validarMediosFacturar(pedido, pagos, config);
+
+    /* ARCA, ANTES de la transacción (0073): pedir el CAE con la caja esperando
+     * es inevitable; hacerlo con la transacción de stock abierta, no. Si el
+     * servicio no contesta, la venta sale igual como ticket provisorio. */
+    const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, config, borrador.total);
+    const tipo = (fiscal.tipo ?? pedido) as any;
 
     await this.db.transaction(async (tx) => {
       const numero = await this.siguienteNumero(tx, tipo, borrador.puntoVenta);
       await tx.update(ventas).set({
         tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago,
+        cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
+        facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
         cajaSesionId: turno?.id ?? null,
         /*
          * LA VENTA ES DE QUIEN LA ARMÓ, y quien la cobró va aparte (0060).
@@ -2286,6 +2366,56 @@ export class VentasService {
       });
     });
 
+    return this.get(id);
+  }
+
+  /**
+   * FACTURA UNA VENTA QUE QUEDÓ PENDIENTE (0073) — el botón "Facturar" de la
+   * pestaña Sin facturar.
+   *
+   * El ticket provisorio ya movió el stock, cobró la plata y cerró el turno:
+   * acá NO se toca nada de eso. Lo único que pasa es la emisión del papel
+   * fiscal: se pide el CAE de nuevo y, si ARCA contesta, la venta PASA A SER
+   * la factura — letra según el cliente de hoy, número nuevo de la serie de
+   * facturas (el correlativo fiscal no puede tener agujeros), y el rastro del
+   * provisorio queda escrito en las observaciones. Si ARCA sigue caído, el
+   * error dice por qué y la venta sigue en la pestaña — reintentar no rompe
+   * nada, se puede apretar mil veces.
+   */
+  async facturarAhora(id: number, opciones: OpcionesVenta = {}) {
+    const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
+    if (!v) throw new NotFoundException('Esa venta no existe.');
+    if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Esa venta es de otra sucursal.');
+    }
+    if (v.estado !== 'confirmada') {
+      throw new BadRequestException('Solo se factura una venta confirmada (esta está anulada o en borrador).');
+    }
+    if (!v.facturarPendiente) {
+      throw new BadRequestException('Esta venta no está pendiente de facturar.');
+    }
+
+    const config = await this.cfg.get('ventas');
+    const cliente = await this.cli.get(v.clienteId);
+    const letra = letraFacturaPara(cliente, config) as any;
+    const r = await this.solicitarCae({ tipo: letra, total: v.total }, config);
+    if (!r.ok) {
+      throw new BadRequestException(`ARCA sigue sin responder: ${r.motivo} La venta queda en Sin facturar.`);
+    }
+
+    const provisorio = `${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
+    await this.db.transaction(async (tx) => {
+      const numero = await this.siguienteNumero(tx, letra, v.puntoVenta);
+      await tx.update(ventas).set({
+        tipo: letra, numero,
+        cae: r.cae, caeVencimiento: r.caeVencimiento,
+        facturarPendiente: false, facturarMotivo: '',
+        /* El rastro del provisorio: sin esto, el ticket de papel que se llevó
+         * el cliente apunta a un comprobante que ya no existe con ese número. */
+        observaciones: `${v.observaciones ? `${v.observaciones}\n` : ''}`
+          + `[Facturada: era el ticket provisorio ${provisorio} — ${v.facturarMotivo || 'ARCA no disponible'}]`,
+      }).where(eq(ventas.id, id));
+    });
     return this.get(id);
   }
 
@@ -2526,6 +2656,7 @@ export class VentasController {
     @Query('medioPago') medioPago?: string,
     @Query('origen') origen?: string,
     @Query('conOferta') conOferta?: string,
+    @Query('sinFacturar') sinFacturar?: string,
     @Query('q') q?: string,
     @Query('offset') offset?: string,
     @Query('limit') limit?: string,
@@ -2548,6 +2679,7 @@ export class VentasController {
       usuarioId: num(usuarioId),
       clienteId: num(clienteId), cajaSesionId: num(cajaSesionId),
       conOferta: conOferta === 'true',
+      sinFacturar: sinFacturar === 'true',
       offset: num(offset), limit: num(limit),
     });
   }
@@ -2620,6 +2752,18 @@ export class VentasController {
   @Permiso('ventas')
   delegar(@Param('id', ParseIntPipe) id: number, @Body() dto: DelegarVentaDto, @Auth() sesion: Sesion) {
     return this.svc.delegar(id, dto.paraUsuarioId, this.opciones(sesion));
+  }
+
+  /**
+   * FACTURAR UNA VENTA PENDIENTE (0073): el botón de la pestaña Sin facturar.
+   * No toca plata ni stock — solo emite el comprobante fiscal que ARCA no dio
+   * al cobrar. Reintentar es inocuo: si ARCA sigue caído, la venta queda como
+   * estaba. El permiso es el del listado, que es donde vive el botón.
+   */
+  @Post(':id/facturar')
+  @Permiso('ventas.listado')
+  facturar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.facturarAhora(id, this.opciones(sesion));
   }
 
   /*

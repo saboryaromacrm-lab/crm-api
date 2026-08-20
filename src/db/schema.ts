@@ -1563,6 +1563,16 @@ export const ventas = pgTable('ventas', {
   // Facturación electrónica (ARCA). Vacío mientras se opere con ticket interno.
   cae: text('cae').notNull().default(''),
   caeVencimiento: timestamp('cae_vencimiento', { withTimezone: true }),
+  /*
+   * ARCA CAÍDO ≠ VENTA CAÍDA (0073). Si el cajero pidió factura y ARCA no
+   * contesta, la venta se confirma IGUAL como ticket provisorio —el cliente
+   * está parado enfrente— y queda marcada acá: pendiente de emitir el
+   * comprobante fiscal. La pestaña "Sin facturar" del listado vive de este
+   * flag, y "Facturar ahora" lo reintenta. `facturarMotivo` guarda por qué
+   * quedó pendiente (el error de ARCA), para que el reintento no sea a ciegas.
+   */
+  facturarPendiente: boolean('facturar_pendiente').notNull().default(false),
+  facturarMotivo: text('facturar_motivo').notNull().default(''),
   refVentaId: integer('ref_venta_id'),                    // NC/ND → venta que ajustan
   observaciones: text('observaciones').notNull().default(''),
   /*
