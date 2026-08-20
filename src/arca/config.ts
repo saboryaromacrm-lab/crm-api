@@ -180,13 +180,43 @@ export function motivoNoDisponible(): string | null {
  * bloquea nada —el que manda es el certificado— pero un CUIT distinto en el
  * papel y en el comprobante hay que verlo ANTES de emitir mil facturas.
  */
-export function diferenciasConEmpresa(empresa: { cuit?: string } | null): string[] {
+export function diferenciasConEmpresa(
+  empresa: { cuit?: string; razonSocial?: string; nombre?: string } | null,
+): string[] {
   const avisos: string[] = [];
   const suyo = soloDigitos(empresa?.cuit);
-  if (ARCA.cuit && suyo && suyo !== ARCA.cuit) {
+  /*
+   * EL CUIT VACÍO ERA EL AGUJERO DE ESTE CONTROL. La comparación exigía que los
+   * dos existieran, así que "no cargado" pasaba sin decir nada — y ahí el papel
+   * sale SIN CUIT, porque la plantilla omite la línea cuando el dato está
+   * vacío. Una factura sin el CUIT del emisor no es una factura. Se descubrió
+   * emitiendo la primera de homologación: el CAE salió bien (lo pide con
+   * ARCA_CUIT, del certificado) y el papel salió mal.
+   */
+  if (ARCA.cuit && !suyo) {
+    avisos.push(
+      'Sistema › Empresa NO tiene el CUIT cargado, así que las facturas se imprimen SIN el CUIT '
+      + `del emisor — y sin ese dato el comprobante no sirve. El CAE se pide igual (con ${ARCA.cuit}, `
+      + 'el del certificado), o sea que el error no se nota hasta que alguien mira el papel.',
+    );
+  } else if (ARCA.cuit && suyo !== ARCA.cuit) {
     avisos.push(
       `El CUIT con el que se factura (${ARCA.cuit}) no es el de Sistema › Empresa (${suyo}). `
       + 'El de ARCA es el del certificado y es el que manda; corregí el del membrete.',
+    );
+  }
+  /*
+   * La razón social es obligatoria en la factura (RG 1415) y el impreso cae al
+   * nombre de fantasía cuando no está cargada. Es válido cuando los dos
+   * coinciden; acá no, y por eso se avisa si el emisor impreso no parece una
+   * razón social distinta del nombre. No se puede saber cuál es la correcta
+   * desde el código: solo se señala que el campo está vacío.
+   */
+  if (ARCA.cuit && !String(empresa?.razonSocial ?? '').trim()) {
+    avisos.push(
+      'Sistema › Empresa no tiene la razón social cargada: las facturas van a salir a nombre de '
+      + `"${String(empresa?.nombre ?? '').trim() || '(sin nombre)'}", que es el nombre de fantasía. `
+      + 'Si ante ARCA facturás con otro nombre, cargalo — en la factura es obligatorio.',
     );
   }
   return avisos;
