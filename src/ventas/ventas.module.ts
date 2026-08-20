@@ -44,6 +44,7 @@ import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
+import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 
 const TIPOS = ['ticket', 'factura_a', 'factura_b', 'factura_c', 'nota_credito', 'nota_debito'] as const;
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
@@ -659,8 +660,17 @@ export class VentasService {
         .from(presentaciones).where(inArray(presentaciones.id, presIds));
       for (const p of filas) tamDe.set(p.id, p.tamKg);
     }
-    const [cli] = await this.db.select({ nombre: clientes.nombre })
-      .from(clientes).where(eq(clientes.id, v.clienteId)).limit(1);
+    /* Los datos FISCALES del cliente, no solo el nombre: una factura impresa
+     * los lleva por ley (documento, condición frente al IVA y domicilio), y el
+     * QR de la RG 4892 necesita tipo y número de documento. */
+    const [cli] = await this.db.select({
+      nombre: clientes.nombre,
+      tipoDoc: clientes.tipoDoc,
+      numeroDoc: clientes.numeroDoc,
+      condicionIva: clientes.condicionIva,
+      direccion: clientes.direccion,
+      localidad: clientes.localidad,
+    }).from(clientes).where(eq(clientes.id, v.clienteId)).limit(1);
     const [suc] = v.sucursalId
       ? await this.db.select({ nombre: sucursales.nombre })
         .from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
@@ -674,6 +684,17 @@ export class VentasService {
     return {
       ...v,
       clienteNombre: cli?.nombre ?? '—',
+      cliente: cli ?? null,
+      /* El QR de la RG 4892, ya armado. Lo calcula la API porque acá viven la
+       * tabla de códigos y el CUIT del certificado; el navegador solo lo
+       * dibuja. `null` = este comprobante no lleva QR (ticket interno, o sin
+       * CAE todavía). */
+      qrArca: urlQrFiscal({
+        tipo: v.tipo, puntoVenta: v.puntoVenta, numero: v.numero,
+        fecha: v.fecha, total: v.total, cae: v.cae,
+        receptor: cli ? { tipoDoc: cli.tipoDoc, numeroDoc: cli.numeroDoc } : null,
+      }),
+      codigoComprobante: codigoComprobante(v.tipo),
       sucursalNombre: suc?.nombre ?? '—',
       cajeroNombre: usr?.nombre ?? '—',
       items: items.map((it) => {

@@ -154,6 +154,13 @@ export const IMPRESION_DEFAULTS = {
   // El remito a Cafetería se imprime todos los días y NO estaba en este
   // catálogo: caía al A4 por defecto y no había forma de mandarlo al rollo.
   remitoCafeteria: 'a4' as string,
+  /**
+   * LA FACTURA ELECTRÓNICA. Arranca en rollo porque **reemplaza al ticket**:
+   * sale de la misma impresora del mostrador y en el mismo momento. Si el
+   * fuerte pasara a ser la Factura A del mayorista —con veinte renglones y un
+   * cliente que archiva el papel— conviene pasarla a A4 desde esta pantalla.
+   */
+  facturaVenta: 'rollo80' as string,
   // La planilla del control de stock: la hoja que se lleva a la góndola para
   // anotar a lápiz lo que hay. Papel grande — en un rollo de 80 mm el renglón
   // no entra y no queda lugar para escribir.
@@ -273,6 +280,7 @@ const REGLAS: Record<string, {
   'impresion.listaPreparacion': { opciones: FORMATOS_PAPEL },
   'impresion.remitoCafeteria': { opciones: FORMATOS_PAPEL },
   'impresion.planillaConteo': { opciones: FORMATOS_PAPEL },
+  'impresion.facturaVenta': { opciones: FORMATOS_PAPEL },
   'impresion.etiquetaFraccionado': { opciones: FORMATOS_ETIQUETA },
 
   /* Los redondeos son una LISTA CERRADA, no un rango: son las monedas con las
