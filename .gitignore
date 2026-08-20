@@ -2,5 +2,18 @@ node_modules/
 dist/
 .env
 *.log
+
+# LOS CERTIFICADOS DE ARCA, NUNCA. Lo mismo que dice .dockerignore, pero acá el
+# riesgo es peor: un .key commiteado queda en el historial para siempre y no se
+# borra con un `git rm` — hay que dar de baja el certificado en ARCA y sacar uno
+# nuevo. Las rutas de ARCA_KEY_PATH/ARCA_CERT_PATH suelen caer adentro del
+# proyecto en desarrollo, así que se ignoran por extensión Y por carpeta.
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+certs/
+certificados/
 npm-debug.log*
 .DS_Store
