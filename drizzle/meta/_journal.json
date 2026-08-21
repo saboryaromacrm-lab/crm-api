@@ -561,6 +561,13 @@
       "when": 1788242400000,
       "tag": "0079_pedidos_y_preparar_a_quien_los_hace",
       "breakpoints": true
+    },
+    {
+      "idx": 80,
+      "version": "7",
+      "when": 1788246000000,
+      "tag": "0080_nota_de_credito_solo_administracion",
+      "breakpoints": true
     }
   ]
 }

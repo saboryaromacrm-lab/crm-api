@@ -25,7 +25,7 @@ import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   cajaMovimientos, cajaSesiones,
@@ -2784,6 +2784,33 @@ export class VentasService {
     if (!v.facturarPendiente) {
       throw new BadRequestException('Esta venta no está pendiente de facturar.');
     }
+    /*
+     * UNA NOTA DE CRÉDITO NO SE "FACTURA".
+     *
+     * Este botón resuelve el comprobante con `resolverFiscal`, que calcula la
+     * LETRA DE UNA FACTURA a partir de las condiciones de IVA. Apretado sobre
+     * una nota de crédito que quedó sin CAE, la convertía en una **Factura B
+     * con CAE real ante ARCA**: plata cobrada donde tenía que ir plata
+     * devuelta, y un comprobante fiscal que no se borra. Encima la fila
+     * conserva su `refVentaId`, y `acreditado()` filtra por eso sin mirar el
+     * tipo — así que la venta original seguía contando el importe como
+     * acreditado mientras aparecía una factura nueva sumando. Cuenta corriente,
+     * arqueo y débito fiscal quedaban mal los tres a la vez.
+     *
+     * Es la misma familia que el candado de abajo (`if (!fiscal.cae)`), que
+     * nació igual: el reintento convertía el ticket provisorio en una factura
+     * sin CAE. Ese ya está; este faltaba.
+     *
+     * Las notas sin CAE quedan pendientes y HOY NO TIENEN CAMINO DE REINTENTO
+     * — anotado en /info. Emitirlas de nuevo no es apretar un botón: hay que
+     * decidir antes qué pasa con la que quedó a medio emitir.
+     */
+    if (esNotaCredito(v.tipo)) {
+      throw new BadRequestException(
+        'Esto es una nota de crédito, no una venta: no se factura. '
+        + 'Quedó sin CAE y su reintento todavía no está construido.',
+      );
+    }
 
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(v.clienteId);
@@ -3007,6 +3034,49 @@ export class VentasService {
         );
       }
       turnoId = turno.id;
+
+      /*
+       * NO SE DEVUELVE MÁS PLATA DE LA QUE ENTRÓ POR ESTA VENTA.
+       *
+       * Sin este tope, `devolverEfectivo` sacaba del cajón el total de la nota
+       * SIN MIRAR NUNCA si la venta se había cobrado. El caso que lo vuelve
+       * grave no es el error de tipeo, es el circuito completo: una venta en
+       * cuenta corriente que el cliente nunca pagó, una nota de crédito con
+       * devolución en efectivo, y sale la plata. **El arqueo cierra perfecto**
+       * —el egreso quedó registrado— y la deuda del cliente se borra con la
+       * nota, así que no queda nadie a quien reclamarle. Auditoría del
+       * 21/8/2026.
+       *
+       * LO COBRADO SON DOS COSAS Y HAY QUE SUMAR LAS DOS: los `venta_pagos`
+       * (lo que se pagó en el mostrador al cerrar el ticket) y las cobranzas
+       * imputadas (lo que se cobró después, si fue a cuenta corriente). Mirar
+       * solo `cobrado` —que son únicamente las cobranzas— habría bloqueado la
+       * devolución de CUALQUIER venta de contado, que es el caso normal del
+       * mostrador: ahí `cobrado` es 0 y la plata está en `venta_pagos`.
+       *
+       * Y se descuenta lo que ya devolvieron notas anteriores, que llevan su
+       * turno de caja anotado justamente porque sacaron plata.
+       */
+      const pagadoEnElActo = (original.pagos ?? [])
+        .reduce((a: number, p: any) => a + (Number(p.importe) || 0), 0);
+      const [yaDevuelto] = await this.db
+        .select({ t: sql<number>`coalesce(sum(${ventas.total}), 0)` })
+        .from(ventas)
+        .where(and(
+          eq(ventas.refVentaId, ventaId),
+          isNotNull(ventas.cajaSesionId),
+          ne(ventas.estado, 'anulada'),
+        ));
+      const entro = money(pagadoEnElActo + (original.cobrado ?? 0));
+      const disponible = money(entro - (Number(yaDevuelto?.t) || 0));
+
+      if (tot.total > disponible + 0.009) {
+        throw new BadRequestException(
+          `No se puede devolver ${money(tot.total)} en efectivo: de esta venta entraron ${entro} `
+          + `y ya se devolvieron ${money(entro - disponible)}, así que quedan ${money(Math.max(disponible, 0))}. `
+          + 'Emití la nota de crédito SIN devolución: la deuda del cliente se ajusta igual.',
+        );
+      }
     }
 
     const id = await this.db.transaction(async (tx) => {
@@ -3517,12 +3587,18 @@ export class VentasController {
   /**
    * NOTA DE CRÉDITO (0076): la única forma de deshacer una factura con CAE.
    *
-   * Mismo permiso que anular —`devoluciones`— porque es la misma decisión de
-   * negocio: mercadería que vuelve y plata que se devuelve. El usuario sale de
-   * la sesión, igual que allá: el body no puede firmar por otro.
+   * PERMISO PROPIO, Y NO EL DE ANULAR (0080). Tenía `devoluciones`, que **el
+   * cajero tiene**, así que el candado de "solo administración emite notas de
+   * crédito" existía únicamente en el navegador: un POST lo salteaba. No son la
+   * misma decisión de negocio aunque se parezcan — anular es deshacer un
+   * comprobante NUESTRO que nunca salió a ARCA; la nota de crédito emite un
+   * comprobante FISCAL, saca plata del cajón, borra la deuda del cliente y da
+   * vuelta el débito fiscal. Decisión del dueño: solo el administrador.
+   *
+   * El usuario sale de la sesión: el body no puede firmar por otro.
    */
   @Post(':id/nota-credito')
-  @Permiso('devoluciones')
+  @Permiso('nota_credito')
   notaCredito(@Param('id', ParseIntPipe) id: number, @Body() dto: NotaCreditoDto, @Auth() sesion: Sesion) {
     return this.svc.notaCredito(id, { ...dto, usuarioId: sesion.usuarioId }, this.opciones(sesion));
   }

@@ -104,6 +104,15 @@ export const CATALOGO_PERMISOS = [
        * el cierre cuadra en cero. Quien la tenga aparece en `anuladoPor` (0059).
        */
       { clave: 'devoluciones', nombre: 'Anular ventas y devoluciones' },
+      /*
+       * LA NOTA DE CRÉDITO ES OTRA COSA QUE ANULAR, y por eso tiene su llave
+       * (0080). Anular deshace un comprobante NUESTRO, que nunca salió a ARCA.
+       * La nota de crédito EMITE un comprobante fiscal contra el CUIT de la
+       * casa, saca plata del cajón si lleva devolución, borra la deuda del
+       * cliente y da vuelta el débito fiscal. Un cajero puede necesitar lo
+       * primero todos los días y no lo segundo nunca.
+       */
+      { clave: 'nota_credito', nombre: 'Emitir notas de crédito (comprobante fiscal)' },
       { clave: 'diferencias', nombre: 'Diferencias de caja (mover plata del cajón)' },
       { clave: 'ofertas', nombre: 'Crear y editar ofertas' },
       /*
