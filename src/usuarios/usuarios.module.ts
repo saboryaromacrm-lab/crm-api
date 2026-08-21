@@ -25,6 +25,10 @@ import { SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
+/* Dos funciones sueltas, no un servicio: el login las necesita antes de que
+ * exista sesión y así Usuarios no tiene que importar el módulo Sucursales
+ * entero por una consulta. */
+import { marcarUsoTerminal, terminalPorToken } from '../sucursales/sucursales.module';
 
 /* ---------------- Catálogo de permisos (fuente de verdad) ---------------- */
 /**
@@ -234,6 +238,10 @@ export const CATALOGO_PERMISOS = [
     secciones: [
       { clave: 'sistema.empresa', nombre: 'Empresa' },
       { clave: 'sistema.impresion', nombre: 'Impresión' },
+      /* Registrar un equipo decide en qué sucursal opera TODO el que se siente
+       * ahí, así que es la misma llave que administrar usuarios y sucursales —
+       * no una preferencia de la máquina. */
+      { clave: 'sistema.terminales', nombre: 'Equipos (terminales)' },
       { clave: 'sistema.respaldos', nombre: 'Respaldos' },
     ],
     acciones: [],
@@ -491,10 +499,31 @@ export class UsuariosService {
      * falla del servidor — y el 500 encima no le dice qué le falta.
      */
     const usuarioId = Number(o?.usuarioId);
-    const sucursalId = Number(o?.sucursalId);
     if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
       throw new UnauthorizedException('Elegí un usuario válido.');
     }
+
+    /*
+     * LA SUCURSAL LA PONE EL EQUIPO, NO LA PERSONA (0081).
+     *
+     * Si este navegador está registrado como una terminal, la sucursal sale de
+     * ahí y **lo que venga en el body se ignora**. Ese es todo el punto: la
+     * cajera dejaba de elegir mal porque deja de elegir. El desplegable venía
+     * precargado con la primera sucursal de la lista, así que la que no lo
+     * tocaba entraba en la Distribuidora sin haber decidido nada — y eso no lo
+     * detecta ni el cierre de caja (ver el comentario de `terminales` en el
+     * schema).
+     *
+     * Se ignora también para el jefe, a propósito: él cruza sucursales con el
+     * selector del encabezado (`POST /auth/sucursal`), que ya existe y deja
+     * rastro en la sesión. Tener dos caminos para lo mismo sería tener uno que
+     * nadie mira.
+     *
+     * Sin terminal registrada, todo sigue como antes: la sucursal viene del
+     * body y es obligatoria.
+     */
+    const terminal = await terminalPorToken(this.db, o?.terminalToken);
+    const sucursalId = terminal ? terminal.sucursalId : Number(o?.sucursalId);
     if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
       throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
     }
@@ -548,12 +577,19 @@ export class UsuariosService {
     // exactamente la frecuencia que este sistema necesita. Un cron para esto
     // sería una pieza más que mantener.
     await this.sesiones.limpiarVencidas();
+    /* Recién acá, con el login YA aceptado: si se marcara antes, el `ultimoUso`
+     * de la terminal contaría también los intentos fallidos y dejaría de servir
+     * para lo que sirve — reconocer qué equipos están realmente en uso. */
+    if (terminal) await marcarUsoTerminal(this.db, terminal.id, userAgent);
 
     return {
       ok: true,
       token,
       usuario: publico(u, r),
       sucursal: { id: suc.id, nombre: suc.nombre },
+      /* Para que el POS pueda mostrar "Caja 2" en el encabezado sin volver a
+       * preguntar quién es este equipo. */
+      terminal: terminal ? { id: terminal.id, nombre: terminal.nombre } : null,
     };
   }
 

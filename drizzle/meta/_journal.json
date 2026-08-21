@@ -568,6 +568,20 @@
       "when": 1788246000000,
       "tag": "0080_nota_de_credito_solo_administracion",
       "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1788332400000,
+      "tag": "0081_terminales_por_sucursal",
+      "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1788336000000,
+      "tag": "0082_registrar_equipos_es_de_administracion",
+      "breakpoints": true
     }
   ]
 }

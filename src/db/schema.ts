@@ -246,6 +246,59 @@ export const sesiones = pgTable('sesiones', {
   ixExpira: index('ix_sesiones_expira').on(t.expiraEn),
 }));
 
+/**
+ * TERMINALES — el equipo sabe en qué sucursal está, así la cajera no tiene que
+ * acordarse (0081).
+ *
+ * EL PROBLEMA QUE RESUELVE. La sucursal se elegía a mano en el login, de un
+ * desplegable que venía **precargado con la primera de la lista** (la
+ * Distribuidora). La cajera de Express 2 que no tocaba ese campo entraba en la
+ * Distribuidora sin haber elegido nada, y a partir de ahí vendía descontando
+ * stock del local equivocado. Y lo peor: **el cierre de caja no lo detecta**,
+ * porque el arqueo es internamente coherente —vendió, cobró, contó su cajón y
+ * la diferencia da cero—; lo que queda roto es el stock de dos locales y la
+ * plata física anotada en otro lado. Desde ARCA es peor todavía: cada sucursal
+ * tiene su punto de venta con numeración propia y su domicilio impreso, así que
+ * una factura mal emitida consume un número que no vuelve y **sale con el
+ * domicilio de otro local**, con CAE y sin poder borrarse.
+ *
+ * POR QUÉ EL EQUIPO Y NO LA PERSONA. Las cajeras **rotan** entre locales, así
+ * que asignarles una sucursal obligaría a reasignarlas a mano todos los días.
+ * La PC de Express 2, en cambio, está siempre en Express 2. Se ata el dato a lo
+ * que está clavado y no a lo que se mueve.
+ *
+ * POR QUÉ NO POR IP, que sería lo natural. Porque cuando se corta internet las
+ * cajeras **siguen vendiendo con los datos de su celular**: la IP pasa a ser la
+ * del operador móvil, cambia sola y dos locales pueden verse iguales. Peor
+ * todavía, el aviso saltaría justo los días de más quilombo, y un aviso que
+ * suena cuando no corresponde enseña a ignorar todos los avisos. El token de la
+ * terminal, en cambio, **vive en el navegador y no en la red**: funciona igual
+ * con fibra, con el repetidor de la Distribuidora o colgado de un celular.
+ *
+ * `tokenHash`: mismo criterio que `sesiones` —se guarda el sha256, nunca el
+ * token—, aunque acá el token no da privilegios: solo dice DÓNDE está parado el
+ * equipo, y elegir sucursal hoy ya es libre. Se hashea igual porque el backup
+ * de la base no tiene por qué contener credenciales de ningún tipo.
+ */
+export const terminales = pgTable('terminales', {
+  id: serial('id').primaryKey(),
+  /** Cómo la llama la gente del local: "Caja 1", "Mostrador", "La del fondo". */
+  nombre: text('nombre').notNull(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  tokenHash: text('token_hash').notNull(),
+  /** Dar de baja un equipo sin borrarlo: el login vuelve a preguntar la sucursal. */
+  activa: boolean('activa').notNull().default(true),
+  creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
+  creadaPor: integer('creada_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  /* Para reconocer en la lista cuál es cuál y detectar la que dejó de usarse
+   * (una notebook que se llevaron, un navegador que se reinstaló). */
+  ultimoUso: timestamp('ultimo_uso', { withTimezone: true }),
+  ultimoAgente: text('ultimo_agente').notNull().default(''),
+}, (t) => ({
+  ixToken: uniqueIndex('ix_terminales_token').on(t.tokenHash),
+  ixSucursal: index('ix_terminales_sucursal').on(t.sucursalId),
+}));
+
 /* ==================================================================== *
  * CATÁLOGOS DEL PRODUCTO — marca, categoría › subcategoría, etiquetas
  * ==================================================================== *
@@ -2664,7 +2717,7 @@ export const pagoFormas = pgTable('pago_formas', {
 
 /** Todas las tablas para pasar al cliente de Drizzle. */
 export const schema = {
-  sucursales, proveedores, roles, usuarios, sesiones, productos, presentaciones, productoProveedores,
+  sucursales, proveedores, roles, usuarios, sesiones, terminales, productos, presentaciones, productoProveedores,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   modalidadesVenta, listasVenta, productoListas, clienteListas, reglasMarca,
   ofertas, ofertaAlcances, ofertaComponentes, precioHistorial, descuentos,
