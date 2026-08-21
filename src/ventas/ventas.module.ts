@@ -2761,6 +2761,41 @@ export class VentasService {
           + '(o se reintentó el cobro). Buscalo en Ventas antes de rehacerlo — la venta ya existe.',
         );
       }
+
+      /*
+       * Y EL TURNO DE CAJA, con el mismo candado y por el mismo motivo.
+       *
+       * `resolverTurno` corrió allá arriba, ANTES de pedirle el CAE a ARCA. Si
+       * en ese hueco alguien cerró la caja, la venta se colgaba de un turno YA
+       * CERRADO: su plata entraba a un arqueo que ya se había calculado y
+       * firmado sin ella, o sea que **quedaba fuera de todo arqueo** y nadie se
+       * enteraba nunca. Es exactamente el agujero que `caja.module.ts` cerró
+       * para los movimientos manuales y las cobranzas — el comentario de
+       * `cerrar` nombra "las dos puertas que insertan movimientos", y las
+       * ventas no eran ninguna de las dos.
+       *
+       * Con UN SOLO CAJÓN COMPARTIDO por dos cajeras (decisión del dueño del
+       * 21/8) esto dejó de ser raro: una cierra el turno mientras la otra está
+       * cobrando.
+       *
+       * Se rechaza en vez de dejarla pasar, que es lo MISMO que ya hace
+       * `notaCredito` unas líneas más abajo ante este caso. La plata de una
+       * venta tiene que estar en el arqueo de alguien.
+       *
+       * EL ORDEN DE LOS CANDADOS —primero la venta, después el turno— es el
+       * mismo que usa `notaCredito`. Dos caminos que toman los mismos dos
+       * candados en orden distinto se traban entre sí.
+       */
+      if (turno) {
+        const [sesion] = await tx.select().from(cajaSesiones)
+          .where(eq(cajaSesiones.id, turno.id)).limit(1).for('update');
+        if (!sesion || sesion.estado !== 'abierta') {
+          throw new BadRequestException(
+            'El turno de caja se cerró mientras se cobraba este ticket. Abrí el turno nuevo y volvé a cobrarlo: '
+            + 'si entrara ahora, su plata quedaría fuera del arqueo que se acaba de firmar.',
+          );
+        }
+      }
       // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
       await tx.update(ventas).set({
@@ -3454,6 +3489,38 @@ export class VentasService {
     }
 
     await this.db.transaction(async (tx) => {
+      /*
+       * MISMO CANDADO QUE LOS TRES CAMINOS DE EMISIÓN, y por partida doble.
+       *
+       * (1) LA VENTA. Anular DEVUELVE STOCK, y el chequeo de "ya está anulada"
+       *     corría afuera: dos pedidos en paralelo —el botón apretado dos
+       *     veces, la conexión que se cortó y se reintentó— pasaban los dos y
+       *     **la mercadería volvía dos veces al depósito**. Es el mismo agujero
+       *     que `confirmar`, al revés: allá el stock salía de más, acá entraba.
+       *
+       * (2) EL TURNO. El chequeo de "su arqueo ya está firmado" también corría
+       *     afuera. Si el cierre entra en el medio, la anulación cae en un
+       *     turno recién cerrado cuyo `sistemaEfectivo` YA se calculó contando
+       *     esta venta: el arqueo queda mal y congelado, que es justo lo que
+       *     ese chequeo existe para impedir.
+       *
+       * Orden de candados igual que en `confirmar` y `notaCredito`: venta y
+       * después turno.
+       */
+      const fresca = await this.bloquearVenta(tx, id);
+      if (fresca.estado === 'anulada') {
+        throw new BadRequestException('Esta venta ya se anuló recién desde otra pantalla.');
+      }
+      if (v.cajaSesionId && !opciones.esJefe) {
+        const [sesion] = await tx.select().from(cajaSesiones)
+          .where(eq(cajaSesiones.id, v.cajaSesionId)).limit(1).for('update');
+        if (sesion && sesion.estado !== 'abierta') {
+          throw new BadRequestException(
+            'El turno de caja de esa venta se cerró recién y su arqueo quedó firmado contando esta venta. '
+            + 'Corregila con una nota de crédito en vez de anularla.',
+          );
+        }
+      }
       await tx.update(ventas).set({
         estado: 'anulada',
         anuladoPor: usuarioId ?? null,
