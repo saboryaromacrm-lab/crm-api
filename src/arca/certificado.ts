@@ -50,6 +50,57 @@ export interface ResultadoPedido {
 /** Un error que la pantalla puede mostrar tal cual. */
 export class ErrorCertificado extends Error {}
 
+/**
+ * ¿LA CARPETA ES UN VOLUMEN DE VERDAD, O ES EL DISCO DEL CONTENEDOR?
+ * ============================================================================
+ * "Que la carpeta exista" NO alcanza, y esto se aprendió perdiendo un
+ * certificado (20/8/2026). El `Dockerfile` crea `/certs` en la imagen —hace
+ * falta, para que un volumen nuevo herede el dueño `node`—, y con eso
+ * `existsSync` empezó a dar `true` **aunque no hubiera ningún volumen
+ * montado**. La clave se generó contra el disco del contenedor, el trámite
+ * salió perfecto, y el deploy siguiente se llevó clave y certificado. El
+ * chequeo de "existe la carpeta" pasó de proteger a tapar el problema.
+ *
+ * La pregunta correcta es si esa carpeta es un **punto de montaje**. Se lee de
+ * `/proc/self/mountinfo`, donde el campo 5 es el destino de cada montaje: si
+ * la carpeta (o algún padre que no sea `/`) figura ahí, lo que se escriba
+ * sobrevive al contenedor.
+ *
+ * Y solo importa **adentro de un contenedor**: en un servidor común, una
+ * carpeta del disco raíz persiste perfectamente. Por eso se mira primero si
+ * estamos en uno; si no, no hay nada que advertir.
+ *
+ * Devuelve `null` cuando no se puede saber (Windows, o sin `/proc`): en
+ * desarrollo no se avisa nada, que es lo correcto — ahí el disco es el disco.
+ */
+export function volumenPersistente(ruta: string): boolean | null {
+  const carpeta = dirname(ruta);
+  if (!carpeta || !existsSync('/proc/self/mountinfo')) return null;
+
+  let montajes: string[];
+  try {
+    montajes = readFileSync('/proc/self/mountinfo', 'utf8').split('\n');
+  } catch {
+    return null;
+  }
+
+  /* ¿Contenedor? El `/.dockerenv` es el indicio clásico; el otro es que la
+   * raíz esté montada sobre `overlay`, que es como corre cualquier imagen. */
+  const raizOverlay = montajes.some((l) => {
+    const campos = l.split(' - ');
+    return campos[0]?.split(' ')[4] === '/' && /^\s*(overlay|aufs)\b/.test(campos[1] ?? '');
+  });
+  if (!existsSync('/.dockerenv') && !raizOverlay) return null;
+
+  /* El destino de cada montaje, sin contar la raíz: esa es justamente la que
+   * se borra. Sirve un padre, porque montar en `/certs` cubre `/certs/x`. */
+  const destinos = montajes
+    .map((l) => l.split(' ')[4])
+    .filter((d): d is string => !!d && d !== '/');
+
+  return destinos.some((d) => carpeta === d || carpeta.startsWith(`${d}/`));
+}
+
 /** Las dos rutas tienen que estar configuradas y su carpeta tiene que existir. */
 function exigirRuta(ruta: string, cual: string, variable: string) {
   if (!ruta) {
@@ -64,6 +115,19 @@ function exigirRuta(ruta: string, cual: string, variable: string) {
       `La carpeta ${carpeta} no existe en el servidor. Es el volumen donde van los `
       + 'certificados: hay que montarlo antes (nunca adentro de la imagen, que se '
       + 'reconstruye entera en cada deploy).',
+    );
+  }
+  /*
+   * SE CORTA ACÁ A PROPÓSITO, aunque escribir funcionaría. Generar la clave
+   * contra el disco del contenedor no falla: falla el deploy siguiente, con el
+   * certificado ya emitido y el trámite hecho al pedo. Mejor no dejar empezar.
+   */
+  if (volumenPersistente(ruta) === false) {
+    throw new ErrorCertificado(
+      `${carpeta} existe pero NO es un volumen montado: es el disco del contenedor, y se borra `
+      + 'entero en el próximo deploy. La clave que generes ahora se pierde, y con ella el '
+      + 'certificado que ARCA te emita. Montá el volumen en Dokploy (Advanced › Volumes › Add, '
+      + `Mount Path ${carpeta}), hacé Redeploy, y volvé a intentar.`,
     );
   }
 }

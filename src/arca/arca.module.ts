@@ -50,6 +50,7 @@ import {
 import { obtenerTicket } from './wsaa';
 import {
   ErrorCertificado, certificadoInstalado, generarPedido, hayClave, instalarCertificado,
+  volumenPersistente,
 } from './certificado';
 
 /** Una fila del diagnóstico: un punto de venta y qué contestó ARCA por él. */
@@ -612,6 +613,10 @@ export class ArcaController {
        * si existe y desde cuándo. */
       clave: hayClave(),
       certificado: certificadoInstalado(),
+      /* `false` = la carpeta existe pero es el disco del contenedor. Se avisa
+       * ANTES del trámite: enterarse después es enterarse con el certificado
+       * ya emitido y la clave borrada. `null` = no se puede saber (desarrollo). */
+      certPersistente: ARCA.keyPath ? volumenPersistente(ARCA.keyPath) : null,
       sucursales: locales,
       /* Cuántos locales facturarían por la boca de expendio de otro. Con un
        * solo local es lo normal y no dice nada; con cinco, es un problema. */
