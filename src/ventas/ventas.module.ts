@@ -886,8 +886,15 @@ export class VentasService {
    * cuentas distintas, la pantalla ofrecería devolver algo que la API rechaza.
    * Las notas ANULADAS no cuentan — nunca existieron.
    */
-  private async acreditado(ventaId: number) {
-    const notas = await this.db.select({
+  /**
+   * `db` es un parámetro para poder recalcular esto DENTRO de la transacción de
+   * `notaCredito`, con la venta original ya tomada con candado: es la cuenta
+   * que decide cuánto queda por acreditar, y leerla afuera es lo que permitía
+   * que dos notas simultáneas devolvieran el 200%. Por defecto lee suelto, que
+   * es lo que necesitan la ficha de la venta y el listado.
+   */
+  private async acreditado(ventaId: number, db: any = this.db) {
+    const notas = await db.select({
       id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta, numero: ventas.numero,
       fecha: ventas.fecha, total: ventas.total, cae: ventas.cae,
       facturarPendiente: ventas.facturarPendiente, observaciones: ventas.observaciones,
@@ -902,8 +909,8 @@ export class VentasService {
     if (notas.length) {
       const ids = notas.map((n) => n.id);
       const [its, exs] = await Promise.all([
-        this.db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids)),
-        this.db.select({ id: ventaExtras.id }).from(ventaExtras)
+        db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids)),
+        db.select({ id: ventaExtras.id }).from(ventaExtras)
           .where(inArray(ventaExtras.ventaId, ids)).limit(1),
       ]);
       for (const it of its) {
@@ -2577,6 +2584,34 @@ export class VentasService {
   }
 
   /**
+   * LA FILA DE LA VENTA, TOMADA CON CANDADO DENTRO DE UNA TRANSACCIÓN.
+   *
+   * Los tres caminos que emiten un comprobante —`confirmar`, `facturarAhora` y
+   * `notaCredito`— leían el estado que los habilita FUERA de la transacción y
+   * escribían adentro. Entre esas dos cosas pasan segundos: la llamada a ARCA
+   * puede tardar 15, y el POS puede recibir dos pedidos (dos pestañas, la
+   * cajera que reintenta porque se le cortó internet, las dos cajas del local).
+   * Los dos leían el mismo estado, los dos pasaban la validación y los dos
+   * escribían: stock descontado dos veces, una venta pisando a la otra, o una
+   * nota de crédito por el 200% de la factura.
+   *
+   * `for('update')` hace que el segundo ESPERE acá hasta que el primero
+   * termine, y recién entonces lea. Por eso lo que importa no es tomar el
+   * candado sino **volver a validar después de tomarlo**: el estado que se leyó
+   * antes de la transacción ya no vale, y esa relectura es la que rechaza al
+   * segundo. Tomar el candado y confiar en la lectura vieja no arregla nada.
+   *
+   * Es el mismo patrón que ya usaba el turno de caja (`cerrar` y `movimiento`
+   * en `caja.module.ts`), traído al módulo donde se emiten los comprobantes.
+   */
+  private async bloquearVenta(tx: any, id: number) {
+    const [v] = await tx.select().from(ventas)
+      .where(eq(ventas.id, id)).limit(1).for('update');
+    if (!v) throw new NotFoundException('Esa venta no existe.');
+    return v;
+  }
+
+  /**
    * Reemplaza el contenido del borrador. El punto de venta lo llama con el
    * ticket completo (no con un delta): así el estado del servidor siempre es
    * exactamente lo que el cajero ve en pantalla.
@@ -2706,6 +2741,26 @@ export class VentasService {
     const puntoVentaFinal = fiscal.puntoVenta ?? borrador.puntoVenta;
 
     await this.db.transaction(async (tx) => {
+      /*
+       * EL CANDADO, Y LA RELECTURA QUE LO HACE VALER (ver `bloquearVenta`).
+       *
+       * `exigirBorrador` corrió allá arriba, antes de pedirle el CAE a ARCA:
+       * entre esa lectura y esta línea pueden haber pasado 15 segundos. Si
+       * entró un segundo pedido por el mismo ticket —la cajera que reintenta
+       * porque se le cortó internet es el caso REAL, no el doble clic— acá
+       * espera a que el primero termine y descubre que ya no es borrador.
+       *
+       * Sin esto los dos seguían de largo: los dos descontaban stock (la
+       * mercadería salía dos veces por una sola venta), los dos insertaban los
+       * pagos y el segundo pisaba el número y el CAE del primero.
+       */
+      const fresca = await this.bloquearVenta(tx, id);
+      if (fresca.estado !== 'borrador') {
+        throw new BadRequestException(
+          'Este ticket ya se cerró mientras se estaba cobrando: alguien lo confirmó desde otra pantalla '
+          + '(o se reintentó el cobro). Buscalo en Ventas antes de rehacerlo — la venta ya existe.',
+        );
+      }
       // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
       await tx.update(ventas).set({
@@ -2876,6 +2931,22 @@ export class VentasService {
     const provisorio = `${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
     const puntoVentaFinal = fiscal.puntoVenta ?? v.puntoVenta;
     await this.db.transaction(async (tx) => {
+      /*
+       * CANDADO Y RELECTURA (ver `bloquearVenta`). Este botón se puede apretar
+       * mil veces a propósito, y el comentario de arriba dice que reintentar no
+       * rompe nada — pero eso valía para reintentos EN FILA, no en paralelo.
+       * Dos clics mientras ARCA tarda 15 segundos pasaban los dos el chequeo de
+       * `facturarPendiente` de allá arriba, y el segundo escribía encima: la
+       * venta terminaba con el número y el CAE del segundo comprobante y el
+       * primero quedaba emitido ante ARCA sin nada que lo represente acá.
+       */
+      const fresca = await this.bloquearVenta(tx, id);
+      if (fresca.estado !== 'confirmada' || !fresca.facturarPendiente) {
+        throw new BadRequestException(
+          'Esta venta ya se facturó recién desde otra pantalla (o se anuló). Recargá el listado: '
+          + 'el comprobante fiscal ya está emitido y volver a emitirlo sería duplicarlo.',
+        );
+      }
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, fiscal.tipo!, puntoVentaFinal);
       await tx.update(ventas).set({
         tipo: fiscal.tipo as any, numero, puntoVenta: puntoVentaFinal,
@@ -3025,6 +3096,11 @@ export class VentasService {
 
     /* -- El turno, solo si se va a devolver efectivo -- */
     let turnoId: number | null = null;
+    /* Lo que ENTRÓ por esta venta, calculado acá y revalidado dentro de la
+     * transacción: `original.pagos` y `original.cobrado` no se mueven (los
+     * pagos quedan fijos al confirmar, y una cobranza nueva solo sumaría), pero
+     * lo ya devuelto sí, y esa es la parte que se relee con candado. */
+    let entroPorLaVenta = 0;
     if (dto.devolverEfectivo) {
       const turno = await this.caja.actual(sucursalId);
       if (!turno) {
@@ -3068,6 +3144,7 @@ export class VentasService {
           ne(ventas.estado, 'anulada'),
         ));
       const entro = money(pagadoEnElActo + (original.cobrado ?? 0));
+      entroPorLaVenta = entro;
       const disponible = money(entro - (Number(yaDevuelto?.t) || 0));
 
       if (tot.total > disponible + 0.009) {
@@ -3080,6 +3157,73 @@ export class VentasService {
     }
 
     const id = await this.db.transaction(async (tx) => {
+      /*
+       * CANDADO SOBRE LA VENTA ORIGINAL, Y LAS TRES CUENTAS REHECHAS ADENTRO.
+       *
+       * Acá el candado no va sobre la fila que se escribe (la nota es nueva)
+       * sino sobre la que se está **consumiendo**: la factura tiene un saldo
+       * acreditable finito, y ese saldo es un recurso compartido entre todas
+       * sus notas. Dos pedidos simultáneos leían los dos "no se acreditó nada
+       * todavía" y los dos pasaban el tope: **dos notas del 100% para una sola
+       * factura**, o sea el 200% devuelto, con su stock reingresado dos veces y
+       * la plata saliendo dos veces del cajón.
+       *
+       * Las validaciones de allá arriba se quedan igual: son las que dan el
+       * mensaje bueno en el 99,9% de los casos, con la pantalla todavía abierta
+       * y sin haber pedido nada a ARCA. Estas son las que cierran la ventana.
+       */
+      const orig = await this.bloquearVenta(tx, ventaId);
+      if (orig.estado !== 'confirmada') {
+        throw new BadRequestException('La venta se anuló mientras se emitía esta nota de crédito.');
+      }
+
+      const ahora = await this.acreditado(ventaId, tx);
+
+      // (1) El tope en plata.
+      const topeReal = money(orig.total - ahora.total);
+      if (tot.total > topeReal + 0.01) {
+        throw new BadRequestException(
+          `Se emitió otra nota de crédito de esta venta hace un instante: quedaban ${tope} `
+          + `y ahora quedan ${money(Math.max(topeReal, 0))}. Revisá la venta y volvé a emitirla por lo que falte.`,
+        );
+      }
+
+      // (2) El tope por renglón: el total puede dar y la mercadería no.
+      const porOriginal = new Map<string, number>();
+      for (const it of original.items) {
+        const k = `${it.productoId}:${it.presentacionId ?? ''}`;
+        porOriginal.set(k, (porOriginal.get(k) ?? 0) + Number(it.cantidad));
+      }
+      for (const r of tot.items) {
+        const k = `${(r as any).productoId}:${(r as any).presentacionId ?? ''}`;
+        const queda = money((porOriginal.get(k) ?? 0) - (ahora.porClave.get(k) ?? 0));
+        if (Number(r.cantidad) > queda + 1e-9) {
+          throw new BadRequestException(
+            `De "${(r as any).nombre}" ya no quedan ${r.cantidad} para devolver (quedan ${Math.max(queda, 0)}): `
+            + 'otra nota de crédito de esta venta se emitió recién.',
+          );
+        }
+      }
+
+      // (3) La plata: lo devuelto por notas anteriores, releído con candado.
+      if (turnoId) {
+        const [ya] = await tx.select({ t: sql<number>`coalesce(sum(${ventas.total}), 0)` })
+          .from(ventas)
+          .where(and(
+            eq(ventas.refVentaId, ventaId),
+            isNotNull(ventas.cajaSesionId),
+            ne(ventas.estado, 'anulada'),
+          ));
+        const disponibleReal = money(entroPorLaVenta - (Number(ya?.t) || 0));
+        if (tot.total > disponibleReal + 0.009) {
+          throw new BadRequestException(
+            `Otra devolución de esta venta salió del cajón hace un instante: de los ${money(entroPorLaVenta)} `
+            + `que habían entrado quedan ${money(Math.max(disponibleReal, 0))}. `
+            + 'Emití la nota SIN devolución: la deuda del cliente se ajusta igual.',
+          );
+        }
+      }
+
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipoNc, puntoVentaFinal);
       const [nc] = await tx.insert(ventas).values({
         tipo: tipoNc as any, puntoVenta: puntoVentaFinal, numero, fecha,
