@@ -175,6 +175,20 @@ export const IMPRESION_DEFAULTS = {
   // anotar a lápiz lo que hay. Papel grande — en un rollo de 80 mm el renglón
   // no entra y no queda lugar para escribir.
   planillaConteo: 'a4' as string,
+  /*
+   * LOS CUATRO COMPROBANTES QUE SE REIMPRIMEN (21/8/2026).
+   *
+   * Todos arrancan en A4 salvo el vale del movimiento: ese se firma y se
+   * archiva de a uno, sale del mostrador y una hoja entera para tres renglones
+   * es papel tirado. La orden de pago va en A4 **a propósito** aunque salga de
+   * la caja: es el único de los cuatro que se le entrega a alguien de afuera,
+   * y un rollo térmico se borra con el calor en unos meses — justo lo que no
+   * querés de un recibo que el proveedor puede reclamar.
+   */
+  remitoTransferencia: 'a4' as string,
+  valeMovimiento: 'rollo80' as string,
+  comprobanteGasto: 'a4' as string,
+  ordenPago: 'a4' as string,
   etiquetaFraccionado: 'etiqueta50x30' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
