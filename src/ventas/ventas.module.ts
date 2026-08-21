@@ -2668,7 +2668,21 @@ export class VentasService {
    * que se confirma sea exactamente lo último que se guardó.
    */
   async confirmar(id: number, dto: ConfirmarVentaDto, opciones: OpcionesVenta = {}) {
-    const borrador = await this.exigirBorrador(id);
+    /*
+     * No usa `exigirBorrador` porque su mensaje —"La venta ya está emitida: no
+     * se puede modificar"— es el correcto para editar un ticket y el PEOR
+     * posible acá. El caso real: se cortó la conexión, el POS esperó, no supo
+     * si la venta salió y le dijo a la cajera que la cobre de nuevo; la venta
+     * había salido igual unos segundos después. Ella aprieta F10 otra vez y lo
+     * que necesita leer no es "no se puede modificar" sino QUÉ HACER.
+     */
+    const borrador = await this.get(id);
+    if (borrador.estado !== 'borrador') {
+      throw new BadRequestException(
+        'Este ticket ya se cobró y la venta existe. Si la pantalla quedó abierta porque se cortó la conexión, '
+        + 'buscala en Ventas y no la vuelvas a cobrar: cobrarla de nuevo la duplicaría.',
+      );
+    }
     if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }
