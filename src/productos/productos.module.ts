@@ -64,6 +64,13 @@ class UpsertProductoDto {
   @IsOptional() @IsString() dun?: string;
   @IsOptional() @IsNumber() unidadesPorBulto?: number;
 
+  /* El texto del cartel de góndola (0083). Nullable con intención:
+   *   ausente → no se toca lo que había
+   *   null    → volver a usar la marca / el nombre del producto
+   *   ''      → esa línea NO se imprime (el cartel de la marca sola) */
+  @IsOptional() @IsString() @MaxLength(60) etiquetaMarca?: string | null;
+  @IsOptional() @IsString() @MaxLength(80) etiquetaNombre?: string | null;
+
   @IsOptional() @IsInt() marcaId?: number | null;
   @IsOptional() @IsInt() categoriaId?: number | null;
   @IsOptional() @IsInt() subcategoriaId?: number | null;
@@ -108,6 +115,19 @@ class UpsertProductoDto {
   @IsOptional() @IsNumber() @Min(0) @Max(100) descuento3?: number;
   @IsOptional() @IsNumber() @Min(0) @Max(100) descuento4?: number;
   @IsOptional() @IsNumber() @Min(0) @Max(100) flete?: number;
+}
+
+/**
+ * SOLO EL CARTEL: lo que acepta `PATCH /productos/:id/cartel` (0083).
+ *
+ * Es su propio DTO y no un subconjunto del de arriba justamente para que no
+ * pueda crecer: con `whitelist: true` en el ValidationPipe global, cualquier
+ * otro campo del body se descarta antes de llegar al servicio. Un endpoint que
+ * alcanza `ventas.cambios` no tiene por qué poder tocar costos ni códigos.
+ */
+class CartelDto {
+  @IsOptional() @IsString() @MaxLength(60) etiquetaMarca?: string | null;
+  @IsOptional() @IsString() @MaxLength(80) etiquetaNombre?: string | null;
 }
 
 /**
@@ -492,6 +512,23 @@ export class ProductosService {
   /* ------------------------------ Escritura ------------------------------ */
 
   /** Campos comunes al alta y a la edición, ya normalizados. */
+  /**
+   * Guarda SOLO el texto del cartel. Mismo criterio de `undefined` / `null` /
+   * `''` que `valores()`: lo que no viene no se toca, `null` vuelve al dato del
+   * producto y `''` apaga esa línea.
+   */
+  async guardarCartel(id: number, dto: CartelDto) {
+    const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
+    if (!p) throw new NotFoundException('Producto inexistente.');
+    const limpiar = (v: string | null | undefined) => (v === null ? null : String(v).trim());
+    const patch: any = {};
+    if (dto.etiquetaMarca !== undefined) patch.etiquetaMarca = limpiar(dto.etiquetaMarca);
+    if (dto.etiquetaNombre !== undefined) patch.etiquetaNombre = limpiar(dto.etiquetaNombre);
+    if (!Object.keys(patch).length) return p;
+    const [n] = await this.db.update(productos).set(patch).where(eq(productos.id, id)).returning();
+    return n;
+  }
+
   private valores(dto: UpsertProductoDto, previo?: any) {
     return {
       nombre: dto.nombre.trim(),
@@ -500,6 +537,17 @@ export class ProductosService {
       codigoBarras: (dto.codigoBarras ?? previo?.codigoBarras ?? '').trim(),
       dun: (dto.dun ?? previo?.dun ?? '').trim(),
       unidadesPorBulto: Number(dto.unidadesPorBulto ?? previo?.unidadesPorBulto ?? 1) || 1,
+      /* MISMO PATRÓN QUE `redondeo` de abajo, y por el mismo motivo: acá `??`
+       * no sirve. Un `''` a propósito —la línea que no se imprime— es un valor
+       * válido, y `??` solo lo dejaría pasar de casualidad; pero un `null`
+       * explícito ("volvé a usar el nombre del producto") caería en `previo` y
+       * el borrado no tendría efecto. Hay que mirar `undefined`. */
+      etiquetaMarca: dto.etiquetaMarca === undefined
+        ? (previo?.etiquetaMarca ?? null)
+        : (dto.etiquetaMarca === null ? null : String(dto.etiquetaMarca).trim()),
+      etiquetaNombre: dto.etiquetaNombre === undefined
+        ? (previo?.etiquetaNombre ?? null)
+        : (dto.etiquetaNombre === null ? null : String(dto.etiquetaNombre).trim()),
       marcaId: dto.marcaId ?? null,
       categoriaId: dto.categoriaId ?? null,
       subcategoriaId: dto.subcategoriaId ?? null,
@@ -1366,6 +1414,21 @@ export class ProductosController {
   @Permiso('compras.productos')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
     return this.svc.update(id, dto);
+  }
+
+  /**
+   * EL TEXTO DEL CARTEL DE GÓNDOLA, y nada más (0083).
+   *
+   * Endpoint aparte en vez de mandarlo por el `PATCH` de arriba, por dos
+   * motivos. **Quién**: los carteles los rehace el que maneja precios, y ese
+   * puede no tener `compras.productos` —que habilita editar costos, códigos y
+   * dar de baja un producto—; darle el update completo para que pueda escribir
+   * dos líneas de texto sería abrir de más. **Qué**: este endpoint no puede
+   * tocar ninguna otra cosa del producto ni aunque le manden el body entero.
+   */
+  @Permiso('compras.productos', 'ventas.cambios')
+  @Patch(':id/cartel') cartel(@Param('id', ParseIntPipe) id: number, @Body() dto: CartelDto) {
+    return this.svc.guardarCartel(id, dto);
   }
   @Permiso('compras.productos')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }

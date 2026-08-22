@@ -190,6 +190,10 @@ export const IMPRESION_DEFAULTS = {
   comprobanteGasto: 'a4' as string,
   ordenPago: 'a4' as string,
   etiquetaFraccionado: 'etiqueta50x30' as string,
+  /** El cartel de góndola (0083): misma familia de etiqueta, nombre más grande
+   * y sin código de barras. Arranca en la más grande de las autoadhesivas: se
+   * lee de lejos, que es todo el punto de un cartel. */
+  etiquetaGondola: 'etiqueta60x40' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
   leyendaNoFiscal: true as boolean,
@@ -306,6 +310,7 @@ const REGLAS: Record<string, {
   'impresion.planillaConteo': { opciones: FORMATOS_PAPEL },
   'impresion.facturaVenta': { opciones: FORMATOS_PAPEL },
   'impresion.etiquetaFraccionado': { opciones: FORMATOS_ETIQUETA },
+  'impresion.etiquetaGondola': { opciones: FORMATOS_ETIQUETA },
 
   /* Los redondeos son una LISTA CERRADA, no un rango: son las monedas con las
    * que se trabaja. Cualquier otra cosa vuelve al default. */

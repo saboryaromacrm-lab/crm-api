@@ -372,6 +372,26 @@ export const productos = pgTable('productos', {
   /** Cuántas unidades trae el bulto que identifica el DUN. */
   unidadesPorBulto: doublePrecision('unidades_por_bulto').notNull().default(1),
 
+  /* Cartel de góndola (0083) --------------------------------------------- *
+   * Lo que dice el cartel que ve el CLIENTE en el estante, para que no tenga
+   * que preguntarle el precio al cajero. El nombre del catálogo sirve para
+   * buscar y facturar —"Aceite de oliva intenso lata x500ml"— pero en un cartel
+   * a un metro de distancia no se lee: ahí va "Aceite Oliva Intenso 500ml", o a
+   * veces solo la marca para toda una góndola.
+   *
+   * SE GUARDAN PARA NO RETIPEARLOS. Los carteles se rehacen cada vez que cambia
+   * un precio, así que si el texto viviera solo en la impresión habría que
+   * reescribirlo en cada actualización — y el que tiene que reescribir 20
+   * carteles termina imprimiendo el nombre largo.
+   *
+   * NULL Y '' SIGNIFICAN COSAS DISTINTAS, y por eso son nullable:
+   *   null → no se personalizó: el cartel usa la marca / el nombre del producto
+   *   ''   → se vació a propósito: esa línea NO se imprime
+   * Sin esa diferencia no se podría hacer el cartel de la marca sola, que es
+   * justamente uno de los casos que se pidieron. */
+  etiquetaMarca: text('etiqueta_marca'),
+  etiquetaNombre: text('etiqueta_nombre'),
+
   /* Clasificación ------------------------------------------------------ */
   marcaId: integer('marca_id').references(() => marcas.id, { onDelete: 'set null' }),
   categoriaId: integer('categoria_id').references(() => categorias.id, { onDelete: 'set null' }),

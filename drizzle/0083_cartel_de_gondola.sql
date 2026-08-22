@@ -1,0 +1,31 @@
+-- EL CARTEL DE GÓNDOLA: lo que el cliente lee en el estante.
+--
+-- PARA QUÉ. Que el cliente vea el precio sin tener que preguntarle al cajero.
+-- Es el mismo formato de etiqueta que ya se usa para los fraccionados, con el
+-- nombre más grande y sin código de barras (nadie escanea un cartel).
+--
+-- POR QUÉ HACE FALTA GUARDAR UN TEXTO. El nombre del catálogo está hecho para
+-- buscar y facturar: "Aceite de oliva intenso lata x500ml". En un cartel que se
+-- lee a un metro, eso no entra ni se lee. Lo que va es "Aceite Oliva Intenso
+-- 500ml" — y a veces ni eso: a veces alcanza con la marca sola para toda una
+-- góndola.
+--
+-- Y SE GUARDA POR PRODUCTO porque los carteles se rehacen cada vez que cambia
+-- un precio. Si el texto viviera solo en el momento de imprimir, cada
+-- actualización obligaría a reescribir los 20 carteles a mano, y el que tiene
+-- que reescribir 20 carteles termina imprimiendo el nombre largo. Guardado, una
+-- actualización de precios es apretar Imprimir.
+--
+-- NULL Y '' NO SON LO MISMO, y por eso las columnas son nullable:
+--   NULL → no se personalizó: el cartel usa la marca / el nombre del producto
+--   ''   → se vació a propósito: esa línea NO se imprime
+-- Sin esa diferencia no se podría hacer el cartel de la marca sola.
+--
+-- No lleva el precio: ese sale del catálogo con IVA, igual que en la caja. Un
+-- precio tipeado a mano en un cartel es el precio que el cliente lee mientras
+-- la caja le cobra otro, y el que exhibió el precio es el negocio.
+--
+-- Idempotente: se puede correr sobre una base que ya lo tenga.
+
+ALTER TABLE productos ADD COLUMN IF NOT EXISTS etiqueta_marca  text;
+ALTER TABLE productos ADD COLUMN IF NOT EXISTS etiqueta_nombre text;

@@ -1170,6 +1170,12 @@ export class VentasService {
         precio: money(filaBase?.netoUnitario ?? 0),
         /** El de la etiqueta: lo que paga el cliente. Solo para MOSTRAR. */
         precioFinal: money(filaBase?.finalUnitario ?? 0),
+        /* El texto del cartel de góndola (0083). Viaja acá y no en su propio
+         * endpoint porque la pantalla que los imprime ya necesita este catálogo
+         * entero —los precios por lista salen de él— y pedir lo mismo dos veces
+         * sería recorrer el catálogo dos veces para juntar dos textos. */
+        etiquetaMarca: p.etiquetaMarca ?? null,
+        etiquetaNombre: p.etiquetaNombre ?? null,
         precios: efectivas.map((ef) => ({
           listaId: ef.listaId,
           precio: money(ef.netoUnitario),
