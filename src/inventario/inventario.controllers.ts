@@ -360,6 +360,24 @@ export class TransferenciasController {
    * sucursal venía armando desde la mañana — y el borrador no tiene historial,
    * así que el trabajo del día desaparecía sin dejar rastro.
    */
+  /**
+   * QUÉ LLEGÓ QUE ESTE LOCAL NO SABE (0083). Lo consume el armado del pedido.
+   *
+   * `destinoId` pasa por `sucursalDeOperacion` igual que el borrador: para el
+   * cajero es SU sucursal y no la que mande, porque el cálculo es relativo al
+   * local —"nunca lo tuviste", "desde tu último pedido"— y pedirlo con el id de
+   * otro sería leer el historial ajeno. El jefe sí puede mirar el de cualquiera,
+   * que es lo mismo que ya puede hacer con el pedido.
+   */
+  @Get('novedades')
+  @Permiso('pedidos')
+  novedades(@Query('origenId') origenId: string, @Query('destinoId') destinoId: string, @Auth() sesion: Sesion) {
+    return this.inv.novedadesPedido({
+      origenId: Number(origenId),
+      destinoId: Number(sucursalDeOperacion(sesion, Number(destinoId))),
+    });
+  }
+
   @Post('borrador')
   @Permiso('pedidos')
   borrador(@Body() dto: AbrirBorradorDto, @Auth() sesion: Sesion) {

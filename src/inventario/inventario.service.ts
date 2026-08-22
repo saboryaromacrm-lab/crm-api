@@ -766,6 +766,160 @@ export class InventarioService {
     });
   }
 
+  /* ------------------------- Novedades del pedido ------------------------- */
+  /**
+   * QUÉ LLEGÓ AL DEPÓSITO QUE ESTE LOCAL TODAVÍA NO SABE (0083).
+   *
+   * El problema es de descubrimiento, no de datos: armando el pedido, el cajero
+   * solo tiene el BUSCADOR y el filtro "sin stock". O sea que **solo encuentra
+   * lo que ya sabe que existe** — un producto nuevo es literalmente invisible,
+   * porque no puede buscar un nombre que nunca escuchó. La mercadería llega a
+   * la Distribuidora y los locales se enteran por comentario de pasillo.
+   *
+   * DOS CHIPS, DOS PREGUNTAS DISTINTAS, y por eso DOS VENTANAS distintas:
+   *
+   *  · **NUEVO** — este local NUNCA lo tuvo. Responde "¿qué cosas nuevas hay
+   *    para vender?". Ventana larga (`DIAS_NUEVO`) porque es la que importa y
+   *    conviene insistirle: si entró el martes y el local pidió el miércoles
+   *    sin darse cuenta, con la ventana corta desaparecía para siempre.
+   *
+   *  · **LLEGÓ** — ya lo tuvo antes y entró mercadería DESDE SU ÚLTIMO PEDIDO.
+   *    Responde "¿ya puedo pedir eso que no había?". Ventana corta a propósito:
+   *    es reposición, y repetirla todos los días la vuelve ruido.
+   *
+   * "Nunca lo tuvo" se mide contra `movimientos` de ESE local: la recepción de
+   * una transferencia graba una fila en cada punta (origen −1, destino +1), así
+   * que una fila con `sucursalId = destino` prueba que alguna vez pasó por ahí.
+   *
+   * TRES COSAS QUE NO SE VEN Y SIN LAS CUALES ESTO NO SIRVE:
+   *
+   *  1. **Se exige stock disponible HOY en el origen.** "Llegó el lunes" no es
+   *     lo mismo que "hay": pudo irse el martes. Una lista que ofrece lo que no
+   *     está se deja de mirar a la segunda vez.
+   *  2. **Solo productos `activo`.** Un discontinuado se sigue vendiendo hasta
+   *     agotar, pero no es una novedad que haya que empujar.
+   *  3. **`CORTE_HISTORICO`** — los productos importados del sistema viejo no
+   *     tienen compras registradas, así que sin esto el día del estreno TODO
+   *     aparecería como novedad y el cajero cerraría la pestaña para siempre.
+   *     Es la trampa clásica de estas funciones: nacen gritando y se apagan.
+   */
+
+  /** Cuántos días sigue siendo "nuevo" un producto que este local nunca tuvo. */
+  private static readonly DIAS_NUEVO = 30;
+
+  /**
+   * Nada anterior a esta fecha cuenta como novedad. El catálogo migrado no
+   * tiene historia de compras: sin este piso, el primer día son 550 novedades.
+   */
+  private static readonly CORTE_HISTORICO = new Date('2026-08-01T00:00:00-03:00');
+
+  async novedadesPedido(o: { origenId: number; destinoId: number }) {
+    const origenId = Number(o.origenId);
+    const destinoId = Number(o.destinoId);
+    if (!Number.isInteger(origenId) || !Number.isInteger(destinoId) || origenId === destinoId) {
+      throw new BadRequestException('Elegí origen y destino distintos.');
+    }
+
+    /* EL CORTE: el último pedido REAL de este local por esta ruta. El borrador
+     * no cuenta —es el que se está armando ahora— y el cancelado tampoco. */
+    const [ultimo] = await this.db
+      .select({ fecha: transferencias.fecha })
+      .from(transferencias)
+      .where(and(
+        eq(transferencias.origenId, origenId),
+        eq(transferencias.destinoId, destinoId),
+        ne(transferencias.estado, 'borrador'),
+        ne(transferencias.estado, 'cancelada'),
+      ))
+      .orderBy(desc(transferencias.fecha))
+      .limit(1);
+
+    const piso = InventarioService.CORTE_HISTORICO;
+    const masNuevo = (a: Date, b: Date) => (a > b ? a : b);
+    /* Sin pedidos previos (local nuevo) la ventana corta arranca en el piso
+     * histórico: mostrarle TODO no ayuda, pero no mostrarle nada tampoco. */
+    const desdeLlego = masNuevo(ultimo?.fecha ?? piso, piso);
+    const desdeNuevo = masNuevo(
+      new Date(Date.now() - InventarioService.DIAS_NUEVO * 86400_000),
+      piso,
+    );
+    /* Se consulta por la MÁS VIEJA de las dos y se clasifica en memoria: son
+     * dos preguntas sobre la misma tabla, y hacerlas por separado sería
+     * recorrer `movimientos` dos veces para el mismo rango. */
+    const desde = desdeLlego < desdeNuevo ? desdeLlego : desdeNuevo;
+
+    /* Lo que ENTRÓ al depósito por compra en la ventana, con la fecha de la
+     * última entrada de cada producto. */
+    const entradas = await this.db
+      .select({
+        productoId: movimientos.productoId,
+        fecha: sql<Date>`max(${movimientos.fecha})`,
+      })
+      .from(movimientos)
+      .where(and(
+        eq(movimientos.tipo, 'compra'),
+        eq(movimientos.sucursalId, origenId),
+        gte(movimientos.fecha, desde),
+        isNotNull(movimientos.productoId),
+      ))
+      .groupBy(movimientos.productoId);
+
+    if (!entradas.length) {
+      return { desde: desdeLlego, desdeNuevo, ultimoPedido: ultimo?.fecha ?? null, items: [] };
+    }
+    const ids = entradas.map((e) => e.productoId!).filter(Boolean);
+
+    /* Cuáles de esos este local YA tuvo alguna vez. Una sola consulta contra
+     * todo el historial del destino, sin ventana: "nunca" es nunca. */
+    const vistos = await this.db
+      .select({ productoId: movimientos.productoId })
+      .from(movimientos)
+      .where(and(eq(movimientos.sucursalId, destinoId), inArray(movimientos.productoId, ids)))
+      .groupBy(movimientos.productoId);
+    const yaTuvo = new Set(vistos.map((v) => v.productoId));
+
+    /* Y cuáles hay REALMENTE para mandar hoy (ver punto 1 del encabezado). */
+    const hay = await this.db
+      .select({
+        productoId: stock.productoId,
+        total: sql<number>`sum(${stock.cantidad})`,
+      })
+      .from(stock)
+      .where(and(
+        eq(stock.sucursalId, origenId),
+        eq(stock.estado, 'disponible'),
+        inArray(stock.productoId, ids),
+      ))
+      .groupBy(stock.productoId);
+    const disponible = new Map(hay.map((h) => [h.productoId, Number(h.total) || 0]));
+
+    const activos = await this.db
+      .select({ id: productos.id })
+      .from(productos)
+      .where(and(inArray(productos.id, ids), eq(productos.estado, 'activo')));
+    const esActivo = new Set(activos.map((a) => a.id));
+
+    const items: { productoId: number; chip: 'nuevo' | 'llego'; fecha: Date; disponible: number }[] = [];
+    for (const e of entradas) {
+      const id = e.productoId!;
+      if (!esActivo.has(id)) continue;
+      const disp = disponible.get(id) ?? 0;
+      if (disp <= 1e-9) continue;
+      const fecha = new Date(e.fecha as any);
+      const nuevo = !yaTuvo.has(id);
+      /* Cada chip tiene SU ventana: lo nunca visto aguanta más días que una
+       * reposición común (ver el encabezado). */
+      if (nuevo ? fecha < desdeNuevo : fecha < desdeLlego) continue;
+      items.push({ productoId: id, chip: nuevo ? 'nuevo' : 'llego', fecha, disponible: disp });
+    }
+    // Lo más reciente primero, y los nunca vistos antes que las reposiciones.
+    items.sort((a, b) => (a.chip === b.chip
+      ? b.fecha.getTime() - a.fecha.getTime()
+      : (a.chip === 'nuevo' ? -1 : 1)));
+
+    return { desde: desdeLlego, desdeNuevo, ultimoPedido: ultimo?.fecha ?? null, items };
+  }
+
   /* ------------------- El pedido que se arma de a poco ------------------- */
   /*
    * EL BORRADOR (0055). El cajero atiende clientes; el pedido lo arma entre
