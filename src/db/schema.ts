@@ -410,6 +410,19 @@ export const productos = pgTable('productos', {
   estado: estadoProductoEnum('estado').notNull().default('activo'),
   /** Cuándo pasó al estado actual: da el "discontinuado hace 8 meses". */
   estadoDesde: timestamp('estado_desde', { withTimezone: true }),
+  /**
+   * CUÁNDO NACIÓ EL PRODUCTO (0084). Es lo que separa un producto NUEVO de un
+   * REINGRESO en las novedades del pedido: nuevo es el que se CREÓ hace poco y
+   * entró a stock; el que ya existía y volvió a entrar es un reingreso, aunque
+   * un local nunca lo haya tenido (corrección del dueño, 25/8/2026 — la
+   * definición anterior era relativa al local y marcaba NUEVO el catálogo
+   * entero para una sucursal recién sumada).
+   *
+   * La migración deja a TODOS los existentes con fecha vieja a propósito: no
+   * hay registro real de sus altas, y adivinar marcaría NUEVO de más — que es
+   * la forma más rápida de que el chip se deje de mirar.
+   */
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   /** Por qué se dio de baja. Lo lee quien decide si vale la pena reactivarlo. */
   motivoBaja: text('motivo_baja').notNull().default(''),
   /**

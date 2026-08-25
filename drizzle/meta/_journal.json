@@ -589,6 +589,13 @@
       "when": 1788422400000,
       "tag": "0083_cartel_de_gondola",
       "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "7",
+      "when": 1788426000000,
+      "tag": "0084_cuando_nacio_el_producto",
+      "breakpoints": true
     }
   ]
 }

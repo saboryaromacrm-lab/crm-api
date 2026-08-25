@@ -776,20 +776,24 @@ export class InventarioService {
    * porque no puede buscar un nombre que nunca escuchó. La mercadería llega a
    * la Distribuidora y los locales se enteran por comentario de pasillo.
    *
-   * DOS CHIPS, DOS PREGUNTAS DISTINTAS, y por eso DOS VENTANAS distintas:
+   * DOS CHIPS, DOS PREGUNTAS DISTINTAS, y por eso DOS VENTANAS distintas
+   * (redefinidos por el dueño el 25/8/2026 — antes "nuevo" era relativo al
+   * local, y a una sucursal sin historia le gritaba NUEVO el catálogo entero):
    *
-   *  · **NUEVO** — este local NUNCA lo tuvo. Responde "¿qué cosas nuevas hay
-   *    para vender?". Ventana larga (`DIAS_NUEVO`) porque es la que importa y
-   *    conviene insistirle: si entró el martes y el local pidió el miércoles
-   *    sin darse cuenta, con la ventana corta desaparecía para siempre.
+   *  · **NUEVO** — el producto SE CREÓ hace poco (`productos.creadoEn` dentro
+   *    de `DIAS_NUEVO`) y entró a stock. Es novedad DEL CATÁLOGO: algo que el
+   *    cajero no puede buscar porque no sabe que existe. Ventana larga y con
+   *    insistencia a propósito: si entró el martes y el local pidió el
+   *    miércoles sin verlo, con ventana corta desaparecía para siempre. Se
+   *    apaga antes solo si este local ya lo recibió (dejó de ser novedad
+   *    para él — eso se mide contra `movimientos` del destino, que graba una
+   *    fila en cada punta de la transferencia).
    *
-   *  · **LLEGÓ** — ya lo tuvo antes y entró mercadería DESDE SU ÚLTIMO PEDIDO.
-   *    Responde "¿ya puedo pedir eso que no había?". Ventana corta a propósito:
-   *    es reposición, y repetirla todos los días la vuelve ruido.
-   *
-   * "Nunca lo tuvo" se mide contra `movimientos` de ESE local: la recepción de
-   * una transferencia graba una fila en cada punta (origen −1, destino +1), así
-   * que una fila con `sucursalId = destino` prueba que alguna vez pasó por ahí.
+   *  · **REINGRESO** — ya existía y VOLVIÓ a entrar al depósito desde el
+   *    último pedido de este local. Responde "¿ya puedo pedir eso que no
+   *    había?". Ventana corta a propósito: es reposición, y repetirla todos
+   *    los días la vuelve ruido. Que este local nunca lo haya tenido no lo
+   *    convierte en nuevo: el producto es viejo en el negocio.
    *
    * TRES COSAS QUE NO SE VEN Y SIN LAS CUALES ESTO NO SIRVE:
    *
@@ -804,7 +808,7 @@ export class InventarioService {
    *     Es la trampa clásica de estas funciones: nacen gritando y se apagan.
    */
 
-  /** Cuántos días sigue siendo "nuevo" un producto que este local nunca tuvo. */
+  /** Cuántos días desde su ALTA un producto sigue siendo "nuevo". */
   private static readonly DIAS_NUEVO = 30;
 
   /**
@@ -894,23 +898,29 @@ export class InventarioService {
     const disponible = new Map(hay.map((h) => [h.productoId, Number(h.total) || 0]));
 
     const activos = await this.db
-      .select({ id: productos.id })
+      .select({ id: productos.id, creadoEn: productos.creadoEn })
       .from(productos)
       .where(and(inArray(productos.id, ids), eq(productos.estado, 'activo')));
-    const esActivo = new Set(activos.map((a) => a.id));
+    const altaDe = new Map(activos.map((a) => [a.id, a.creadoEn]));
 
-    const items: { productoId: number; chip: 'nuevo' | 'llego'; fecha: Date; disponible: number }[] = [];
+    const items: { productoId: number; chip: 'nuevo' | 'reingreso'; fecha: Date; disponible: number }[] = [];
     for (const e of entradas) {
       const id = e.productoId!;
-      if (!esActivo.has(id)) continue;
+      if (!altaDe.has(id)) continue;
       const disp = disponible.get(id) ?? 0;
       if (disp <= 1e-9) continue;
       const fecha = new Date(e.fecha as any);
-      const nuevo = !yaTuvo.has(id);
-      /* Cada chip tiene SU ventana: lo nunca visto aguanta más días que una
-       * reposición común (ver el encabezado). */
+      /*
+       * NUEVO se decide por la EDAD DEL PRODUCTO, no por el local (25/8): se
+       * creó dentro de la ventana y este local todavía no lo recibió. Todo lo
+       * demás que entró es REINGRESO — el producto ya existía en el negocio.
+       */
+      const alta = new Date(altaDe.get(id) as any);
+      const nuevo = alta >= desdeNuevo && !yaTuvo.has(id);
+      /* Cada chip tiene SU ventana: la novedad del catálogo aguanta más días
+       * que una reposición común (ver el encabezado). */
       if (nuevo ? fecha < desdeNuevo : fecha < desdeLlego) continue;
-      items.push({ productoId: id, chip: nuevo ? 'nuevo' : 'llego', fecha, disponible: disp });
+      items.push({ productoId: id, chip: nuevo ? 'nuevo' : 'reingreso', fecha, disponible: disp });
     }
     /* LO ÚLTIMO QUE ENTRÓ VA ARRIBA, sin agrupar por chip (pedido del dueño,
      * 25/8/2026 — antes los NUEVO iban todos antes que los LLEGÓ). El chip ya
