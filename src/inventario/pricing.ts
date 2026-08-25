@@ -1,7 +1,8 @@
 /**
  * PRECIOS — el único lugar donde se derivan (puro, sin DB).
  * ============================================================================
- *   costoNeto = costo × (1 − desc%) × (1 + flete%)
+ *   costoNeto = costo × (1 − desc%) × (1 + flete%)   ← con parte sin factura,
+ *                el flete entra × ratio (ver `costosFormato`)
  *   neto      = costoNeto × (1 + markup% de la lista)          ← lista
  *   neto      = … × tamKg × (1 + recargo%)                       ← presentación
  *   final     = neto × (1 + IVA%)      ← lo que ve el cliente en góndola
@@ -65,7 +66,8 @@ export interface CostosFormato {
   /**
    * EL COSTO ECONÓMICO REAL del bulto: lo que la mercadería cuesta de verdad
    * (el IVA facturado no cuenta, se recupera como crédito; la parte sin factura
-   * cuenta entera, no hay nada que recuperar). Es el que valúa stock, pérdidas
+   * cuenta entera, no hay nada que recuperar; el flete entra EN NETO, porque
+   * viene facturado y su IVA también vuelve). Es el que valúa stock, pérdidas
    * y transferencias — y con `porcSinFactura: 0` coincide con el de siempre.
    */
   costoNeto: number;
@@ -82,9 +84,14 @@ export interface CostosFormato {
    * cliente: lo absorbe el negocio. Es el 17,36% del sistema viejo, calculado
    * en vez de tipeado — y vale para cualquier alícuota, no solo el 21.
    *
-   * La prueba de que la cuenta es la del negocio: `costoPrecio × (1+IVA)` da
-   * exactamente el desembolso — comprar a $100 en negro y vender "sin IVA"
-   * al costo devuelve los $100 clavados.
+   * El FLETE pasa por el mismo ratio que la mercadería (25/8/2026, la cadena
+   * de Sistel): viene facturado y su % es bruto, así que su IVA vuelve como
+   * crédito y a la base entra en neto. Ver el encabezado de `costosFormato`.
+   *
+   * La prueba de que la cuenta es la del negocio: `costoPrecio × (1+IVA)`
+   * devuelve TODO lo que salió del bolsillo — el desembolso al proveedor más
+   * lo pagado al fletero. Comprar a $100 en negro y vender "sin IVA" al costo
+   * devuelve los $100 clavados.
    */
   costoPrecio: number;
   costoPrecioUnitario: number;
@@ -132,23 +139,44 @@ export function descuentoEfectivo(e?: CostoEntry | null): number {
  *
  *   costoNeto    ¿cuánto cuesta de verdad? La parte facturada en neto (su IVA
  *                se recupera como crédito) + la parte sin factura entera (no
- *                hay nada que recuperar) + el flete. Valúa stock y pérdidas.
+ *                hay nada que recuperar) + el flete EN NETO. Valúa stock.
  *   costoPrecio  ¿sobre qué se calcula el markup? A la parte sin factura se le
  *                quita el IVA que la venta va a generar (÷ factor), porque ese
  *                IVA lo absorbe el negocio y no se le traslada al cliente. Es
  *                el "descuento del 17,36%" del sistema viejo, hecho cuenta.
  *
- * EL % CORRE SOLO SOBRE LA MERCADERÍA, NUNCA SOBRE EL FLETE (19/8/2026, el
- * dueño lo corrigió el mismo día): el flete es un costo PROPIO — lo paga el
- * negocio, a un tercero, ajeno al proveedor de la liquidación — así que no
- * hay IVA que absorber ahí. Aplicarle el ÷factor al flete regalaba 17,36
- * centavos por cada peso de flete en cada venta. Por eso `partir()` recibe la
- * mercadería y el flete POR SEPARADO: la cuenta corre sobre la primera y el
- * segundo entra entero a la base.
+ * EL FLETE SIGUE LA CADENA DEL SISTEMA VIEJO (decisión del dueño, 25/8/2026,
+ * revirtiendo la del 19/8). Sistel aplicaba el % de flete DESPUÉS del ×1,21:
+ * `lista × (1−17,36%) × 1,21 × (1+flete%)`. Eso solo es correcto bajo dos
+ * condiciones que el dueño confirmó al elegir "tal cual el anterior":
+ *
+ *   1. El flete VIENE FACTURADO por el transportista: su IVA se recupera como
+ *      crédito fiscal, igual que el de la mercadería en blanco.
+ *   2. El % cargado es el BRUTO — la fracción de lo que SALE DEL BOLSILLO por
+ *      el bulto, no un neto contable. "10% de flete" = el 10% de lo pagado.
+ *
+ * De ahí sale la forma cerrada. Lo pagado al fletero es `desembolso × flete%`,
+ * y como su IVA vuelve, el flete real en neto es `flete × ratio` — con
+ * `ratio = (1−q) + q/factor`, EL MISMO factor por el que ya pasa la
+ * mercadería. Todo uniforme:
+ *
+ *   costoPrecio  = (mercadería + flete) × ratio      ← la cadena de Sistel
+ *   costoNeto    = mercadería + flete × ratio
+ *   ivaAbsorbido = mercadería × (1 − ratio)          ← SOLO la mercadería
+ *                  absorbe: el IVA del flete no se pierde, vuelve como crédito
+ *
+ * La corrección del 19/8 ("el flete entra entero, sin ÷factor") suponía flete
+ * pagado SIN papel; con el flete facturado, ese camino cobraba de más: le
+ * trasladaba al cliente un 21% del flete que en realidad volvía como crédito
+ * (~$100 por unidad en el aceite de CARLOS OLIVAA contra el precio correcto).
+ *
+ * Con `porcSinFactura: 0` el ratio es 1 y TODO queda exactamente como siempre:
+ * el cambio solo alcanza a los formatos marcados con parte sin factura.
  *
  * La diferencia entre los dos costos es `ivaAbsorbido`: plata que sale del
- * margen al vender. Con `porcSinFactura: 0` las dos columnas coinciden y todo
- * queda exactamente como siempre.
+ * margen al vender. La identidad de control ahora cierra el circuito entero:
+ * `costoPrecio × factor = desembolso al proveedor + pagado al fletero` — la
+ * base con IVA reconstruye TODO lo que salió del bolsillo.
  */
 export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const vacio: CostosFormato = {
@@ -166,28 +194,38 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const q = Math.min(Math.max(Number(e.porcSinFactura) || 0, 0), 100) / 100;
 
   /**
-   * `M` es la MERCADERÍA (post descuentos, sin flete) y `flete` el importe del
-   * flete propio. La cuenta corre solo sobre M:
-   *   base del precio = M·(1−q) + M·q/factor + flete  ← la parte negra sin su
-   *                                                     IVA; el flete entero
-   *   IVA absorbido   = M·q·(1 − 1/factor)            ← lo que el margen pierde
-   *   desembolso      = M·(1−q)·factor + M·q          ← lo que se le paga AL
-   *                                                     PROVEEDOR (el flete se
-   *                                                     paga aparte, a otro)
-   * La identidad de control es de la mercadería: `(base − flete) × factor =
-   * desembolso` — comprar en negro y vender "sin IVA" al costo devuelve el
-   * mismo peso que salió.
+   * `ratio` es la fracción del valor nominal que entra a la base del precio:
+   * la parte facturada entera (su IVA es crédito, no cuesta) y la parte sin
+   * factura despojada del IVA que la venta va a generar. Con q=0 vale 1.
+   */
+  const ratio = (1 - q) + q / factorIva;
+
+  /**
+   * `M` es la MERCADERÍA (post descuentos, sin flete) y `flete` su importe
+   * nominal `M × flete%`, YA EN LA MISMA ESCALA que M (ver el encabezado: el %
+   * cargado es bruto sobre lo pagado, y como el IVA del fletero vuelve, el
+   * flete real en neto es `flete × ratio` — la cadena de Sistel):
+   *
+   *   base del precio = (M + flete) × ratio    ← todo uniforme
+   *   IVA absorbido   = M · (1 − ratio)        ← solo la mercadería: el IVA del
+   *                                              flete no se pierde, es crédito
+   *   desembolso      = M·(1−q)·factor + M·q   ← lo que se le paga AL PROVEEDOR
+   *                                              (el fletero cobra aparte)
+   *
+   * Identidad de control: `base × factor = desembolso + flete·((1−q)·factor+q)`
+   * — la base con IVA devuelve TODO lo que salió del bolsillo, proveedor y
+   * fletero juntos. Con q=0 se reduce a la de siempre.
    */
   const partir = (mercaderia: number, flete: number) => {
-    const baseMercaderia = mercaderia * ((1 - q) + q / factorIva);
-    const costoPrecio = baseMercaderia + flete;
+    const costoPrecio = (mercaderia + flete) * ratio;
     const desembolso = mercaderia * ((1 - q) * factorIva + q);
+    const absorbido = mercaderia * (1 - ratio);
     return {
       porcSinFactura: q * 100,
       costoPrecio,
       costoPrecioUnitario: costoPrecio / cantidad,
-      ivaAbsorbido: mercaderia - baseMercaderia,
-      ivaAbsorbidoUnitario: (mercaderia - baseMercaderia) / cantidad,
+      ivaAbsorbido: absorbido,
+      ivaAbsorbidoUnitario: absorbido / cantidad,
       desembolso,
       desembolsoUnitario: desembolso / cantidad,
     };
@@ -219,7 +257,12 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const costoLista = Number(e.costo) || 0;
   const desc = descuentoEfectivo(e);
   const costoBruto = costoLista * (1 - desc / 100);
-  const costoNeto = costoBruto * (1 + (Number(e.flete) || 0) / 100);
+  /* El flete NOMINAL (M × flete%) y su valor REAL en neto: como viene
+   * facturado, la parte proporcional al negro pierde su IVA por el ratio —
+   * exactamente igual que la mercadería. Con q=0, `fleteNeto === flete`. */
+  const flete = costoBruto * ((Number(e.flete) || 0) / 100);
+  const fleteNeto = flete * ratio;
+  const costoNeto = costoBruto + fleteNeto;
   const costoFinal = costoNeto * factorIva;
   return {
     cantidad,
@@ -231,8 +274,9 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     costoFinal,
     costoNetoUnitario: costoNeto / cantidad,
     costoFinalUnitario: costoFinal / cantidad,
-    // La mercadería es el bruto (post descuentos); el flete, la diferencia.
-    ...partir(costoBruto, costoNeto - costoBruto),
+    // La mercadería es el bruto (post descuentos); el flete va NOMINAL —
+    // `partir` le aplica el ratio adentro, junto con la mercadería.
+    ...partir(costoBruto, flete),
   };
 }
 
