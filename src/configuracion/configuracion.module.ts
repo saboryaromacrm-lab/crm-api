@@ -207,6 +207,9 @@ export const IMPRESION_DEFAULTS = {
    * rige el diseño estándar proporcional de imprimir.js.
    */
   plantillaCartel: '' as string,
+  /** Ídem para la etiqueta del fraccionado (25/8, "hacelo igual"): nombre,
+   * peso, precio, código de barras, número y vencimiento, cada uno en sus mm. */
+  plantillaFraccionado: '' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
   leyendaNoFiscal: true as boolean,
@@ -316,49 +319,60 @@ const FORMATOS_ETIQUETA = [
 ];
 
 /**
- * LA PLANTILLA DEL CARTEL, saneada. Es la excepción anidada del módulo (ver el
- * default): JSON en string, un objeto por formato con la posición en mm de
- * cada elemento. Se parsea, se poda a las claves y números conocidos (con sus
- * topes: nada fuera de 0–300 mm, letra de 1 a 40 mm) y se re-serializa. Lo
- * ilegible o vacío cae a '' — sin plantilla, diseño estándar — que es la misma
+ * LAS PLANTILLAS DE ETIQUETA, saneadas. Son la excepción anidada del módulo
+ * (ver los defaults): JSON en string, un objeto por formato con la posición en
+ * mm de cada elemento. Cada plantilla declara SUS elementos y de qué tipo son
+ * (caja = x/y/ancho/alto, texto = con ancho para centrar y achicar, línea =
+ * solo posición y letra); lo que no está en el esquema se descarta y los
+ * números se acomodan a sus topes (0–300 mm, letra de 1 a 40 mm). Lo ilegible
+ * o vacío cae a '' — sin plantilla, diseño estándar — que es la misma
  * filosofía del resto de las reglas: acomodar, nunca romper la lectura.
  */
-function plantillaCartelSaneada(v: string): string {
+const ESQUEMA_PLANTILLA: Record<string, Record<string, 'caja' | 'texto' | 'linea'>> = {
+  plantillaCartel: {
+    recuadro: 'caja', marca: 'texto', nombre: 'texto', minorista: 'linea', mayorista: 'linea',
+  },
+  plantillaFraccionado: {
+    nombre: 'texto', peso: 'linea', precio: 'linea', barras: 'caja', codigo: 'texto', vencimiento: 'linea',
+  },
+};
+
+function saneadorPlantilla(campo: keyof typeof ESQUEMA_PLANTILLA) {
+  const esquema = ESQUEMA_PLANTILLA[campo];
   const num = (x: any, def: number, min: number, max: number) => {
     const n = Number(x);
     if (!Number.isFinite(n)) return def;
     return Math.round(Math.min(max, Math.max(min, n)) * 100) / 100;
   };
-  try {
-    const raw = JSON.parse(String(v || ''));
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
-    const out: Record<string, any> = {};
-    for (const formato of FORMATOS_ETIQUETA) {
-      const t = (raw as any)[formato];
-      if (!t || typeof t !== 'object') continue;
-      const caja = (e: any) => (e && typeof e === 'object'
-        ? {
-          x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300),
-          w: num(e.w, 10, 1, 300), h: num(e.h, 10, 1, 300),
-          grosor: num(e.grosor, 0.5, 0.2, 3),
-        } : null);
-      const texto = (e: any) => (e && typeof e === 'object'
-        ? {
-          x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300),
-          w: num(e.w, 10, 1, 300), size: num(e.size, 3, 1, 40),
-        } : null);
-      const linea = (e: any) => (e && typeof e === 'object'
-        ? { x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300), size: num(e.size, 3, 1, 40) } : null);
-      const limpio: Record<string, any> = {};
-      const r = caja(t.recuadro); if (r) limpio.recuadro = r;
-      const m = texto(t.marca); if (m) limpio.marca = m;
-      const nb = texto(t.nombre); if (nb) limpio.nombre = nb;
-      const mi = linea(t.minorista); if (mi) limpio.minorista = mi;
-      const ma = linea(t.mayorista); if (ma) limpio.mayorista = ma;
-      if (Object.keys(limpio).length) out[formato] = limpio;
-    }
-    return Object.keys(out).length ? JSON.stringify(out) : '';
-  } catch { return ''; }
+  return (v: string): string => {
+    try {
+      const raw = JSON.parse(String(v || ''));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
+      const out: Record<string, any> = {};
+      for (const formato of FORMATOS_ETIQUETA) {
+        const t = (raw as any)[formato];
+        if (!t || typeof t !== 'object') continue;
+        const limpio: Record<string, any> = {};
+        for (const [elem, tipo] of Object.entries(esquema)) {
+          const e = t[elem];
+          if (!e || typeof e !== 'object') continue;
+          const base = { x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300) };
+          if (tipo === 'caja') {
+            limpio[elem] = {
+              ...base, w: num(e.w, 10, 1, 300), h: num(e.h, 10, 1, 300),
+              grosor: num(e.grosor, 0.5, 0.2, 3),
+            };
+          } else if (tipo === 'texto') {
+            limpio[elem] = { ...base, w: num(e.w, 10, 1, 300), size: num(e.size, 3, 1, 40) };
+          } else {
+            limpio[elem] = { ...base, size: num(e.size, 3, 1, 40) };
+          }
+        }
+        if (Object.keys(limpio).length) out[formato] = limpio;
+      }
+      return Object.keys(out).length ? JSON.stringify(out) : '';
+    } catch { return ''; }
+  };
 }
 
 const REGLAS: Record<string, {
@@ -375,7 +389,8 @@ const REGLAS: Record<string, {
   'impresion.facturaVenta': { opciones: FORMATOS_PAPEL },
   'impresion.etiquetaFraccionado': { opciones: FORMATOS_ETIQUETA },
   'impresion.etiquetaGondola': { opciones: FORMATOS_ETIQUETA },
-  'impresion.plantillaCartel': { texto: plantillaCartelSaneada },
+  'impresion.plantillaCartel': { texto: saneadorPlantilla('plantillaCartel') },
+  'impresion.plantillaFraccionado': { texto: saneadorPlantilla('plantillaFraccionado') },
 
   /* Los redondeos son una LISTA CERRADA, no un rango: son las monedas con las
    * que se trabaja. Cualquier otra cosa vuelve al default. */
