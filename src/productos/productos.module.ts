@@ -1340,6 +1340,25 @@ export class ProductosService {
           await tx.insert(productoProveedores).values(valores(f, i));
         }
       }
+
+      /*
+       * EL BULTO DE LA FICHA SE COMPLETA SOLO (25/8). `productos.
+       * unidades_por_bulto` es lo que hace que el pedido ofrezca "por caja",
+       * y el formato de compra recién guardado ya trae ese mismo bulto físico
+       * cargado mirando la factura. Misma regla que el script db:bulto, acá
+       * para que el hueco no se vuelva a abrir con cada producto nuevo:
+       * SOLO RELLENA LO VACÍO (nunca pisa lo cargado a mano), solo enteros,
+       * y solo si todos los formatos declaran EL MISMO bulto — con dos
+       * proveedores en desacuerdo no hay respuesta única y elegir sería
+       * inventar: ese caso queda para el ojo humano, como en el script.
+       */
+      if (p.tipo === 'entero' && !(Number(p.unidadesPorBulto) > 1)) {
+        const bultos = [...new Set(validas.map((f) => plata(f.cantidad, 1_000_000) || 1).filter((c) => c > 1))];
+        if (bultos.length === 1) {
+          await tx.update(productos).set({ unidadesPorBulto: bultos[0] })
+            .where(eq(productos.id, id));
+        }
+      }
     });
     // El costo pudo cambiar → el precio también. Queda en la evolución.
     await this.evolucion.snapshot([id], 'formato_compra');
