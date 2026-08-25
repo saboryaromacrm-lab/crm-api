@@ -196,6 +196,17 @@ export const IMPRESION_DEFAULTS = {
   // 64×32 es el rollo REAL que el dueño tiene en la Zebra (medido el 25/8):
   // con esto producción arranca imprimiendo bien sin tocar nada en Sistema.
   etiquetaGondola: 'etiqueta64x32' as string,
+  /**
+   * LA PLANTILLA DEL CARTEL (25/8): el diseño que el dueño arma arrastrando
+   * los elementos en el editor de Ventas › Carteles. Es un JSON **en string**
+   * — un objeto por formato de etiqueta, con la posición en milímetros de cada
+   * elemento (recuadro, marca, nombre, minorista, mayorista) — porque el
+   * `sanitize` de este módulo trabaja con campos planos y esta forma anidada
+   * no le calza; la regla `impresion.plantillaCartel` (abajo) lo parsea, poda
+   * y re-serializa, así el portero sigue existiendo. Vacío = sin plantilla:
+   * rige el diseño estándar proporcional de imprimir.js.
+   */
+  plantillaCartel: '' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
   leyendaNoFiscal: true as boolean,
@@ -304,6 +315,52 @@ const FORMATOS_ETIQUETA = [
   'etiqueta64x32', 'etiqueta80x50', 'etiqueta100x50', 'etiqueta100x60',
 ];
 
+/**
+ * LA PLANTILLA DEL CARTEL, saneada. Es la excepción anidada del módulo (ver el
+ * default): JSON en string, un objeto por formato con la posición en mm de
+ * cada elemento. Se parsea, se poda a las claves y números conocidos (con sus
+ * topes: nada fuera de 0–300 mm, letra de 1 a 40 mm) y se re-serializa. Lo
+ * ilegible o vacío cae a '' — sin plantilla, diseño estándar — que es la misma
+ * filosofía del resto de las reglas: acomodar, nunca romper la lectura.
+ */
+function plantillaCartelSaneada(v: string): string {
+  const num = (x: any, def: number, min: number, max: number) => {
+    const n = Number(x);
+    if (!Number.isFinite(n)) return def;
+    return Math.round(Math.min(max, Math.max(min, n)) * 100) / 100;
+  };
+  try {
+    const raw = JSON.parse(String(v || ''));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
+    const out: Record<string, any> = {};
+    for (const formato of FORMATOS_ETIQUETA) {
+      const t = (raw as any)[formato];
+      if (!t || typeof t !== 'object') continue;
+      const caja = (e: any) => (e && typeof e === 'object'
+        ? {
+          x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300),
+          w: num(e.w, 10, 1, 300), h: num(e.h, 10, 1, 300),
+          grosor: num(e.grosor, 0.5, 0.2, 3),
+        } : null);
+      const texto = (e: any) => (e && typeof e === 'object'
+        ? {
+          x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300),
+          w: num(e.w, 10, 1, 300), size: num(e.size, 3, 1, 40),
+        } : null);
+      const linea = (e: any) => (e && typeof e === 'object'
+        ? { x: num(e.x, 0, 0, 300), y: num(e.y, 0, 0, 300), size: num(e.size, 3, 1, 40) } : null);
+      const limpio: Record<string, any> = {};
+      const r = caja(t.recuadro); if (r) limpio.recuadro = r;
+      const m = texto(t.marca); if (m) limpio.marca = m;
+      const nb = texto(t.nombre); if (nb) limpio.nombre = nb;
+      const mi = linea(t.minorista); if (mi) limpio.minorista = mi;
+      const ma = linea(t.mayorista); if (ma) limpio.mayorista = ma;
+      if (Object.keys(limpio).length) out[formato] = limpio;
+    }
+    return Object.keys(out).length ? JSON.stringify(out) : '';
+  } catch { return ''; }
+}
+
 const REGLAS: Record<string, {
   valores?: number[]; opciones?: string[]; min?: number; max?: number;
   entero?: boolean; texto?: (v: string) => string;
@@ -318,6 +375,7 @@ const REGLAS: Record<string, {
   'impresion.facturaVenta': { opciones: FORMATOS_PAPEL },
   'impresion.etiquetaFraccionado': { opciones: FORMATOS_ETIQUETA },
   'impresion.etiquetaGondola': { opciones: FORMATOS_ETIQUETA },
+  'impresion.plantillaCartel': { texto: plantillaCartelSaneada },
 
   /* Los redondeos son una LISTA CERRADA, no un rango: son las monedas con las
    * que se trabaja. Cualquier otra cosa vuelve al default. */
