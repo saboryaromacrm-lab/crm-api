@@ -193,7 +193,9 @@ export const IMPRESION_DEFAULTS = {
   /** El cartel de góndola (0083): misma familia de etiqueta, nombre más grande
    * y sin código de barras. Arranca en la más grande de las autoadhesivas: se
    * lee de lejos, que es todo el punto de un cartel. */
-  etiquetaGondola: 'etiqueta60x40' as string,
+  // 64×32 es el rollo REAL que el dueño tiene en la Zebra (medido el 25/8):
+  // con esto producción arranca imprimiendo bien sin tocar nada en Sistema.
+  etiquetaGondola: 'etiqueta64x32' as string,
   imprimirTicketAlCobrar: true as boolean,
   pieTicket: '¡Gracias por su compra!' as string,
   leyendaNoFiscal: true as boolean,
@@ -297,9 +299,9 @@ export const CONFIG_DEFAULTS: Record<string, Record<string, any>> = {
 const FORMATOS_PAPEL = ['rollo80', 'rollo58', 'a4', 'carta'];
 const FORMATOS_ETIQUETA = [
   'etiqueta50x30', 'etiqueta50x25', 'etiqueta40x25', 'etiqueta60x40',
-  // Las medidas GRANDES del cartel de góndola (25/8): el rollo real resultó
-  // más ancho que todo lo que había cargado. Espejo de FORMATOS en imprimir.js.
-  'etiqueta80x50', 'etiqueta100x50', 'etiqueta100x60',
+  // Las medidas del cartel de góndola (25/8): 64×32 es el rollo real medido
+  // por el dueño; las grandes quedan por si cambia. Espejo de imprimir.js.
+  'etiqueta64x32', 'etiqueta80x50', 'etiqueta100x50', 'etiqueta100x60',
 ];
 
 const REGLAS: Record<string, {
