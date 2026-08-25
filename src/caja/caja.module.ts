@@ -186,14 +186,30 @@ export class CajaService {
     const montoInicial = money(dto.montoInicial);
     if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
 
-    const [c] = await this.db.insert(cajaSesiones).values({
-      sucursalId,
-      usuarioId: dto.usuarioId ?? null,
-      montoInicial,
-      estado: 'abierta',
-      observaciones: dto.observaciones ?? '',
-    }).returning();
-    return c;
+    /*
+     * EL CHEQUEO DE ARRIBA ES CORTESÍA; EL CANDADO ES LA BASE (0085). Entre el
+     * select y el insert cabe un doble clic — dos aperturas a la vez pasaban
+     * las dos y quedaban DOS turnos abiertos en la misma sucursal, con cada
+     * venta eligiendo uno u otro. El índice único parcial
+     * `uq_caja_abierta_por_sucursal` hace que el segundo insert reviente con
+     * 23505, y acá se traduce al mismo mensaje amable del chequeo.
+     */
+    try {
+      const [c] = await this.db.insert(cajaSesiones).values({
+        sucursalId,
+        usuarioId: dto.usuarioId ?? null,
+        montoInicial,
+        estado: 'abierta',
+        observaciones: dto.observaciones ?? '',
+      }).returning();
+      return c;
+    } catch (e: any) {
+      const code = e?.code ?? e?.cause?.code;
+      if (code === '23505') {
+        throw new BadRequestException('Ya hay un turno de caja abierto en esta sucursal. Cerralo antes de abrir otro.');
+      }
+      throw e;
+    }
   }
 
   /**

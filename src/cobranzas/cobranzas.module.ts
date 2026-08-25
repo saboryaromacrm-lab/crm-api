@@ -26,7 +26,7 @@ import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
-import { cobranzaImputaciones, cobranzaPagos, cobranzas, ventas } from '../db/schema';
+import { cajaSesiones, cobranzaImputaciones, cobranzaPagos, cobranzas, ventas } from '../db/schema';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { CajaModule, CajaService } from '../caja/caja.module';
@@ -291,6 +291,28 @@ export class CobranzasService {
     const fecha = fechaDeDocumento(dto.fecha, esJefeSesion);
 
     const id = await this.db.transaction(async (tx) => {
+      /*
+       * EL TURNO, RELEÍDO CON CANDADO (25/8). `caja.actual()` se consultó fuera
+       * de la transacción, y entre esa lectura y el insert cabía el cierre de
+       * caja: el recibo entraba a un turno cuyo arqueo ya estaba calculado — la
+       * misma carrera que se cerró en la venta. FOR UPDATE espera a un cierre
+       * en curso; si al soltar el candado el turno ya no está abierto, con
+       * efectivo obligatorio se rechaza, y sin esa exigencia el recibo cae a
+       * administración (null), igual que si nunca hubiera habido turno.
+       */
+      let turnoIdEnTx: number | null = null;
+      if (turno) {
+        const [t] = await tx.select().from(cajaSesiones)
+          .where(eq(cajaSesiones.id, turno.id)).limit(1).for('update');
+        if (t && t.estado === 'abierta') {
+          turnoIdEnTx = t.id;
+        } else if (hayEfectivo && !!config.cajaObligatoria) {
+          throw new BadRequestException(
+            'El turno de caja se cerró mientras se cargaba este recibo. Abrí la caja y volvé a cobrar.',
+          );
+        }
+      }
+
       if (imputaciones.length) {
         const saldos = await this.saldosEnTx(tx, imputaciones.map((i) => i.ventaId));
         for (const i of imputaciones) {
@@ -321,7 +343,7 @@ export class CobranzasService {
         puntoVenta, numero, fecha, clienteId: cliente.id,
         sucursalId,
         usuarioId: dto.usuarioId ?? null,
-        cajaSesionId: turno?.id ?? null,
+        cajaSesionId: turnoIdEnTx,
         total, aCuenta, estado: 'confirmada', observaciones: dto.observaciones ?? '',
       }).returning();
 
@@ -365,22 +387,35 @@ export class CobranzasService {
     const razon = (motivo ?? '').trim();
     if (!razon) throw new BadRequestException('Indicá por qué se anula el recibo.');
 
-    if (c.cajaSesionId) {
-      const turno = await this.caja.getOpcional(c.cajaSesionId);
-      if (turno && turno.estado === 'cerrada' && !opciones.esJefe) {
-        throw new BadRequestException(
-          'El turno de caja de ese recibo ya está cerrado: su arqueo quedó firmado. '
-          + 'Corregilo con un recibo nuevo en vez de anularlo.',
-        );
+    /*
+     * CANDADO Y RELECTURA (25/8), como en `ventas.anular`: el chequeo de arriba
+     * es de cortesía — acá adentro se retoma la cobranza FOR UPDATE (dos
+     * anulaciones a la vez: gana una) y el turno FOR UPDATE (un cierre en
+     * curso espera o esta anulación se rechaza porque el arqueo ya se firmó).
+     */
+    await this.db.transaction(async (tx) => {
+      const [fresca] = await tx.select().from(cobranzas)
+        .where(eq(cobranzas.id, id)).limit(1).for('update');
+      if (!fresca || fresca.estado === 'anulada') {
+        throw new BadRequestException('La cobranza ya está anulada.');
       }
-    }
-
-    await this.db.update(cobranzas).set({
-      estado: 'anulada',
-      anuladoPor: usuarioId ?? null,
-      anuladoEn: new Date(),
-      anuladoMotivo: razon,
-    }).where(eq(cobranzas.id, id));
+      if (fresca.cajaSesionId) {
+        const [turno] = await tx.select().from(cajaSesiones)
+          .where(eq(cajaSesiones.id, fresca.cajaSesionId)).limit(1).for('update');
+        if (turno && turno.estado === 'cerrada' && !opciones.esJefe) {
+          throw new BadRequestException(
+            'El turno de caja de ese recibo ya está cerrado: su arqueo quedó firmado. '
+            + 'Corregilo con un recibo nuevo en vez de anularlo.',
+          );
+        }
+      }
+      await tx.update(cobranzas).set({
+        estado: 'anulada',
+        anuladoPor: usuarioId ?? null,
+        anuladoEn: new Date(),
+        anuladoMotivo: razon,
+      }).where(eq(cobranzas.id, id));
+    });
     return this.get(id);
   }
 }

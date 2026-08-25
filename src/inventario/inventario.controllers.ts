@@ -90,7 +90,6 @@ class VentaDto {
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() presId?: number | null;
   @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class AsignacionDto {
@@ -103,7 +102,6 @@ class FraccionarDto {
   @IsOptional() @IsInt() sucursalId?: number;
   @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => AsignacionDto)
   asignaciones!: AsignacionDto[];
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class CorregirFraccionadoDto {
@@ -122,7 +120,6 @@ class CorregirFraccionadoDto {
    */
   @IsNumber() @Min(0) @Max(MAX_CANT) cantidadReal!: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class MovimientoDto {
@@ -134,13 +131,15 @@ class MovimientoDto {
   /** Solo lo miran los tipos de dirección 0 (`ajuste`): +1 suma, cualquier otro resta. */
   @IsOptional() @IsInt() signo?: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
+/* Los `usuarioId` de los DTOs de este archivo se fueron el 25/8/2026: el autor
+ * de cada operación sale de la SESIÓN (como en Ventas y Cobranzas), no de lo
+ * que mande el cliente — una traza que elige el cliente no prueba nada. Los
+ * frontends viejos que todavía lo manden no rompen: `whitelist` lo descarta. */
 class AbrirBorradorDto {
   @IsInt() origenId!: number;
   @IsOptional() @IsInt() destinoId?: number;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class ItemBorradorDto {
@@ -153,11 +152,9 @@ class GuardarBorradorDto {
   @IsOptional() @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => ItemBorradorDto)
   items?: ItemBorradorDto[];
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
-class UsuarioDto {
-  @IsOptional() @IsInt() usuarioId?: number;
+class AvanzarDto {
   @IsOptional() @IsString() desde?: string;
 }
 
@@ -176,7 +173,6 @@ class AgregarItemDto {
 class ConfirmarListaDto {
   @IsIn(['enteros', 'granel']) tipo!: 'enteros' | 'granel';
   @IsBoolean() listo!: boolean;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class ItemRecibidoDto {
@@ -192,7 +188,6 @@ class RecibirDto {
   @IsOptional() @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => ItemRecibidoDto)
   items?: ItemRecibidoDto[];
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
-  @IsOptional() @IsInt() usuarioId?: number;
 }
 
 class CrearIncidenciaDto {
@@ -296,20 +291,20 @@ export class OperacionesController {
   @Post('venta')
   @Permiso('inventario')
   venta(@Body() dto: VentaDto, @Auth() sesion: Sesion) {
-    return this.inv.opVenta({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+    return this.inv.opVenta({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   @Post('fraccionar')
   @Permiso('fraccionar')
   fraccionar(@Body() dto: FraccionarDto, @Auth() sesion: Sesion) {
-    return this.inv.opFraccionar({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+    return this.inv.opFraccionar({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   /** "Puse 20 paquetes y son 19": ajusta los paquetes Y el granel de una vez. */
   @Post('corregir-fraccionado')
   @Permiso('fraccionar')
   corregirFraccionado(@Body() dto: CorregirFraccionadoDto, @Auth() sesion: Sesion) {
-    return this.inv.opCorregirFraccionado({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+    return this.inv.opCorregirFraccionado({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
   /**
@@ -333,7 +328,7 @@ export class OperacionesController {
     if (dto.tipo === 'ajuste' && !dto.motivo?.trim()) {
       throw new BadRequestException('Un ajuste necesita su motivo: es lo que queda en el historial.');
     }
-    return this.inv.opSimple({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+    return this.inv.opSimple({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 }
 
@@ -383,20 +378,20 @@ export class TransferenciasController {
   borrador(@Body() dto: AbrirBorradorDto, @Auth() sesion: Sesion) {
     const destinoId = sucursalDeOperacion(sesion, dto.destinoId);
     return this.inv.borradorTransferencia({
-      origenId: Number(dto.origenId), destinoId: Number(destinoId), usuarioId: dto.usuarioId,
+      origenId: Number(dto.origenId), destinoId: Number(destinoId), usuarioId: sesion.usuarioId,
     });
   }
 
   @Put(':id/borrador')
   @Permiso('pedidos')
   guardarBorrador(@Param('id', ParseIntPipe) id: number, @Body() dto: GuardarBorradorDto, @Auth() sesion: Sesion) {
-    return this.inv.guardarBorrador(id, dto ?? {}, soloSuSucursal(sesion));
+    return this.inv.guardarBorrador(id, { ...(dto ?? {}), usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
 
   @Post(':id/enviar')
   @Permiso('pedidos')
-  enviarBorrador(@Param('id', ParseIntPipe) id: number, @Body() dto: UsuarioDto, @Auth() sesion: Sesion) {
-    return this.inv.enviarBorrador(id, { usuarioId: dto?.usuarioId }, soloSuSucursal(sesion));
+  enviarBorrador(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.inv.enviarBorrador(id, { usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
 
   @Delete(':id/borrador')
@@ -408,8 +403,8 @@ export class TransferenciasController {
   /** Avanza el estado. Es la preparación: se compara contra el ORIGEN. */
   @Post(':id/avanzar')
   @Permiso('preparar')
-  avanzar(@Param('id', ParseIntPipe) id: number, @Body() dto: UsuarioDto, @Auth() sesion: Sesion) {
-    return this.inv.avanzarTransferencia(id, dto?.usuarioId, dto?.desde, soloSuSucursal(sesion));
+  avanzar(@Param('id', ParseIntPipe) id: number, @Body() dto: AvanzarDto, @Auth() sesion: Sesion) {
+    return this.inv.avanzarTransferencia(id, sesion.usuarioId, dto?.desde, soloSuSucursal(sesion));
   }
 
   /* --- Preparación en dos listas (fase "preparada"): siempre contra el ORIGEN --- */
@@ -448,7 +443,7 @@ export class TransferenciasController {
   @Post(':id/lista')
   @Permiso('preparar')
   confirmarLista(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarListaDto, @Auth() sesion: Sesion) {
-    return this.inv.confirmarListaTransferencia(id, dto, soloSuSucursal(sesion));
+    return this.inv.confirmarListaTransferencia(id, { ...dto, usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
 
   /**
@@ -459,7 +454,7 @@ export class TransferenciasController {
   @Post(':id/recibir')
   @Permiso('pedidos')
   recibir(@Param('id', ParseIntPipe) id: number, @Body() dto: RecibirDto, @Auth() sesion: Sesion) {
-    return this.inv.recibirTransferencia(id, dto ?? {}, soloSuSucursal(sesion));
+    return this.inv.recibirTransferencia(id, { ...(dto ?? {}), usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
 
   /** Cancelar libera la reserva del ORIGEN, así que es de quien la preparó. */

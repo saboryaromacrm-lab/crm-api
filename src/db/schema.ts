@@ -1539,6 +1539,11 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   observaciones: text('observaciones').notNull().default(''),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
+  /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el
+   * chequeo de la aplicación era un select fuera de transacción y un doble
+   * clic abría dos turnos. Índice parcial: las cerradas no cuentan. */
+  uqAbierta: uniqueIndex('uq_caja_abierta_por_sucursal').on(t.sucursalId)
+    .where(sql`${t.estado} = 'abierta'`),
 }));
 
 /** Entradas y salidas de dinero que no son ventas ni cobranzas (retiros, gastos). */

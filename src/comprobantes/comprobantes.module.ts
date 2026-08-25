@@ -667,6 +667,20 @@ export class ComprobantesService {
       );
     }
     const estado = dto.estado ?? 'confirmado';
+    /*
+     * UN BORRADOR NO RECIBE MERCADERÍA (25/8). Con `borrador` + `recepcion` el
+     * stock entraba igual (la condición de abajo solo excluía `anulado`) pero
+     * el documento no generaba deuda — y como no existe endpoint que confirme
+     * un borrador, quedaba para siempre en ese limbo: mercadería adentro,
+     * factura que no es factura. El dashboard nunca manda borradores; si algún
+     * día se quiere el estado, la recepción va a tener que ser parte de la
+     * confirmación, no del alta.
+     */
+    if (estado === 'borrador' && dto.recepcion) {
+      throw new BadRequestException(
+        'Un borrador no puede recibir mercadería: cargá el comprobante confirmado, o sin recepción.',
+      );
+    }
     // El papel imprime cinco dígitos y el sistema usa cuatro: normalizar acá es
     // lo que hace que el único de la base cruce las dos formas de cargarlo.
     const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? '0001');

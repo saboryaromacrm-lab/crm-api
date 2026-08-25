@@ -596,6 +596,13 @@
       "when": 1788426000000,
       "tag": "0084_cuando_nacio_el_producto",
       "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "7",
+      "when": 1788440400000,
+      "tag": "0085_una_caja_abierta_por_sucursal",
+      "breakpoints": true
     }
   ]
 }
