@@ -912,10 +912,11 @@ export class InventarioService {
       if (nuevo ? fecha < desdeNuevo : fecha < desdeLlego) continue;
       items.push({ productoId: id, chip: nuevo ? 'nuevo' : 'llego', fecha, disponible: disp });
     }
-    // Lo más reciente primero, y los nunca vistos antes que las reposiciones.
-    items.sort((a, b) => (a.chip === b.chip
-      ? b.fecha.getTime() - a.fecha.getTime()
-      : (a.chip === 'nuevo' ? -1 : 1)));
+    /* LO ÚLTIMO QUE ENTRÓ VA ARRIBA, sin agrupar por chip (pedido del dueño,
+     * 25/8/2026 — antes los NUEVO iban todos antes que los LLEGÓ). El chip ya
+     * distingue nuevo de reingreso a la vista: agruparlos encima repetía esa
+     * información, y escondía lo recién llegado detrás de novedades viejas. */
+    items.sort((a, b) => b.fecha.getTime() - a.fecha.getTime());
 
     return { desde: desdeLlego, desdeNuevo, ultimoPedido: ultimo?.fecha ?? null, items };
   }
