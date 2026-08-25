@@ -295,7 +295,12 @@ export const CONFIG_DEFAULTS: Record<string, Record<string, any>> = {
  * inventado caía a A4, con lo que el rollo de 80 mm salía en hoja.
  */
 const FORMATOS_PAPEL = ['rollo80', 'rollo58', 'a4', 'carta'];
-const FORMATOS_ETIQUETA = ['etiqueta50x30', 'etiqueta50x25', 'etiqueta40x25', 'etiqueta60x40'];
+const FORMATOS_ETIQUETA = [
+  'etiqueta50x30', 'etiqueta50x25', 'etiqueta40x25', 'etiqueta60x40',
+  // Las medidas GRANDES del cartel de góndola (25/8): el rollo real resultó
+  // más ancho que todo lo que había cargado. Espejo de FORMATOS en imprimir.js.
+  'etiqueta80x50', 'etiqueta100x50', 'etiqueta100x60',
+];
 
 const REGLAS: Record<string, {
   valores?: number[]; opciones?: string[]; min?: number; max?: number;
