@@ -124,7 +124,16 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
   async productosAdmin() {
     const [dist] = await this.db.select().from(sucursales).where(eq(sucursales.tipo, 'distribuidora')).limit(1);
     const [prods, existencias] = await Promise.all([
-      this.db.select({ id: productos.id, webStockMin: productos.webStockMin }).from(productos),
+      /* Los códigos viajan para la subida de fotos EN LOTE (25/8): el panel
+       * empareja cada archivo con su producto por el nombre del archivo, y el
+       * código de barras es el emparejado infalible. El catálogo público no
+       * los trae — y no tiene por qué: esto es del panel, con su permiso. */
+      this.db.select({
+        id: productos.id,
+        webStockMin: productos.webStockMin,
+        codigoBarras: productos.codigoBarras,
+        codigoPropio: productos.codigoPropio,
+      }).from(productos),
       dist
         ? this.db.select().from(stock)
           .where(and(eq(stock.sucursalId, dist.id), eq(stock.estado, 'disponible'), isNull(stock.presentacionId)))
@@ -136,6 +145,8 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
       id: p.id,
       webStockMin: p.webStockMin,
       stockDisp: Math.round((disp.get(p.id) ?? 0) * 100) / 100,
+      codigoBarras: p.codigoBarras || '',
+      codigoPropio: p.codigoPropio || '',
     }));
   }
 
