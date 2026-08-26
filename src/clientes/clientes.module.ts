@@ -50,6 +50,18 @@ export class UpsertClienteDto {
   @IsOptional() @IsBoolean() activo?: boolean;
 }
 
+/**
+ * Los TRES campos del crédito y nada más: el atajo de la pestaña Cuenta
+ * corriente (habilitar sin pasar por la edición completa del cliente) viaja
+ * por acá, y el endpoint entero pide la llave `cta_cte` — no hay ficha que
+ * preservar porque no toca ninguna.
+ */
+export class CreditoClienteDto {
+  @IsBoolean() ctaCteHabilitada!: boolean;
+  @IsOptional() @IsNumber() @Min(0) limiteCredito?: number;
+  @IsOptional() @IsInt() @Min(0) diasPlazo?: number;
+}
+
 /** Solo dígitos: el documento se guarda normalizado para poder compararlo. */
 const soloDigitos = (v?: string) => (v ?? '').replace(/\D/g, '');
 
@@ -241,6 +253,26 @@ export class ClientesService {
     const [c] = await this.db.update(clientes).set({ activo: true }).where(eq(clientes.id, id)).returning();
     return c;
   }
+
+  /**
+   * El crédito solo, sin tocar la ficha. Existe para el atajo de la pestaña
+   * Cuenta corriente: quien tiene la llave habilita (o corrige el límite) ahí
+   * mismo, sin abrir la edición completa del cliente.
+   */
+  async setCredito(id: number, dto: CreditoClienteDto) {
+    const actual = await this.get(id);
+    // El Consumidor Final es el ticket de mostrador: venderle a crédito sería
+    // fiarle a "nadie en particular", y no hay a quién cobrarle después.
+    if (actual.esConsumidorFinal) {
+      throw new BadRequestException('El Consumidor Final no lleva cuenta corriente.');
+    }
+    const [c] = await this.db.update(clientes).set({
+      ctaCteHabilitada: !!dto.ctaCteHabilitada,
+      limiteCredito: Number(dto.limiteCredito) || 0,
+      diasPlazo: Number(dto.diasPlazo) || 0,
+    }).where(eq(clientes.id, id)).returning();
+    return c;
+  }
 }
 
 /**
@@ -272,6 +304,13 @@ export class ClientesController {
 
   @Post(':id/reactivar') @Permiso('ventas.clientes')
   reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }
+
+  /* El atajo del crédito: acá la llave gatea el ENDPOINT entero (no hay ficha
+   * de por medio que un admin pudiera necesitar guardar). */
+  @Patch(':id/credito') @Permiso('cta_cte')
+  credito(@Param('id', ParseIntPipe) id: number, @Body() dto: CreditoClienteDto) {
+    return this.svc.setCredito(id, dto);
+  }
 
   @Delete(':id') @Permiso('ventas.clientes')
   remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
