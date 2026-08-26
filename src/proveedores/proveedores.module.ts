@@ -2,8 +2,10 @@ import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
-import { and, eq } from 'drizzle-orm';
+import {
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min,
+} from 'class-validator';
+import { and, eq, inArray } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
@@ -45,6 +47,15 @@ class UpsertProveedorDto {
    * que manda para el costo es siempre el del formato.
    */
   @IsOptional() @IsNumber() @Min(0) @Max(100) porcSinFactura?: number;
+}
+
+/** Tope de filas por importación de proveedores (el padrón real son ~170). */
+export const MAX_FILAS_IMPORT_PROV = 500;
+
+class ImportarProveedoresDto {
+  @IsArray() @ArrayMaxSize(MAX_FILAS_IMPORT_PROV, {
+    message: `Demasiadas filas en una sola importación (máximo ${MAX_FILAS_IMPORT_PROV}).`,
+  }) filas!: any[];
 }
 
 /* Cómo se muestran los valores de la ficha comercial en la auditoría: el
@@ -250,6 +261,151 @@ export class ProveedoresService {
     });
     return this.percepciones(proveedorId);
   }
+
+  /* ------------------------- IMPORTACIÓN MASIVA (26/8) ------------------------- *
+   * El padrón entero del sistema viejo en una pasada, para la migración. El
+   * PLAN llega armado desde el navegador (vista previa obligatoria), pero acá
+   * se RE-RESUELVE cada fila contra la base — el navegador pudo quedar viejo
+   * entre la vista previa y el confirmar:
+   *
+   *   - por CUIT (si trae uno válido de 11 dígitos) o por nombre normalizado:
+   *     si YA EXISTE, se COMPLETA (solo campos vacíos, nunca pisa lo cargado a
+   *     mano) — así es idempotente: correr dos veces el mismo archivo no rompe.
+   *   - la fila puede traer `proveedorId` (el emparejamiento MANUAL de un
+   *     dudoso en la vista previa: "NUEVO COSMOS S.A" del archivo ES el "Nuevo
+   *     Cosmo S.A. - Lucfel" cargado a mano) y ese gana.
+   *   - lo que no existe se CREA.
+   *
+   * La mitad CONTABLE del archivo (saldos, facturado, vencimientos) NO entra a
+   * propósito: el saldo del CRM nace de los comprobantes, y un número suelto
+   * importado hoy queda viejo mañana. Los saldos iniciales son un paso propio
+   * el día del corte — decisión del dueño, 26/8.
+   */
+  async importar(dto: ImportarProveedoresDto, usuarioId?: number | null) {
+    const filas = dto.filas || [];
+    if (!filas.length) throw new BadRequestException('No hay nada para importar.');
+
+    const norm = (v: any) => String(v ?? '').toLowerCase().normalize('NFD')
+      .replace(/\p{Diacritic}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim();
+    const soloDigitos = (v: any) => String(v ?? '').replace(/\D/g, '');
+    const MEDIOS = new Set(['efectivo', 'transferencia', 'deposito', 'echeq', 'cta_cte']);
+    const CONDICIONES = new Set(['factura', 'liquidacion', 'mixto']);
+
+    const todos = await this.db.select().from(proveedores);
+    const porCuit = new Map(todos.filter((p) => soloDigitos(p.cuit).length === 11)
+      .map((p) => [soloDigitos(p.cuit), p]));
+    const porNombre = new Map(todos.map((p) => [norm(p.nombre), p]));
+    const porId = new Map(todos.map((p) => [p.id, p]));
+
+    const creados: string[] = [];
+    const completados: string[] = [];
+    const saltados: { nombre: string; motivo: string }[] = [];
+
+    await this.db.transaction(async (tx) => {
+      for (const f of filas) {
+        const nombre = String(f?.nombre ?? '').trim();
+        if (!nombre) { saltados.push({ nombre: '(sin nombre)', motivo: 'fila sin nombre' }); continue; }
+
+        const cuit = soloDigitos(f.cuit);
+        const cuitValido = cuit.length === 11 ? cuit : '';
+        const condicion = CONDICIONES.has(f.condicionCompra) ? f.condicionCompra : 'factura';
+        const medio = MEDIOS.has(f.medioHabitual) ? f.medioHabitual : null;
+        const dias = Number(f.diasPago) > 0 ? Math.min(365, Math.round(Number(f.diasPago))) : null;
+        const modo = f.modoCuenta === 'libre' ? 'libre' : 'facturas';
+        const sinFactura = Math.min(100, Math.max(0, Number(f.porcSinFactura) || 0));
+        const esperados = Math.max(0, Math.round(Number(f.productosEsperados) || 0));
+        const cuentas = (Array.isArray(f.cuentas) ? f.cuentas : [])
+          .map((c: any) => ({
+            cbuAlias: String(c?.cbuAlias ?? '').trim().slice(0, 120),
+            descripcion: String(c?.descripcion ?? '').trim().slice(0, 100),
+          }))
+          .filter((c: any) => c.cbuAlias);
+
+        // A quién le toca: el emparejado a mano gana; después el CUIT; después el nombre.
+        const existente = (Number(f.proveedorId) ? porId.get(Number(f.proveedorId)) : null)
+          || (cuitValido ? porCuit.get(cuitValido) : null)
+          || porNombre.get(norm(nombre))
+          || null;
+
+        if (existente) {
+          /* COMPLETAR: solo lo vacío. Los defaults del sistema (condición
+           * "factura", modo "por facturas") se consideran "sin cargar" — la
+           * ficha tocada a mano no se pisa nunca. */
+          await tx.update(proveedores).set({
+            cuit: existente.cuit?.trim() ? existente.cuit : (f.cuit ? String(f.cuit).trim() : ''),
+            email: existente.email?.trim() ? existente.email : String(f.email ?? '').trim(),
+            telefono: existente.telefono?.trim() ? existente.telefono : String(f.telefono ?? '').trim(),
+            condicionCompra: (existente.condicionCompra === 'factura' ? condicion : existente.condicionCompra) as any,
+            medioHabitual: (existente.medioHabitual ?? medio) as any,
+            diasPago: existente.diasPago ?? dias,
+            modoCuenta: (existente.modoCuenta === 'facturas' ? modo : existente.modoCuenta) as any,
+            porcSinFactura: Number(existente.porcSinFactura) > 0 ? existente.porcSinFactura : sinFactura,
+            proveeMercaderia: existente.proveeMercaderia || f.proveeMercaderia !== false,
+            proveeGastos: existente.proveeGastos || f.proveeGastos === true,
+            // La referencia de migración SÍ se pisa siempre: es meta del
+            // archivo, no un dato que alguien haya cargado a mano.
+            productosEsperados: esperados || existente.productosEsperados,
+          }).where(eq(proveedores.id, existente.id));
+
+          if (cuentas.length) {
+            const actuales = await tx.select().from(proveedorCuentas)
+              .where(eq(proveedorCuentas.proveedorId, existente.id));
+            const yaTiene = new Set(actuales.map((c) => c.cbuAlias.trim()));
+            const nuevas = cuentas.filter((c: any) => !yaTiene.has(c.cbuAlias))
+              .slice(0, Math.max(0, 5 - actuales.length))
+              .map((c: any) => ({ ...c, proveedorId: existente.id }));
+            if (nuevas.length) await tx.insert(proveedorCuentas).values(nuevas);
+          }
+          completados.push(nombre);
+          continue;
+        }
+
+        const [p] = await tx.insert(proveedores).values({
+          nombre,
+          cuit: f.cuit ? String(f.cuit).trim() : '',
+          email: String(f.email ?? '').trim(),
+          telefono: String(f.telefono ?? '').trim(),
+          proveeMercaderia: f.proveeMercaderia !== false,
+          proveeGastos: f.proveeGastos === true,
+          condicionCompra: condicion as any,
+          medioHabitual: medio as any,
+          diasPago: dias,
+          modoCuenta: modo as any,
+          porcSinFactura: sinFactura || (condicion === 'liquidacion' ? 100 : 0),
+          productosEsperados: esperados,
+        }).returning();
+        if (cuentas.length) {
+          await tx.insert(proveedorCuentas).values(
+            cuentas.slice(0, 5).map((c: any) => ({ ...c, proveedorId: p.id })),
+          );
+        }
+        // Las filas siguientes del MISMO archivo también lo tienen que ver:
+        // una razón social repetida en el archivo completa, no duplica.
+        porNombre.set(norm(nombre), p);
+        if (cuitValido) porCuit.set(cuitValido, p);
+        creados.push(nombre);
+      }
+    });
+
+    /* Un solo registro de auditoría por corrida: 170 filas de "se creó X"
+     * taparían cualquier otro cambio del registro. */
+    await this.audit.registrar([{
+      entidad: 'proveedor', entidadId: 0, ambito: 'Importación del padrón',
+      campo: 'Importar proveedores', usuarioId: usuarioId ?? null,
+      despues: `${creados.length} creados · ${completados.length} completados · ${saltados.length} saltados`,
+    }]);
+
+    return { ok: true, creados, completados, saltados };
+  }
+
+  /** El tilde manual de "terminé de migrar este proveedor". */
+  async setMigracionLista(id: number, lista: boolean) {
+    await this.get(id);
+    const [p] = await this.db.update(proveedores)
+      .set({ migracionLista: !!lista })
+      .where(eq(proveedores.id, id)).returning();
+    return p;
+  }
 }
 
 @Controller('proveedores')
@@ -284,6 +440,14 @@ export class ProveedoresController {
     return this.svc.setPercepciones(id, body?.percepciones ?? body, sesion?.usuarioId ?? null);
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
+  @Post('importar') importar(@Body() dto: ImportarProveedoresDto, @Auth() sesion: Sesion) {
+    return this.svc.importar(dto, sesion?.usuarioId ?? null);
+  }
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
+  @Post(':id/migracion') migracion(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
+    return this.svc.setMigracionLista(id, !!body?.lista);
+  }
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')

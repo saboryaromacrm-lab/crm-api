@@ -610,6 +610,13 @@
       "when": 1788526800000,
       "tag": "0086_auditoria_de_cambios",
       "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1788613200000,
+      "tag": "0087_migracion_de_proveedores",
+      "breakpoints": true
     }
   ]
 }

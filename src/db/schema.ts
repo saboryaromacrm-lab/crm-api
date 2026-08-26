@@ -181,6 +181,16 @@ export const proveedores = pgTable('proveedores', {
   conciliadoHasta: timestamp('conciliado_hasta', { withTimezone: true }),
   conciliadoPor: integer('conciliado_por'),
   conciliadoAt: timestamp('conciliado_at', { withTimezone: true }),
+  /**
+   * LA MIGRACIÓN DESDE EL SISTEMA VIEJO (0087, 26/8): cuántos productos tiene
+   * este proveedor allá ("Productos asociados" de su export) — referencia para
+   * mostrar el avance "35 de 64" — y el tilde MANUAL de "terminé con este
+   * proveedor". Manual a propósito: el número viejo puede incluir
+   * discontinuados que nunca van a migrar; el que sabe si está completo es el
+   * que carga.
+   */
+  productosEsperados: integer('productos_esperados').notNull().default(0),
+  migracionLista: boolean('migracion_lista').notNull().default(false),
 });
 
 /**

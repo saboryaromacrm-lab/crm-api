@@ -649,17 +649,29 @@ export class ProductosService {
     const codigosPropios = items.map((x) => (x.producto?.codigoPropio ?? '').trim()).filter(Boolean);
     const yaEnBase = codigosPropios.length
       ? await this.db.select({
-        codigoPropio: productos.codigoPropio, nombre: productos.nombre, estado: productos.estado,
+        id: productos.id, codigoPropio: productos.codigoPropio, nombre: productos.nombre, estado: productos.estado,
       }).from(productos).where(inArray(productos.codigoPropio, codigosPropios))
       : [];
-    /* El importador nunca pisa lo que ya existe: lo saltea. Eso también evita
-     * que un archivado REVIVA en silencio porque volvió a aparecer en el CSV —
-     * pero el motivo tiene que decir que está dado de baja, si no el usuario
-     * cree que ya está disponible y en realidad hay que reactivarlo. */
-    const existentes = new Map(yaEnBase.map((p) => [
-      p.codigoPropio,
-      p.estado === 'activo' ? p.nombre : `${p.nombre} — ${p.estado}, hay que reactivarlo`,
-    ]));
+    const existentes = new Map(yaEnBase.map((p) => [p.codigoPropio, p]));
+
+    /* Qué productos ya tienen formato de compra, y de qué proveedores. Es lo
+     * que decide el destino de un producto que YA EXISTE (26/8, migración):
+     * un mismo producto viene en el catálogo de VARIOS proveedores, y la
+     * versión anterior lo salteaba entero — el catálogo del segundo proveedor
+     * dejaba el producto sin su formato de compra y nadie avisaba. Ahora el
+     * existente se VINCULA: se le agrega el formato de compra de este
+     * proveedor, sin tocar el precio (el primero que lo cargó lo sigue
+     * fijando; este entra como alternativa con `usarParaPrecio: false`). */
+    const idsExistentes = yaEnBase.map((p) => p.id);
+    const formatosDeExistentes = idsExistentes.length
+      ? await this.db.select({ productoId: productoProveedores.productoId, proveedorId: productoProveedores.proveedorId })
+        .from(productoProveedores).where(inArray(productoProveedores.productoId, idsExistentes))
+      : [];
+    const provsDeProducto = new Map<number, Set<number>>();
+    for (const f of formatosDeExistentes) {
+      (provsDeProducto.get(f.productoId) ?? provsDeProducto.set(f.productoId, new Set()).get(f.productoId)!)
+        .add(f.proveedorId);
+    }
 
     // Todos los códigos de barras que ya usa el sistema (producto, presentación
     // o formato de venta): uno no puede identificar dos cosas distintas.
@@ -676,6 +688,7 @@ export class ProductosService {
 
     const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
     const aCrear: any[] = [];
+    const aVincular: { productoId: number; nombre: string; codigo: string; esPrimero: boolean; it: any }[] = [];
     const vistosCodigo = new Set<string>();
     const vistosBarras = new Set<string>();
 
@@ -685,8 +698,28 @@ export class ProductosService {
       const nombre = (p.nombre ?? '').trim();
       if (!nombre) { saltados.push({ codigo, nombre, motivo: 'sin nombre' }); continue; }
       if (!codigo) { saltados.push({ codigo, nombre, motivo: 'sin código interno' }); continue; }
-      if (existentes.has(codigo)) {
-        saltados.push({ codigo, nombre, motivo: `ya existe como "${existentes.get(codigo)}"` });
+      const existente = existentes.get(codigo);
+      if (existente) {
+        /* Un archivado no se vincula en silencio: primero hay que decidir si
+         * revive. Y el que ya tiene el formato de ESTE proveedor no tiene nada
+         * que agregar — la actualización de costos es trabajo de la factura. */
+        if (existente.estado === 'archivado') {
+          saltados.push({ codigo, nombre, motivo: `ya existe como "${existente.nombre}" — archivado, hay que reactivarlo` });
+        } else if (provsDeProducto.get(existente.id)?.has(prov.id)) {
+          saltados.push({ codigo, nombre, motivo: `ya existe como "${existente.nombre}" y ya tiene el formato de este proveedor` });
+        } else if (vistosCodigo.has(codigo)) {
+          saltados.push({ codigo, nombre, motivo: 'código repetido en el archivo' });
+        } else {
+          vistosCodigo.add(codigo);
+          aVincular.push({
+            productoId: existente.id,
+            nombre: existente.nombre,
+            codigo,
+            // Sin ningún formato previo no hay quién fije el precio: este pasa a fijarlo.
+            esPrimero: !(provsDeProducto.get(existente.id)?.size),
+            it,
+          });
+        }
         continue;
       }
       if (vistosCodigo.has(codigo)) { saltados.push({ codigo, nombre, motivo: 'código repetido en el archivo' }); continue; }
@@ -705,7 +738,9 @@ export class ProductosService {
       aCrear.push(it);
     }
 
-    if (!aCrear.length) return { ok: true, creados: 0, saltados, marcasCreadas: [], rubrosCreados: [] };
+    if (!aCrear.length && !aVincular.length) {
+      return { ok: true, creados: 0, vinculados: [], saltados, marcasCreadas: [], rubrosCreados: [] };
+    }
 
     /* ---- Marcas y rubros por nombre: se reusa lo que hay, se crea lo que falta ---- */
     const marcasCreadas: string[] = [];
@@ -844,13 +879,45 @@ export class ProductosService {
           }
         }
       }
+
+      /* ---- Los EXISTENTES que este proveedor también vende (26/8) ----
+       * Solo se les agrega el formato de compra de este proveedor: ni la ficha
+       * ni el precio de venta se tocan — eso ya lo administra quien lo cargó
+       * primero. `usarParaPrecio` solo si el producto no tenía ningún formato
+       * (huérfano de costo): ahí este pasa a fijar el precio porque no hay
+       * alternativa. */
+      for (const v of aVincular) {
+        const f = v.it.formatoCompra || {};
+        await tx.insert(productoProveedores).values({
+          productoId: v.productoId,
+          proveedorId: prov.id,
+          cantidad: Number(f.cantidad) > 0 ? Number(f.cantidad) : 1,
+          costo: Number(f.costo) || 0,
+          descuento: Number(f.descuento) || 0,
+          descuento2: Number(f.descuento2) || 0,
+          descuento3: Number(f.descuento3) || 0,
+          descuento4: Number(f.descuento4) || 0,
+          flete: Number(f.flete) || 0,
+          modoCosto: f.modoCosto === 'final' ? 'final' : 'lista',
+          costoFinal: Number(f.costoFinal) || 0,
+          usarParaPrecio: v.esPrimero,
+          codigoProveedor: (f.codigoProveedor ?? '').trim(),
+        });
+      }
     });
 
     // El primer precio de cada producto queda en la evolución: un solo snapshot
     // para todos, no uno por producto (son cientos).
     if (ids.length) await this.evolucion.snapshot(ids, 'inicial');
 
-    return { ok: true, creados: ids.length, saltados, marcasCreadas, rubrosCreados };
+    return {
+      ok: true,
+      creados: ids.length,
+      vinculados: aVincular.map((v) => ({ codigo: v.codigo, nombre: v.nombre, fijaPrecio: v.esPrimero })),
+      saltados,
+      marcasCreadas,
+      rubrosCreados,
+    };
   }
 
   async update(id: number, dto: UpsertProductoDto) {
