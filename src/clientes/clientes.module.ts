@@ -10,7 +10,7 @@
  *  2. Un cliente con historial NUNCA se borra: baja lógica (`activo=false`).
  */
 import {
-  Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
+  Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
@@ -18,7 +18,7 @@ import {
 } from 'class-validator';
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { clientes, cobranzas, presupuestos, ventas } from '../db/schema';
 
 const COND_IVA = ['responsable_inscripto', 'monotributo', 'consumidor_final', 'exento', 'no_categorizado'] as const;
@@ -52,6 +52,21 @@ export class UpsertClienteDto {
 
 /** Solo dígitos: el documento se guarda normalizado para poder compararlo. */
 const soloDigitos = (v?: string) => (v ?? '').replace(/\D/g, '');
+
+/**
+ * LA LLAVE DEL CRÉDITO (26/8/2026). Cargar la ficha es de `ventas.clientes`;
+ * habilitar la cuenta corriente y fijar el límite es OTORGAR CRÉDITO, y eso
+ * pide la acción `cta_cte` — que ningún rol trae de fábrica, así que arranca
+ * siendo solo del superadmin (`*`). El candado va a nivel CAMPO y no de
+ * endpoint, porque es el mismo formulario: el admin sigue creando y editando
+ * el cliente entero, y los tres campos del crédito viajan solo si los puede
+ * tocar.
+ */
+const conLlaveCredito = (sesion?: Sesion) =>
+  !!sesion?.permisos && (sesion.permisos.includes('*') || sesion.permisos.includes('cta_cte'));
+
+const SIN_LLAVE_CREDITO =
+  'Habilitar la cuenta corriente y fijar su límite pide la llave "Cuenta corriente" (Gerencia › Usuarios y roles). El resto de la ficha se guarda igual si no tocás esos campos.';
 
 @Injectable()
 export class ClientesService {
@@ -139,8 +154,14 @@ export class ClientesService {
     };
   }
 
-  async create(dto: UpsertClienteDto) {
+  async create(dto: UpsertClienteDto, puedeCredito = true) {
     if (!dto.nombre?.trim()) throw new BadRequestException('Ingresá el nombre o razón social.');
+    // Sin la llave, un alta con crédito ya cargado se rechaza con nombre y
+    // apellido — ignorarlo en silencio guardaría un cliente distinto del que
+    // el usuario cree haber creado.
+    if (!puedeCredito && (dto.ctaCteHabilitada || Number(dto.limiteCredito) > 0 || Number(dto.diasPlazo) > 0)) {
+      throw new ForbiddenException(SIN_LLAVE_CREDITO);
+    }
     const doc = await this.validarDocumento(dto);
     const [c] = await this.db.insert(clientes)
       .values({ ...this.valores(dto, doc), activo: dto.activo ?? true })
@@ -148,12 +169,28 @@ export class ClientesService {
     return c;
   }
 
-  async update(id: number, dto: UpsertClienteDto) {
+  async update(id: number, dto: UpsertClienteDto, puedeCredito = true) {
     const actual = await this.get(id);
     if (!dto.nombre?.trim()) throw new BadRequestException('Ingresá el nombre o razón social.');
 
     const doc = await this.validarDocumento(dto, id);
     const values: Record<string, any> = { ...this.valores(dto, doc), activo: dto.activo ?? actual.activo };
+
+    /* Sin la llave, los tres campos del crédito se PRESERVAN tal como están.
+     * No alcanza con "no exigirlos": `valores()` traduce ausente a false/0,
+     * así que un PATCH sin la llave y sin estos campos APAGARÍA la cuenta
+     * corriente de paso. Y si el pedido intenta cambiarlos, se rechaza
+     * fuerte: un candado que ignora en silencio enseña que el botón anda. */
+    if (!puedeCredito) {
+      const intenta =
+        (dto.ctaCteHabilitada !== undefined && !!dto.ctaCteHabilitada !== actual.ctaCteHabilitada) ||
+        (dto.limiteCredito !== undefined && Number(dto.limiteCredito) !== Number(actual.limiteCredito)) ||
+        (dto.diasPlazo !== undefined && Number(dto.diasPlazo) !== Number(actual.diasPlazo));
+      if (intenta) throw new ForbiddenException(SIN_LLAVE_CREDITO);
+      values.ctaCteHabilitada = actual.ctaCteHabilitada;
+      values.limiteCredito = actual.limiteCredito;
+      values.diasPlazo = actual.diasPlazo;
+    }
 
     // El Consumidor Final es un cliente del sistema: no se le cambia lo fiscal
     // ni se lo desactiva, porque el punto de venta siempre tiene que encontrarlo.
@@ -224,10 +261,14 @@ export class ClientesController {
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
   @Post() @Permiso('ventas.clientes')
-  create(@Body() dto: UpsertClienteDto) { return this.svc.create(dto); }
+  create(@Body() dto: UpsertClienteDto, @Auth() sesion: Sesion) {
+    return this.svc.create(dto, conLlaveCredito(sesion));
+  }
 
   @Patch(':id') @Permiso('ventas.clientes')
-  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertClienteDto) { return this.svc.update(id, dto); }
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertClienteDto, @Auth() sesion: Sesion) {
+    return this.svc.update(id, dto, conLlaveCredito(sesion));
+  }
 
   @Post(':id/reactivar') @Permiso('ventas.clientes')
   reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }

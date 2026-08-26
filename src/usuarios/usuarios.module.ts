@@ -117,6 +117,15 @@ export const CATALOGO_PERMISOS = [
        * primero todos los días y no lo segundo nunca.
        */
       { clave: 'nota_credito', nombre: 'Emitir notas de crédito (comprobante fiscal)' },
+      /*
+       * LA LLAVE DEL CRÉDITO (26/8/2026, decisión del dueño). Cargar la ficha
+       * del cliente es del admin; habilitarle cuenta corriente y ponerle el
+       * límite es OTORGAR CRÉDITO del negocio, y eso lo decide el superadmin.
+       * Sin migración a propósito: ningún rol la trae, así que solo pasa el
+       * `*` del superadmin — el día que quiera delegarla, se tilda en
+       * Gerencia › Usuarios y roles y listo, sin tocar código.
+       */
+      { clave: 'cta_cte', nombre: 'Clientes: habilitar cuenta corriente y fijar límite' },
       { clave: 'diferencias', nombre: 'Diferencias de caja (mover plata del cajón)' },
       { clave: 'ofertas', nombre: 'Crear y editar ofertas' },
       /*
