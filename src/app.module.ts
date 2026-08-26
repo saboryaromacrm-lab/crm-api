@@ -31,6 +31,7 @@ import { VencimientosModule } from './vencimientos/vencimientos.module';
 import { ChatModule } from './chat/chat.module';
 import { GerenciaModule } from './gerencia/gerencia.module';
 import { AuditoriaModule } from './auditoria/auditoria.module';
+import { RespaldosModule } from './respaldos/respaldos.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { AuditoriaModule } from './auditoria/auditoria.module';
     // los 224 endpoints. Cerrado por defecto; lo público se marca a mano.
     AuthModule,
     AuditoriaModule,
+    RespaldosModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,

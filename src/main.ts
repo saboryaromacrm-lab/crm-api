@@ -79,7 +79,9 @@ async function bootstrap() {
 
   const origins = (config.get<string>('CORS_ORIGINS') ?? 'http://localhost:3000,http://localhost:5173')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  app.enableCors({ origin: origins, credentials: true });
+  // exposedHeaders: sin esto el fetch del dashboard no puede LEER el
+  // Content-Disposition y la descarga del respaldo pierde su nombre con fecha.
+  app.enableCors({ origin: origins, credentials: true, exposedHeaders: ['Content-Disposition'] });
 
   const port = Number(config.get('PORT') ?? 3001);
   /*
