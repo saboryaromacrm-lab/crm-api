@@ -532,10 +532,11 @@ export class UsuariosService {
      * body y es obligatoria.
      */
     const terminal = await terminalPorToken(this.db, o?.terminalToken);
-    const sucursalId = terminal ? terminal.sucursalId : Number(o?.sucursalId);
-    if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
-      throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
-    }
+    /* La validación dura de la sucursal se corrió DESPUÉS de verificar la
+     * contraseña (26/8): el superadmin puede omitirla, y saber si este usuario
+     * lo es recién se puede —sin regalarle el dato a cualquiera— con el login
+     * ya aceptado. Acá solo se parsea; con NaN no se consulta nada. */
+    let sucursalId = terminal ? terminal.sucursalId : Number(o?.sucursalId);
     // El freno va ANTES de mirar la contraseña: es lo que evita que se puedan
     // probar las 10.000 claves de 4 dígitos.
     this.freno.revisar(usuarioId, ip);
@@ -568,9 +569,29 @@ export class UsuariosService {
       throw new UnauthorizedException('Contraseña incorrecta.');
     }
     this.freno.exito(usuarioId, ip);
+    const [r] = await this.db.select().from(roles).where(eq(roles.id, u.rolId)).limit(1);
+
+    /*
+     * EL SUPERADMIN ENTRA SIN ELEGIR SUCURSAL (26/8, pedido del dueño): opera
+     * sobre todo el negocio desde cualquier máquina, así que obligarlo a
+     * declarar un local era una pregunta sin respuesta correcta. Si la omite,
+     * queda parado en LA CENTRAL (la primera sucursal) y la cambia cuando
+     * quiera con el selector del encabezado, que deja rastro en la sesión.
+     *
+     * Para cualquier otro rol la sucursal sigue siendo obligatoria — es su
+     * contexto de trabajo y de arqueo. Y en un equipo registrado la terminal
+     * manda para todos, superadmin incluido (0081): ahí tampoco hay pregunta.
+     */
+    if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
+      const esSuper = r?.clave === 'superadmin' || (Array.isArray(r?.permisos) && (r.permisos as string[]).includes('*'));
+      if (!esSuper) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
+      const [central] = await this.db.select().from(sucursales).orderBy(sucursales.id).limit(1);
+      if (!central) throw new UnauthorizedException('No hay sucursales cargadas.');
+      sucursalId = central.id;
+    }
+
     const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     if (!suc) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
-    const [r] = await this.db.select().from(roles).where(eq(roles.id, u.rolId)).limit(1);
 
     /*
      * ACÁ NACE LA CREDENCIAL. Antes esto devolvía el usuario y terminaba: el
