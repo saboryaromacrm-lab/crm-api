@@ -220,6 +220,60 @@ class CreateComprobanteDto {
   compromisos?: CompromisoNuevoDto[];
 }
 
+/**
+ * Un renglón al FACTURAR UN REMITO (26/8): el producto y la cantidad están
+ * CLAVADOS —son lo que entró al depósito—, y lo único que el papel puede traer
+ * distinto es el precio. Por eso el renglón viaja por su `itemId` y no por
+ * producto: no hay ambigüedad ni forma de colar mercadería nueva.
+ */
+class FacturarItemDto {
+  @IsInt() itemId!: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) costoUnitario?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
+  @IsOptional() @IsNumber() @IsIn(ALICUOTAS_IVA as unknown as number[], {
+    message: `Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_TEXTO}%.`,
+  }) iva?: number;
+}
+
+/**
+ * LLEGÓ LA FACTURA DE UN REMITO (26/8). Es el `CreateComprobanteDto` de una
+ * factura menos todo lo que el remito ya decidió: ni tipo, ni proveedor, ni
+ * sucursal, ni ítems nuevos — solo el encabezado del papel, los precios reales
+ * de los renglones, el pie y cómo se paga.
+ */
+class FacturarRemitoDto {
+  @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
+  @IsOptional() @IsString() puntoVenta?: string;
+  @IsOptional() @IsInt() numero?: number;
+  /** La fecha DEL PAPEL: define el período fiscal de la factura. */
+  @IsOptional() @IsString() fecha?: string;
+  @IsOptional() @IsString() fechaCarga?: string;
+  @IsOptional() @IsString() vencimientoPago?: string;
+  /** El CAE del papel (del QR o del PDF). */
+  @IsOptional() @IsString() cae?: string;
+  /** El papel de la bandeja que esta factura cierra (si entró por ahí). */
+  @IsOptional() @IsInt() lecturaId?: number;
+  @IsOptional() @IsString() observaciones?: string;
+  @IsOptional() @IsNumber() bonificacion?: number;
+  @IsOptional() @IsNumber() bonificacionImporte?: number;
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => PercepcionDto)
+  percepciones?: PercepcionDto[];
+  /** Precios corregidos de los renglones del remito. Los que no vengan quedan como estaban. */
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => FacturarItemDto)
+  items?: FacturarItemDto[];
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ActualizarCostoDto)
+  actualizarCostos?: ActualizarCostoDto[];
+  @IsOptional() @IsArray() @IsInt({ each: true })
+  activarProveedor?: number[];
+  @IsOptional() @ValidateNested() @Type(() => PagoContadoDto)
+  pagoContado?: PagoContadoDto;
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => TomarPagoDto)
+  tomarPagos?: TomarPagoDto[];
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => CompromisoNuevoDto)
+  compromisos?: CompromisoNuevoDto[];
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
 @Injectable()
 export class ComprobantesService {
   constructor(
@@ -529,6 +583,256 @@ export class ComprobantesService {
     }
   }
 
+  /* ------------------------- EL PIE DE LA FACTURA -------------------------
+   * En el mismo orden en que lo lee el papel: los renglones dan el bruto, la
+   * bonificación general lo baja, el IVA se calcula sobre el neto YA
+   * bonificado (si se calculara antes, el IVA quedaría más alto que el de la
+   * factura) y las percepciones se suman al final — no son IVA, son pago a
+   * cuenta de otro impuesto.
+   *
+   * Es UN método porque lo usan dos puertas: el alta (`create`) y la
+   * conversión del remito (`facturar`). El mismo papel tiene que dar el mismo
+   * total entre por donde entre.
+   */
+  private armarPie(
+    entrada: {
+      items: Array<Record<string, any>>;
+      bonificacion?: number; bonificacionImporte?: number; percepciones?: PercepcionDto[];
+    },
+    fiscal: boolean,
+    ivaDefault: number,
+  ) {
+    let bruto = 0;
+    // El spread conserva los campos del renglón original (productoId, itemId…);
+    // el tipo se abre a propósito porque las dos puertas traen formas distintas.
+    const items: Array<Record<string, any> & { iva: number; subtotal: number }> = entrada.items.map((it) => {
+      const cantidad = Number(it.cantidad) || 0;
+      const costo = Number(it.costoUnitario) || 0;
+      const desc = Number(it.descuento) || 0;
+      const ivaP = it.iva != null ? Number(it.iva) : ivaDefault;
+      const neto = cantidad * costo * (1 - desc / 100);
+      bruto += neto;
+      return { ...it, iva: ivaP, subtotal: neto };
+    });
+
+    // La bonificación llega como % o como importe: el IMPORTE manda cuando
+    // viene, porque el proveedor redondea a su manera y el total tiene que dar
+    // igual al del papel, al centavo.
+    const bonifPct = Number(entrada.bonificacion) || 0;
+    if (bonifPct < 0 || bonifPct >= 100) {
+      if (bonifPct !== 0) throw new BadRequestException('La bonificación tiene que estar entre 0 y 100%.');
+    }
+    let bonificacionImporte = entrada.bonificacionImporte != null
+      ? Number(entrada.bonificacionImporte) || 0
+      : r2(bruto * bonifPct / 100);
+    /*
+     * EL SIGNO SE VALIDA ANTES DEL TECHO, y no es un detalle de orden.
+     *
+     * El techo de abajo compara `bonificacionImporte > bruto`. Con una
+     * bonificación NEGATIVA la comparación es falsa —así que el techo no se
+     * dispara—, y el clamp que sigue la deja en 0… pero antes ya había sumado al
+     * bruto: mandando ítems que dieran bruto negativo se grababa un comprobante
+     * con TOTAL NEGATIVO, que resta de la cuenta corriente del proveedor como
+     * una nota de crédito que nadie emitió.
+     */
+    if (!(bonificacionImporte >= 0)) {
+      throw new BadRequestException('La bonificación no puede ser negativa.');
+    }
+    if (bonificacionImporte > bruto + 0.009) {
+      throw new BadRequestException('La bonificación no puede ser mayor que el subtotal de los ítems.');
+    }
+    if (bonificacionImporte < 0) bonificacionImporte = 0;
+    // El factor real, para repartir la bonificación entre los renglones y que
+    // el libro de IVA cierre con el neto gravado de cada alícuota.
+    const factorBonif = bruto > 0 ? 1 - bonificacionImporte / bruto : 1;
+
+    /*
+     * EN UNA LIQUIDACIÓN EL IVA ES CERO, y se fuerza acá y no en la pantalla.
+     *
+     * No es cosmético: si el renglón guardara su 21%, el importe existiría en la
+     * base y cualquier suma futura de IVA de compras lo levantaría como crédito
+     * fiscal de una factura que no existe. El precio de la mitad no facturada ya
+     * viene sin IVA — es la razón por la que es más barata.
+     */
+    let subtotalNeto = 0;
+    let ivaTotal = 0;
+    for (const it of items) {
+      const neto = it.subtotal * factorBonif;
+      it.subtotal = neto;
+      subtotalNeto += neto;
+      if (!fiscal) it.iva = 0;
+      ivaTotal += neto * it.iva / 100;
+    }
+
+    // Percepciones: cada una con su nombre y alícuota copiados del proveedor,
+    // porque la factura del año pasado tiene que seguir explicando su total.
+    const conIva = subtotalNeto + ivaTotal;
+    // Las percepciones son pago a cuenta de un impuesto: en un comprobante que
+    // no existe para ARCA no hay nada a cuenta de qué. Se descartan.
+    const percepciones = (fiscal ? (entrada.percepciones ?? []) : [])
+      .filter((p) => (p?.nombre ?? '').trim())
+      .map((p) => {
+        const base = p.base === 'total' ? 'total' : 'neto';
+        const alicuota = Number(p.alicuota) || 0;
+        const calculado = (base === 'total' ? conIva : subtotalNeto) * alicuota / 100;
+        // El importe del papel gana: el proveedor puede redondear distinto.
+        const importe = p.importe != null ? Number(p.importe) || 0 : r2(calculado);
+        return { nombre: String(p.nombre).trim(), alicuota, base: base as 'neto' | 'total', importe };
+      })
+      .filter((p) => p.importe > 0.009);
+    const percepcionesTotal = percepciones.reduce((a, p) => a + p.importe, 0);
+
+    const total = subtotalNeto + ivaTotal + percepcionesTotal;
+    return { items, bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total };
+  }
+
+  /**
+   * LAS CUOTAS DEL COMPROMISO, normalizadas y validadas contra el saldo que
+   * queda en cuenta corriente (el total menos lo que se paga en el mismo acto).
+   * Compartida por el alta y la conversión del remito: comprometer plata que ya
+   * se pagó infla el saldo proyectado, entre por donde entre la factura.
+   */
+  private normalizarCompromisos(
+    dto: { compromisos?: CompromisoNuevoDto[]; pagoContado?: PagoContadoDto; tomarPagos?: TomarPagoDto[] },
+    total: number,
+  ) {
+    const compromisosNorm = (dto.compromisos ?? []).map((k) => ({
+      importe: r2(k.importe),
+      fechaVenc: new Date(`${String(k.fechaVenc).slice(0, 10)}T00:00:00`),
+      obs: String(k.obs ?? '').trim().slice(0, 300),
+    }));
+    if (!compromisosNorm.length) return compromisosNorm;
+    for (const k of compromisosNorm) {
+      if (Number.isNaN(k.fechaVenc.getTime())) {
+        throw new BadRequestException('La fecha de vencimiento del compromiso va como AAAA-MM-DD.');
+      }
+    }
+    /* Las cuotas cubren LO QUE QUEDA EN CUENTA CORRIENTE: el total menos lo
+     * que se paga en el mismo acto (contado + pagos de sucursal tomados). */
+    const sumaComp = r2(compromisosNorm.reduce((a, k) => a + k.importe, 0));
+    const contadoPrevisto = r2((Number(dto.pagoContado?.importe) || 0)
+      + (dto.tomarPagos ?? []).reduce((a, t) => a + (Number(t.importe) || 0), 0));
+    const saldoPrevisto = r2(total - contadoPrevisto);
+    if (Math.abs(sumaComp - saldoPrevisto) > 0.009) {
+      throw new BadRequestException(
+        `Los compromisos suman ${sumaComp} y lo que queda en cuenta corriente es ${saldoPrevisto}: las cuotas tienen que cubrir ese saldo exacto.`,
+      );
+    }
+    return compromisosNorm;
+  }
+
+  /**
+   * EL COMPROMISO NACE CON LA FACTURA (0068), en la misma transacción: si la
+   * factura no queda, la promesa tampoco. Si el proveedor cobra con ECHEQ,
+   * nace también el echeq con número y banco "a completar" — el papel del
+   * echeq se emite después, y la cartera lo espera con nombre.
+   */
+  private async crearCompromisosTx(
+    tx: any,
+    c: { id: number; fecha: Date; puntoVenta: string; numero: number | null },
+    prov: { id: number; medioHabitual?: string | null },
+    compromisosNorm: Array<{ importe: number; fechaVenc: Date; obs: string }>,
+    nombreDoc: string,
+  ) {
+    const esEcheq = prov.medioHabitual === 'echeq';
+    const n = compromisosNorm.length;
+    for (let i = 0; i < n; i++) {
+      const k = compromisosNorm[i];
+      const [comp] = await tx.insert(proveedorCompromisos).values({
+        proveedorId: prov.id,
+        comprobanteId: c.id,
+        importe: k.importe,
+        fechaEmision: c.fecha,
+        fechaVenc: k.fechaVenc,
+        origen: 'factura',
+        esEcheq,
+        cuota: n > 1 ? i + 1 : null,
+        cuotas: n > 1 ? n : null,
+        obs: k.obs,
+      }).returning();
+      if (esEcheq) {
+        await tx.insert(proveedorEcheqs).values({
+          numero: `PEND-${comp.id}`,
+          banco: 'A definir',
+          importe: k.importe,
+          fechaEmision: c.fecha,
+          fechaVenc: k.fechaVenc,
+          proveedorId: prov.id,
+          compromisoId: comp.id,
+          obs: `Auto-creado con ${nombreDoc} ${c.puntoVenta}-${c.numero ?? c.id} — completar número y banco reales.`,
+        });
+      }
+    }
+  }
+
+  /*
+   * EL PAGO EN EL MISMO ACTO, después del commit del comprobante y a propósito.
+   *
+   * Va afuera de la transacción porque `PagosProveedorService` maneja la suya
+   * (el pago, su egreso de caja y el recálculo son una sola operación). Si el
+   * pago falla —turno cerrado, el pago que se quiso tomar ya no tiene saldo—,
+   * el comprobante queda cargado y con deuda: un estado válido y recuperable
+   * desde el detalle. Perder también la carga de la factura sería peor.
+   *
+   * Al final, la CONDICIÓN se deriva de lo que realmente se pagó: quedó
+   * saldado = contado, quedó saldo = cuenta corriente. Así el campo no puede
+   * contradecir al saldo.
+   */
+  private async saldarEnElActo(
+    id: number,
+    args: {
+      proveedorId: number; concepto: string; fecha?: string; sucursalId?: number | null; usuarioId?: number;
+      tomarPagos?: TomarPagoDto[]; pagoContado?: PagoContadoDto;
+    },
+    opciones: { sucursalSesion: number; cruzaSucursales?: boolean },
+  ) {
+    // Primero los pagos que ya existían: es plata que ya salió del cajón y
+    // la factura viene a explicarla.
+    for (const t of args.tomarPagos ?? []) {
+      /* El `true` final: esta imputación pasa DENTRO del alta, donde el total
+       * ya se validó completo (contado + tomados + cuotas = total exacto).
+       * Sin él, el candado del modo "por facturas" rechazaba lo más común —
+       * el flete adelantado, el vuelto que se le dejó al repartidor— por ser
+       * un importe menor al saldo de la factura. */
+      await this.pagos.imputar(Number(t.pagoId), {
+        imputaciones: [{ comprobanteId: id, importe: Number(t.importe) }],
+        usuarioId: args.usuarioId,
+      }, opciones.cruzaSucursales, true);
+    }
+    // Y después el resto que se paga en el acto.
+    const contado = Number(args.pagoContado?.importe) || 0;
+    if (contado > 0) {
+      await this.pagos.crear({
+        proveedorId: args.proveedorId,
+        destino: 'mercaderia',
+        importe: contado,
+        medio: args.pagoContado?.medio,
+        fecha: args.fecha,
+        concepto: args.concepto,
+        referencia: args.pagoContado?.referencia,
+        sucursalId: args.sucursalId ?? undefined,
+        cajaSesionId: args.pagoContado?.cajaSesionId,
+        usuarioId: args.usuarioId,
+        imputaciones: [{ comprobanteId: id, importe: contado }],
+        // Mismo motivo que arriba: el contado puede ser una entrega parcial
+        // con el resto en cuotas, y el total ya se validó completo.
+      }, opciones.sucursalSesion, opciones.cruzaSucursales, true);
+    }
+
+    /*
+     * Se fija UNA vez, al crear: describe cómo se acordó esta compra. Que una
+     * factura en cuenta corriente se pague después no la convierte en contado.
+     */
+    if ((args.tomarPagos?.length || contado > 0)) {
+      const [final] = await this.db.select({ total: comprobantes.total, pagado: comprobantes.pagado })
+        .from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
+      const saldado = final && final.pagado >= final.total - 0.009;
+      await this.db.update(comprobantes)
+        .set({ condicionPago: saldado ? 'contado' : 'cuenta_corriente' })
+        .where(eq(comprobantes.id, id));
+    }
+  }
+
   async create(
     dto: CreateComprobanteDto,
     opciones: { puedeTocarPrecios?: boolean; sucursalSesion: number; cruzaSucursales?: boolean },
@@ -562,93 +866,14 @@ export class ComprobantesService {
     const discrimina = prov.condicionIva === 'responsable_inscripto';
     const ivaDefault = discrimina ? 21 : 0;
 
-    /* ------------------------- EL PIE DE LA FACTURA -------------------------
-     * En el mismo orden en que lo lee el papel: los renglones dan el bruto, la
-     * bonificación general lo baja, el IVA se calcula sobre el neto YA
-     * bonificado (si se calculara antes, el IVA quedaría más alto que el de la
-     * factura) y las percepciones se suman al final — no son IVA, son pago a
-     * cuenta de otro impuesto.
-     */
-    let bruto = 0;
-    const items = dto.items.map((it) => {
-      const cantidad = Number(it.cantidad) || 0;
-      const costo = Number(it.costoUnitario) || 0;
-      const desc = Number(it.descuento) || 0;
-      const ivaP = it.iva != null ? Number(it.iva) : ivaDefault;
-      const neto = cantidad * costo * (1 - desc / 100);
-      bruto += neto;
-      return { ...it, iva: ivaP, subtotal: neto };
-    });
-
-    // La bonificación llega como % o como importe: el IMPORTE manda cuando
-    // viene, porque el proveedor redondea a su manera y el total tiene que dar
-    // igual al del papel, al centavo.
-    const bonifPct = Number(dto.bonificacion) || 0;
-    if (bonifPct < 0 || bonifPct >= 100) {
-      if (bonifPct !== 0) throw new BadRequestException('La bonificación tiene que estar entre 0 y 100%.');
-    }
-    let bonificacionImporte = dto.bonificacionImporte != null
-      ? Number(dto.bonificacionImporte) || 0
-      : r2(bruto * bonifPct / 100);
-    /*
-     * EL SIGNO SE VALIDA ANTES DEL TECHO, y no es un detalle de orden.
-     *
-     * El techo de abajo compara `bonificacionImporte > bruto`. Con una
-     * bonificación NEGATIVA la comparación es falsa —así que el techo no se
-     * dispara—, y el clamp que sigue la deja en 0… pero antes ya había sumado al
-     * bruto: mandando ítems que dieran bruto negativo se grababa un comprobante
-     * con TOTAL NEGATIVO, que resta de la cuenta corriente del proveedor como
-     * una nota de crédito que nadie emitió.
-     */
-    if (!(bonificacionImporte >= 0)) {
-      throw new BadRequestException('La bonificación no puede ser negativa.');
-    }
-    if (bonificacionImporte > bruto + 0.009) {
-      throw new BadRequestException('La bonificación no puede ser mayor que el subtotal de los ítems.');
-    }
-    if (bonificacionImporte < 0) bonificacionImporte = 0;
-    // El factor real, para repartir la bonificación entre los renglones y que
-    // el libro de IVA cierre con el neto gravado de cada alícuota.
-    const factorBonif = bruto > 0 ? 1 - bonificacionImporte / bruto : 1;
-
-    /*
-     * EN UNA LIQUIDACIÓN EL IVA ES CERO, y se fuerza acá y no en la pantalla.
-     *
-     * No es cosmético: si el renglón guardara su 21%, el importe existiría en la
-     * base y cualquier suma futura de IVA de compras lo levantaría como crédito
-     * fiscal de una factura que no existe. El precio de la mitad no facturada ya
-     * viene sin IVA — es la razón por la que es más barata.
-     */
+    /* EL PIE DE LA FACTURA — la cuenta vive en `armarPie()`, compartida con
+     * `facturar()` (la conversión del remito): dos copias de esta matemática
+     * habrían divergido tarde o temprano y el total dejaría de cerrar con el
+     * papel según por qué puerta se cargó. */
     const fiscal = esFiscal(dto.tipo);
-    let subtotalNeto = 0;
-    let ivaTotal = 0;
-    for (const it of items) {
-      const neto = it.subtotal * factorBonif;
-      it.subtotal = neto;
-      subtotalNeto += neto;
-      if (!fiscal) it.iva = 0;
-      ivaTotal += neto * it.iva / 100;
-    }
-
-    // Percepciones: cada una con su nombre y alícuota copiados del proveedor,
-    // porque la factura del año pasado tiene que seguir explicando su total.
-    const conIva = subtotalNeto + ivaTotal;
-    // Las percepciones son pago a cuenta de un impuesto: en un comprobante que
-    // no existe para ARCA no hay nada a cuenta de qué. Se descartan.
-    const percepciones = (fiscal ? (dto.percepciones ?? []) : [])
-      .filter((p) => (p?.nombre ?? '').trim())
-      .map((p) => {
-        const base = p.base === 'total' ? 'total' : 'neto';
-        const alicuota = Number(p.alicuota) || 0;
-        const calculado = (base === 'total' ? conIva : subtotalNeto) * alicuota / 100;
-        // El importe del papel gana: el proveedor puede redondear distinto.
-        const importe = p.importe != null ? Number(p.importe) || 0 : r2(calculado);
-        return { nombre: String(p.nombre).trim(), alicuota, base: base as 'neto' | 'total', importe };
-      })
-      .filter((p) => p.importe > 0.009);
-    const percepcionesTotal = percepciones.reduce((a, p) => a + p.importe, 0);
-
-    const total = subtotalNeto + ivaTotal + percepcionesTotal;
+    const {
+      items, bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total,
+    } = this.armarPie(dto, fiscal, ivaDefault);
     /*
      * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
      *
@@ -742,33 +967,10 @@ export class ComprobantesService {
      */
     const puedeComprometer = estado === 'confirmado'
       && (dto.tipo === 'factura' || dto.tipo === 'liquidacion');
-    const compromisosNorm = (dto.compromisos ?? []).map((k) => ({
-      importe: r2(k.importe),
-      fechaVenc: new Date(`${String(k.fechaVenc).slice(0, 10)}T00:00:00`),
-      obs: String(k.obs ?? '').trim().slice(0, 300),
-    }));
-    if (compromisosNorm.length) {
-      if (!puedeComprometer) {
-        throw new BadRequestException('Los compromisos de pago son de una factura o liquidación confirmada.');
-      }
-      for (const k of compromisosNorm) {
-        if (Number.isNaN(k.fechaVenc.getTime())) {
-          throw new BadRequestException('La fecha de vencimiento del compromiso va como AAAA-MM-DD.');
-        }
-      }
-      /* Las cuotas cubren LO QUE QUEDA EN CUENTA CORRIENTE: el total menos lo
-       * que se paga en el mismo acto (contado + pagos de sucursal tomados).
-       * Comprometer plata que ya se pagó infla el saldo proyectado. */
-      const sumaComp = r2(compromisosNorm.reduce((a, k) => a + k.importe, 0));
-      const contadoPrevisto = r2((Number(dto.pagoContado?.importe) || 0)
-        + (dto.tomarPagos ?? []).reduce((a, t) => a + (Number(t.importe) || 0), 0));
-      const saldoPrevisto = r2(total - contadoPrevisto);
-      if (Math.abs(sumaComp - saldoPrevisto) > 0.009) {
-        throw new BadRequestException(
-          `Los compromisos suman ${sumaComp} y lo que queda en cuenta corriente es ${saldoPrevisto}: las cuotas tienen que cubrir ese saldo exacto.`,
-        );
-      }
+    if (dto.compromisos?.length && !puedeComprometer) {
+      throw new BadRequestException('Los compromisos de pago son de una factura o liquidación confirmada.');
     }
+    const compromisosNorm = this.normalizarCompromisos(dto, total);
 
     /**
      * El mismo comprobante no se carga dos veces. El índice único de la base es
@@ -860,42 +1062,9 @@ export class ComprobantesService {
         );
       }
 
-      /*
-       * EL COMPROMISO NACE CON LA FACTURA (0068), en la misma transacción: si
-       * la factura no queda, la promesa tampoco. Si el proveedor cobra con
-       * ECHEQ, nace también el echeq con número y banco "a completar" — el
-       * papel del echeq se emite después, y la cartera lo espera con nombre.
-       */
+      /* El compromiso (0068) nace en la MISMA transacción — ver `crearCompromisosTx`. */
       if (compromisosNorm.length) {
-        const esEcheq = prov.medioHabitual === 'echeq';
-        const n = compromisosNorm.length;
-        for (let i = 0; i < n; i++) {
-          const k = compromisosNorm[i];
-          const [comp] = await tx.insert(proveedorCompromisos).values({
-            proveedorId: prov.id,
-            comprobanteId: c.id,
-            importe: k.importe,
-            fechaEmision: c.fecha,
-            fechaVenc: k.fechaVenc,
-            origen: 'factura',
-            esEcheq,
-            cuota: n > 1 ? i + 1 : null,
-            cuotas: n > 1 ? n : null,
-            obs: k.obs,
-          }).returning();
-          if (esEcheq) {
-            await tx.insert(proveedorEcheqs).values({
-              numero: `PEND-${comp.id}`,
-              banco: 'A definir',
-              importe: k.importe,
-              fechaEmision: c.fecha,
-              fechaVenc: k.fechaVenc,
-              proveedorId: prov.id,
-              compromisoId: comp.id,
-              obs: `Auto-creado con ${NOMBRE_TIPO[dto.tipo]} ${c.puntoVenta}-${c.numero ?? c.id} — completar número y banco reales.`,
-            });
-          }
-        }
+        await this.crearCompromisosTx(tx, c, prov, compromisosNorm, NOMBRE_TIPO[dto.tipo]);
       }
 
       if (ingresaStock) {
@@ -1003,13 +1172,7 @@ export class ComprobantesService {
     }
 
     /*
-     * EL PAGO, después del commit del comprobante y a propósito.
-     *
-     * Va afuera de la transacción porque `PagosProveedorService` maneja la suya
-     * (el pago, su egreso de caja y el recálculo son una sola operación). Si el
-     * pago falla —turno cerrado, el pago que se quiso tomar ya no tiene saldo—,
-     * el comprobante queda cargado y con deuda: un estado válido y recuperable
-     * desde el detalle. Perder también la carga de la factura sería peor.
+     * EL PAGO, después del commit y a propósito — ver `saldarEnElActo`.
      *
      * Solo los documentos que GENERAN deuda se pagan. Una nota de crédito
      * resta deuda: pagarla no significa nada.
@@ -1019,56 +1182,15 @@ export class ComprobantesService {
     const generaDeuda = estado === 'confirmado'
       && (dto.tipo === 'factura' || dto.tipo === 'liquidacion' || dto.tipo === 'nota_debito');
     if (generaDeuda) {
-      // Primero los pagos que ya existían: es plata que ya salió del cajón y
-      // la factura viene a explicarla.
-      for (const t of dto.tomarPagos ?? []) {
-        /* El `true` final: esta imputación pasa DENTRO del alta, donde el total
-         * ya se validó completo (contado + tomados + cuotas = total exacto).
-         * Sin él, el candado del modo "por facturas" rechazaba lo más común —
-         * el flete adelantado, el vuelto que se le dejó al repartidor— por ser
-         * un importe menor al saldo de la factura. */
-        await this.pagos.imputar(Number(t.pagoId), {
-          imputaciones: [{ comprobanteId: id, importe: Number(t.importe) }],
-          usuarioId: dto.usuarioId,
-        }, opciones.cruzaSucursales, true);
-      }
-      // Y después el resto que se paga en el acto.
-      const contado = Number(dto.pagoContado?.importe) || 0;
-      if (contado > 0) {
-        await this.pagos.crear({
-          proveedorId: prov.id,
-          destino: 'mercaderia',
-          importe: contado,
-          medio: dto.pagoContado?.medio,
-          fecha: dto.fecha,
-          concepto: `${dto.tipo} ${dto.letra ?? 'A'} ${puntoVenta}-${dto.numero ?? id}`.trim(),
-          referencia: dto.pagoContado?.referencia,
-          sucursalId: dto.sucursalId,
-          cajaSesionId: dto.pagoContado?.cajaSesionId,
-          usuarioId: dto.usuarioId,
-          imputaciones: [{ comprobanteId: id, importe: contado }],
-          // Mismo motivo que arriba: el contado puede ser una entrega parcial
-          // con el resto en cuotas, y el total ya se validó completo.
-        }, opciones.sucursalSesion, opciones.cruzaSucursales, true);
-      }
-
-      /*
-       * La CONDICIÓN se deriva de lo que realmente se pagó en el acto, no de lo
-       * que dijo el que llamó: quedó saldado = contado, quedó saldo = cuenta
-       * corriente. Así el campo no puede contradecir al saldo — que es
-       * exactamente lo que pasaba antes, cuando "contado" era solo una etiqueta.
-       *
-       * Se fija UNA vez, al crear: describe cómo se acordó esta compra. Que una
-       * factura en cuenta corriente se pague después no la convierte en contado.
-       */
-      if ((dto.tomarPagos?.length || contado > 0)) {
-        const [final] = await this.db.select({ total: comprobantes.total, pagado: comprobantes.pagado })
-          .from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
-        const saldado = final && final.pagado >= final.total - 0.009;
-        await this.db.update(comprobantes)
-          .set({ condicionPago: saldado ? 'contado' : 'cuenta_corriente' })
-          .where(eq(comprobantes.id, id));
-      }
+      await this.saldarEnElActo(id, {
+        proveedorId: prov.id,
+        concepto: `${dto.tipo} ${dto.letra ?? 'A'} ${puntoVenta}-${dto.numero ?? id}`.trim(),
+        fecha: dto.fecha,
+        sucursalId: dto.sucursalId,
+        usuarioId: dto.usuarioId,
+        tomarPagos: dto.tomarPagos,
+        pagoContado: dto.pagoContado,
+      }, opciones);
     }
     /*
      * Si esta nota ajusta una factura, el saldo de ESA factura acaba de
@@ -1079,6 +1201,252 @@ export class ComprobantesService {
     if (esNota && dto.refComprobanteId && estado === 'confirmado') {
       await this.pagos.sincronizarComprobante(dto.refComprobanteId);
     }
+    return this.get(id);
+  }
+
+  /**
+   * LLEGÓ LA FACTURA DE UN REMITO (26/8) — el remito PASA A SER la factura.
+   * ==========================================================================
+   * El circuito real que esto resuelve: el proveedor entrega la mercadería con
+   * un remito y la factura llega días después. El remito ya ingresó el stock
+   * (se vende desde el día uno); cuando aparece el papel, este método convierte
+   * ESE documento en la factura — mismo id, misma mercadería— completando lo
+   * que el remito no tenía: número y letra del papel, precios reales, pie
+   * (bonificación, percepciones, IVA), la deuda del proveedor y el pago.
+   *
+   * LO QUE NO HACE, y es todo el punto: **no toca el stock**. La mercadería
+   * entró UNA vez, con el remito. Cargar la factura como documento nuevo la
+   * ingresaba de vuelta — el agujero que motivó este circuito.
+   *
+   * Producto y cantidad de cada renglón quedan CLAVADOS (son lo que entró al
+   * depósito); si el papel difiere en cantidades, eso es una diferencia de
+   * entrega y se resuelve como siempre: ajuste de stock o nota de crédito.
+   * Es el espejo de Ventas ⚠ Sin facturar (0073): el documento provisorio
+   * pasa a ser el definitivo, con rastro en observaciones.
+   */
+  async facturar(
+    id: number,
+    dto: FacturarRemitoDto,
+    opciones: { puedeTocarPrecios?: boolean; sucursalSesion: number; cruzaSucursales?: boolean },
+  ) {
+    // El mismo corte de permisos que el alta: facturar también puede tocar precios.
+    if (!opciones.puedeTocarPrecios && (dto.actualizarCostos?.length || dto.activarProveedor?.length)) {
+      throw new ForbiddenException(
+        'Para actualizar costos o cambiar el proveedor activo hace falta el permiso de precios. '
+        + 'Facturá el remito sin esa parte y pedile a quien maneja precios que la haga.',
+      );
+    }
+
+    const [c] = await this.db.select().from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
+    if (!c) throw new NotFoundException('Comprobante inexistente.');
+    if (c.tipo !== 'remito') {
+      throw new BadRequestException(`${etiquetaDoc(c)} no es un remito: solo un remito pendiente se convierte en factura.`);
+    }
+    if (c.estado !== 'confirmado') {
+      throw new BadRequestException(`El remito está ${c.estado}: no se puede facturar.`);
+    }
+    const [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, c.proveedorId)).limit(1);
+    if (!prov) throw new BadRequestException('El proveedor del remito ya no existe.');
+
+    const filasRemito = await this.db.select().from(comprobanteItems)
+      .where(eq(comprobanteItems.comprobanteId, id)).orderBy(comprobanteItems.id);
+    if (!filasRemito.length) throw new BadRequestException('El remito no tiene ítems.');
+
+    /* Los precios corregidos viajan POR itemId: no hay matching por producto ni
+     * forma de colar un renglón nuevo. Un itemId ajeno corta todo. */
+    const porItem = new Map((dto.items ?? []).map((x) => [Number(x.itemId), x]));
+    for (const k of porItem.keys()) {
+      if (!filasRemito.some((f) => f.id === k)) {
+        throw new BadRequestException('Uno de los renglones enviados no pertenece a este remito.');
+      }
+    }
+
+    const discrimina = prov.condicionIva === 'responsable_inscripto';
+    const ivaDefault = discrimina ? 21 : 0;
+    const base = filasRemito.map((f) => {
+      const o = porItem.get(f.id);
+      return {
+        itemId: f.id,
+        // CLAVADOS: el producto y la cantidad son lo que entró al depósito.
+        productoId: f.productoId,
+        cantidad: f.cantidad,
+        costoUnitario: o?.costoUnitario != null ? Number(o.costoUnitario) : f.costoUnitario,
+        descuento: o?.descuento != null ? Number(o.descuento) : f.descuento,
+        iva: o?.iva != null ? Number(o.iva) : (f.iva ?? ivaDefault),
+      };
+    });
+
+    // El MISMO pie que el alta (armarPie), armado con los renglones del
+    // remito y los precios del papel: la factura siempre es fiscal.
+    const pieReal = this.armarPie(
+      { items: base, bonificacion: dto.bonificacion, bonificacionImporte: dto.bonificacionImporte, percepciones: dto.percepciones },
+      true,
+      ivaDefault,
+    );
+    if (pieReal.total <= 0) {
+      throw new BadRequestException(`El total de la factura da ${r2(pieReal.total)}: revisá los costos y la bonificación.`);
+    }
+
+    const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? c.puntoVenta ?? '0001');
+    // La factura resultante tampoco se puede duplicar contra las ya cargadas.
+    if (dto.numero) {
+      const [ya] = await this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
+        eq(comprobantes.proveedorId, prov.id),
+        eq(comprobantes.tipo, 'factura'),
+        eq(comprobantes.puntoVenta, puntoVenta),
+        eq(comprobantes.numero, dto.numero),
+        ne(comprobantes.id, id),
+      )).limit(1);
+      if (ya) {
+        throw new BadRequestException(
+          `${prov.nombre} ya tiene cargada la factura ${puntoVenta}-${dto.numero} (comprobante #${ya.id}).`,
+        );
+      }
+    }
+
+    const compromisosNorm = this.normalizarCompromisos(dto, pieReal.total);
+
+    // La etiqueta del remito, capturada ANTES de convertirlo: es el rastro.
+    const etiquetaRemito = etiquetaDoc(c);
+    const fechaRemito = c.fecha instanceof Date ? c.fecha.toISOString().slice(0, 10) : String(c.fecha).slice(0, 10);
+
+    await this.db.transaction(async (tx) => {
+      // etiquetaDoc ya dice "Remito A 0001-…": no se repite la palabra.
+      const rastro = `Nace del ${etiquetaRemito} (${fechaRemito}): la mercadería ya había ingresado — el stock no se vuelve a mover.`;
+      const [actualizado] = await tx.update(comprobantes).set({
+        tipo: 'factura',
+        letra: dto.letra ?? 'A',
+        puntoVenta,
+        numero: dto.numero ?? c.numero ?? null,
+        // La fecha pasa a ser LA DEL PAPEL: es la que define el período fiscal.
+        fecha: dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : c.fecha,
+        fechaCarga: dto.fechaCarga
+          ? new Date(dto.fechaCarga.length <= 10 ? `${dto.fechaCarga}T00:00:00` : dto.fechaCarga)
+          : new Date(),
+        vencimientoPago: dto.vencimientoPago
+          ? new Date(dto.vencimientoPago.length <= 10 ? `${dto.vencimientoPago}T00:00:00` : dto.vencimientoPago)
+          : null,
+        condicionPago: 'cuenta_corriente',
+        bonificacion: pieReal.bonifPct,
+        bonificacionImporte: r2(pieReal.bonificacionImporte),
+        subtotalNeto: pieReal.subtotalNeto,
+        ivaTotal: pieReal.ivaTotal,
+        percepcionesTotal: r2(pieReal.percepcionesTotal),
+        total: pieReal.total,
+        cae: String(dto.cae ?? '').slice(0, 32),
+        observaciones: [String(dto.observaciones ?? '').trim(), String(c.observaciones ?? '').trim(), rastro]
+          .filter(Boolean).join('\n'),
+        // Quién facturó (puede no ser quien cargó el remito).
+        ...(dto.usuarioId != null ? { usuarioId: dto.usuarioId } : {}),
+      }).where(eq(comprobantes.id, id)).returning();
+
+      // Los renglones conservan producto y cantidad; cambian precio, desc. e IVA.
+      for (const it of pieReal.items as any[]) {
+        await tx.update(comprobanteItems).set({
+          costoUnitario: Number(it.costoUnitario) || 0,
+          descuento: Number(it.descuento) || 0,
+          iva: it.iva,
+          subtotal: it.subtotal,
+        }).where(eq(comprobanteItems.id, it.itemId));
+      }
+
+      /* Un remito no debería tener percepciones, pero si alguna quedó, la
+       * factura las reemplaza por las del papel — no se suman dos veces. */
+      await tx.delete(comprobantePercepciones).where(eq(comprobantePercepciones.comprobanteId, id));
+      if (pieReal.percepciones.length) {
+        await tx.insert(comprobantePercepciones).values(
+          pieReal.percepciones.map((p) => ({ comprobanteId: id, ...p })),
+        );
+      }
+
+      /* El compromiso (0068) nace recién AHORA: el remito no generaba deuda,
+       * así que no había nada que prometer hasta este momento. */
+      if (compromisosNorm.length) {
+        await this.crearCompromisosTx(tx, actualizado, prov, compromisosNorm, 'la factura');
+      }
+
+      /*
+       * Los costos que el usuario aceptó actualizar, igual que en el alta: la
+       * factura ES la lista de precios nueva del proveedor, y acá es donde por
+       * fin llegan los precios reales (el remito entró con los de catálogo).
+       */
+      const pedidos = (dto.actualizarCostos ?? []).filter((x) => Number(x.costo) > 0);
+      if (pedidos.length) {
+        const entradas = await tx.select().from(productoProveedores)
+          .where(and(
+            eq(productoProveedores.proveedorId, prov.id),
+            inArray(productoProveedores.productoId, pedidos.map((x) => x.productoId)),
+          ));
+        const porProducto = new Map(entradas.map((e: any) => [e.productoId, e.id]));
+
+        for (const x of pedidos) {
+          const cant = Number(x.cantidad);
+          const entradaId = porProducto.get(x.productoId);
+          if (entradaId && cant > 0) {
+            await tx.update(productoProveedores).set({ cantidad: cant })
+              .where(eq(productoProveedores.id, entradaId));
+          }
+        }
+
+        const cambios = pedidos
+          .map((x) => {
+            const entradaId = porProducto.get(x.productoId);
+            return entradaId ? { id: entradaId, costo: x.costo, descuento: x.descuento, flete: x.flete } : null;
+          })
+          .filter(Boolean) as any[];
+
+        if (cambios.length) {
+          await this.precios.actualizarCostos({
+            cambios,
+            origen: 'recepcion',
+            motivo: `factura ${puntoVenta}-${dto.numero ?? id} · ${prov.nombre} (del remito ${etiquetaRemito})`,
+            usuarioId: dto.usuarioId,
+            comprobanteId: id,
+          } as any, tx);
+        }
+      }
+
+      if (dto.activarProveedor?.length) {
+        await this.precios.activarProveedor({
+          productoIds: dto.activarProveedor,
+          proveedorId: prov.id,
+          origen: 'recepcion',
+          motivo: `factura ${puntoVenta}-${dto.numero ?? id} · ${prov.nombre} (del remito ${etiquetaRemito})`,
+          usuarioId: dto.usuarioId,
+          comprobanteId: id,
+        }, tx);
+      }
+
+      // Y el papel de la bandeja que esta factura cierra, si vino de ahí.
+      if (dto.lecturaId) {
+        await tx.update(facturaLecturas)
+          .set({ estado: 'cargada', comprobanteId: id })
+          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')));
+      }
+    });
+
+    // La evolución de precios, DESPUÉS del commit (igual que en el alta).
+    const tocados = [
+      ...(dto.actualizarCostos ?? []).map((x) => x.productoId),
+      ...(dto.activarProveedor ?? []),
+    ];
+    if (tocados.length) {
+      await this.precios.registrarEvolucion(tocados, 'costo', {
+        detalle: 'Facturación de remito', usuarioId: dto.usuarioId ?? null,
+      });
+    }
+
+    // Recién ahora existe deuda que pagar: el remito no debía nada.
+    await this.saldarEnElActo(id, {
+      proveedorId: prov.id,
+      concepto: `factura ${dto.letra ?? 'A'} ${puntoVenta}-${dto.numero ?? id}`.trim(),
+      fecha: dto.fecha,
+      sucursalId: c.sucursalId,
+      usuarioId: dto.usuarioId,
+      tomarPagos: dto.tomarPagos,
+      pagoContado: dto.pagoContado,
+    }, opciones);
+
     return this.get(id);
   }
 
@@ -1244,6 +1612,20 @@ export class ComprobantesController {
   @Get(':id')
   get(@Param('id', ParseIntPipe) id: number) {
     return this.svc.get(id);
+  }
+
+  /**
+   * LLEGÓ LA FACTURA DE UN REMITO: el remito `:id` pasa a ser la factura, sin
+   * volver a mover stock. Mismos permisos que el alta — y el mismo corte de
+   * `precios`, porque también puede actualizar costos por adentro.
+   */
+  @Post(':id/facturar')
+  facturar(@Param('id', ParseIntPipe) id: number, @Body() dto: FacturarRemitoDto, @Auth() auth: Sesion) {
+    return this.svc.facturar(id, dto, {
+      puedeTocarPrecios: tienePermiso(auth.permisos, ['precios']),
+      sucursalSesion: auth.sucursalId,
+      cruzaSucursales: esJefe(auth),
+    });
   }
 
   @Post()
