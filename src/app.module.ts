@@ -30,6 +30,7 @@ import { CafeteriaModule } from './cafeteria/cafeteria.module';
 import { VencimientosModule } from './vencimientos/vencimientos.module';
 import { ChatModule } from './chat/chat.module';
 import { GerenciaModule } from './gerencia/gerencia.module';
+import { AuditoriaModule } from './auditoria/auditoria.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { GerenciaModule } from './gerencia/gerencia.module';
     // Antes que todo lo demás: registra el guard global, que es la puerta de
     // los 224 endpoints. Cerrado por defecto; lo público se marca a mano.
     AuthModule,
+    AuditoriaModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,

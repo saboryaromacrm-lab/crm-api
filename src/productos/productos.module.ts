@@ -14,6 +14,7 @@ import { ConfiguracionModule, ConfiguracionService } from '../configuracion/conf
 import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
 import { CatalogosModule } from '../catalogos/catalogos.module';
+import { AuditoriaModule, AuditoriaService, type CambioAuditado } from '../auditoria/auditoria.module';
 import {
   categorias, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, marcas, movimientos,
   pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
@@ -162,6 +163,7 @@ export class ProductosService {
     private readonly cfg: ConfiguracionService,
     private readonly listas: ListasService,
     private readonly evolucion: HistorialPreciosService,
+    private readonly audit: AuditoriaService,
   ) {}
 
   /* ------------------------------ Armado ------------------------------ */
@@ -1258,7 +1260,7 @@ export class ProductosService {
    * silencio la auditoría entera del producto. Solo se borra lo que el usuario
    * sacó de verdad de la lista.
    */
-  async setFormatosCompra(id: number, filas: any[]) {
+  async setFormatosCompra(id: number, filas: any[], usuarioAudit?: number | null) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
 
@@ -1324,22 +1326,61 @@ export class ProductosService {
       codigoProveedor: (f.codigoProveedor ?? '').trim(),
     });
 
+    /* AUDITORÍA (0086): estos números definen el costo y arrastran la góndola,
+     * y hasta acá se pisaban sin firma. La foto legible de cada formato se
+     * compara campo a campo; el alta y la baja dejan una fila resumen. El
+     * registro cuelga del PROVEEDOR (es su condición comercial) con el
+     * producto como detalle — así la pestaña Auditoría del proveedor lo lista. */
+    const dinero = (n: number) => `$ ${(Number(n) || 0).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
+    const fotoFormato = (v: any): Record<string, string> => ({
+      cantidad: `${Number(v.cantidad) || 1} u.`,
+      costo: v.modoCosto === 'final' ? dinero(v.costoFinal) : dinero(v.costo),
+      modoCosto: v.modoCosto === 'final' ? 'Costo final — se le quitan los descuentos' : 'Costo de lista — el sistema descuenta',
+      descuentos: [v.descuento, v.descuento2, v.descuento3, v.descuento4]
+        .map((d: any) => Number(d) || 0).filter((d: number) => d > 0).map((d: number) => `${d}%`).join(' + ') || 'Sin descuentos',
+      flete: `${Number(v.flete) || 0}%`,
+      porcSinFactura: `${Number(v.porcSinFactura) || 0}%`,
+      usarParaPrecio: v.usarParaPrecio ? 'Sí' : 'No',
+      codigoProveedor: v.codigoProveedor || '',
+    });
+    const CAMPOS_FORMATO = {
+      cantidad: 'Unidades por bulto', costo: 'Costo del bulto', modoCosto: 'Cómo se carga el costo',
+      descuentos: 'Descuentos', flete: 'Flete %', porcSinFactura: 'Sin factura %',
+      usarParaPrecio: 'Fija el precio', codigoProveedor: 'Código del proveedor',
+    };
+    const resumenFormato = (v: any) => {
+      const foto = fotoFormato(v);
+      return `bulto ${foto.cantidad} · ${foto.costo} · flete ${foto.flete} · sin factura ${foto.porcSinFactura}`;
+    };
+    const cambiosAudit: CambioAuditado[] = [];
+    const baseAudit = (proveedorId: number) => ({
+      entidad: 'proveedor', entidadId: proveedorId, ambito: 'Formato de compra',
+      detalle: p.nombre, usuarioId: usuarioAudit,
+    });
+
     await this.db.transaction(async (tx) => {
       for (const e of existentes) {
         if (!enviados.has(e.id)) {
+          cambiosAudit.push({ ...baseAudit(e.proveedorId), campo: 'Formato', antes: resumenFormato(e), despues: '(quitado)' });
           await tx.delete(productoProveedores).where(eq(productoProveedores.id, e.id));
         }
       }
       for (let i = 0; i < validas.length; i += 1) {
         const f = validas[i];
         const fid = Number(f.id);
+        const v = valores(f, i);
         if (porId.has(fid)) {
-          await tx.update(productoProveedores).set(valores(f, i))
+          cambiosAudit.push(...this.audit.diferencias(
+            baseAudit(v.proveedorId), fotoFormato(porId.get(fid)), fotoFormato(v), CAMPOS_FORMATO,
+          ));
+          await tx.update(productoProveedores).set(v)
             .where(eq(productoProveedores.id, fid));
         } else {
-          await tx.insert(productoProveedores).values(valores(f, i));
+          cambiosAudit.push({ ...baseAudit(v.proveedorId), campo: 'Formato', antes: '(no estaba)', despues: resumenFormato(v) });
+          await tx.insert(productoProveedores).values(v);
         }
       }
+      await this.audit.registrar(cambiosAudit, tx);
 
       /*
        * EL BULTO DE LA FICHA SE COMPLETA SOLO (25/8). `productos.
@@ -1474,8 +1515,8 @@ export class ProductosController {
 
   @Permiso('compras.productos')
   @Put(':id/formatos-compra')
-  setFormatosCompra(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.setFormatosCompra(id, body?.formatos ?? body?.proveedores ?? body);
+  setFormatosCompra(@Param('id', ParseIntPipe) id: number, @Body() body: any, @Auth() sesion: Sesion) {
+    return this.svc.setFormatosCompra(id, body?.formatos ?? body?.proveedores ?? body, sesion?.usuarioId ?? null);
   }
 
   @Permiso('precios', 'ventas.listas')
@@ -1497,7 +1538,7 @@ export class ProductosController {
 }
 
 @Module({
-  imports: [ConfiguracionModule, ListasModule, CatalogosModule, PreciosModule],
+  imports: [ConfiguracionModule, ListasModule, CatalogosModule, PreciosModule, AuditoriaModule],
   controllers: [ProductosController],
   providers: [ProductosService],
   exports: [ProductosService],

@@ -2753,6 +2753,30 @@ export const pagoFormas = pgTable('pago_formas', {
   ixPago: index('ix_pago_formas_pago').on(t.pagoId),
 }));
 
+/**
+ * AUDITORÍA DE CAMBIOS (0086): quién tocó qué y cuándo, con antes → después.
+ * General a propósito (entidad + entidadId): hoy la escriben las condiciones
+ * comerciales del proveedor; mañana la lee Gerencia › Auditoría completa.
+ * Cada fila es UN campo que cambió — solo se graba lo que cambió de verdad.
+ */
+export const auditoria = pgTable('auditoria', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  // SET NULL: borrar un usuario no borra la historia de lo que hizo.
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  entidad: text('entidad').notNull(),
+  entidadId: integer('entidad_id').notNull(),
+  /** Dónde se cambió: 'Formato de compra', 'Percepciones', 'Ficha'… */
+  ambito: text('ambito').notNull(),
+  /** Contexto de la fila ("Aceite de oliva x500" para un formato de compra). */
+  detalle: text('detalle').notNull().default(''),
+  campo: text('campo').notNull(),
+  antes: text('antes').notNull().default(''),
+  despues: text('despues').notNull().default(''),
+}, (t) => ({
+  ixEntidad: index('ix_auditoria_entidad').on(t.entidad, t.entidadId),
+}));
+
 /** Todas las tablas para pasar al cliente de Drizzle. */
 export const schema = {
   sucursales, proveedores, roles, usuarios, sesiones, terminales, productos, presentaciones, productoProveedores,
@@ -2767,4 +2791,5 @@ export const schema = {
   gastoCategorias, gastos, gastoItems, gastosRecurrentes, gastoAdjuntos,
   proveedorPagos, proveedorImputaciones,
   proveedorCuentas, pedidosProveedor, proveedorCompromisos, proveedorEcheqs, proveedorAjustes, pagoFormas,
+  auditoria,
 };

@@ -4,9 +4,10 @@ import {
 } from '@nestjs/common';
 import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 import { and, eq } from 'drizzle-orm';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 
 class UpsertProveedorDto {
   @IsString() nombre!: string;
@@ -46,9 +47,35 @@ class UpsertProveedorDto {
   @IsOptional() @IsNumber() @Min(0) @Max(100) porcSinFactura?: number;
 }
 
+/* Cómo se muestran los valores de la ficha comercial en la auditoría: el
+ * registro se LEE, así que guarda las palabras de la pantalla, no los enums. */
+const LEGIBLE_CONDICION: Record<string, string> = {
+  factura: 'Factura', liquidacion: 'Liquidación', mixto: 'Mixto (mitad y mitad)',
+};
+const LEGIBLE_MEDIO: Record<string, string> = {
+  efectivo: 'Efectivo', transferencia: 'Transferencia', deposito: 'Depósito',
+  echeq: 'Echeq', cta_cte: 'Cuenta corriente',
+};
+
 @Injectable()
 export class ProveedoresService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly audit: AuditoriaService,
+  ) {}
+
+  /** La foto legible de lo auditable de la ficha, para comparar antes/después. */
+  private fotoFicha(p: any): Record<string, string> {
+    return {
+      nombre: p.nombre ?? '',
+      cuit: p.cuit ?? '',
+      condicionCompra: LEGIBLE_CONDICION[p.condicionCompra] ?? (p.condicionCompra ?? ''),
+      medioHabitual: p.medioHabitual ? (LEGIBLE_MEDIO[p.medioHabitual] ?? p.medioHabitual) : 'Sin definir',
+      diasPago: p.diasPago ? `${p.diasPago} día(s)` : 'Sin plazo',
+      modoCuenta: p.modoCuenta === 'libre' ? 'Libre' : 'Por facturas',
+      porcSinFactura: `${Number(p.porcSinFactura) || 0}%`,
+    };
+  }
 
   /**
    * `tipo` filtra por clasificación ('mercaderia' | 'gastos'); sin él vienen
@@ -88,7 +115,7 @@ export class ProveedoresService {
     return p;
   }
 
-  async update(id: number, dto: UpsertProveedorDto) {
+  async update(id: number, dto: UpsertProveedorDto, usuarioId?: number | null) {
     const actual = await this.get(id);
     const [p] = await this.db.update(proveedores).set({
       nombre: dto.nombre.trim(),
@@ -114,6 +141,19 @@ export class ProveedoresService {
       modoCuenta: (dto.modoCuenta ?? actual.modoCuenta) as any,
       porcSinFactura: dto.porcSinFactura ?? actual.porcSinFactura,
     }).where(eq(proveedores.id, id)).returning();
+
+    /* AUDITORÍA (0086): la identidad y la ficha comercial, campo por campo.
+     * Se compara la FOTO legible antes/después — solo lo que cambió deja fila. */
+    await this.audit.registrar(this.audit.diferencias(
+      { entidad: 'proveedor', entidadId: id, ambito: 'Ficha del proveedor', usuarioId },
+      this.fotoFicha(actual), this.fotoFicha(p),
+      {
+        nombre: 'Nombre', cuit: 'CUIT',
+        condicionCompra: 'Condición de compra', medioHabitual: 'Medio de pago habitual',
+        diasPago: 'Plazo de pago', modoCuenta: 'Modo de cuenta',
+        porcSinFactura: 'Sin factura % (default de sus formatos)',
+      },
+    ));
     return p;
   }
 
@@ -169,7 +209,7 @@ export class ProveedoresService {
    * tienen su propia copia con nombre y alícuota, así que tocar esta lista no
    * altera ninguna factura vieja.
    */
-  async setPercepciones(proveedorId: number, filas: any[]) {
+  async setPercepciones(proveedorId: number, filas: any[], usuarioId?: number | null) {
     await this.get(proveedorId);
     const validas = (filas || [])
       .filter((f) => (f?.nombre ?? '').trim())
@@ -185,9 +225,28 @@ export class ProveedoresService {
         throw new BadRequestException(`La alícuota de "${f.nombre}" tiene que estar entre 0 y 100.`);
       }
     }
+
+    /* AUDITORÍA (0086): el full-replace se traduce a cambios legibles POR
+     * PERCEPCIÓN (comparando por nombre): agregada, quitada o modificada. */
+    const anteriores = await this.percepciones(proveedorId);
+    const legible = (f: any) => `${Number(f.alicuota) || 0}% sobre ${f.base === 'total' ? 'el total' : 'el neto'}${f.activa === false ? ' (inactiva)' : ''}`;
+    const viejas = new Map(anteriores.map((f: any) => [f.nombre, legible(f)]));
+    const nuevas = new Map(validas.map((f) => [f.nombre, legible(f)]));
+    const cambios = [] as { campo: string; antes: string; despues: string }[];
+    for (const [nombre, v] of viejas) {
+      if (!nuevas.has(nombre)) cambios.push({ campo: nombre, antes: v, despues: '(quitada)' });
+      else if (nuevas.get(nombre) !== v) cambios.push({ campo: nombre, antes: v, despues: nuevas.get(nombre)! });
+    }
+    for (const [nombre, v] of nuevas) {
+      if (!viejas.has(nombre)) cambios.push({ campo: nombre, antes: '(no estaba)', despues: v });
+    }
+
     await this.db.transaction(async (tx) => {
       await tx.delete(proveedorPercepciones).where(eq(proveedorPercepciones.proveedorId, proveedorId));
       if (validas.length) await tx.insert(proveedorPercepciones).values(validas);
+      await this.audit.registrar(cambios.map((c) => ({
+        entidad: 'proveedor', entidadId: proveedorId, ambito: 'Percepciones', usuarioId, ...c,
+      })), tx);
     });
     return this.percepciones(proveedorId);
   }
@@ -221,19 +280,22 @@ export class ProveedoresController {
    * lo administran los dos mundos.
    */
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
-  @Put(':id/percepciones') setPercepciones(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.setPercepciones(id, body?.percepciones ?? body);
+  @Put(':id/percepciones') setPercepciones(@Param('id', ParseIntPipe) id: number, @Body() body: any, @Auth() sesion: Sesion) {
+    return this.svc.setPercepciones(id, body?.percepciones ?? body, sesion?.usuarioId ?? null);
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Post() create(@Body() dto: UpsertProveedorDto) { return this.svc.create(dto); }
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
-  @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto) { return this.svc.update(id, dto); }
+  @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProveedorDto, @Auth() sesion: Sesion) {
+    return this.svc.update(id, dto, sesion?.usuarioId ?? null);
+  }
   @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
 }
 
 @Module({
+  imports: [AuditoriaModule],
   controllers: [ProveedoresController],
   providers: [ProveedoresService],
   exports: [ProveedoresService],
