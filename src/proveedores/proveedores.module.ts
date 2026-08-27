@@ -5,10 +5,10 @@ import {
 import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min,
 } from 'class-validator';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
+import { productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 
 class UpsertProveedorDto {
@@ -93,13 +93,28 @@ export class ProveedoresService {
    * todos. El filtro NO es excluyente: un proveedor marcado como los dos sale
    * en las dos listas, que es exactamente lo que se quiere.
    */
-  list(tipo?: string) {
+  async list(tipo?: string) {
     const conds: any[] = [];
     if (tipo === 'mercaderia') conds.push(eq(proveedores.proveeMercaderia, true));
     if (tipo === 'gastos') conds.push(eq(proveedores.proveeGastos, true));
-    return this.db.select().from(proveedores)
-      .where(conds.length ? and(...conds) : undefined)
-      .orderBy(proveedores.nombre);
+    const [filas, cargados] = await Promise.all([
+      this.db.select().from(proveedores)
+        .where(conds.length ? and(...conds) : undefined)
+        .orderBy(proveedores.nombre),
+      /*
+       * EL AVANCE DE LA MIGRACIÓN viaja con el padrón (26/8): cuántos productos
+       * ya tienen su formato de compra con cada proveedor, contra los
+       * `productosEsperados` del sistema viejo. Se cuenta acá, en una consulta
+       * agrupada, porque el tablero vive en el módulo Proveedores — que no
+       * carga el catálogo de productos y no tiene con qué contarlo en memoria.
+       */
+      this.db.select({
+        proveedorId: productoProveedores.proveedorId,
+        n: sql<number>`count(*)`,
+      }).from(productoProveedores).groupBy(productoProveedores.proveedorId),
+    ]);
+    const porProv = new Map(cargados.map((c) => [c.proveedorId, Number(c.n)]));
+    return filas.map((p) => ({ ...p, productosCargados: porProv.get(p.id) ?? 0 }));
   }
 
   async get(id: number) {
