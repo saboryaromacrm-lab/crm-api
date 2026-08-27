@@ -47,6 +47,7 @@ import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
+import { resolverOperador } from '../usuarios/usuarios.module';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -344,6 +345,13 @@ export class CreateVentaDto {
   @IsOptional() @IsInt() clienteId?: number;
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
+  /**
+   * EL RELEVO DE CAJA (0088): quién está físicamente en la registradora cuando
+   * no es el de la sesión ("la cajera se ausenta, cobra el repositor"). El
+   * AutorInterceptor NO lo toca a propósito — significa OTRO usuario, como
+   * `paraUsuarioId` — y el servidor lo valida: activo y habilitado como relevo.
+   */
+  @IsOptional() @IsInt() operadorId?: number;
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsIn(TIPOS_CREABLES as unknown as string[]) tipo?: (typeof TIPOS)[number];
   /** 'borrador' deja la venta abierta en el punto de venta. */
@@ -392,6 +400,8 @@ class ConfirmarVentaDto {
    */
   @IsOptional() @IsNumber() @Min(0.01) @Max(100, { message: 'El redondeo puede sumar hasta $100.' })
   redondeo?: number;
+  /** El relevo de caja (0088): quién cobra de verdad. Ver `CreateVentaDto`. */
+  @IsOptional() @IsInt() operadorId?: number;
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => VentaPagoDto)
   pagos?: VentaPagoDto[];
 }
@@ -804,6 +814,12 @@ export class VentasService {
       ? await this.db.select({ nombre: usuarios.nombre })
         .from(usuarios).where(eq(usuarios.id, v.usuarioId)).limit(1)
       : [];
+    /* Quién COBRÓ, cuando no es quien armó (0060/0088): con el relevo de caja
+     * esta es LA respuesta a "¿quién cerró esta venta?". */
+    const [cobrador] = v.cobradoPor && v.cobradoPor !== v.usuarioId
+      ? await this.db.select({ nombre: usuarios.nombre })
+        .from(usuarios).where(eq(usuarios.id, v.cobradoPor)).limit(1)
+      : [];
     const tam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
 
     const itemsSalida = items.map((it) => {
@@ -855,6 +871,7 @@ export class VentasService {
        * empresa, que es lo correcto mientras haya un solo local. */
       sucursalDireccion: suc?.direccion ?? '',
       cajeroNombre: usr?.nombre ?? '—',
+      cobradoPorNombre: cobrador?.nombre ?? '',
       items: itemsSalida,
       extras,
       pagos,
@@ -2392,6 +2409,9 @@ export class VentasService {
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.consumidorFinal();
     if (!cliente.activo) throw new BadRequestException('El cliente está desactivado.');
+    /* EL RELEVO (0088): si hay un operador puesto en el POS, la venta nace
+     * firmada por él — validado contra la marca `relevoCaja`, no de palabra. */
+    const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     const esBorrador = dto.estado === 'borrador';
     if (!esBorrador && !dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
@@ -2448,7 +2468,7 @@ export class VentasService {
     if (esBorrador) {
       const [v] = await this.db.insert(ventas).values({
         tipo, puntoVenta, numero: null, fecha, clienteId: cliente.id, sucursalId,
-        usuarioId: dto.usuarioId ?? null, cajaSesionId: null,
+        usuarioId: autor, cajaSesionId: null,
         estado: 'borrador', condicionPago, vencimientoPago: null,
         presupuestoId: dto.presupuestoId ?? null,
         listaPrecio: dto.listaPrecio ?? '',
@@ -2496,7 +2516,7 @@ export class VentasService {
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipoFinal, puntoVentaFinal);
       const [v] = await tx.insert(ventas).values({
         tipo: tipoFinal, puntoVenta: puntoVentaFinal, numero, fecha, clienteId: cliente.id, sucursalId,
-        usuarioId: dto.usuarioId ?? null, cajaSesionId: turno?.id ?? null,
+        usuarioId: autor, cajaSesionId: turno?.id ?? null,
         estado: 'confirmada', condicionPago, vencimientoPago,
         presupuestoId: dto.presupuestoId ?? null,
         listaPrecio: dto.listaPrecio ?? '',
@@ -2516,12 +2536,12 @@ export class VentasService {
       }
 
       if (dto.presupuestoId) {
-        await this.cerrarPresupuesto(tx, Number(dto.presupuestoId), v.id, sucursalId, cliente.id, dto.usuarioId);
+        await this.cerrarPresupuesto(tx, Number(dto.presupuestoId), v.id, sucursalId, cliente.id, autor ?? dto.usuarioId);
       }
 
       await this.inv.egresarStockItems(tx, {
         sucursalId,
-        usuarioId: dto.usuarioId,
+        usuarioId: autor ?? dto.usuarioId,
         permitirNegativo: !!config.permitirStockNegativo,
         descripcion: `Venta ${puntoVenta}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
         items: tot.items,
@@ -2635,6 +2655,8 @@ export class VentasService {
     if (opciones.soloSuSucursal && actual.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }
+    // El relevo (0088): quien está en la registradora firma el borrador que toca.
+    const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.get(actual.clienteId);
     /* Mismo portero que en el alta: el borrador se edita en cada tecla del POS y
@@ -2659,7 +2681,7 @@ export class VentasService {
     await this.db.transaction(async (tx) => {
       await tx.update(ventas).set({
         clienteId: cliente.id,
-        usuarioId: dto.usuarioId ?? actual.usuarioId,
+        usuarioId: autor ?? actual.usuarioId,
         condicionPago: dto.condicionPago ?? actual.condicionPago,
         listaPrecio: dto.listaPrecio ?? '',
         observaciones: dto.observaciones ?? actual.observaciones,
@@ -2710,6 +2732,9 @@ export class VentasService {
     const cliente = await this.cli.get(borrador.clienteId);
     const condicionPago = dto.condicionPago ?? borrador.condicionPago;
     const sucursalId = borrador.sucursalId!;
+    /* EL RELEVO (0088): quien está en la caja firma el cobro y el movimiento
+     * de stock. La venta sigue siendo de quien la armó (0060). */
+    const cobrador = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     /*
      * EL REDONDEO DEL COBRO (27/8): "$39.893 se cobra $39.900", hasta $100 de
@@ -2900,8 +2925,8 @@ export class VentasService {
          * a nombre de Juan: en el listado, en los reportes por vendedor y en el
          * movimiento de stock. Con comisiones por vendedor, es plata.
          */
-        usuarioId: borrador.usuarioId ?? dto.usuarioId ?? null,
-        cobradoPor: dto.usuarioId ?? null,
+        usuarioId: borrador.usuarioId ?? cobrador ?? null,
+        cobradoPor: cobrador ?? null,
         observaciones: dto.observaciones ?? borrador.observaciones,
       }).where(eq(ventas.id, id));
 
@@ -2913,13 +2938,13 @@ export class VentasService {
 
       // El borrador nació de un presupuesto: este cobro lo cierra.
       if (borrador.presupuestoId) {
-        await this.cerrarPresupuesto(tx, borrador.presupuestoId, id, sucursalId, cliente.id, dto.usuarioId ?? borrador.usuarioId);
+        await this.cerrarPresupuesto(tx, borrador.presupuestoId, id, sucursalId, cliente.id, cobrador ?? borrador.usuarioId);
       }
 
       await this.inv.egresarStockItems(tx, {
         sucursalId,
         // Acá sí va QUIEN COBRÓ: es el que ejecutó el movimiento de stock.
-        usuarioId: dto.usuarioId ?? borrador.usuarioId,
+        usuarioId: cobrador ?? borrador.usuarioId,
         permitirNegativo: !!config.permitirStockNegativo,
         descripcion: `Venta ${borrador.puntoVenta}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
         items: borrador.items,

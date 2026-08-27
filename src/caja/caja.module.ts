@@ -21,6 +21,7 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
+import { resolverOperador } from '../usuarios/usuarios.module';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
 } from '../db/schema';
@@ -49,6 +50,9 @@ class ControlCajaDto {
   @IsNumber() contadoEfectivo!: number;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** El relevo de caja (0088): quién está en la registradora. El interceptor
+   *  no lo toca (significa OTRO usuario) y el servidor valida la marca. */
+  @IsOptional() @IsInt() operadorId?: number;
 }
 
 class MovimientoCajaDto {
@@ -56,6 +60,8 @@ class MovimientoCajaDto {
   @IsNumber() importe!: number;
   @IsOptional() @IsString() motivo?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** Ídem `ControlCajaDto`: el relevo firma el movimiento manual. */
+  @IsOptional() @IsInt() operadorId?: number;
 }
 
 @Injectable()
@@ -278,7 +284,8 @@ export class CajaService {
       contadoEfectivo: contado,
       diferencia: money(contado - a.esperadoEfectivo),
       observaciones: (dto.observaciones ?? '').trim(),
-      usuarioId: dto.usuarioId ?? null,
+      // El relevo (0088): el conteo lo firma quien está parado en la caja.
+      usuarioId: await resolverOperador(this.db, dto.operadorId, dto.usuarioId),
     }).returning();
     return c;
   }
@@ -287,6 +294,8 @@ export class CajaService {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe debe ser mayor a 0.');
     if (!dto.motivo?.trim()) throw new BadRequestException('Indicá el motivo del movimiento.');
+    // El relevo (0088): el ingreso/egreso manual lo firma quien está en la caja.
+    const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     return this.db.transaction(async (tx) => {
       /* Con candado y en la misma transacción que el insert: si el cierre está
@@ -302,7 +311,7 @@ export class CajaService {
       if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
 
       const [m] = await tx.insert(cajaMovimientos).values({
-        cajaSesionId: id, tipo: dto.tipo, importe, motivo: dto.motivo!.trim(), usuarioId: dto.usuarioId ?? null,
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo: dto.motivo!.trim(), usuarioId: autor,
       }).returning();
       return m;
     });

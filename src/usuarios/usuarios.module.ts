@@ -23,6 +23,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
 import { SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
 /* Dos funciones sueltas, no un servicio: el login las necesita antes de que
@@ -326,7 +327,38 @@ function publico(u: any, r: any) {
     rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '',
     permisos: r?.permisos ?? [],
     tienePassword: !!u.passwordHash,
+    /* El relevo de caja (0088): la marca y si YA tiene PIN — el PIN mismo
+     * jamás viaja, ni siquiera hasheado. */
+    relevoCaja: !!u.relevoCaja,
+    tienePin: !!u.pinHash,
   };
+}
+
+/** El PIN del relevo: corto a propósito (se tipea con un cliente esperando),
+ *  y por eso con freno de intentos en `verificarRelevo`. */
+const PIN_VALIDO = /^\d{4,6}$/;
+
+/**
+ * RESUELVE QUIÉN FIRMA UNA OPERACIÓN DE CAJA (0088) — compartido por ventas,
+ * caja y cobranzas. `operadorId` es el relevo elegido en el POS; si no viene o
+ * es el mismo de la sesión, firma la sesión. Si viene, tiene que ser un
+ * usuario ACTIVO y HABILITADO como relevo — sin eso, el campo sería una forma
+ * de firmar con el nombre de cualquiera, que es exactamente lo que el
+ * AutorInterceptor vino a cerrar.
+ */
+export async function resolverOperador(
+  db: Database,
+  operadorId: unknown,
+  sesionUsuarioId: number | null | undefined,
+): Promise<number | null> {
+  const id = Number(operadorId) || 0;
+  const propio = Number(sesionUsuarioId) || null;
+  if (!id || id === propio) return propio;
+  const [u] = await db.select().from(usuarios).where(eq(usuarios.id, id)).limit(1);
+  if (!u || !u.activo || !u.relevoCaja) {
+    throw new BadRequestException('El operador del relevo no está habilitado para relevar en caja.');
+  }
+  return id;
 }
 
 @Injectable()
@@ -335,6 +367,8 @@ export class UsuariosService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly sesiones: SesionesService,
     private readonly freno: FrenoLogin,
+    /** El rastro de los relevos de caja (0088) va a la auditoría general. */
+    private readonly audit: AuditoriaService,
   ) {}
 
   /* ---------------- Roles ---------------- */
@@ -486,8 +520,19 @@ export class UsuariosService {
     if (password.length < MIN_PASSWORD) {
       throw new BadRequestException(`La contraseña necesita al menos ${MIN_PASSWORD} caracteres.`);
     }
+    // El relevo de caja también puede nacer con el alta (0088): mismas reglas
+    // que la edición — la marca no existe sin PIN.
+    const pin = String(o?.pin ?? '');
+    if (pin && !PIN_VALIDO.test(pin)) {
+      throw new BadRequestException('El PIN del relevo son 4 a 6 dígitos.');
+    }
+    const relevoCaja = !!o?.relevoCaja;
+    if (relevoCaja && !pin) {
+      throw new BadRequestException('Para habilitarlo como relevo de caja definile un PIN.');
+    }
     const [u] = await this.db.insert(usuarios).values({
       nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
+      relevoCaja, pinHash: pin ? hashPassword(pin) : '',
     }).returning();
     return { ok: true, id: u.id };
   }
@@ -659,6 +704,86 @@ export class UsuariosService {
     return otros.length === 0;
   }
 
+  /* ---------------- Relevo de caja (0088) ---------------- */
+
+  /**
+   * Freno del PIN, en memoria y POR USUARIO: 5 fallos seguidos lo bloquean 5
+   * minutos. Un PIN de 4 dígitos sin freno se adivina probando — y acá el que
+   * prueba ya tiene una sesión ajena abierta adelante, así que el freno es lo
+   * único entre él y firmar con el nombre de otro.
+   */
+  private pinFallos = new Map<number, { n: number; hasta: number }>();
+
+  /** Los usuarios que pueden tomar la caja: activos, con la marca y con PIN. */
+  async listRelevos() {
+    const us = await this.db.select().from(usuarios)
+      .where(and(eq(usuarios.activo, true), eq(usuarios.relevoCaja, true)))
+      .orderBy(usuarios.nombre);
+    return us.filter((u) => !!u.pinHash).map((u) => ({ id: u.id, nombre: u.nombre }));
+  }
+
+  /**
+   * EL RELEVO ENTRA: verifica el PIN y deja el rastro en la auditoría. La
+   * sesión no cambia — de acá en más el POS firma las operaciones con el
+   * `operadorId` que cada endpoint valida con `resolverOperador`.
+   */
+  async verificarRelevo(o: any, sesion?: Sesion) {
+    /* `relevoId` y NO `usuarioId`: el AutorInterceptor pisa `body.usuarioId`
+     * con el de la sesión en toda escritura — con ese nombre, el PIN se
+     * verificaba siempre contra la cajera titular. Mismo motivo por el que
+     * delegar usa `paraUsuarioId`. */
+    const id = Number(o?.relevoId) || 0;
+    const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, id)).limit(1);
+    if (!u || !u.activo || !u.relevoCaja || !u.pinHash) {
+      throw new BadRequestException('Ese usuario no está habilitado para relevar en caja.');
+    }
+    /* 403 y NO 401 a propósito: para el httpClient un 401 significa "la sesión
+     * venció" y ECHA a la cajera al login — acá la sesión de la titular está
+     * perfecta, lo que falla es el PIN del relevo. */
+    const f = this.pinFallos.get(u.id);
+    if (f && f.hasta > Date.now()) {
+      throw new ForbiddenException('Demasiados intentos fallidos: el PIN queda bloqueado unos minutos.');
+    }
+    if (!verificarPassword(String(o?.pin ?? ''), u.pinHash)) {
+      const n = (f && f.hasta === 0 ? f.n : 0) + 1;
+      this.pinFallos.set(u.id, { n, hasta: n >= 5 ? Date.now() + 5 * 60_000 : 0 });
+      throw new ForbiddenException('PIN incorrecto.');
+    }
+    this.pinFallos.delete(u.id);
+
+    /* El relevo MISMO queda auditado: quién tomó la caja, en la sesión de
+     * quién y en qué turno. El día que Gerencia › Auditoría exista, esto ya
+     * está escrito. */
+    const turno = Number(o?.cajaSesionId) || 0;
+    await this.audit.registrar([{
+      entidad: 'caja',
+      entidadId: turno,
+      ambito: 'Relevo de caja',
+      detalle: turno ? `Turno #${turno}` : 'Sin turno abierto',
+      campo: 'Quién está en la caja',
+      antes: sesion?.nombre ?? '',
+      despues: u.nombre,
+      usuarioId: sesion?.usuarioId ?? null,
+    }]);
+    return { ok: true, usuario: { id: u.id, nombre: u.nombre } };
+  }
+
+  /** El titular vuelve: sin PIN (la sesión ES suya), pero con rastro igual. */
+  async volverDeRelevo(o: any, sesion?: Sesion) {
+    const turno = Number(o?.cajaSesionId) || 0;
+    await this.audit.registrar([{
+      entidad: 'caja',
+      entidadId: turno,
+      ambito: 'Relevo de caja',
+      detalle: turno ? `Turno #${turno}` : 'Sin turno abierto',
+      campo: 'Quién está en la caja',
+      antes: String(o?.operadorNombre ?? '').slice(0, 120),
+      despues: sesion?.nombre ?? '',
+      usuarioId: sesion?.usuarioId ?? null,
+    }]);
+    return { ok: true };
+  }
+
   async editarUsuario(id: number, o: any, sesion?: Sesion) {
     const [u] = await this.db.select().from(usuarios).where(eq(usuarios.id, id)).limit(1);
     if (!u) throw new NotFoundException('Usuario inexistente.');
@@ -708,6 +833,26 @@ export class UsuariosService {
       }
       patch.passwordHash = hashPassword(pw);
     }
+    /*
+     * EL RELEVO DE CAJA (0088). El PIN es corto a propósito (4-6 dígitos: se
+     * tipea con un cliente esperando) — la defensa está en el freno de
+     * intentos del verificador, no en el largo. Vacío = no cambiar; la marca
+     * no se puede prender sin un PIN existente o nuevo, porque un relevo sin
+     * PIN sería un selector decorativo: cualquiera firma como cualquiera.
+     */
+    if (o?.pin != null && o.pin !== '') {
+      const pin = String(o.pin);
+      if (!PIN_VALIDO.test(pin)) {
+        throw new BadRequestException('El PIN del relevo son 4 a 6 dígitos.');
+      }
+      patch.pinHash = hashPassword(pin);
+    }
+    if (o?.relevoCaja != null && !!o.relevoCaja !== u.relevoCaja) {
+      if (o.relevoCaja && !u.pinHash && !patch.pinHash) {
+        throw new BadRequestException('Para habilitarlo como relevo de caja definile un PIN.');
+      }
+      patch.relevoCaja = !!o.relevoCaja;
+    }
     if (Object.keys(patch).length) await this.db.update(usuarios).set(patch).where(eq(usuarios.id, id));
 
     /*
@@ -750,6 +895,25 @@ export class UsuariosController {
   @Post() crear(@Body() body: any, @Auth() sesion: Sesion) { return this.svc.crearUsuario(body ?? {}, sesion); }
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() body: any, @Auth() sesion: Sesion) {
     return this.svc.editarUsuario(id, body ?? {}, sesion);
+  }
+}
+
+/**
+ * EL RELEVO DE CAJA, del lado del POS (0088). Llaves de quien opera la
+ * registradora (OR): el que puede vender, mover caja o cobrar puede pedir la
+ * lista de relevos y verificar un PIN — administrar QUIÉNES son relevo sigue
+ * siendo de `gerencia.usuarios`, por el ABM de arriba.
+ */
+@Controller('relevos')
+@Permiso('ventas.pos', 'ventas.caja', 'ventas.cobranzas')
+export class RelevosController {
+  constructor(private readonly svc: UsuariosService) {}
+  @Get() list() { return this.svc.listRelevos(); }
+  @Post('verificar') verificar(@Body() body: any, @Auth() sesion: Sesion) {
+    return this.svc.verificarRelevo(body ?? {}, sesion);
+  }
+  @Post('volver') volver(@Body() body: any, @Auth() sesion: Sesion) {
+    return this.svc.volverDeRelevo(body ?? {}, sesion);
   }
 }
 
@@ -834,7 +998,8 @@ export class AuthController {
 }
 
 @Module({
-  controllers: [RolesController, UsuariosController, AuthController],
+  imports: [AuditoriaModule],
+  controllers: [RolesController, UsuariosController, RelevosController, AuthController],
   providers: [UsuariosService],
   exports: [UsuariosService],
 })

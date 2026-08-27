@@ -31,6 +31,7 @@ import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { CajaModule, CajaService } from '../caja/caja.module';
 import { VentasModule, VentasService, fechaDeDocumento, money } from '../ventas/ventas.module';
+import { resolverOperador } from '../usuarios/usuarios.module';
 
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
 
@@ -78,6 +79,9 @@ export class CreateCobranzaDto {
   /** Pista: para el cajero la sucursal sale de su sesión. Ver `sucursalDeOperacion`. */
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** El relevo de caja (0088): quién está en la registradora. El interceptor
+   *  no lo toca (significa OTRO usuario) y el servidor valida la marca. */
+  @IsOptional() @IsInt() operadorId?: number;
   /*
    * `cajaSesionId` NO está acá y no vuelve: lo resuelve el servidor (ver
    * `create`). El campo se aceptaba sin validar nada —turno cerrado, turno de
@@ -224,6 +228,8 @@ export class CobranzasService {
     const esJefeSesion = !!opciones.esJefe;
     const cliente = await this.cli.get(dto.clienteId);
     const config = await this.cfg.get('ventas');
+    // El relevo (0088): el recibo lo firma quien está parado en la caja.
+    const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     const pagos = (dto.pagos ?? []).filter((p) => Number(p.importe) > 0);
     if (!pagos.length) throw new BadRequestException('Cargá al menos un medio de pago con importe.');
@@ -342,7 +348,7 @@ export class CobranzasService {
       const [c] = await tx.insert(cobranzas).values({
         puntoVenta, numero, fecha, clienteId: cliente.id,
         sucursalId,
-        usuarioId: dto.usuarioId ?? null,
+        usuarioId: autor,
         cajaSesionId: turnoIdEnTx,
         total, aCuenta, estado: 'confirmada', observaciones: dto.observaciones ?? '',
       }).returning();

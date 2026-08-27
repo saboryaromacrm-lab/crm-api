@@ -216,6 +216,14 @@ export const usuarios = pgTable('usuarios', {
   passwordHash: text('password_hash').notNull().default(''),
   /** Los usuarios no se borran (están en el historial): se desactivan. */
   activo: boolean('activo').notNull().default(true),
+  /*
+   * RELEVO DE CAJA (0088): puede tomar la registradora de una sesión ajena
+   * ("la cajera se ausenta, cobra el repositor") firmando con su PIN. Es
+   * TRAZABILIDAD, no permiso: los permisos siguen siendo los de la sesión.
+   */
+  relevoCaja: boolean('relevo_caja').notNull().default(false),
+  /** PIN del relevo, mismo formato que passwordHash. Vacío = sin PIN. */
+  pinHash: text('pin_hash').notNull().default(''),
 });
 
 /**

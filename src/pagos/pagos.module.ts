@@ -36,6 +36,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
+import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import {
@@ -122,6 +123,9 @@ export class CrearPagoDto {
   /** Turno del que sale el efectivo: genera el egreso en esa caja. */
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** El relevo de caja (0088): quién está en la registradora pagando. El
+   *  interceptor no lo toca (significa OTRO usuario) y el servidor valida. */
+  @IsOptional() @IsInt() operadorId?: number;
   @IsOptional() @IsString() @MaxLength(1000) observaciones?: string;
   /** Imputación en el mismo acto (pagar una factura que ya está cargada). */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionDto)
@@ -703,6 +707,11 @@ export class PagosProveedorService {
   ) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
+    /* EL RELEVO DE CAJA (0088): si el POS tiene un operador puesto, el pago lo
+     * firma él. Se resuelve UNA vez y se pisa `dto.usuarioId` para que todos
+     * los usos de abajo (pago, egreso, imputaciones, fletes) firmen igual. */
+    const operadorResuelto = await resolverOperador(this.db, (dto as any).operadorId, dto.usuarioId);
+    if (operadorResuelto) dto.usuarioId = operadorResuelto;
 
     let proveedorId: number | null = null;
     let prov: any = null;

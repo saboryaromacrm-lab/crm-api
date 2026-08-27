@@ -617,6 +617,13 @@
       "when": 1788613200000,
       "tag": "0087_migracion_de_proveedores",
       "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "7",
+      "when": 1788616800000,
+      "tag": "0088_relevo_de_caja",
+      "breakpoints": true
     }
   ]
 }
