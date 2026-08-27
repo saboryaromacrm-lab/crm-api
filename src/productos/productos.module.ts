@@ -91,6 +91,13 @@ class UpsertProductoDto {
    */
   @IsOptional() @IsBoolean() soloFraccionar?: boolean;
 
+  /**
+   * Uso exclusivo de Cafetería (0089): no se vende en el mostrador — sale solo
+   * por el envío de Almacén › Cafetería. El POS lo muestra bloqueado con el
+   * motivo y la venta lo rechaza en el confirm.
+   */
+  @IsOptional() @IsBoolean() soloCafeteria?: boolean;
+
   /** Solo en el alta: después el tipo no se cambia (hay stock atado a él). */
   @IsOptional() @IsBoolean() esGranel?: boolean;
 
@@ -559,6 +566,7 @@ export class ProductosService {
       redondeo: dto.redondeo === undefined ? (previo?.redondeo ?? null) : dto.redondeo,
       publicado: dto.publicado ?? previo?.publicado ?? false,
       soloFraccionar: dto.soloFraccionar ?? previo?.soloFraccionar ?? false,
+      soloCafeteria: dto.soloCafeteria ?? previo?.soloCafeteria ?? false,
       idExterno: (dto.idExterno ?? previo?.idExterno ?? '').trim(),
     };
   }

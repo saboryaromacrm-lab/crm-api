@@ -451,6 +451,16 @@ export const productos = pgTable('productos', {
    * venta (API) y el POS ni la ofrece suelta.
    */
   soloFraccionar: boolean('solo_fraccionar').notNull().default(false),
+  /**
+   * USO EXCLUSIVO DE CAFETERÍA (Coffit, 0089): mercadería que la distribuidora
+   * compra y guarda solo para mandarle a la cafetería (la Serenísima que no va
+   * a la góndola). Es stock normal en todo — compra, existencias, conteos,
+   * vencimientos, envíos — pero NO SE VENDE en el mostrador: el POS lo bloquea
+   * y la venta lo revalida (el catálogo se cachea al abrir la caja, así que el
+   * candado de verdad es el del confirm). Destildar la marca lo vuelve
+   * vendible; por eso es un campo de la ficha y no una etiqueta blanda.
+   */
+  soloCafeteria: boolean('solo_cafeteria').notNull().default(false),
   stockMin: doublePrecision('stock_min').notNull().default(0),
   /**
    * Redondeo de góndola propio. NULL = hereda el de configuración, que es lo

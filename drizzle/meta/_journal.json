@@ -624,6 +624,13 @@
       "when": 1788616800000,
       "tag": "0088_relevo_de_caja",
       "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1788616801000,
+      "tag": "0089_uso_exclusivo_cafeteria",
+      "breakpoints": true
     }
   ]
 }

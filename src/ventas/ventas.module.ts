@@ -1188,6 +1188,10 @@ export class VentasService {
         proveedorIds: proveedoresDe.get(p.id) ?? [],
         detalle: p.tipo === 'granel' ? 'Suelto (por kg)' : 'Unidad',
         tipo: p.tipo,
+        /* Uso exclusivo de Cafetería (0089): viaja al POS para MOSTRARSE
+         * bloqueado con su motivo — esconderlo haría que un código escaneado
+         * "no exista", que parece un error. El candado real está en la venta. */
+        soloCafeteria: p.soloCafeteria,
         unidad: p.tipo === 'granel' ? 'kg' : 'u',
         fraccionable: p.tipo === 'granel',   // admite cantidad decimal
         iva: p.iva,
@@ -1244,6 +1248,9 @@ export class VentasService {
           proveedorIds: proveedoresDe.get(p.id) ?? [],
           detalle: pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`,
           tipo: p.tipo,
+          // El paquete hereda la exclusividad de la madre: si el granel es de
+          // la Cafetería, sus fraccionados tampoco van al mostrador.
+          soloCafeteria: p.soloCafeteria,
           unidad: 'u',
           fraccionable: false,
           iva: p.iva,
@@ -2388,15 +2395,28 @@ export class VentasService {
    * y no un interruptor. El candado va acá y no solo en el catálogo del POS,
    * porque el catálogo se cachea al abrir la caja: un producto archivado en el
    * medio del turno seguiría estando en la pantalla del cajero.
+   *
+   * El USO EXCLUSIVO DE CAFETERÍA (0089) es el mismo candado con otro motivo:
+   * mercadería que la distribuidora guarda para Coffit y no va al mostrador.
+   * Sale solo por el envío de Almacén › Cafetería, que no pasa por acá.
    */
   private async validarEstadoVendible(items: Array<{ productoId: number }>) {
     const ids = [...new Set((items ?? []).map((it) => it.productoId))];
     if (!ids.length) return;
-    const [archivado] = await this.db.select({ nombre: productos.nombre }).from(productos)
-      .where(and(inArray(productos.id, ids), eq(productos.estado, 'archivado'))).limit(1);
+    const filas = await this.db
+      .select({ nombre: productos.nombre, estado: productos.estado, soloCafeteria: productos.soloCafeteria })
+      .from(productos).where(inArray(productos.id, ids));
+    const archivado = filas.find((f) => f.estado === 'archivado');
     if (archivado) {
       throw new BadRequestException(
         `${archivado.nombre} está archivado: ya no se vende. Si volvió a entrar, reactivalo en Compras › Productos.`,
+      );
+    }
+    const deCafeteria = filas.find((f) => f.soloCafeteria);
+    if (deCafeteria) {
+      throw new BadRequestException(
+        `${deCafeteria.nombre} es de uso exclusivo de la Cafetería: no se vende en el mostrador. `
+        + 'Sale por el envío de Almacén › Cafetería. Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
       );
     }
   }
