@@ -1787,11 +1787,20 @@ export class InventarioService {
    * Historial paginado. Ya no viaja en el bootstrap, así que el panel lo pide
    * con sus filtros y un techo duro: la tabla crece para siempre.
    */
-  async listMovimientos(q: { productoId?: number; sucursalId?: number; tipo?: string; limit?: number } = {}) {
+  async listMovimientos(q: {
+    productoId?: number; sucursalId?: number; tipo?: string;
+    desde?: string; hasta?: string; limit?: number;
+  } = {}) {
     const conds: any[] = [];
     if (q.productoId) conds.push(eq(movimientos.productoId, Number(q.productoId)));
     if (q.sucursalId) conds.push(eq(movimientos.sucursalId, Number(q.sucursalId)));
     if (q.tipo) conds.push(eq(movimientos.tipo, q.tipo as any));
+    /* Mismo criterio que el libro del almacén: `fechaLocal` para el desde (un
+     * '2026-08-13' pelado es las 21 h del 12 en Formosa) y fin de día para el
+     * hasta — un rango de UN día tiene que traer ese día completo. */
+    const desde = fechaLocal(q.desde);
+    if (desde) conds.push(gte(movimientos.fecha, desde));
+    if (q.hasta) conds.push(lte(movimientos.fecha, new Date(`${q.hasta}T23:59:59`)));
     const limit = Math.min(Math.max(Number(q.limit) || 300, 1), 1000);
     return this.db.select().from(movimientos)
       .where(conds.length ? and(...conds) : undefined)

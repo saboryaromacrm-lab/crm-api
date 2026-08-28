@@ -248,6 +248,8 @@ export class MovimientosController {
     @Query('productoId') productoId?: string,
     @Query('sucursalId') sucursalId?: string,
     @Query('tipo') tipo?: string,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
     @Query('limit') limit?: string,
   ) {
     const mia = soloSuSucursal(sesion);
@@ -257,6 +259,8 @@ export class MovimientosController {
       // reconstruía la operación completa de todas las sucursales.
       sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
       tipo,
+      desde,
+      hasta,
       limit: limit ? Number(limit) : undefined,
     });
   }
