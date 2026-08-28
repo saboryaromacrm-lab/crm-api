@@ -22,7 +22,9 @@
  * (node dist/db/migrate.js) + psql -f archivo.sql — las instrucciones van en
  * el encabezado del propio archivo, que es donde se las busca en la urgencia.
  */
-import { Controller, Get, Inject, Injectable, Module, Res } from '@nestjs/common';
+import {
+  BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, Post, Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import type { Pool } from 'pg';
 import { desc, eq, and, sql } from 'drizzle-orm';
@@ -34,6 +36,55 @@ import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module
 /** Literal SQL: comillas simples dobladas. `standard_conforming_strings` es el
  *  default de Postgres, así que la barra invertida no necesita nada. */
 const literal = (v: string | null) => (v === null ? 'NULL' : `'${v.replace(/'/g, "''")}'`);
+
+/**
+ * LIMPIEZA DE FIN DE PRÁCTICA (28/8/2026, pedido del dueño): las tablas
+ * TRANSACCIONALES que se vacían cuando termina el período de prueba del
+ * equipo. Todo lo que es CATÁLOGO o IDENTIDAD se conserva: productos y sus
+ * formatos, proveedores con percepciones y cuentas, clientes, listas y
+ * precios (con su historial), ofertas, usuarios/roles/sesiones, sucursales,
+ * terminales, configuración, fotos de la tienda, chat y las plantillas de
+ * gastos recurrentes.
+ *
+ * TRUNCATE SIN CASCADE a propósito: si alguna tabla nueva referencia a una de
+ * estas y no está en la lista, Postgres se niega y la transacción aborta —
+ * mejor un error que borrar de más en silencio. `RESTART IDENTITY` deja los
+ * contadores en 1: la primera venta real es el ticket 1 (la numeración fiscal
+ * la lleva ARCA y no se toca).
+ */
+const TABLAS_PRACTICA = [
+  // stock y su película
+  'stock', 'movimientos',
+  // almacén: conteos, transferencias, incidencias, vencimientos
+  'conteos', 'conteo_items',
+  'transferencias', 'transferencia_items', 'transferencia_hist',
+  'incidencias',
+  'vencimiento_sesiones', 'vencimientos',
+  // compras: comprobantes (facturas, remitos, liquidaciones) y la bandeja
+  'comprobantes', 'comprobante_items', 'comprobante_percepciones',
+  'factura_lecturas', 'factura_archivos',
+  // ventas: tickets, presupuestos, cobranzas y caja
+  'ventas', 'venta_items', 'venta_extras', 'venta_pagos',
+  'presupuestos', 'presupuesto_items',
+  'cobranzas', 'cobranza_pagos', 'cobranza_imputaciones',
+  'caja_sesiones', 'caja_movimientos', 'caja_controles',
+  // proveedores: pagos (con su split multi-medio), compromisos, echeqs,
+  // ajustes EDOC y la pizarra. `pago_formas` la encontró la PRUEBA: el
+  // TRUNCATE sin CASCADE se negó porque referencia a proveedor_pagos —
+  // exactamente el aviso para el que existe ese diseño.
+  'proveedor_pagos', 'pago_formas', 'proveedor_imputaciones',
+  'proveedor_compromisos', 'proveedor_echeqs', 'proveedor_ajustes',
+  'pedidos_proveedor',
+  // gastos (los cargados; las plantillas recurrentes y los rubros quedan)
+  'gastos', 'gasto_items', 'gasto_adjuntos',
+  // cafetería
+  'pedidos_cafeteria', 'pedido_cafeteria_items',
+  'envios_cafeteria', 'envio_cafeteria_items',
+  // tienda: eventos (las fotos quedan)
+  'web_eventos',
+  // el rastro de la práctica; el primer registro de la era nueva es la limpieza
+  'auditoria',
+];
 
 @Injectable()
 export class RespaldosService {
@@ -154,6 +205,48 @@ export class RespaldosService {
       despues: `${tablas.length} tablas · ${filasTotal.toLocaleString('es-AR')} filas · ${mb} MB`,
     }]);
   }
+
+  /** El ensayo de la limpieza: cuántas filas se irían, tabla por tabla. */
+  async ensayoLimpieza() {
+    const detalle: { tabla: string; filas: number }[] = [];
+    let total = 0;
+    for (const t of TABLAS_PRACTICA) {
+      const r = await this.pool.query(`SELECT count(*)::int AS n FROM "${t}"`);
+      const n = Number(r.rows[0]?.n) || 0;
+      if (n > 0) detalle.push({ tabla: t, filas: n });
+      total += n;
+    }
+    return { tablas: TABLAS_PRACTICA.length, total, detalle };
+  }
+
+  /**
+   * LA LIMPIEZA. Una sola transacción sobre UNA conexión (un BEGIN por
+   * `pool.query` iría a conexiones distintas y no ataría nada). El registro
+   * de auditoría se escribe DESPUÉS del commit: es el primer rastro de la era
+   * nueva — dentro de la transacción lo borraría el propio TRUNCATE.
+   */
+  async limpiarPractica(usuarioId: number | null) {
+    const antes = await this.ensayoLimpieza();
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`TRUNCATE ${TABLAS_PRACTICA.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY`);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw new BadRequestException(
+        'La limpieza se canceló entera (no quedó nada a medias): ' + ((e as Error).message ?? e),
+      );
+    } finally {
+      client.release();
+    }
+    await this.audit.registrar([{
+      entidad: 'sistema', entidadId: 0, ambito: 'Limpieza',
+      campo: 'Fin del período de prueba', usuarioId,
+      despues: `Se vaciaron ${antes.total.toLocaleString('es-AR')} filas de ${antes.detalle.length} tablas (stock, ventas, compras, caja, cobranzas y demás operatoria de práctica). El catálogo, los proveedores, los clientes y la configuración quedaron intactos.`,
+    }]);
+    return { ok: true, borradas: antes.total, detalle: antes.detalle };
+  }
 }
 
 @Controller('sistema/respaldos')
@@ -166,6 +259,32 @@ export class RespaldosController {
   @Get('descargar') @Permiso('sistema.respaldos')
   descargar(@Res() res: Response, @Auth() sesion: Sesion) {
     return this.svc.volcar(res, sesion?.usuarioId ?? null);
+  }
+
+  /* La limpieza de fin de práctica es DEL SUPERADMIN y de nadie más: no es un
+   * permiso delegable como los demás — borra la operatoria entera. El comodín
+   * `*` es la definición de superadmin en todo el sistema. */
+  private soloSuperadmin(sesion: Sesion) {
+    if (!sesion?.permisos?.includes('*')) {
+      throw new ForbiddenException('La limpieza del sistema es exclusiva del superadmin.');
+    }
+  }
+
+  @Get('limpieza/ensayo') @Permiso('sistema.respaldos')
+  ensayoLimpieza(@Auth() sesion: Sesion) {
+    this.soloSuperadmin(sesion);
+    return this.svc.ensayoLimpieza();
+  }
+
+  @Post('limpieza') @Permiso('sistema.respaldos')
+  limpiar(@Body() body: any, @Auth() sesion: Sesion) {
+    this.soloSuperadmin(sesion);
+    /* La palabra tipeada es el segundo seguro: un clic solo, aunque pase por
+     * dos modales, sigue siendo un clic. */
+    if (String(body?.confirmar ?? '') !== 'LIMPIAR') {
+      throw new BadRequestException('Para confirmar, escribí LIMPIAR tal cual.');
+    }
+    return this.svc.limpiarPractica(sesion?.usuarioId ?? null);
   }
 }
 
