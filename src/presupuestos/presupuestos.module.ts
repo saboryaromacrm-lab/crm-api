@@ -239,7 +239,12 @@ export class PresupuestosService {
    */
   async crearDesdeWeb(dto: {
     clienteId: number | null; sucursalId: number; entrega?: string; observaciones?: string;
-    items: any[]; webCliente?: { nombre: string; apellido: string; telefono: string; dni: string };
+    items: any[];
+    webCliente?: {
+      nombre: string; apellido: string; telefono: string; dni: string;
+      /** Solo con envío (cadete / camioneta): a dónde va el pedido. */
+      direccion?: string; localidad?: string; referencia?: string;
+    };
   }) {
     if (!dto?.sucursalId) throw new BadRequestException('Falta la sucursal.');
     if (!dto.clienteId && !dto.webCliente) throw new BadRequestException('Faltan los datos del cliente.');
@@ -441,6 +446,10 @@ export class PresupuestosService {
         const c = await this.clientesSvc.create({
           nombre: `${wc.nombre ?? ''} ${wc.apellido ?? ''}`.trim(),
           tipoDoc: 'dni', numeroDoc: dni, telefono: String(wc.telefono ?? ''),
+          // La dirección del pedido web (si hubo envío) queda en la ficha:
+          // el próximo pedido ya sabe a dónde ir.
+          direccion: String(wc.direccion ?? ''),
+          localidad: String(wc.localidad ?? ''),
           condicionIva: 'consumidor_final',
         } as any);
         clienteId = c.id;

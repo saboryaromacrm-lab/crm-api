@@ -1,0 +1,30 @@
+# CI mínima: en cada push a dev/main y en cada pull request, la API tiene que
+# tipar, compilar y pasar sus tests. No despliega nada — el deploy lo sigue
+# disparando Dokploy por webhook; esto es la red que faltaba ANTES de eso.
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # La misma versión que la imagen de producción (node:22-alpine).
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias (lockfile exacto)
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Compilar y correr tests
+        run: npm test

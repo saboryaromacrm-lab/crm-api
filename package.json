@@ -11,6 +11,7 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main.js",
+    "test": "nest build && node --test \"dist/**/*.test.js\"",
     "db:generate": "drizzle-kit generate",
     "db:create": "ts-node -r tsconfig-paths/register src/db/create.ts",
     "db:migrate": "ts-node -r tsconfig-paths/register src/db/migrate.ts",

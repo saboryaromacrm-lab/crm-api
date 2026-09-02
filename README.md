@@ -24,7 +24,7 @@ cd crm-api
 npm install
 cp .env.example .env          # y editá DATABASE_URL con tu password de postgres
 npm run db:create             # crea la base "crm"
-npm run db:migrate            # crea las 28 tablas
+npm run db:migrate            # aplica las migraciones (79 tablas)
 npm run db:seed               # datos de ejemplo
 npm run start:dev             # http://localhost:3001/api
 ```
@@ -86,33 +86,45 @@ Otros scripts:
 | `npm run db:migrate` | Aplica las migraciones pendientes de `drizzle/` |
 | `npm run db:seed` | Vacía las tablas de datos y carga el ejemplo (respeta la configuración guardada) |
 | `npm run db:reset` | Vacía todas las tablas, sin insertar nada |
-| `npm run db:generate` | Regenera las migraciones SQL desde `src/db/schema.ts` (tras cambiar el esquema) |
+| `npm run db:generate` | Genera la migración SQL con el diff entre `src/db/schema.ts` y el último snapshot de `drizzle/meta/` (ver abajo) |
+| `npm test` | Compila y corre los tests (`src/**/*.test.ts`, runner nativo de Node) |
+
+### Cómo se cambia el esquema
+
+1. Editar `src/db/schema.ts`.
+2. `npm run db:generate` → deja `drizzle/00NN_<nombre>.sql` y `drizzle/meta/00NN_snapshot.json`.
+   Conviene pasar un nombre: `npx drizzle-kit generate --name lo_que_cambia`.
+3. Leer el SQL generado (Drizzle a veces propone más de lo necesario) y, si
+   hace falta algo que el esquema no expresa (un `CHECK`, un índice parcial),
+   agregarlo a mano en ese mismo archivo.
+4. `npm run db:migrate`.
+
+> **Sobre los snapshots.** Hasta el 1/9/2026 la carpeta `drizzle/meta/` tenía
+> snapshots que no reflejaban la base (copias repetidas desde `0010` y archivos
+> escritos a mano hasta `0062`, con 29 tablas de 79), así que `db:generate` no
+> funcionaba y las migraciones `0063`–`0089` se escribieron a mano. Ese día se
+> reconstruyó **un solo snapshot** (`0089_snapshot.json`) desde `schema.ts`,
+> que es la base de diff actual. Las migraciones aplicadas no se tocaron.
 
 ### Archivos de base de datos
 
-La carpeta `database/` tiene un volcado listo para usar, por si preferís cargar
-la base directamente en vez de correr las migraciones:
-
 | Archivo | Contenido |
 |---------|-----------|
-| `database/schema.sql` | Estructura completa: 20 tipos enumerados, 28 tablas, índices y claves foráneas. **Sin datos.** |
-| `database/seed-ejemplo.sql` | Solo los datos de ejemplo (sucursales, productos, proveedores, clientes, comprobantes). Se carga **después** del esquema. |
+| `database/schema.sql` | Estructura completa (79 tablas, 47 tipos enumerados), generada por drizzle-kit desde `src/db/schema.ts` el 1/9/2026. Para **leer** el esquema de un vistazo. |
+| `database/seed-ejemplo.sql` | Datos de ejemplo del esquema **viejo** (28 tablas). Ya no carga sobre la base actual; usá `npm run db:seed`. |
+
+**Ninguno de los dos sirve para levantar la base**: `schema.sql` no crea la
+tabla de migraciones de Drizzle, así que una base creada con él rechaza
+`db:migrate` después. Para levantar la base: `db:create` + `db:migrate`
+(+ `db:seed`). Para regenerar `schema.sql` desde una base migrada, con
+`pg_dump` (en Windows está en `C:\Program Files\PostgreSQL\18\bin\`):
 
 ```bash
-# Restaurar desde los volcados (alternativa a db:migrate + db:seed)
-createdb -U postgres crm
-psql -U postgres -d crm -f database/schema.sql
-psql -U postgres -d crm -f database/seed-ejemplo.sql
+pg_dump -U postgres -d crm --schema-only > database/schema.sql
 ```
 
-En Windows, si `psql` no está en el PATH, está en
-`C:\Program Files\PostgreSQL\18\bin\psql.exe`.
-
 > **Cuál es la fuente de verdad.** Las migraciones de `drizzle/` son las que
-> mandan: se generan desde `src/db/schema.ts` y son las que se aplican en
-> producción. Los archivos de `database/` son una **foto** para levantar rápido
-> o para inspeccionar el esquema de un vistazo — si cambiás el esquema, hay que
-> regenerarlos con `pg_dump`.
+> mandan: son las que se aplican en producción.
 
 ## 4. Levantar la API
 
@@ -233,14 +245,24 @@ los que coffit va a leer en la fase de integración por API (con token acotado).
 | GET | `/tienda/imagenes/...` | Imágenes del catálogo |
 | GET/PUT | `/web/*` | Administración del sitio desde el CRM (publicados, banners, configuración) |
 
-> Los 4 endpoints de `/tienda` son los **únicos** que quedarán públicos cuando
-> la API tenga autenticación (requisito previo al deploy). Con rate-limit
-> propio por ruta y `trust proxy` ya activo.
+> Los 4 endpoints de `/tienda` son, junto con `POST /auth/login`,
+> `GET /auth/opciones`, `POST /terminales/actual` y `GET /health`, los
+> **únicos públicos** de la API: todo lo demás exige `Authorization: Bearer`
+> (ver *Autenticación* más abajo). Tienen rate-limit propio por ruta y
+> `trust proxy` activo.
 
 ## Arquitectura
 
-- `src/db/schema.ts` — esquema Drizzle (28 tablas). Stock **sin lote**: Producto × Sucursal × Presentación × Estado.
+- `src/db/schema.ts` — esquema Drizzle (79 tablas, 47 enums). Stock **sin lote**: Producto × Sucursal × Presentación × Estado.
 - `src/db/db.module.ts` — pool de PostgreSQL + cliente Drizzle (global).
+- `src/auth/` — **autenticación y autorización**. Un guard global (`APP_GUARD`)
+  cierra TODOS los endpoints por defecto; lo público se marca con `@Publico()`.
+  El login (`POST /auth/login`, en `src/usuarios/`) devuelve un token aleatorio
+  de 32 bytes que viaja en `Authorization: Bearer`; en la base queda solo su
+  SHA-256 (tabla `sesiones`, 12 h de inactividad). Las contraseñas se guardan
+  con scrypt. `@Permiso(...)` exige claves del rol; el superadmin tiene `*`.
+  Freno de intentos de login por usuario+IP y por IP (`freno-login.ts`). La
+  sucursal con la que se opera sale de la sesión, no del body (`auth.guard.ts`).
 - `src/inventario/inventario.service.ts` — **motor**: operaciones, transferencias e incidencias, en transacciones. Réplica de la lógica del frontend. `ingresarStockItems` / `egresarStockItems` / `reingresarStockItems` son los ganchos que usan los documentos (comprobantes de compra, ventas).
 - `src/{productos,proveedores,sucursales,usuarios,clientes}/` — recursos CRUD.
 - `src/ventas/` — comprobantes de venta: tabla propia (numeración del sistema, CAE, libro IVA aparte), cuenta corriente, límite de crédito y catálogo del POS. Las **ventas abiertas** del punto de venta son filas con `estado=borrador`: no consumen numeración (el índice único de `numero` es parcial), no tocan stock y se pueden editar, delegar o descartar. `venta_extras` guarda los cargos que no son mercadería (envío, packaging).
@@ -261,9 +283,8 @@ Un solo criterio en todo el sistema evita descuadres de centavos entre los dos c
 La lista viva y completa está en el CRM: **Info de sistema › Pendientes**. Los
 grandes titulares:
 
-- **Autenticación — BLOQUEANTE del deploy**: sesiones con token en toda la API
-  salvo los 4 endpoints públicos de `/tienda`; Node escuchando solo en
-  localhost detrás de nginx.
+- ~~Autenticación~~ — **hecha** (guard global + sesiones, ver *Arquitectura*).
+  El sistema está en producción en un VPS con Dokploy (`deploy/DEPLOY.md`).
 - **Nota de crédito** (compra y venta) con saldo acreditable.
 - **Anular comprobante de compra** (debe liberar las imputaciones de pagos).
 - **Facturación electrónica ARCA** (estado `pendiente_cae` ya previsto).

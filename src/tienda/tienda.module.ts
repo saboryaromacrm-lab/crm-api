@@ -23,6 +23,7 @@ import {
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
 import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
+import { telefonoArgentino } from '../common/telefono';
 import type { Response } from 'express';
 import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -83,18 +84,34 @@ function precioConOferta(o: any, precioFinal: number): number | null {
   return null; // nxm / segunda_unidad / pack: el cartel avisa, el precio unitario no cambia.
 }
 
+/** Formas de entrega que el sitio ofrece; cualquier otra cosa cae a retiro. */
+const ENTREGAS_TIENDA = ['retiro', 'cadete', 'camioneta'] as const;
+type EntregaTienda = (typeof ENTREGAS_TIENDA)[number];
+
+/** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */
+const MAX_CALLE = 120;
+const MAX_LOCALIDAD = 80;
+const MAX_REFERENCIA = 200;
+
 /**
- * Teléfono argentino normalizado a área + abonado (10 dígitos), o '' si no
- * llega. Misma regla que el checkout del sitio y que el link de WhatsApp del
- * CRM: tolera `+54`, el `9` de celular, el `0` y el viejo `15`.
+ * La DIRECCIÓN DE ENTREGA del pedido, saneada, o `null` si es retiro.
+ *
+ * Es obligatoria con envío (`cadete` / `camioneta`): antes el pedido llegaba
+ * sin domicilio y dependía de que el cliente lo escribiera en las notas o de
+ * pedírselo después por WhatsApp — el cadete salía sin saber a dónde.
  */
-function telefonoArgentino(tel: string): string {
-  let d = String(tel ?? '').replace(/\D/g, '');
-  if (d.startsWith('54')) d = d.slice(2);
-  if (d.startsWith('0')) d = d.slice(1);
-  if (d.startsWith('9')) d = d.slice(1);
-  d = d.replace(/^(\d{2,4})15(\d{6,8})$/, '$1$2');
-  return d.length === 10 ? d : '';
+export function direccionDeEntrega(entrega: EntregaTienda, cruda: any): {
+  direccion: string; localidad: string; referencia: string;
+} | null {
+  if (entrega === 'retiro') return null;
+  const d = cruda ?? {};
+  const direccion = String(d.calle ?? '').trim().slice(0, MAX_CALLE);
+  const localidad = String(d.localidad ?? '').trim().slice(0, MAX_LOCALIDAD);
+  const referencia = String(d.referencia ?? '').trim().slice(0, MAX_REFERENCIA);
+  if (!direccion || !localidad) {
+    throw new BadRequestException('Para el envío necesitamos la dirección: calle y número, y el barrio o localidad.');
+  }
+  return { direccion, localidad, referencia };
 }
 
 @Injectable()
@@ -421,6 +438,10 @@ export class TiendaService {
     const dni = String(c.dni ?? '').replace(/\D/g, '');
     if (dni.length < 7 || dni.length > 8) throw new BadRequestException('El DNI debe tener entre 7 y 8 dígitos (es solo para identificarte, no es de facturación).');
 
+    const entrega: EntregaTienda = ENTREGAS_TIENDA.includes(dto?.entrega) ? dto.entrega : 'retiro';
+    // Se valida ANTES de cotizar: si falta la dirección no hay para qué tocar el catálogo.
+    const domicilio = direccionDeEntrega(entrega, dto?.direccion);
+
     /*
      * El techo va ANTES de tocar la base: el body admite 4 MB, y con
      * `{"productoId":1,"cantidad":1}` repetido eso son ~110.000 renglones
@@ -512,7 +533,7 @@ export class TiendaService {
      * por cantidades): mover el vehículo cuesta lo mismo lleve lo que lleve,
      * así que el pedido tiene que valer el viaje.
      */
-    if (dto.entrega === 'camioneta' && cat.montoMinimoCamioneta > 0 && total < cat.montoMinimoCamioneta) {
+    if (entrega === 'camioneta' && cat.montoMinimoCamioneta > 0 && total < cat.montoMinimoCamioneta) {
       throw new BadRequestException(
         `El envío con la camioneta necesita un pedido de al menos $${cat.montoMinimoCamioneta}. `
         + 'Sumá productos, o elegí retiro en el local o envío por cadete.',
@@ -550,11 +571,14 @@ export class TiendaService {
       // Topes de largo del lado del servidor: el `maxLength` del checkout vive
       // en el navegador y no protege al `POST` directo. Un pedido con 3 MB de
       // texto en observaciones vuelve inusable la bandeja de Órdenes al pintarla.
-      entrega: dto.entrega, observaciones: String(dto.observaciones ?? '').slice(0, 500),
+      entrega, observaciones: String(dto.observaciones ?? '').slice(0, 500),
       webCliente: {
         nombre: String(c.nombre ?? '').trim().slice(0, 60),
         apellido: String(c.apellido ?? '').trim().slice(0, 60),
         telefono, dni,
+        // La dirección viaja con los datos del cliente (jsonb, sin migración):
+        // el CRM la muestra en la orden y la usa al darlo de alta.
+        ...(domicilio ?? {}),
       },
       items,
     });
