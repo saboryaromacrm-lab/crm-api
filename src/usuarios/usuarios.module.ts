@@ -24,6 +24,7 @@ import { roles, sucursales, usuarios } from '../db/schema';
 import { SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
+import { PERMISOS_BASE, conPermisosBase } from '../auth/permisos-base';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
 /* Dos funciones sueltas, no un servicio: el login las necesita antes de que
@@ -381,7 +382,23 @@ export class UsuariosService {
     return rs.map((r) => ({ ...r, usuarios: us.filter((u) => u.rolId === r.id).length }));
   }
 
-  catalogoPermisos() { return CATALOGO_PERMISOS; }
+  /**
+   * El catálogo para la pantalla de roles, con los de fábrica MARCADOS.
+   *
+   * La marca existe para que la pantalla no mienta: esas claves las tiene todo
+   * el mundo (ver `permisos-base.ts`), así que mostrarlas destildadas haría
+   * pensar que están apagadas — y a quien las tildara "para arreglarlo" le
+   * guardaría en la base algo que ya rige solo.
+   */
+  catalogoPermisos() {
+    const deFabrica = (p: { clave: string }) =>
+      (PERMISOS_BASE.includes(p.clave) ? { ...p, base: true } : p);
+    return CATALOGO_PERMISOS.map((g) => ({
+      ...g,
+      secciones: g.secciones.map(deFabrica),
+      acciones: g.acciones.map(deFabrica),
+    }));
+  }
 
   /**
    * Las DOS reglas de repartir permisos, en un solo lugar.
@@ -660,7 +677,11 @@ export class UsuariosService {
     return {
       ok: true,
       token,
-      usuario: publico(u, r),
+      /* Los MISMOS permisos que va a devolver `/auth/yo` en la próxima carga:
+       * los del rol más los de fábrica (`permisos-base.ts`). Sin esto el
+       * login devolvía menos claves que el refresco siguiente, y la sesión
+       * recién abierta se comportaba distinto que al minuto. */
+      usuario: { ...publico(u, r), permisos: conPermisosBase(r?.permisos, r?.clave ?? '') },
       sucursal: { id: suc.id, nombre: suc.nombre },
       /* Para que el POS pueda mostrar "Caja 2" en el encabezado sin volver a
        * preguntar quién es este equipo. */

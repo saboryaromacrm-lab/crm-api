@@ -12,6 +12,7 @@ import {
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
 import { costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioLista, precioVentaFila } from './pricing';
+import { conPermisosBase } from '../auth/permisos-base';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
 /**
@@ -1869,7 +1870,8 @@ export class InventarioService {
       const r = rolDe.get(u.rolId);
       return {
         id: u.id, nombre: u.nombre, activo: u.activo, rolId: u.rolId,
-        rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '', permisos: r?.permisos ?? [],
+        rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '',
+        permisos: conPermisosBase(r?.permisos, r?.clave ?? ''),
       };
     });
   }

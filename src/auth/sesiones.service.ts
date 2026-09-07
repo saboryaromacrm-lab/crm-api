@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sesiones, sucursales, usuarios } from '../db/schema';
 import type { Sesion } from './auth.decoradores';
+import { conPermisosBase } from './permisos-base';
 
 /**
  * EL ALMACÉN DE SESIONES
@@ -111,7 +112,8 @@ export class SesionesService {
       rolId: f.rolId,
       rolClave: f.rolClave ?? '',
       rolNombre: f.rolNombre ?? '',
-      permisos: (f.permisos as string[]) ?? [],
+      // Los del rol MÁS los de fábrica (ver `permisos-base.ts`).
+      permisos: conPermisosBase(f.permisos as string[], f.rolClave ?? ''),
       sucursalId: f.sucursalId,
       sucursalNombre: f.sucursalNombre,
     };

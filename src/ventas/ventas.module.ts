@@ -48,6 +48,7 @@ import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, 
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 import { resolverOperador } from '../usuarios/usuarios.module';
+import { conPermisosBase } from '../auth/permisos-base';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -3700,7 +3701,7 @@ export class VentasService {
       return {
         id: u.id, nombre: u.nombre, activo: u.activo, rolId: u.rolId,
         rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '',
-        permisos: esYo ? (r?.permisos ?? []) : [],
+        permisos: esYo ? conPermisosBase(r?.permisos, r?.clave ?? '') : [],
       };
     });
     // Las listas predeterminadas de cada cliente en UNA consulta, no una por
