@@ -259,7 +259,15 @@ export class CajaService {
         diferencia: money(declarado - a.esperadoEfectivo),
         totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
         estado: 'cerrada',
-        observaciones: dto.observaciones ?? sesion.observaciones,
+        /*
+         * `||` y NO `??`: el modal de cierre manda el campo VACIO cuando la
+         * cajera no escribe nada, y `??` solo cae al valor viejo con null o
+         * undefined — con `''` se lo comia. Resultado: la nota de la APERTURA
+         * ("arranco con poco cambio", "faltan 2 de mil, aviso a Lucas") se
+         * borraba sola al cerrar, y es una nota que despues sale impresa en el
+         * comprobante con el que se rinde la plata.
+         */
+        observaciones: dto.observaciones || sesion.observaciones,
       }).where(eq(cajaSesiones.id, id)).returning();
       return c;
     });
