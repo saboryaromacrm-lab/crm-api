@@ -631,6 +631,13 @@
       "when": 1788616801000,
       "tag": "0089_uso_exclusivo_cafeteria",
       "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1789084035403,
+      "tag": "0090_indices_stock_y_movimientos",
+      "breakpoints": true
     }
   ]
 }

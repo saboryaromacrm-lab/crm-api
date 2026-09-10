@@ -1029,7 +1029,15 @@ export const stock = pgTable('stock', {
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'cascade' }),
   estado: estadoStockEnum('estado').notNull().default('disponible'),
   cantidad: doublePrecision('cantidad').notNull().default(0),
-});
+}, (t) => ({
+  /*
+   * Sin este índice, cada consulta de existencias recorría la tabla ENTERA.
+   * Se lee en cada carga del sistema y en cada venta (para saber si hay), así
+   * que es de las más consultadas que hay. El orden de las columnas sigue al
+   * de las consultas: primero se filtra por sucursal, después por producto.
+   */
+  ixSucProd: index('ix_stock_suc_prod').on(t.sucursalId, t.productoId),
+}));
 
 /* ---------------- Movimientos (registro inmutable de altas/bajas) ---------------- */
 export const movimientos = pgTable('movimientos', {
@@ -1062,7 +1070,23 @@ export const movimientos = pgTable('movimientos', {
   /** El ajuste que nació de un control de stock apunta a su sesión (0066). */
   refConteoId: integer('ref_conteo_id'),
   descripcion: text('descripcion').notNull().default(''),
-});
+}, (t) => ({
+  /*
+   * ESTA TABLA NO TENÍA NI UN ÍNDICE, y es la que el propio código describe
+   * como "crece sin techo": guarda cada alta y cada baja de mercadería desde
+   * el día uno.
+   *
+   * La consultan el historial de movimientos (filtrando por producto y por
+   * sucursal) y el catálogo público de la tienda, que busca los reingresos de
+   * los últimos 14 días. Sin índice, cada una de esas consultas lee la tabla
+   * completa de punta a punta — y cuanto más vieja la instalación, más tarda.
+   * Es lento de a poco: no se nota el primer mes y ahoga al año.
+   *
+   * `fecha` va al revés (desc) porque siempre se pide lo último primero.
+   */
+  ixProdFecha: index('ix_mov_prod_fecha').on(t.productoId, t.fecha.desc()),
+  ixSucTipoFecha: index('ix_mov_suc_tipo_fecha').on(t.sucursalId, t.tipo, t.fecha.desc()),
+}));
 
 /* ---------------- Control de stock (0066) ---------------- */
 /**

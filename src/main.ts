@@ -5,9 +5,12 @@ import { ConfigService } from '@nestjs/config';
 import { json } from 'express';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { LoggerApi, RegistroInterceptor } from './common/registro';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // El logger propio calla el inventario de rutas del arranque cuando corre
+  // en el servidor (300 líneas por reinicio). Ver src/common/registro.ts.
+  const app = await NestFactory.create(AppModule, { logger: new LoggerApi() });
   const config = app.get(ConfigService);
 
   /*
@@ -76,12 +79,37 @@ async function bootstrap() {
 
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  // Deja escritas las peticiones LENTAS (>2 s) y las que fallan por el lado del
+  // servidor. Es el rastro que no existía cuando hubo que buscar por qué las
+  // cajas veían "no se pudo conectar".
+  app.useGlobalInterceptors(new RegistroInterceptor());
 
   const origins = (config.get<string>('CORS_ORIGINS') ?? 'http://localhost:3000,http://localhost:5173')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  // exposedHeaders: sin esto el fetch del dashboard no puede LEER el
-  // Content-Disposition y la descarga del respaldo pierde su nombre con fecha.
-  app.enableCors({ origin: origins, credentials: true, exposedHeaders: ['Content-Disposition'] });
+  /*
+   * EL PERMISO SE PIDE UNA VEZ CADA DOS HORAS, NO EN CADA LLAMADA (`maxAge`).
+   *
+   * El dashboard vive en un dominio y la API en otro, así que el navegador
+   * PIDE PERMISO antes de cada llamada: manda un `OPTIONS`, espera el visto
+   * bueno, y recién entonces manda la llamada de verdad. Son dos viajes por
+   * cada cosa que el CRM pregunta.
+   *
+   * Sin `maxAge`, Chrome se acuerda de ese permiso solo 5 segundos — menos que
+   * el intervalo de casi todos los avisos del sidebar, así que en la práctica
+   * TODAS las llamadas pagaban el viaje doble. Con dos horas (el techo que
+   * respeta Chrome), el permiso se pide una vez al entrar y listo: la mitad
+   * del tráfico desaparece, y con él la mitad de las chances de que una
+   * llamada se pierda en el camino.
+   *
+   * exposedHeaders: sin esto el fetch del dashboard no puede LEER el
+   * Content-Disposition y la descarga del respaldo pierde su nombre con fecha.
+   */
+  app.enableCors({
+    origin: origins,
+    credentials: true,
+    exposedHeaders: ['Content-Disposition'],
+    maxAge: 7200,
+  });
 
   const port = Number(config.get('PORT') ?? 3001);
   /*
@@ -99,6 +127,46 @@ async function bootstrap() {
    * localhost. Ver deploy/DEPLOY.md.
    */
   const host = (config.get<string>('HOST') ?? '0.0.0.0').trim();
+
+  /*
+   * CUÁNTO AGUANTA ABIERTA UNA CONEXIÓN EN SILENCIO. Esto arregla los cortes
+   * intermitentes que no tenían ninguna explicación.
+   *
+   * EL PROBLEMA. Delante de la API hay un proxy (Traefik). Para no rearmar la
+   * conexión en cada llamada, el proxy mantiene un puñado abiertas y las
+   * reusa. Node, por su lado, CIERRA cualquier conexión que lleve 5 segundos
+   * sin usarse — ese es su default y nadie lo había tocado.
+   *
+   * Como el proxy las cree vivas mucho más tiempo, tarde o temprano manda una
+   * llamada justo por una que Node está cerrando en ese mismo instante. Esa
+   * llamada se pierde. El proxy responde 502, y como ESA respuesta la escribe
+   * el proxy y no la API, viaja sin los permisos de CORS: el navegador la
+   * descarta antes de que el CRM pueda leerla y el cajero ve el error de red
+   * genérico, sin código ni causa. En el log del servidor no queda nada,
+   * porque la llamada nunca llegó a la API.
+   *
+   * Por eso era aleatorio, sin patrón, y aparecía más seguido en las pantallas
+   * quietas: son las que dejan conexiones envejeciendo.
+   *
+   * LA REGLA es que el de acá sea MAYOR que el del proxy, para que el que
+   * cierre sea siempre el proxy —que sabe que lo está haciendo— y nunca Node
+   * por sorpresa. 65 segundos supera cómodamente el ciclo de reuso de Traefik.
+   *
+   * `headersTimeout` tiene que ser mayor que `keepAliveTimeout`: es el plazo
+   * para recibir los encabezados, y si queda por debajo corta conexiones sanas.
+   */
+  const server = app.getHttpServer();
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 70_000;
+
+  /*
+   * Cerrar ORDENADO. Sin esto, cada publicación mataba el proceso de golpe y
+   * cortaba a la mitad las llamadas en curso: la cajera que estaba cobrando en
+   * ese segundo veía el error. Ahora Nest termina lo que está haciendo antes
+   * de bajar.
+   */
+  app.enableShutdownHooks();
+
   await app.listen(port, host);
   // eslint-disable-next-line no-console
   console.log(`CRM API escuchando en http://${host}:${port}/api`);
