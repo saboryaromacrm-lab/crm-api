@@ -393,14 +393,6 @@ class ConfirmarVentaDto {
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
   @IsOptional() @IsString() observaciones?: string;
-  /**
-   * EL REDONDEO DEL COBRO (27/8, pedido del dueño — venía del sistema viejo):
-   * "$39.893 se cobra $39.900" para no pelear el vuelto chico en efectivo.
-   * Es el IMPORTE que se suma (los $7), con tope de $100, y solo hacia arriba:
-   * cobrar de menos es un descuento y tiene su circuito.
-   */
-  @IsOptional() @IsNumber() @Min(0.01) @Max(100, { message: 'El redondeo puede sumar hasta $100.' })
-  redondeo?: number;
   /** El relevo de caja (0088): quién cobra de verdad. Ver `CreateVentaDto`. */
   @IsOptional() @IsInt() operadorId?: number;
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => VentaPagoDto)
@@ -2758,55 +2750,43 @@ export class VentasService {
     const cobrador = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     /*
-     * EL REDONDEO DEL COBRO (27/8): "$39.893 se cobra $39.900", hasta $100 de
-     * más, para el vuelto en efectivo. Se materializa como un EXTRA
-     * ("Redondeo", IVA 0) — así viaja gratis por todo lo que ya existe: el
-     * ticket impreso lo lista, ARCA lo recibe como base al 0% (alícuota id 3),
-     * la nota de crédito total lo devuelve y el margen lo cuenta como ganancia
-     * pura. Con IVA 0 el total sube EXACTO lo pedido, que es todo el punto:
-     * con 21% el paso mínimo es de 1,21 centavos y el número redondo puede ser
-     * inalcanzable.
+     * SE COBRA EL TOTAL EXACTO (se sacó el redondeo del cobro el 8/9, por
+     * pedido del dueño).
      *
-     * Es IDEMPOTENTE a propósito: primero se limpia cualquier "Redondeo" de un
-     * cobro anterior que falló a mitad de camino (turno cerrado, conexión) y
-     * recién después se aplica el pedido — el reintento no lo duplica, y un
-     * cobro SIN redondeo limpia el rastro del intento que lo tenía.
+     * Entre el 27/8 y esa fecha, el POS podía llevar el total al próximo número
+     * redondo ("$39.893 se cobra $39.900") y acá se materializaba como un extra
+     * llamado "Redondeo" con IVA 0. El ticket lo listaba como un renglón más,
+     * que es lo que molestaba: el papel decía "Redondeo" y el cliente no tenía
+     * cómo saber qué era.
+     *
+     * Lo único que queda es la LIMPIEZA, y queda por un caso concreto: un cobro
+     * de aquella época que falló a mitad de camino (turno cerrado, conexión
+     * cortada) pudo dejar el extra pegado a un borrador que todavía está sin
+     * emitir. Si ese borrador se confirma hoy, cobraría de más por un cargo que
+     * ya nadie puede explicar. Se borra antes de seguir.
+     *
+     * Las ventas YA EMITIDAS no se tocan: su extra es parte del comprobante que
+     * el cliente se llevó, y sacarlo dejaría un total que no cierra con su
+     * propio detalle. Por eso el ticket sigue sabiendo imprimir extras.
      */
-    const redondeoPedido = money(Number(dto.redondeo) || 0);
-    if (redondeoPedido > 0 && condicionPago !== 'contado') {
-      throw new BadRequestException('El redondeo es del cobro al contado: en cuenta corriente el comprobante va por su total exacto.');
-    }
     const redondeosViejos = (borrador.extras ?? []).filter(
       (e: any) => e.concepto === 'Redondeo' && !(Number(e.iva) > 0),
     );
-    if (redondeosViejos.length || redondeoPedido > 0) {
+    if (redondeosViejos.length) {
       const quitar = money(redondeosViejos.reduce((a: number, e: any) => a + (Number(e.importe) || 0), 0));
-      const delta = money(redondeoPedido - quitar);
       await this.db.transaction(async (tx) => {
-        if (redondeosViejos.length) {
-          await tx.delete(ventaExtras)
-            .where(inArray(ventaExtras.id, redondeosViejos.map((e: any) => e.id)));
-        }
-        if (redondeoPedido > 0) {
-          await tx.insert(ventaExtras).values({ ventaId: id, concepto: 'Redondeo', importe: redondeoPedido, iva: 0 });
-        }
-        if (delta !== 0) {
-          await tx.update(ventas).set({
-            // El extra suma a la base (como en calcularTotales); con IVA 0 el
-            // total sube lo mismo y el ivaTotal no se toca.
-            subtotalNeto: money(borrador.subtotalNeto + delta),
-            total: money(borrador.total + delta),
-          }).where(eq(ventas.id, id));
-        }
+        await tx.delete(ventaExtras)
+          .where(inArray(ventaExtras.id, redondeosViejos.map((e: any) => e.id)));
+        await tx.update(ventas).set({
+          subtotalNeto: money(borrador.subtotalNeto - quitar),
+          total: money(borrador.total - quitar),
+        }).where(eq(ventas.id, id));
       });
       // La copia en memoria sigue el mismo camino: pagos, crédito y ARCA se
-      // validan y arman contra el total YA redondeado.
-      borrador.extras = [
-        ...borrador.extras.filter((e: any) => !redondeosViejos.includes(e)),
-        ...(redondeoPedido > 0 ? [{ concepto: 'Redondeo', importe: redondeoPedido, iva: 0 }] : []),
-      ] as any;
-      borrador.subtotalNeto = money(borrador.subtotalNeto + delta);
-      borrador.total = money(borrador.total + delta);
+      // validan contra el total ya sin el redondeo.
+      borrador.extras = borrador.extras.filter((e: any) => !redondeosViejos.includes(e)) as any;
+      borrador.subtotalNeto = money(borrador.subtotalNeto - quitar);
+      borrador.total = money(borrador.total - quitar);
     }
 
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], borrador.total);
