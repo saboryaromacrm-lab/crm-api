@@ -54,6 +54,8 @@ import { conPermisosBase } from '../auth/permisos-base';
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
   'nota_credito_a', 'nota_credito_b', 'nota_credito_c',
+  // La devolución de un ticket: nota de crédito por dentro, sin fiscalidad.
+  'nota_credito_ticket',
   'nota_debito_a', 'nota_debito_b', 'nota_debito_c',
 ] as const;
 
@@ -235,7 +237,8 @@ const SIGNO_NC = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -
 /** "Factura B 0003-00000042", para mensajes y rastros. */
 const etiquetaVenta = (v: { tipo: string; puntoVenta: string; numero: number | null }) => {
   const nombre = v.tipo === 'ticket' ? 'Ticket'
-    : `${esNotaCredito(v.tipo) ? 'Nota de crédito' : 'Factura'} ${letraDe(v.tipo) ?? ''}`.trim();
+    : v.tipo === 'nota_credito_ticket' ? 'Devolución'
+      : `${esNotaCredito(v.tipo) ? 'Nota de crédito' : 'Factura'} ${letraDe(v.tipo) ?? ''}`.trim();
   return `${nombre} ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
 };
 
@@ -283,6 +286,15 @@ type DescuentoResuelto = {
  * lo de acá lo decide el servidor mirando quién llamó, no lo que mandó.
  */
 export interface OpcionesVenta {
+  /**
+   * POR QUÉ PUERTA ENTRÓ EL PEDIDO DE DESHACER UNA VENTA. `true` = por
+   * `POST /:id/devolucion` (permiso `devoluciones`, el del cajero), que solo
+   * acepta TICKETS; `false`/ausente = por `POST /:id/nota-credito` (permiso
+   * `nota_credito`, solo administración), que solo acepta FACTURAS. Es el
+   * servicio el que cierra la puerta: sin esto, la llave del cajero abriría
+   * también la nota de crédito fiscal, que es justo lo que la 0080 cerró.
+   */
+  desdeTicket?: boolean;
   /**
    * DÓNDE SE GRABA la venta nueva: la sucursal de la sesión, o la pedida si
    * quien llama es un jefe (`sucursalDeOperacion`).
@@ -3160,25 +3172,64 @@ export class VentasService {
     opciones: OpcionesVenta = {},
   ) {
     const original = await this.get(ventaId);
+    /*
+     * LA DEVOLUCIÓN DE UN TICKET ES ESTE MISMO CIRCUITO.
+     *
+     * Antes el ticket quedaba afuera ("no lleva nota de crédito, anulala") y
+     * anular es TODO O NADA: el cliente que compró cinco cosas y devolvía una
+     * obligaba a anular la venta entera y recargarla sin ese renglón — se
+     * perdía el número original, y si el turno ya había cerrado ni siquiera
+     * eso se podía. Y "me llevo tres, devuelvo uno" es el caso normal de un
+     * mostrador, no la excepción.
+     *
+     * En vez de un circuito nuevo, el ticket entra por ESTE, que ya sabe todo
+     * lo difícil: qué renglones quedan por devolver, que no se devuelva dos
+     * veces, que no salga más plata de la que entró, el stock que vuelve, la
+     * deuda que baja, los candados contra el doble clic. La única diferencia
+     * es que no se declara a ARCA y el comprobante se llama
+     * `nota_credito_ticket`. Un segundo circuito "parecido" es la forma
+     * segura de que uno de los dos se olvide de algo con plata en el medio.
+     *
+     * DOS PUERTAS, cada una con su llave y su tipo: `desdeTicket` viene del
+     * endpoint y se cruza con el tipo real de la venta. Un cajero con
+     * `devoluciones` no puede colar por acá una nota de crédito fiscal, y un
+     * administrador no puede registrarle "una devolución" a una factura, que
+     * ante ARCA sería un ajuste sin declarar.
+     */
+    const esTicket = original.tipo === 'ticket';
+    const doc = esTicket ? 'la devolución' : 'la nota de crédito';
     if (original.estado !== 'confirmada') {
-      throw new BadRequestException('Solo se le hace nota de crédito a una venta confirmada.');
+      throw new BadRequestException(`Solo se registra ${doc} sobre una venta confirmada.`);
     }
     if (esNotaCredito(original.tipo)) {
       throw new BadRequestException('No se le puede hacer una nota de crédito a otra nota de crédito.');
     }
-    if (original.tipo === 'ticket') {
+    if (esTicket && !opciones.desdeTicket) {
       throw new BadRequestException(
         'Esta venta es un ticket interno, no un comprobante fiscal: no lleva nota de crédito. '
-        + (original.facturarPendiente
-          ? 'Está pendiente de facturar — facturala primero, o anulala si la venta no va.'
-          : 'Anulala.'),
+        + 'Registrale una DEVOLUCIÓN (total o parcial), o anulala si la venta no va.',
+      );
+    }
+    if (!esTicket && opciones.desdeTicket) {
+      throw new BadRequestException(
+        'Esta venta es una factura: se corrige con una NOTA DE CRÉDITO, que la emite administración.',
+      );
+    }
+    /* Un ticket que espera su factura (ARCA caído al cobrar) todavía va a ser
+     * un comprobante fiscal: si se le registra una devolución interna ahora y
+     * después se factura, el ajuste quedaría sin declarar. Primero se factura
+     * y ahí sí, nota de crédito; o se anula si la venta no va. */
+    if (esTicket && original.facturarPendiente) {
+      throw new BadRequestException(
+        'Este ticket está pendiente de facturar: facturalo primero y después emití la nota de crédito, '
+        + 'o anulalo si la venta no va.',
       );
     }
     if (opciones.soloSuSucursal && original.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Esa venta es de otra sucursal.');
     }
     const motivo = (dto.motivo ?? '').trim();
-    if (!motivo) throw new BadRequestException('Indicá por qué se emite la nota de crédito.');
+    if (!motivo) throw new BadRequestException(`Indicá por qué se registra ${doc}.`);
 
     /* -- Lo ya acreditado por notas anteriores, renglón por renglón -- */
     const previo = await this.acreditado(ventaId);
@@ -3238,7 +3289,7 @@ export class VentasService {
     const tope = money(original.total - acreditadoTotal);
     if (tot.total > tope + 0.01) {
       throw new BadRequestException(
-        `La nota de crédito da ${money(tot.total)} y de esta venta quedan ${tope} por acreditar `
+        `${esTicket ? 'La devolución' : 'La nota de crédito'} da ${money(tot.total)} y de esta venta quedan ${tope} por acreditar `
         + `(total ${original.total}, ya acreditado ${money(acreditadoTotal)}).`,
       );
     }
@@ -3247,7 +3298,7 @@ export class VentasService {
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(original.clienteId);
     const letra = letraDe(original.tipo);
-    const tipoNc = `nota_credito_${(letra ?? 'b').toLowerCase()}`;
+    const tipoNc = esTicket ? 'nota_credito_ticket' : `nota_credito_${(letra ?? 'b').toLowerCase()}`;
 
     const fiscal = await this.resolverFiscalNota(
       tipoNc, cliente, config, original,
@@ -3270,7 +3321,9 @@ export class VentasService {
       if (!turno) {
         throw new BadRequestException(
           'No hay un turno de caja abierto en esta sucursal: no se puede devolver el efectivo. '
-          + 'Abrí la caja, o emití la nota de crédito sin devolución y entregá la plata aparte.',
+          + (esTicket
+            ? 'Abrí la caja, o registrá la devolución sin plata y entregala aparte.'
+            : 'Abrí la caja, o emití la nota de crédito sin devolución y entregá la plata aparte.'),
         );
       }
       turnoId = turno.id;
@@ -3315,7 +3368,9 @@ export class VentasService {
         throw new BadRequestException(
           `No se puede devolver ${money(tot.total)} en efectivo: de esta venta entraron ${entro} `
           + `y ya se devolvieron ${money(entro - disponible)}, así que quedan ${money(Math.max(disponible, 0))}. `
-          + 'Emití la nota de crédito SIN devolución: la deuda del cliente se ajusta igual.',
+          + (esTicket
+            ? 'Registrá la devolución SIN plata: la deuda del cliente se ajusta igual.'
+            : 'Emití la nota de crédito SIN devolución: la deuda del cliente se ajusta igual.'),
         );
       }
     }
@@ -3404,7 +3459,7 @@ export class VentasService {
         facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
         facturarCbteNro: fiscal.facturarPendiente ? fiscal.facturarCbteNro : null,
         facturarCbteTipo: fiscal.facturarPendiente ? fiscal.facturarCbteTipo : null,
-        observaciones: `${motivo}\n[Nota de crédito de ${etiquetaVenta(original)}]`,
+        observaciones: `${motivo}\n[${esTicket ? 'Devolución' : 'Nota de crédito'} de ${etiquetaVenta(original)}]`,
       }).returning();
 
       await tx.insert(ventaItems).values(tot.items.map((it) => ({ ...it, ventaId: nc.id })));
@@ -3416,7 +3471,7 @@ export class VentasService {
         await this.inv.reingresarStockItems(tx, {
           sucursalId,
           usuarioId: dto.usuarioId,
-          descripcion: `NC ${puntoVentaFinal}-${String(numero).padStart(8, '0')} de ${etiquetaVenta(original)}: ${motivo}`,
+          descripcion: `${esTicket ? 'Devolución' : 'NC'} ${puntoVentaFinal}-${String(numero).padStart(8, '0')} de ${etiquetaVenta(original)}: ${motivo}`,
           items: tot.items,
         });
       }
@@ -3435,7 +3490,7 @@ export class VentasService {
           cajaSesionId: turnoId,
           tipo: 'egreso',
           importe: money(tot.total),
-          motivo: `Devolución NC ${puntoVentaFinal}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
+          motivo: `Devolución ${esTicket ? '' : 'NC '}${puntoVentaFinal}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
           usuarioId: dto.usuarioId ?? null,
         });
       }
@@ -3457,6 +3512,9 @@ export class VentasService {
       facturarPendiente: false, facturarMotivo: '',
       facturarCbteNro: null as number | null, facturarCbteTipo: null as number | null,
     };
+    /* La devolución de un ticket no es un comprobante fiscal: no hay CAE que
+     * pedir ni nada que declarar. Sale numerada por el sistema, como el ticket. */
+    if (tipoNc === 'nota_credito_ticket') return vacio;
     if (!config.arcaHabilitado) return vacio;
     if (!this.arca.disponible()) {
       return {
@@ -3941,6 +3999,23 @@ export class VentasController {
   @Permiso('nota_credito')
   notaCredito(@Param('id', ParseIntPipe) id: number, @Body() dto: NotaCreditoDto, @Auth() sesion: Sesion) {
     return this.svc.notaCredito(id, { ...dto, usuarioId: sesion.usuarioId }, this.opciones(sesion));
+  }
+
+  /**
+   * DEVOLUCIÓN DE UN TICKET, total o parcial. Es el mismo circuito que la nota
+   * de crédito (mismo DTO, mismos topes, mismos candados) por otra puerta:
+   * pide `devoluciones` —la llave del cajero, la misma que anular— y el
+   * servicio solo la deja pasar para tickets. Con `desdeTicket` es el
+   * servidor el que decide, no el navegador.
+   */
+  @Post(':id/devolucion')
+  @Permiso('devoluciones')
+  devolucion(@Param('id', ParseIntPipe) id: number, @Body() dto: NotaCreditoDto, @Auth() sesion: Sesion) {
+    return this.svc.notaCredito(
+      id,
+      { ...dto, usuarioId: sesion.usuarioId },
+      { ...this.opciones(sesion), desdeTicket: true },
+    );
   }
 
   @Delete(':id')

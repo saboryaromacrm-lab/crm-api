@@ -1640,6 +1640,15 @@ export const tipoVentaEnum = pgEnum('tipo_venta', [
   'ticket',
   'factura_a', 'factura_b', 'factura_c',
   'nota_credito_a', 'nota_credito_b', 'nota_credito_c',
+  /*
+   * LA DEVOLUCIÓN DE UN TICKET. Por dentro es una nota de crédito —resta,
+   * apunta a la venta que deshace, va por renglones— y por eso lleva el mismo
+   * prefijo: todo lo que suma con signo (`like 'nota_credito%'`) la trata
+   * bien sin tocar una línea. Pero NO es un comprobante fiscal: no tiene
+   * letra, no va a ARCA y no entra al débito fiscal (que lista sus tipos uno
+   * por uno). Es al ticket lo que la nota de crédito es a la factura.
+   */
+  'nota_credito_ticket',
   'nota_debito_a', 'nota_debito_b', 'nota_debito_c',
 ]);
 export const estadoVentaEnum = pgEnum('estado_venta', [

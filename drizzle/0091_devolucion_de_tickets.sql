@@ -1,0 +1,16 @@
+-- DEVOLUCIÓN DE TICKETS (0091)
+-- ============================================================================
+-- Un tipo de comprobante nuevo: la devolución (total o parcial) de un ticket.
+-- Por dentro es una nota de crédito —resta, apunta a la venta que deshace, va
+-- por renglones— y por eso lleva el mismo prefijo `nota_credito`: todo lo que
+-- suma con signo (`like 'nota_credito%'`) la trata bien sin tocar una línea.
+-- Pero NO es fiscal: sin letra, sin CAE, y no entra al débito fiscal (que
+-- lista sus tipos uno por uno).
+--
+-- Se agrega con ADD VALUE y no recreando el enum (como hizo la 0076) porque
+-- acá alcanza: Postgres ≥ 12 acepta ADD VALUE dentro de una transacción. LA
+-- REGLA QUE SÍ SIGUE VALIENDO: el valor recién agregado NO SE PUEDE USAR en la
+-- misma transacción que lo agregó, y el migrador corre todas las pendientes
+-- en UNA. Ninguna migración que venga después de esta puede insertar
+-- 'nota_credito_ticket' — lo usa la aplicación, recién después del commit.
+ALTER TYPE "public"."tipo_venta" ADD VALUE 'nota_credito_ticket' BEFORE 'nota_debito_a';
