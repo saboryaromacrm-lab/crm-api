@@ -35,6 +35,7 @@ import {
   listasVenta, ventaExtras, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
+import { agruparPor, grupo } from '../common/agrupar';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
@@ -1095,9 +1096,31 @@ export class VentasService {
     const porLista = new Map<number, any>(activas.map((l: any) => [l.id, l]));
     const listaBase = activas.find((l: any) => l.id === cfg.listaBaseId) || activas[0] || null;
 
+    /*
+     * LOS TRES ÍNDICES QUE EVITAN RECORRER TODO POR CADA PRODUCTO.
+     *
+     * Abajo hay un bucle por producto que necesita, para cada uno, sus filas de
+     * proveedor, sus formatos de venta y sus presentaciones. Cuando eso se
+     * resolvía con un `filter` adentro del bucle, cada producto volvía a
+     * recorrer la lista ENTERA: con 2.700 productos y 15.000 formatos son
+     * decenas de millones de comparaciones, y Node las hace en un solo hilo —
+     * mientras tanto la API no contesta nada, ni la venta de la otra caja.
+     *
+     * Agrupando una vez por adelantado, buscar el grupo de un producto es
+     * instantáneo. `agruparPor` conserva el orden original dentro de cada
+     * grupo, que es lo que hace que el resultado sea idéntico al de antes:
+     * `formatoActivo` elige "el primero" cuando ninguno está marcado, así que
+     * alterar ese orden cambiaría el costo — y con él, el precio.
+     */
+    const provsDe = agruparPor(provs, (x) => x.productoId);
+    const presDe = agruparPor(press, (x) => x.productoId);
+    /* Los formatos se piden siempre por producto Y presentación juntos (el
+     * suelto o un paquete), así que la clave los lleva a los dos. */
+    const formatosDe = agruparPor(formatos, (f) => `${f.productoId}:${f.presentacionId ?? ''}`);
+
     const costoPorProd = new Map<number, number>();
     for (const p of prods) {
-      const suyos = provs.filter((x) => x.productoId === p.id);
+      const suyos = grupo(provsDe, p.id);
       // La BASE del precio (0072): la parte sin factura entra sin el IVA que
       // el negocio absorbe. El costo real no viaja al POS — acá se cotiza.
       costoPorProd.set(p.id, costoPrecioEntry(formatoActivo(suyos), p.iva));
@@ -1134,8 +1157,8 @@ export class VentasService {
        * uno de sus paquetes, que se cotiza solo desde la 0053. Sin ese filtro, la
        * madre mostraría como propios los precios de sus hijos.
        */
-      const efectivasDe = (presId: number | null, costo: number) => formatos
-        .filter((f) => f.productoId === p.id && (f.presentacionId ?? null) === presId && porLista.has(f.listaId))
+      const efectivasDe = (presId: number | null, costo: number) => grupo(formatosDe, `${p.id}:${presId ?? ''}`)
+        .filter((f) => porLista.has(f.listaId))
         .map((f) => {
           /* Los DOS precios de la fila: el neto es la moneda del motor (el
            * renglón del ticket trabaja en neto y el IVA se suma al total); el
@@ -1217,7 +1240,7 @@ export class VentasService {
         stockSucursales: desglose(p.id, null),
       });
 
-      for (const pres of press.filter((x) => x.productoId === p.id)) {
+      for (const pres of grupo(presDe, p.id)) {
         /*
          * EL PAQUETE SE COTIZA SOLO (0053). Su costo es el del kilo por lo que
          * consume; el precio sale de SUS filas, no de las de la madre. Sin filas

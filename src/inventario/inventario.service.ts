@@ -1,6 +1,7 @@
 import { Inject, Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
 import { fechaLocal } from '../common/documentos';
+import { agruparPor, grupo } from '../common/agrupar';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
@@ -1926,15 +1927,34 @@ export class InventarioService {
       if (arr) arr.push(pe.etiquetaId); else etiquetasDe.set(pe.productoId, [pe.etiquetaId]);
     }
 
+    /*
+     * LOS ÍNDICES DEL ARMADO DE PRODUCTOS.
+     *
+     * Abajo se recorre producto por producto y, para cada uno, se buscaban sus
+     * costos, sus formatos y sus presentaciones con un `filter` sobre la lista
+     * COMPLETA. Con 2.700 productos eso vuelve a recorrer todo 2.700 veces por
+     * cada lista: decenas de millones de comparaciones en el único hilo de
+     * Node, que mientras tanto no atiende ninguna otra pantalla.
+     *
+     * Y esta carga no es ocasional: el sistema la vuelve a pedir DESPUÉS DE
+     * CADA cambio de stock, de cada factura cargada y de cada corrección.
+     *
+     * `agruparPor` conserva el orden original dentro de cada grupo — de eso
+     * depende `formatoActivo`, que define el costo cuando ninguno está marcado.
+     */
+    const costosDe = agruparPor(provCostos, (x) => x.productoId);
+    const formatosDe = agruparPor(formatos, (x: any) => x.productoId);
+    const presDe = agruparPor(pres, (x) => x.productoId);
+
     const productosFull = prods.map((p) => {
-      const pp = provCostos.filter((x) => x.productoId === p.id);
+      const pp = grupo(costosDe, p.id);
       const active = formatoActivo(pp);
       /* Dos costos, dos preguntas (0072): `cn` es el REAL (valúa el stock que
        * muestra la pantalla), `cnPrecio` la base que multiplica el markup. Con
        * todo facturado son el mismo número. */
       const cn = costoNetoEntry(active, p.iva);
       const cnPrecio = costoPrecioEntry(active, p.iva);
-      const mias = formatos.filter((x) => x.productoId === p.id);
+      const mias = grupo(formatosDe, p.id);
       // El redondeo propio del producto pisa al de configuración; null = heredar.
       const opts = { iva: p.iva, redondeo: p.redondeo ?? redondeo };
 
@@ -1989,7 +2009,7 @@ export class InventarioService {
         costoNeto: cn,
         /* Cada paquete con SU formato de venta. `precio` null = todavía no tiene
          * ninguna lista cargada, que no es lo mismo que valer cero. */
-        presentaciones: pres.filter((x) => x.productoId === p.id).map((pr) => {
+        presentaciones: grupo(presDe, p.id).map((pr) => {
           // El paquete hereda los DOS costos de la madre, escalados a su tamaño.
           const costoPaquete = costoNetoPresentacion(cn, pr.tamKg);
           const suyas = armarFormato(pr.id, costoNetoPresentacion(cnPrecio, pr.tamKg));
