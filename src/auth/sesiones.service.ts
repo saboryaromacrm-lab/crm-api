@@ -126,8 +126,8 @@ export class SesionesService {
    * cuando el jefe cambiaba de sucursal desde el encabezado el cambio duraba
    * hasta el F5 siguiente: `/auth/yo` devolvía la sucursal vieja (la de la
    * sesión) y pisaba la elegida, mientras el contexto de los módulos —que NO
-   * se pisa— seguía en la nueva. El sistema quedaba partido: el encabezado y
-   * el chat en una sucursal y Compras/Almacén/Ventas en otra.
+   * se pisa— seguía en la nueva. El sistema quedaba partido: el encabezado
+   * en una sucursal y Compras/Almacén/Ventas en otra.
    */
   async moverSucursal(sesionId: number, sucursalId: number) {
     await this.db.update(sesiones)

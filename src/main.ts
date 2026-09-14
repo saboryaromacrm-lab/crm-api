@@ -4,6 +4,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { json } from 'express';
 import helmet from 'helmet';
+import compression from 'compression';
 import { AppModule } from './app.module';
 import { LoggerApi, RegistroInterceptor } from './common/registro';
 
@@ -25,6 +26,25 @@ async function bootstrap() {
    *   - se apaga el `X-Powered-By` de Express, que anuncia con qué está hecho.
    */
   app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+  /*
+   * LAS RESPUESTAS VIAJAN COMPRIMIDAS. Nada las comprimía: ni la API ni el
+   * proxy de adelante (se verificó pidiendo /api/health con Accept-Encoding y
+   * mirando que no volviera Content-Encoding).
+   *
+   * Y acá el tamaño es el problema: con 2.700 productos, el catálogo del
+   * punto de venta pesa 4,5 MB y el inventario completo (`/bootstrap`) casi
+   * 10 MB — y ese último se volvía a bajar entero después de cada operación
+   * de stock. Son JSON con miles de filas parecidas, que comprimidos quedan
+   * en 150 KB y 700 KB (30 y 14 veces menos). Sobre la conexión del servidor,
+   * con seis cajas abiertas a la vez, la diferencia entre bajar 10 MB y
+   * 700 KB es la diferencia entre "se colgó" y "abrió".
+   *
+   * `threshold`: lo chico (un contador del sidebar, un ok) sale como está;
+   * comprimir 80 bytes cuesta más de lo que ahorra. La compresión corre en
+   * los hilos de zlib, no en el hilo único de Node que atiende las cajas.
+   */
+  app.use(compression({ threshold: 1024 }));
 
   // El logo de la empresa viaja como data-URL en la configuración: el body
   // default de 100kb no le alcanza a una imagen.

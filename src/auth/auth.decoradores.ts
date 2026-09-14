@@ -80,5 +80,5 @@ export const Auth = createParamDecorator((_d: unknown, ctx: ExecutionContext): S
  *
  * La sucursal NO se pisa igual: en casi todos los endpoints es un DATO (el
  * admin mirando el stock de Express 2), no "dónde estoy". Donde sí significa
- * "mi sucursal" —el chat— se toma de la sesión a mano y con su comentario.
+ * "mi sucursal" se toma de la sesión a mano (`sucursalDeOperacion`).
  */

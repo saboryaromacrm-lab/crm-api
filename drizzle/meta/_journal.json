@@ -645,6 +645,20 @@
       "when": 1789130552162,
       "tag": "0091_devolucion_de_tickets",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1789405753931,
+      "tag": "0092_indices_pedidos_y_stock",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1789406760708,
+      "tag": "0093_baja_chat_interno",
+      "breakpoints": true
     }
   ]
 }

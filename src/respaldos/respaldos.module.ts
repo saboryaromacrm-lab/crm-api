@@ -43,8 +43,8 @@ const literal = (v: string | null) => (v === null ? 'NULL' : `'${v.replace(/'/g,
  * equipo. Todo lo que es CATÁLOGO o IDENTIDAD se conserva: productos y sus
  * formatos, proveedores con percepciones y cuentas, clientes, listas y
  * precios (con su historial), ofertas, usuarios/roles/sesiones, sucursales,
- * terminales, configuración, fotos de la tienda, chat y las plantillas de
- * gastos recurrentes.
+ * terminales, configuración, fotos de la tienda y las plantillas de gastos
+ * recurrentes.
  *
  * TRUNCATE SIN CASCADE a propósito: si alguna tabla nueva referencia a una de
  * estas y no está en la lista, Postgres se niega y la transacción aborta —

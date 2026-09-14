@@ -991,8 +991,7 @@ export class AuthController {
    * sucursal de la sesión se fijaba en el login y no se movía nunca, así que
    * `/auth/yo` devolvía la vieja en la recarga siguiente y pisaba la elegida —
    * mientras el contexto de los módulos, que no se pisa, seguía en la nueva. El
-   * encabezado y el chat quedaban en una sucursal y Compras/Almacén/Ventas en
-   * otra.
+   * encabezado quedaba en una sucursal y Compras/Almacén/Ventas en otra.
    *
    * Solo el jefe: es el mismo criterio de `esJefe` que usa todo el sistema para
    * decidir quién atraviesa sucursales, y el mismo con el que el encabezado

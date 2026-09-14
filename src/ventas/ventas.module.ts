@@ -764,68 +764,79 @@ export class VentasService {
     ]);
     const cobrado = imput.get(id) ?? 0;
 
-    /* Si ESTE comprobante es una nota, de quién viene: el detalle y el impreso
-     * tienen que decir a qué factura ajusta. */
-    const [origen] = v.refVentaId
-      ? await this.db.select({
-        id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta,
-        numero: ventas.numero, fecha: ventas.fecha, total: ventas.total,
-      }).from(ventas).where(eq(ventas.id, v.refVentaId)).limit(1)
-      : [];
-
     /*
-     * Los NOMBRES, que hasta acá no venían: el ticket se reimprime desde el
-     * listado y desde el POS, y sin esto salía "#12" en lugar del producto y
-     * sin el nombre del cliente. El nombre del producto NO está congelado en el
-     * renglón (a diferencia de la lista y la oferta), así que se resuelve al
-     * leer: si alguien renombró el producto, el ticket reimpreso dice el nombre
-     * de hoy — que es el que el cliente reconoce en la góndola.
+     * LAS SIETE LECTURAS SUELTAS, DE UNA SOLA VEZ.
+     *
+     * Ninguna depende de otra: todas salen de la fila de la venta que ya se
+     * tiene. Pedirlas en fila era pagar siete viajes a la base uno después del
+     * otro, y esta ficha se arma en CADA autoguardado del ticket (una vez por
+     * tecla, con retardo) y en cada cobro. Con la base en otro contenedor,
+     * cada viaje son milisegundos que se suman mientras la caja espera.
      */
     const prodIds = [...new Set(items.map((i) => i.productoId))];
     const presIds = [...new Set(items.map((i) => i.presentacionId).filter(Boolean) as number[])];
+    const nada: any[] = [];
+    const [[origen], filasProd, filasPres, [cli], [suc], [usr], [cobrador]] = await Promise.all([
+      /* Si ESTE comprobante es una nota, de quién viene: el detalle y el
+       * impreso tienen que decir a qué factura ajusta. */
+      v.refVentaId
+        ? this.db.select({
+          id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta,
+          numero: ventas.numero, fecha: ventas.fecha, total: ventas.total,
+        }).from(ventas).where(eq(ventas.id, v.refVentaId)).limit(1)
+        : nada,
+      /*
+       * Los NOMBRES, que hasta acá no venían: el ticket se reimprime desde el
+       * listado y desde el POS, y sin esto salía "#12" en lugar del producto y
+       * sin el nombre del cliente. El nombre del producto NO está congelado en
+       * el renglón (a diferencia de la lista y la oferta), así que se resuelve
+       * al leer: si alguien renombró el producto, el ticket reimpreso dice el
+       * nombre de hoy — que es el que el cliente reconoce en la góndola.
+       */
+      prodIds.length
+        ? this.db.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo })
+          .from(productos).where(inArray(productos.id, prodIds))
+        : nada,
+      presIds.length
+        ? this.db.select({ id: presentaciones.id, tamKg: presentaciones.tamKg })
+          .from(presentaciones).where(inArray(presentaciones.id, presIds))
+        : nada,
+      /* Los datos FISCALES del cliente, no solo el nombre: una factura impresa
+       * los lleva por ley (documento, condición frente al IVA y domicilio), y
+       * el QR de la RG 4892 necesita tipo y número de documento. */
+      this.db.select({
+        nombre: clientes.nombre,
+        tipoDoc: clientes.tipoDoc,
+        numeroDoc: clientes.numeroDoc,
+        condicionIva: clientes.condicionIva,
+        direccion: clientes.direccion,
+        localidad: clientes.localidad,
+      }).from(clientes).where(eq(clientes.id, v.clienteId)).limit(1),
+      /* El domicilio va junto al nombre porque la FACTURA lleva el domicilio
+       * comercial del punto de venta que la emitió (0077), no uno solo de la
+       * empresa: la de Belgrano 728 tiene que decir Belgrano 728. */
+      v.sucursalId
+        ? this.db.select({
+          nombre: sucursales.nombre,
+          direccion: sucursales.direccion,
+          puntoVenta: sucursales.puntoVenta,
+        }).from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
+        : nada,
+      v.usuarioId
+        ? this.db.select({ nombre: usuarios.nombre })
+          .from(usuarios).where(eq(usuarios.id, v.usuarioId)).limit(1)
+        : nada,
+      /* Quién COBRÓ, cuando no es quien armó (0060/0088): con el relevo de
+       * caja esta es LA respuesta a "¿quién cerró esta venta?". */
+      v.cobradoPor && v.cobradoPor !== v.usuarioId
+        ? this.db.select({ nombre: usuarios.nombre })
+          .from(usuarios).where(eq(usuarios.id, v.cobradoPor)).limit(1)
+        : nada,
+    ]);
     const prods = new Map<number, { nombre: string; tipo: string }>();
+    for (const p of filasProd) prods.set(p.id, { nombre: p.nombre, tipo: p.tipo });
     const tamDe = new Map<number, number>();
-    if (prodIds.length) {
-      const filas = await this.db.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo })
-        .from(productos).where(inArray(productos.id, prodIds));
-      for (const p of filas) prods.set(p.id, { nombre: p.nombre, tipo: p.tipo });
-    }
-    if (presIds.length) {
-      const filas = await this.db.select({ id: presentaciones.id, tamKg: presentaciones.tamKg })
-        .from(presentaciones).where(inArray(presentaciones.id, presIds));
-      for (const p of filas) tamDe.set(p.id, p.tamKg);
-    }
-    /* Los datos FISCALES del cliente, no solo el nombre: una factura impresa
-     * los lleva por ley (documento, condición frente al IVA y domicilio), y el
-     * QR de la RG 4892 necesita tipo y número de documento. */
-    const [cli] = await this.db.select({
-      nombre: clientes.nombre,
-      tipoDoc: clientes.tipoDoc,
-      numeroDoc: clientes.numeroDoc,
-      condicionIva: clientes.condicionIva,
-      direccion: clientes.direccion,
-      localidad: clientes.localidad,
-    }).from(clientes).where(eq(clientes.id, v.clienteId)).limit(1);
-    /* El domicilio va junto al nombre porque la FACTURA lleva el domicilio
-     * comercial del punto de venta que la emitió (0077), no uno solo de la
-     * empresa: la de Belgrano 728 tiene que decir Belgrano 728. */
-    const [suc] = v.sucursalId
-      ? await this.db.select({
-        nombre: sucursales.nombre,
-        direccion: sucursales.direccion,
-        puntoVenta: sucursales.puntoVenta,
-      }).from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1)
-      : [];
-    const [usr] = v.usuarioId
-      ? await this.db.select({ nombre: usuarios.nombre })
-        .from(usuarios).where(eq(usuarios.id, v.usuarioId)).limit(1)
-      : [];
-    /* Quién COBRÓ, cuando no es quien armó (0060/0088): con el relevo de caja
-     * esta es LA respuesta a "¿quién cerró esta venta?". */
-    const [cobrador] = v.cobradoPor && v.cobradoPor !== v.usuarioId
-      ? await this.db.select({ nombre: usuarios.nombre })
-        .from(usuarios).where(eq(usuarios.id, v.cobradoPor)).limit(1)
-      : [];
+    for (const p of filasPres) tamDe.set(p.id, p.tamKg);
     const tam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
 
     const itemsSalida = items.map((it) => {
@@ -2666,6 +2677,28 @@ export class VentasService {
   }
 
   /**
+   * EL BORRADOR TAL COMO ESTÁ GUARDADO, sin armar la ficha completa.
+   *
+   * `actualizar` corre en cada autoguardado del ticket (una vez por tecla,
+   * con retardo) y arrancaba con `exigirBorrador`, que arma la ficha entera —
+   * nombres de productos, cliente fiscal, sucursal, cajero, las notas de
+   * crédito que tuviera y cuánto queda por acreditar: doce consultas— para
+   * usar de todo eso cinco campos de la fila y los descuentos que ya traían
+   * los renglones. Acá se lee solo eso, con la misma regla (borrador o nada).
+   * La ficha completa se arma UNA vez, al devolver.
+   */
+  private async borradorGuardado(id: number) {
+    const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
+    if (!v) throw new NotFoundException('Venta inexistente.');
+    if (v.estado !== 'borrador') {
+      throw new BadRequestException('La venta ya está emitida: no se puede modificar.');
+    }
+    const items = await this.db.select({ descuentoId: ventaItems.descuentoId })
+      .from(ventaItems).where(eq(ventaItems.ventaId, id));
+    return { ...v, items };
+  }
+
+  /**
    * LA FILA DE LA VENTA, TOMADA CON CANDADO DENTRO DE UNA TRANSACCIÓN.
    *
    * Los tres caminos que emiten un comprobante —`confirmar`, `facturarAhora` y
@@ -2699,7 +2732,7 @@ export class VentasService {
    * exactamente lo que el cajero ve en pantalla.
    */
   async actualizar(id: number, dto: CreateVentaDto, opciones: OpcionesVenta = {}) {
-    const actual = await this.exigirBorrador(id);
+    const actual = await this.borradorGuardado(id);
     if (opciones.soloSuSucursal && actual.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }

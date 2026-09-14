@@ -28,7 +28,6 @@ import { GastosModule } from './gastos/gastos.module';
 import { PagosModule } from './pagos/pagos.module';
 import { CafeteriaModule } from './cafeteria/cafeteria.module';
 import { VencimientosModule } from './vencimientos/vencimientos.module';
-import { ChatModule } from './chat/chat.module';
 import { GerenciaModule } from './gerencia/gerencia.module';
 import { AuditoriaModule } from './auditoria/auditoria.module';
 import { RespaldosModule } from './respaldos/respaldos.module';
@@ -69,7 +68,6 @@ import { RespaldosModule } from './respaldos/respaldos.module';
     GastosModule,
     CafeteriaModule,
     VencimientosModule,
-    ChatModule,
     // El tablero de gestión: Rentabilidad (0072).
     GerenciaModule,
   ],

@@ -25,8 +25,7 @@ import { Observable } from 'rxjs';
  *
  *   * el QUERY STRING. Ahí `usuarioId` es un FILTRO de lectura —"mostrame las
  *     ventas de Marta"— y pisarlo rompería el listado, que es justo para
- *     mirar el trabajo de otro. Los dos lugares donde el query sí significaba
- *     "quién soy" eran los del chat, y se arreglaron a mano.
+ *     mirar el trabajo de otro.
  *   * los campos que significan OTRO usuario. Delegar una venta a un compañero
  *     manda un id que no es el propio; ese campo se llama `paraUsuarioId`
  *     justamente para no confundirse con el autor.

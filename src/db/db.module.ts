@@ -17,8 +17,8 @@ import { resolverDatabaseUrl } from './url';
  * El default de `pg` son 10, y este sistema pide MUCHAS MÁS DE 10 POR PEDIDO:
  * `GET /bootstrap` dispara ~20 consultas en paralelo (inventario.service.ts) y
  * `GET /ventas/catalogo` unas 14. O sea que UN SOLO pedido de esos se lleva el
- * pool entero y hace esperar a todo lo demás — los pollers del sidebar, el
- * chat, la venta que está cobrando otra caja.
+ * pool entero y hace esperar a todo lo demás — los pollers del sidebar, la
+ * venta que está cobrando otra caja.
  *
  * 20 no es un número mágico: es el techo razonable para un Postgres chico
  * (su default es 100 conexiones en total) dejando lugar a los respaldos y a

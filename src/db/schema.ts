@@ -548,6 +548,9 @@ export const presentaciones = pgTable('presentaciones', {
 }, (t) => ({
   ixCodigo: index('ix_presentaciones_codigo').on(t.codigoBarras),
   uqCodigo: uniqueIndex('uq_presentacion_codigo_barras').on(t.codigoBarras).where(sql`${t.codigoBarras} <> ''`),
+  // "Los paquetes de este producto": se pregunta al fraccionar, al cotizar un
+  // renglón y al armar el catálogo. Sin índice era recorrer la tabla entera.
+  ixProducto: index('ix_presentaciones_producto').on(t.productoId),
 }));
 
 /* Costo de un producto según cada proveedor (descuento y flete en %). */
@@ -1037,6 +1040,12 @@ export const stock = pgTable('stock', {
    * de las consultas: primero se filtra por sucursal, después por producto.
    */
   ixSucProd: index('ix_stock_suc_prod').on(t.sucursalId, t.productoId),
+  /*
+   * Y por producto solo: es como se lee la foto de un producto después de
+   * moverle stock (todas sus sucursales y estados, `fotoProducto`), que pasa
+   * en cada fraccionamiento y cada movimiento manual.
+   */
+  ixProd: index('ix_stock_prod').on(t.productoId),
 }));
 
 /* ---------------- Movimientos (registro inmutable de altas/bajas) ---------------- */
@@ -1221,7 +1230,15 @@ export const transferenciaItems = pgTable('transferencia_items', {
    * cambiado — el remito viejo tiene que decir siempre lo mismo.
    */
   costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
-});
+}, (t) => ({
+  /*
+   * Los renglones de un pedido. El borrador se guarda entero en cada
+   * autoguardado (borrar los de ese pedido, insertar los nuevos) y cada
+   * remito los lee al listar: sin índice, cada una de esas era recorrer TODOS
+   * los renglones de TODOS los pedidos de la historia.
+   */
+  ixTransferencia: index('ix_transferencia_items_transferencia').on(t.transferenciaId),
+}));
 
 export const transferenciaHist = pgTable('transferencia_hist', {
   id: serial('id').primaryKey(),
@@ -1229,7 +1246,10 @@ export const transferenciaHist = pgTable('transferencia_hist', {
   estado: estadoTransferEnum('estado').notNull(),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-});
+}, (t) => ({
+  // Mismo motivo que los renglones: el historial se lee por pedido.
+  ixTransferencia: index('ix_transferencia_hist_transferencia').on(t.transferenciaId),
+}));
 
 /* ---------------- Incidencias ---------------- */
 export const incidencias = pgTable('incidencias', {
@@ -2357,40 +2377,6 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
   // La consulta de sincronización de coffit entra por acá.
   ixActualizado: index('ix_envios_cafe_actualizado').on(t.actualizadoEn),
-}));
-
-/* ============================================================================
- * CHAT INTERNO — el mostrador le pregunta a administración sin dejar el puesto
- * ============================================================================
- * Un canal por sucursal (hoy habilitado SOLO en la distribuidora: el gate lo
- * decide la API por el tipo de sucursal, no el cliente). Sin WebSockets: el
- * cliente pollea como los demás avisos del sistema, y la base es la verdad —
- * historial consultable, sobrevive recargas, y el que llega tarde ve todo.
- * `chat_lecturas` guarda hasta dónde leyó cada usuario: el "no leídos" es por
- * usuario y sobrevive al F5 (no vive en el navegador).
- */
-export const chatMensajes = pgTable('chat_mensajes', {
-  id: serial('id').primaryKey(),
-  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
-  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
-  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-  /** NULL = canal grupal del local; con valor = mensaje PRIVADO para ese usuario. */
-  paraUsuarioId: integer('para_usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-  texto: text('texto').notNull(),
-}, (t) => ({
-  ixCanal: index('ix_chat_mensajes_canal').on(t.sucursalId, t.id),
-  ixPara: index('ix_chat_mensajes_para').on(t.sucursalId, t.paraUsuarioId, t.id),
-}));
-
-export const chatLecturas = pgTable('chat_lecturas', {
-  id: serial('id').primaryKey(),
-  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
-  usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
-  /** Qué conversación: 0 = canal grupal; otro valor = el privado con ESE usuario. */
-  canalUsuarioId: integer('canal_usuario_id').notNull().default(0),
-  ultimoMensajeId: integer('ultimo_mensaje_id').notNull().default(0),
-}, (t) => ({
-  uq: uniqueIndex('uq_chat_lectura').on(t.sucursalId, t.usuarioId, t.canalUsuarioId),
 }));
 
 export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {

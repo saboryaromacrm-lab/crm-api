@@ -275,6 +275,44 @@ export class InventarioService {
     const [p] = await tx.select().from(productos).where(eq(productos.id, id)).limit(1);
     return p;
   }
+  /**
+   * Los productos de un lote de renglones en UNA consulta, por id. Es lo que
+   * usan las operaciones que recorren los ítems de un documento (la venta que
+   * egresa stock, la nota que lo reingresa): antes cada renglón hacía su
+   * propio viaje a la base por el producto, adentro de la transacción y con
+   * la venta tomada con candado — quince renglones, quince viajes en fila
+   * mientras la otra caja espera.
+   */
+  private async productosDe(tx: any, ids: number[]) {
+    const limpios = [...new Set(ids.filter((n) => Number.isInteger(n) && n > 0))];
+    const filas = limpios.length ? await tx.select().from(productos).where(inArray(productos.id, limpios)) : [];
+    return new Map<number, any>(filas.map((p: any) => [p.id, p]));
+  }
+  /**
+   * LA FOTO DEL PRODUCTO DESPUÉS DE MOVER SU STOCK: sus filas de stock (todas
+   * las sucursales y estados) y su estado de catálogo.
+   *
+   * Viaja en la respuesta de cada operación de stock (venta suelta,
+   * fraccionamiento, corrección, movimiento manual) para que la pantalla
+   * actualice SOLO ese producto. Hasta ahora, después de cada una de esas
+   * operaciones el CRM volvía a bajar el inventario ENTERO —10 MB con 2.700
+   * productos, y el armado de precios de todos ellos en el servidor— por un
+   * fraccionamiento de tres paquetes. Con cuatro personas trabajando, ese
+   * armado repetido era lo que dejaba la API sin responder a las cajas.
+   *
+   * Se lee DENTRO de la misma transacción, así que es exactamente lo que quedó
+   * guardado: la pantalla termina igual de exacta que recargando todo. El
+   * estado del producto va porque un ingreso puede despertar a un archivado
+   * (`despertarArchivado`), y eso también tiene que verse.
+   */
+  private async fotoProducto(tx: any, productoId: number) {
+    const [filas, [p]] = await Promise.all([
+      tx.select().from(stock).where(eq(stock.productoId, productoId)),
+      tx.select({ id: productos.id, estado: productos.estado, estadoDesde: productos.estadoDesde, motivoBaja: productos.motivoBaja })
+        .from(productos).where(eq(productos.id, productoId)).limit(1),
+    ]);
+    return { stock: filas, producto: p ?? null };
+  }
   private async distribuidoraId(tx: any): Promise<number | null> {
     const [s] = await tx.select().from(sucursales).where(eq(sucursales.tipo, 'distribuidora')).limit(1);
     return s ? s.id : null;
@@ -338,7 +376,7 @@ export class InventarioService {
         unidad: this.unidadDe(prod.tipo, presId), estadoDesde: 'disponible', usuarioId: o.usuarioId ?? null,
         descripcion: `${esGranelSuelto ? 'Venta suelta ' : 'Venta '}${this.fmtCant(prod.tipo, presId, c)} · $${importe.toFixed(2)}`,
       });
-      return { ok: true, importe, movimiento: m };
+      return { ok: true, importe, movimiento: m, ...(await this.fotoProducto(tx, prod.id)) };
     });
   }
 
@@ -370,7 +408,7 @@ export class InventarioService {
         presLabel: 'Granel → paquetes', usuarioId: o.usuarioId ?? null,
         descripcion: `Fraccionó ${total} kg en ${detalle}`,
       });
-      return { ok: true, movimiento: m };
+      return { ok: true, movimiento: m, ...(await this.fotoProducto(tx, prod.id)) };
     });
   }
 
@@ -404,7 +442,7 @@ export class InventarioService {
 
       const actual = await this.cant(tx, prod.id, sucId, pres.id, 'disponible');
       const delta = real - actual;
-      if (Math.abs(delta) < 1e-9) return { ok: true, sinCambios: true };
+      if (Math.abs(delta) < 1e-9) return { ok: true, sinCambios: true, ...(await this.fotoProducto(tx, prod.id)) };
 
       const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
       if (delta > 0) {
@@ -428,13 +466,18 @@ export class InventarioService {
         usuarioId: o.usuarioId ?? null, motivo: (o.motivo ?? '').trim(),
         descripcion: `Corrigió ${tam}: ${actual} → ${real} paquetes (${kg} kg ${delta > 0 ? 'salen del' : 'vuelven al'} granel)`,
       });
-      return { ok: true, movimiento: m, delta, kg };
+      return { ok: true, movimiento: m, delta, kg, ...(await this.fotoProducto(tx, prod.id)) };
     });
   }
 
   /** Movimiento simple: devolución (+), ajuste (±), merma/vencido/defectuoso (−). */
   async opSimple(o: any) {
-    return this.db.transaction(async (tx) => this.opSimpleTx(tx, o));
+    return this.db.transaction(async (tx) => {
+      const r = await this.opSimpleTx(tx, o);
+      // La foto va acá y no en `opSimpleTx`: el que lo llama con su propia
+      // transacción (procesar un vencimiento) no la necesita.
+      return { ...r, ...(await this.fotoProducto(tx, Number(o.productoId))) };
+    });
   }
 
   /**
@@ -586,11 +629,13 @@ export class InventarioService {
     // Por defecto egresa lo DISPONIBLE; un documento puede egresar otro estado
     // (el envío a Cafetería cierra sacando lo que viajaba en_transito).
     const estado: EstadoStock = o.estado || 'disponible';
+    // Todos los productos del documento de una vez (ver `productosDe`).
+    const prodDe = await this.productosDe(tx, (o.items || []).map((it: any) => Number(it.productoId)));
     for (const it of o.items || []) {
       const presId = it.presentacionId || null;
       const cantidad = Number(it.cantidad) || 0;
       if (cantidad <= 0) continue;
-      const prod = await this.getProducto(tx, it.productoId);
+      const prod = prodDe.get(Number(it.productoId));
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, estado);
       if (!o.permitirNegativo && cantidad > disp + 1e-9) {
@@ -706,11 +751,12 @@ export class InventarioService {
    * Contrapartida exacta de `egresarStockItems`.
    */
   async reingresarStockItems(tx: any, o: any) {
+    const prodDe = await this.productosDe(tx, (o.items || []).map((it: any) => Number(it.productoId)));
     for (const it of o.items || []) {
       const presId = it.presentacionId || null;
       const cantidad = Number(it.cantidad) || 0;
       if (cantidad <= 0) continue;
-      const prod = await this.getProducto(tx, it.productoId);
+      const prod = prodDe.get(Number(it.productoId));
       if (!prod) continue;
       await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado: 'disponible' }, cantidad);
       await this.mov(tx, {
@@ -1000,21 +1046,43 @@ export class InventarioService {
       const crudos = Array.isArray(o.items) ? o.items : [];
       if (crudos.length > 300) throw new BadRequestException('Demasiados renglones en un pedido (máximo 300).');
 
+      /*
+       * LOS PRODUCTOS Y LOS PAQUETES DE TODOS LOS RENGLONES, EN DOS CONSULTAS.
+       *
+       * Esto corre en cada guardado automático del pedido —cada vez que el
+       * cajero deja de tipear un segundo— y hacía dos viajes a la base POR
+       * RENGLÓN, con la transacción abierta: un pedido de 150 renglones eran
+       * 300 consultas en fila por cada cantidad que se tocaba, y con dos
+       * locales armando su pedido a la vez la API se quedaba sin conexiones
+       * para las cajas. Las validaciones son las mismas, en el mismo orden;
+       * solo cambia que la base se consulta una vez.
+       */
+      const prodIds = crudos.map((it) => Number(it.productoId)).filter((n) => Number.isInteger(n) && n > 0);
+      const presIds = crudos.map((it) => (it.presId ? Number(it.presId) : 0)).filter((n) => Number.isInteger(n) && n > 0);
+      const [prods, press] = await Promise.all([
+        prodIds.length
+          ? tx.select({ id: productos.id }).from(productos).where(inArray(productos.id, [...new Set(prodIds)]))
+          : [],
+        presIds.length
+          ? tx.select({ id: presentaciones.id, productoId: presentaciones.productoId })
+            .from(presentaciones).where(inArray(presentaciones.id, [...new Set(presIds)]))
+          : [],
+      ]);
+      const existe = new Set(prods.map((p: any) => p.id));
+      const duenoDePres = new Map<number, number>(press.map((p: any): [number, number] => [p.id, p.productoId]));
+
       const filas: any[] = [];
       for (const it of crudos) {
         const prodId = Number(it.productoId);
         if (!Number.isInteger(prodId) || prodId <= 0) continue;
-        const prod = await this.getProducto(tx, prodId);
-        if (!prod) throw new BadRequestException('Hay un renglón con un producto que ya no existe.');
+        if (!existe.has(prodId)) throw new BadRequestException('Hay un renglón con un producto que ya no existe.');
         const cant = Number(it.cantidad);
         if (!Number.isFinite(cant) || cant < 0) throw new BadRequestException('Cantidad inválida en un renglón.');
         let presId: number | null = it.presId ? Number(it.presId) : null;
         if (presId) {
           // La presentación tiene que ser DE ESE producto: un id ajeno pediría
           // "5 paquetes de 250 g" de algo que no los tiene.
-          const [pres] = await tx.select().from(presentaciones)
-            .where(and(eq(presentaciones.id, presId), eq(presentaciones.productoId, prodId))).limit(1);
-          if (!pres) throw new BadRequestException('Una presentación elegida no es de su producto.');
+          if (duenoDePres.get(presId) !== prodId) throw new BadRequestException('Una presentación elegida no es de su producto.');
         }
         filas.push({
           transferenciaId: t.id, productoId: prodId, presentacionId: presId,
