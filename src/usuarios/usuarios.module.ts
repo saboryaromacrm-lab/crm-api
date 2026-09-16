@@ -283,17 +283,27 @@ const CLAVES_LEGADAS = new Set(['ver', 'config', 'usuarios']);
 const COMODIN = '*';
 
 /**
- * Largo mínimo de contraseña. Era 4 — o sea que un PIN de 4 dígitos son 10.000
- * combinaciones, que contra scrypt caen en minutos si alguna vez se filtra la
- * base. Sube a 8 junto con el cambio del freno de intentos (`freno-login.ts`),
- * que a cambio de no dejar bloquear a nadie desde afuera tolera más intentos por
- * usuario: la contraseña pasa a ser la defensa principal y tiene que valerlo.
+ * Largo mínimo de contraseña: CUATRO, o sea que puede ser un PIN.
  *
- * Solo rige para contraseñas NUEVAS: las que ya están guardadas siguen
- * entrando, así que esto no deja a nadie afuera. Cambiar las `1234` que reparte
- * la semilla está en el checklist del deploy.
+ * Estuvo en 8 entre el 14/8 y el 16/9. Vuelve a 4 por decisión del dueño y por
+ * el uso real: la contraseña se tipea de parado, en el mostrador, con un
+ * cliente esperando y varias veces por turno — el mismo motivo por el que el
+ * PIN del relevo de caja (0088) nació corto.
+ *
+ * LO QUE ESO CUESTA, dicho sin vueltas: cuatro dígitos son 10.000
+ * combinaciones. La defensa deja de estar en el largo y pasa a estar ENTERA en
+ * el freno de intentos (`freno-login.ts`), que por eso se endureció en el mismo
+ * cambio: la espera crece en cada tanda de fallos. Las dos piezas van juntas —
+ * bajar esto sin aquello deja el login abierto a fuerza bruta.
+ *
+ * Lo que el freno NO cubre, y queda dicho acá: si alguna vez se filtrara la
+ * base, un PIN de 4 dígitos contra scrypt cae en minutos. Para una cuenta que
+ * puede TODO conviene igual una contraseña larga — el sistema ya no la exige.
+ *
+ * Rige solo para contraseñas NUEVAS: las guardadas de antes siguen entrando,
+ * así que bajarlo no deja a nadie afuera ni obliga a nadie a cambiar la suya.
  */
-const MIN_PASSWORD = 8;
+const MIN_PASSWORD = 4;
 
 /** ¿Esta sesión ES el dueño del sistema? (el único que puede repartir mando) */
 const esSuperadmin = (sesion?: Sesion) => (sesion?.permisos ?? []).includes(COMODIN);
