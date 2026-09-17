@@ -1945,26 +1945,81 @@ export class InventarioService {
     });
   }
 
-  async bootstrap() {
-    const [suc, prov, usr, prods, pres, provCostos, formatos, listasCat, stk, transfs, incs,
-      ms, cs, ss, es, pes, rolesCat, pendientesLectura, pendientesPedidoCafe,
-      urgentesVenc] = await Promise.all([
+  /* ==================================================================== *
+   * El snapshot del inventario, EN TRES PARTES
+   * ==================================================================== *
+   * Compras y Almacén arrancan bajando el inventario entero, y hasta el 17/9
+   * lo volvían a bajar entero después de casi cada cambio. Con 2.700
+   * productos eso son 10 MB por viaje —8 de productos con sus precios, 3 de
+   * stock— y era lo que se cortaba a mitad de camino en el mostrador.
+   *
+   * Se parte por VELOCIDAD DE CAMBIO, que es lo que decide qué vale la pena
+   * volver a bajar:
+   *
+   *   · `base`     — sucursales, usuarios, listas, catálogos, remitos, avisos.
+   *                  Chico. Cambia cada tanto.
+   *   · `catalogo` — los productos con sus precios ya resueltos. 8 MB.
+   *                  Cambia cuando alguien edita un producto o un precio: pocas
+   *                  veces por día.
+   *   · `stock`    — las existencias. 3 MB. Cambia con CADA venta.
+   *
+   * Cada parte lleva una VERSIÓN (secuencia de Postgres que avanza un trigger
+   * en cada escritura: migración 0094). El controlador la lee ANTES de armar
+   * nada: si el CRM ya tiene esa versión, contesta 304 y no toca una tabla
+   * pesada. Así, después de una venta se vuelve a bajar el stock y nada más;
+   * después de editar un producto, el catálogo y nada más. Y el 304 nunca
+   * puede mentir, porque la versión la lleva la base y no el código.
+   *
+   * `bootstrap()` a secas sigue existiendo y devuelve las tres juntas con la
+   * forma de siempre: un CRM abierto con la versión anterior lo sigue llamando
+   * hasta que recargue.
+   */
+
+  /**
+   * Las versiones de las tres partes, en una consulta a tres secuencias. Es
+   * lo único que se lee para decidir un 304, por eso tiene que ser barato:
+   * `last_value` no toma candado ni espera a nadie.
+   *
+   * SE LEE ANTES DE LOS DATOS, a propósito (ver el controlador): si se leyera
+   * después, una escritura entre medio podría dejar una versión más nueva que
+   * el contenido, y el CRM se quedaría con datos viejos creyendo que están al
+   * día. Al revés —versión vieja, contenido nuevo— solo cuesta un 200 de más.
+   *
+   * `is_called` NO ES DECORATIVO. Una secuencia recién creada tiene
+   * `last_value = 1` con `is_called = false`, y el PRIMER `nextval()` devuelve
+   * ese 1 sin mover `last_value`: mirando solo `last_value`, el primer cambio
+   * después de la migración sería invisible y el 304 mentiría una vez. Con
+   * `is_called` la cuenta es 0 antes de cualquier escritura y 1 después de la
+   * primera, y no hay hueco.
+   */
+  async versiones(): Promise<{ base: number; catalogo: number; stock: number }> {
+    const r: any = await this.db.execute(sql`
+      SELECT (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM ver_base)     AS base,
+             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM ver_catalogo) AS catalogo,
+             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM ver_stock)    AS stock`);
+    const f = r.rows?.[0] ?? {};
+    return { base: Number(f.base) || 0, catalogo: Number(f.catalogo) || 0, stock: Number(f.stock) || 0 };
+  }
+
+  /** Las existencias, tal cual: la parte que cambia con cada venta. */
+  async bootstrapStock() {
+    return { stock: await this.db.select().from(stock) };
+  }
+
+  /** Lo chico y estable: sucursales, usuarios, listas, catálogos, remitos, avisos. */
+  async bootstrapBase() {
+    const [suc, prov, usr, listasCat, transfs, incs, ms, cs, ss, es, rolesCat,
+      pendientesLectura, pendientesPedidoCafe, urgentesVenc] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
-      this.db.select().from(productos),
-      this.db.select().from(presentaciones),
-      this.db.select().from(productoProveedores),
-      this.db.select().from(productoListas),
       this.listas.catalogo(),
-      this.db.select().from(stock),
       this.listTransferencias(),
       this.db.select().from(incidencias).orderBy(desc(incidencias.id)),
       this.db.select().from(marcas),
       this.db.select().from(categorias),
       this.db.select().from(subcategorias),
       this.db.select().from(etiquetas),
-      this.db.select().from(productoEtiquetas),
       this.db.select().from(roles),
       this.db.select({ n: sql<number>`count(*)` }).from(facturaLecturas)
         .where(eq(facturaLecturas.estado, 'pendiente')),
@@ -1976,6 +2031,45 @@ export class InventarioService {
       // server (a la noche UTC ya es mañana y adelantaría los vencidos).
       this.db.select({ n: sql<number>`count(*)` }).from(vencimientos)
         .where(sql`(${vencimientos.procesado} = false AND ${vencimientos.fechaVencimiento} - (now() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date <= 7)`),
+    ]);
+    const cfgVentas = await this.cfg.get('ventas');
+    return {
+      listasCatalogo: listasCat,
+      // Los catálogos del producto: chicos y estables, viajan enteros para que
+      // los desplegables del modal no cuesten una llamada cada uno.
+      catalogos: { marcas: ms, categorias: cs, subcategorias: ss, etiquetas: es },
+      sucursales: suc, proveedores: prov, usuarios: this.usuariosPublicos(usr, rolesCat),
+      transferencias: transfs, incidencias: incs,
+      /*
+       * Cuántas facturas de papel están esperando que alguien las cargue. Viaja
+       * solo el NÚMERO —para el globito del menú—: la bandeja en sí la pide su
+       * panel, con sus filtros. Sin este aviso nadie se entera de que hay
+       * facturas subidas, y el papel se queda en la bandeja como se quedaba en
+       * el cajón.
+       */
+      lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
+      /** Pedidos del café sin resolver (pendiente + armando): el globito de Cafetería. */
+      pedidosCafeteriaPendientes: Number(pendientesPedidoCafe?.[0]?.n) || 0,
+      vencimientosUrgentes: Number(urgentesVenc?.[0]?.n) || 0,
+      // El frontend replica el cálculo de precios: necesita el mismo redondeo
+      // para no mostrar un número distinto al de la API.
+      configVentas: cfgVentas,
+    };
+  }
+
+  /** Los productos con sus precios ya resueltos: la parte pesada y estable. */
+  async bootstrapCatalogo() {
+    const [prods, pres, provCostos, formatos, listasCat, ms, cs, ss, es, pes] = await Promise.all([
+      this.db.select().from(productos),
+      this.db.select().from(presentaciones),
+      this.db.select().from(productoProveedores),
+      this.db.select().from(productoListas),
+      this.listas.catalogo(),
+      this.db.select().from(marcas),
+      this.db.select().from(categorias),
+      this.db.select().from(subcategorias),
+      this.db.select().from(etiquetas),
+      this.db.select().from(productoEtiquetas),
     ]);
     const cfgVentas = await this.cfg.get('ventas');
     const redondeo = cfgVentas.redondeoPrecio;
@@ -2097,28 +2191,19 @@ export class InventarioService {
         listas: listasProd,
       };
     });
-    return {
-      listasCatalogo: listasCat,
-      // Los catálogos del producto: chicos y estables, viajan enteros para que
-      // los desplegables del modal no cuesten una llamada cada uno.
-      catalogos: { marcas: ms, categorias: cs, subcategorias: ss, etiquetas: es },
-      sucursales: suc, proveedores: prov, usuarios: this.usuariosPublicos(usr, rolesCat), productos: productosFull,
-      stock: stk, transferencias: transfs, incidencias: incs,
-      /*
-       * Cuántas facturas de papel están esperando que alguien las cargue. Viaja
-       * solo el NÚMERO —para el globito del menú—: la bandeja en sí la pide su
-       * panel, con sus filtros. Sin este aviso nadie se entera de que hay
-       * facturas subidas, y el papel se queda en la bandeja como se quedaba en
-       * el cajón.
-       */
-      lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
-      /** Pedidos del café sin resolver (pendiente + armando): el globito de Cafetería. */
-      pedidosCafeteriaPendientes: Number(pendientesPedidoCafe?.[0]?.n) || 0,
-      vencimientosUrgentes: Number(urgentesVenc?.[0]?.n) || 0,
-      // El frontend replica el cálculo de precios: necesita el mismo redondeo
-      // para no mostrar un número distinto al de la API.
-      configVentas: cfgVentas,
-    };
+    return { productos: productosFull };
+  }
+
+  /**
+   * El snapshot entero, con la forma de siempre: las tres partes juntas. Lo
+   * usa el CRM que todavía no recargó después del deploy; el nuevo pide las
+   * partes por separado (`/bootstrap/base`, `/catalogo`, `/stock`).
+   */
+  async bootstrap() {
+    const [base, catalogo, stk] = await Promise.all([
+      this.bootstrapBase(), this.bootstrapCatalogo(), this.bootstrapStock(),
+    ]);
+    return { ...base, ...catalogo, ...stk };
   }
 
   /* ==================================================================== *

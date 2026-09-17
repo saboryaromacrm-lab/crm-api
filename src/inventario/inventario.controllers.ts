@@ -34,7 +34,7 @@
  */
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Param,
-  ParseIntPipe, Patch, Post, Put, Query,
+  ParseIntPipe, Patch, Post, Put, Query, Req, Res,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
@@ -233,6 +233,50 @@ export class BootstrapController {
   @Get()
   bootstrap() {
     return this.inv.bootstrap();
+  }
+
+  /*
+   * LAS TRES PARTES, cada una con su versión (ver el encabezado de
+   * `bootstrap` en el servicio). Es HTTP de libro: la respuesta lleva un
+   * `ETag` con la versión y `Cache-Control: private, no-cache`, que quiere
+   * decir "guardalo, pero preguntame siempre antes de usarlo". El navegador
+   * guarda el cuerpo y en la próxima manda `If-None-Match` solo; si la versión
+   * es la misma, se le contesta 304 sin cuerpo y él reutiliza el suyo — y eso
+   * sobrevive a un F5, porque vive en la caché del navegador y no en la
+   * memoria de la pestaña.
+   *
+   * LA VERSIÓN SE LEE ANTES DE ARMAR NADA. Es lo que hace que un 304 cueste
+   * una consulta a tres secuencias en vez de veinte consultas y 10 MB. Y se
+   * lee antes y no después por lo que explica `versiones()`: la versión no
+   * puede ser más nueva que el contenido que viaja con ella.
+   */
+  @Get('base')
+  base(@Req() req: any, @Res() res: any) {
+    return this.parte(req, res, 'base', () => this.inv.bootstrapBase());
+  }
+
+  @Get('catalogo')
+  catalogo(@Req() req: any, @Res() res: any) {
+    return this.parte(req, res, 'catalogo', () => this.inv.bootstrapCatalogo());
+  }
+
+  @Get('stock')
+  stock(@Req() req: any, @Res() res: any) {
+    return this.parte(req, res, 'stock', () => this.inv.bootstrapStock());
+  }
+
+  private async parte(req: any, res: any, nombre: 'base' | 'catalogo' | 'stock', armar: () => Promise<unknown>) {
+    const v = await this.inv.versiones();
+    const etag = `"inv-${nombre}-${v[nombre]}"`;
+    res.setHeader('ETag', etag);
+    res.setHeader('Cache-Control', 'private, no-cache');
+    // `If-None-Match` puede traer varios, separados por coma.
+    const pedidos = String(req.headers?.['if-none-match'] ?? '').split(',').map((x: string) => x.trim());
+    if (pedidos.includes(etag)) {
+      res.status(304).end();
+      return;
+    }
+    res.json(await armar());
   }
 }
 
