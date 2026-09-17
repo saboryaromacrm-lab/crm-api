@@ -1293,21 +1293,36 @@ export class InventarioService {
         if (this.listaDe(prod.tipo) === o.tipo && it.cantidadPreparada > 1e-9) mios.push({ it, prod });
       }
 
-      if (o.listo) {
-        // Primero se valida TODO y recién después se mueve: el error detalla
-        // cada renglón corto y no deja reservas a medias.
-        const faltas: string[] = [];
-        for (const { it, prod } of mios) {
-          const disp = await this.cant(tx, it.productoId, t.origenId, it.presentacionId, 'disponible');
-          if (it.cantidadPreparada > disp + 1e-9) {
-            faltas.push(`${prod.nombre}: preparado ${this.fmtCant(prod.tipo, it.presentacionId, it.cantidadPreparada)}, disponible ${this.fmtCant(prod.tipo, it.presentacionId, disp)}`);
-          }
-        }
-        if (faltas.length) throw new BadRequestException(`Stock insuficiente para confirmar — ${faltas.join(' · ')}`);
-      }
+      /*
+       * ANTES DE RESERVAR, SE COMPLETA LO QUE FALTA (17/9/2026, pedido del dueño).
+       *
+       * Acá había un `throw`: cualquier renglón corto abortaba la confirmación
+       * entera con "Stock insuficiente para confirmar". Y el caso que lo
+       * disparaba casi siempre no era escasez — era la FORMA de la mercadería.
+       * El pedido pide 2 paquetes de 150 g, el depósito tiene 50 kg a granel y
+       * CERO paquetes: para el stock son dos cosas distintas, y el paquete no
+       * existe hasta que alguien lo arma. El sistema sabía los kilos que hay y
+       * los paquetes que faltan, y aun así mandaba al fraccionador a entrar
+       * producto por producto a hacer la cuenta a mano — cinco renglones, cinco
+       * viajes, y en cada uno tipeando un número que el pedido ya dice.
+       *
+       * Ahora confirmar hace el trabajo: fracciona lo justo para cubrir cada
+       * renglón y recién entonces reserva. Y si ni el granel alcanza, no traba:
+       * baja lo preparado a lo que realmente hay, lo deja anotado con su motivo
+       * y sigue. El pedido viaja con lo que existe, que es lo que iba a viajar
+       * igual — la diferencia es que ya no hay que pelearlo a mano.
+       *
+       * Todo dentro de la MISMA transacción que la reserva: si algo falla más
+       * abajo, el fraccionado tampoco ocurrió.
+       */
+      let armados: string[] = [];
+      let recortes: string[] = [];
+      if (o.listo) ({ armados, recortes } = await this.completarPreparado(tx, t, mios, o.usuarioId));
 
       const etiqueta = o.tipo === 'enteros' ? 'Enteros' : 'Fraccionados';
       for (const { it, prod } of mios) {
+        // Recortado a 0 por falta de stock: no queda nada que apartar.
+        if (!(it.cantidadPreparada > 1e-9)) continue;
         if (o.listo) {
           await this.move(tx, { productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId }, 'disponible', 'comprometido', it.cantidadPreparada);
         } else {
@@ -1323,8 +1338,92 @@ export class InventarioService {
             : `${t.codigo}: lista ${etiqueta} desconfirmada, stock liberado`,
         });
       }
-      return { ok: true, tipo: o.tipo, listo: o.listo };
+      return { ok: true, tipo: o.tipo, listo: o.listo, armados, recortes };
     });
+  }
+
+  /**
+   * COMPLETA LOS RENGLONES CORTOS DE UNA LISTA, JUSTO ANTES DE RESERVARLA.
+   *
+   * Dos herramientas, en este orden:
+   *
+   *   1. FRACCIONAR. Sirve solo para el paquete de un granel, que es el único
+   *      caso en que la mercadería YA ESTÁ en el depósito, nada más que en
+   *      otra forma. Se arma lo JUSTO para cubrir el renglón: ni un paquete de
+   *      más, porque armar de más deja kilos encerrados en un envase que quizá
+   *      nadie pidió, y el granel envasado no se desarma solo.
+   *
+   *   2. RECORTAR. Si ni así alcanza, lo preparado baja a lo que hay y queda
+   *      el motivo escrito. Un motivo que el encargado haya puesto a mano NO
+   *      se pisa: él sabe POR QUÉ falta, el sistema solo sabe que falta.
+   *
+   * Los renglones se recorren EN ORDEN y cada uno vuelve a leer el granel: dos
+   * presentaciones del mismo producto comen del mismo pozo, y si no da para
+   * las dos, la primera de la lista se lleva lo que hay. Es arbitrario, pero
+   * es estable y explicable — repartir a medias no completaría ninguna.
+   */
+  private async completarPreparado(
+    tx: any,
+    t: any,
+    mios: { it: any; prod: any }[],
+    usuarioId?: number,
+  ): Promise<{ armados: string[]; recortes: string[] }> {
+    const armados: string[] = [];
+    const recortes: string[] = [];
+
+    const presIds = Array.from(
+      new Set(mios.map(({ it }) => it.presentacionId).filter((x: any) => x != null)),
+    ) as number[];
+    const press = presIds.length
+      ? await tx.select().from(presentaciones).where(inArray(presentaciones.id, presIds))
+      : [];
+    const porId = new Map<number, any>(press.map((pr: any): [number, any] => [pr.id, pr]));
+
+    for (const { it, prod } of mios) {
+      let disp = await this.cant(tx, it.productoId, t.origenId, it.presentacionId, 'disponible');
+      if (it.cantidadPreparada <= disp + 1e-9) continue;
+
+      const pres = it.presentacionId != null ? porId.get(it.presentacionId) : null;
+      if (prod.tipo === 'granel' && pres && pres.tamKg > 0) {
+        const faltan = Math.ceil(it.cantidadPreparada - disp - 1e-9);
+        const granel = await this.cant(tx, it.productoId, t.origenId, null, 'disponible');
+        const armar = Math.min(faltan, Math.floor(granel / pres.tamKg + 1e-9));
+        if (armar > 0) {
+          const kg = Math.round(armar * pres.tamKg * 1000) / 1000;
+          const base = { productoId: it.productoId, sucursalId: t.origenId, estado: 'disponible' as const };
+          await this.addDelta(tx, { ...base, presentacionId: null }, -kg);
+          await this.addDelta(tx, { ...base, presentacionId: it.presentacionId }, armar);
+          await this.mov(tx, {
+            tipo: 'fraccionamiento', productoId: it.productoId, sucursalId: t.origenId,
+            presentacionId: it.presentacionId, signo: 0, cantidad: kg, unidad: 'kg',
+            presLabel: `Granel → ${this.fmtTam(pres.tamKg)}`,
+            refTransferenciaId: t.id, usuarioId: usuarioId ?? null,
+            descripcion: `${t.codigo}: fraccionó ${kg} kg en ${armar}×${this.fmtTam(pres.tamKg)} para completar el pedido`,
+          });
+          armados.push(`${prod.nombre}: ${armar}×${this.fmtTam(pres.tamKg)} (${kg} kg de granel)`);
+          disp += armar;
+        }
+      }
+
+      if (it.cantidadPreparada <= disp + 1e-9) continue;
+
+      /* Lo que queda va como viaja: paquetes y unidades ENTEROS —medio paquete
+       * no sube al camión—, el granel suelto con sus tres decimales. */
+      const antes = it.cantidadPreparada;
+      const hay = this.unidadDe(prod.tipo, it.presentacionId) === 'kg'
+        ? Math.max(0, Math.round(disp * 1000) / 1000)
+        : Math.max(0, Math.floor(disp + 1e-9));
+      const patch: any = { cantidadPreparada: hay };
+      if (!String(it.motivo ?? '').trim()) patch.motivo = 'Sin stock: se preparó lo que había';
+      await tx.update(transferenciaItems).set(patch).where(eq(transferenciaItems.id, it.id));
+      // La fila EN MEMORIA es la que usa la reserva de abajo: se actualiza igual.
+      it.cantidadPreparada = hay;
+      if (patch.motivo) it.motivo = patch.motivo;
+      recortes.push(
+        `${prod.nombre}: quedó en ${this.fmtCant(prod.tipo, it.presentacionId, hay)} (faltó para ${this.fmtCant(prod.tipo, it.presentacionId, antes)})`,
+      );
+    }
+    return { armados, recortes };
   }
 
   /**
