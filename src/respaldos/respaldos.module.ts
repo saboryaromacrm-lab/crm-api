@@ -23,7 +23,7 @@
  * el encabezado del propio archivo, que es donde se las busca en la urgencia.
  */
 import {
-  BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, Post, Res,
+  BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, Post, Query, Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import type { Pool } from 'pg';
@@ -206,17 +206,80 @@ export class RespaldosService {
     }]);
   }
 
+  /** Qué tablas se vacían esta vez: todas, o todas menos `stock` (17/9/2026). */
+  private tablasDe(preservarStock: boolean) {
+    return preservarStock ? TABLAS_PRACTICA.filter((t) => t !== 'stock') : TABLAS_PRACTICA;
+  }
+
+  /**
+   * Cuántas filas de STOCK quedan reservadas ahora mismo (`comprometido` para
+   * un pedido en preparación, `en_transito` para uno ya despachado). Es el
+   * número que se PIERDE de la foto — al preservar el stock, esas cantidades
+   * no se borran, se devuelven a disponible (ver `liberarReservas`) — pero el
+   * ensayo tiene que decir que están, porque cambian de fila.
+   */
+  private async reservasActuales() {
+    const r = await this.pool.query(
+      `SELECT count(*)::int AS n FROM "stock" WHERE estado IN ('comprometido', 'en_transito') AND cantidad > 0`,
+    );
+    return Number(r.rows[0]?.n) || 0;
+  }
+
   /** El ensayo de la limpieza: cuántas filas se irían, tabla por tabla. */
-  async ensayoLimpieza() {
+  async ensayoLimpieza(preservarStock = false) {
+    const tablas = this.tablasDe(preservarStock);
     const detalle: { tabla: string; filas: number }[] = [];
     let total = 0;
-    for (const t of TABLAS_PRACTICA) {
+    for (const t of tablas) {
       const r = await this.pool.query(`SELECT count(*)::int AS n FROM "${t}"`);
       const n = Number(r.rows[0]?.n) || 0;
       if (n > 0) detalle.push({ tabla: t, filas: n });
       total += n;
     }
-    return { tablas: TABLAS_PRACTICA.length, total, detalle };
+    const reservas = preservarStock ? await this.reservasActuales() : 0;
+    return { tablas: tablas.length, total, detalle, preservarStock, reservas };
+  }
+
+  /**
+   * LO RESERVADO VUELVE A DISPONIBLE, antes de borrar lo que lo reservaba.
+   *
+   * Con `preservarStock`, la tabla `stock` no se toca — pero un pedido en
+   * preparación tenía mercadería en `comprometido`, y uno ya despachado la
+   * tenía en `en_transito`. Esos dos estados EXISTEN solo mientras existe el
+   * documento (la transferencia) que los explica; al borrar transferencias sin
+   * esto, esos kilos quedan apartados para siempre, sin ningún pedido al que
+   * volver ni ninguna pantalla que los libere — invisibles para Ventas
+   * (que solo vende desde disponible) y perdidos para Almacén (no hay
+   * transferencia que recibir ni cancelar).
+   *
+   * No hay restricción de UNICIDAD en `stock` por (producto, sucursal,
+   * presentación, estado): sumar con un `UPDATE` sobre la fila `disponible`
+   * que ya existe, y solo INSERTar una fila nueva para las claves que todavía
+   * no tenían disponible — nunca duplicar una fila `disponible`, porque el
+   * resto del sistema lee con `LIMIT 1` y una fila hermana quedaría invisible.
+   * El total en kilos/unidades no cambia: dejan de estar reservados, no dejan
+   * de existir.
+   */
+  private async liberarReservas(client: any) {
+    await client.query(`
+      UPDATE "stock" s SET cantidad = s.cantidad + sub.extra
+      FROM (
+        SELECT producto_id, sucursal_id, presentacion_id, SUM(cantidad) AS extra
+        FROM "stock" WHERE estado IN ('comprometido', 'en_transito')
+        GROUP BY producto_id, sucursal_id, presentacion_id
+      ) sub
+      WHERE s.estado = 'disponible' AND s.producto_id = sub.producto_id AND s.sucursal_id = sub.sucursal_id
+        AND s.presentacion_id IS NOT DISTINCT FROM sub.presentacion_id`);
+    await client.query(`
+      INSERT INTO "stock" (producto_id, sucursal_id, presentacion_id, estado, cantidad)
+      SELECT r.producto_id, r.sucursal_id, r.presentacion_id, 'disponible', SUM(r.cantidad)
+      FROM "stock" r
+      WHERE r.estado IN ('comprometido', 'en_transito') AND NOT EXISTS (
+        SELECT 1 FROM "stock" d WHERE d.estado = 'disponible' AND d.producto_id = r.producto_id
+          AND d.sucursal_id = r.sucursal_id AND d.presentacion_id IS NOT DISTINCT FROM r.presentacion_id
+      )
+      GROUP BY r.producto_id, r.sucursal_id, r.presentacion_id`);
+    await client.query(`DELETE FROM "stock" WHERE estado IN ('comprometido', 'en_transito')`);
   }
 
   /**
@@ -224,13 +287,21 @@ export class RespaldosService {
    * `pool.query` iría a conexiones distintas y no ataría nada). El registro
    * de auditoría se escribe DESPUÉS del commit: es el primer rastro de la era
    * nueva — dentro de la transacción lo borraría el propio TRUNCATE.
+   *
+   * `preservarStock` (17/9/2026, pedido puntual del dueño): el comportamiento
+   * de fábrica vacía `stock` con todo lo demás —es lo correcto la mayoría de
+   * las veces, arrancar realmente de cero—, pero esta vez el pedido fue
+   * distinto: borrar la OPERATORIA (ventas, pedidos, movimientos, cajas,
+   * proveedores) y dejar las EXISTENCIAS actuales tal como están.
    */
-  async limpiarPractica(usuarioId: number | null) {
-    const antes = await this.ensayoLimpieza();
+  async limpiarPractica(usuarioId: number | null, preservarStock = false) {
+    const antes = await this.ensayoLimpieza(preservarStock);
+    const tablas = this.tablasDe(preservarStock);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`TRUNCATE ${TABLAS_PRACTICA.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY`);
+      if (preservarStock) await this.liberarReservas(client);
+      await client.query(`TRUNCATE ${tablas.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY`);
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -243,9 +314,9 @@ export class RespaldosService {
     await this.audit.registrar([{
       entidad: 'sistema', entidadId: 0, ambito: 'Limpieza',
       campo: 'Fin del período de prueba', usuarioId,
-      despues: `Se vaciaron ${antes.total.toLocaleString('es-AR')} filas de ${antes.detalle.length} tablas (stock, ventas, compras, caja, cobranzas y demás operatoria de práctica). El catálogo, los proveedores, los clientes y la configuración quedaron intactos.`,
+      despues: `Se vaciaron ${antes.total.toLocaleString('es-AR')} filas de ${antes.detalle.length} tablas (${preservarStock ? 'ventas, compras, caja, cobranzas y demás operatoria — el stock actual se conservó, y lo que estaba reservado (comprometido o en tránsito) volvió a disponible' : 'stock, ventas, compras, caja, cobranzas y demás operatoria de práctica'}). El catálogo, los proveedores, los clientes y la configuración quedaron intactos.`,
     }]);
-    return { ok: true, borradas: antes.total, detalle: antes.detalle };
+    return { ok: true, borradas: antes.total, detalle: antes.detalle, preservarStock };
   }
 }
 
@@ -271,9 +342,9 @@ export class RespaldosController {
   }
 
   @Get('limpieza/ensayo') @Permiso('sistema.respaldos')
-  ensayoLimpieza(@Auth() sesion: Sesion) {
+  ensayoLimpieza(@Query('preservarStock') preservarStock: string, @Auth() sesion: Sesion) {
     this.soloSuperadmin(sesion);
-    return this.svc.ensayoLimpieza();
+    return this.svc.ensayoLimpieza(preservarStock === 'true');
   }
 
   @Post('limpieza') @Permiso('sistema.respaldos')
@@ -284,7 +355,7 @@ export class RespaldosController {
     if (String(body?.confirmar ?? '') !== 'LIMPIAR') {
       throw new BadRequestException('Para confirmar, escribí LIMPIAR tal cual.');
     }
-    return this.svc.limpiarPractica(sesion?.usuarioId ?? null);
+    return this.svc.limpiarPractica(sesion?.usuarioId ?? null, body?.preservarStock === true);
   }
 }
 
