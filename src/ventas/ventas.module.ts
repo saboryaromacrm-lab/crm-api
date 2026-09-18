@@ -1163,6 +1163,27 @@ export class VentasService {
         cantidad: money(stockDe.get(clave(prodId, presId, su.id)) ?? 0),
       }));
 
+    /**
+     * LOS FORMATOS QUE TIENEN IDENTIDAD PROPIA en la caja: los que traen su
+     * código de caja y los que se venden de a N ("caja x12"). Uno y otro son
+     * la misma cosa vista de dos lados, y el POS los usa para las dos puertas
+     * que llevan al bulto — escanear su EAN, y elegirlo en el buscador.
+     *
+     * Estaba escrito dos veces, igual, en el producto y en el paquete: la
+     * segunda copia es la que se olvida de crecer (`finalFormato` habría
+     * llegado a la madre y no al fraccionado, y la caja x12 de bolsas de 500 g
+     * habría mostrado el precio mal).
+     */
+    const formatosConIdentidad = (efs: any[]) => efs
+      .filter((ef) => ef.codigoBarras || ef.unidades > 1)
+      .map((ef) => ({
+        listaId: ef.listaId,
+        codigoBarras: ef.codigoBarras,
+        unidades: ef.unidades,
+        /** Lo que sale el bulto cerrado, para mostrarlo sin recalcularlo. */
+        precioFormato: money(ef.finalFormato),
+      }));
+
     const items: any[] = [];
     for (const p of prods) {
       const costoNeto = costoPorProd.get(p.id) ?? 0;
@@ -1194,6 +1215,16 @@ export class VentasService {
             orden: porLista.get(f.listaId)!.orden,
             netoUnitario: pv.netoUnitario,
             finalUnitario: pv.finalUnitario,
+            /*
+             * EL PRECIO DEL BULTO ENTERO, y no el unitario multiplicado.
+             *
+             * En modo `precio` el número que fijó una persona es el del FORMATO
+             * ("caja x12 $10.000") y el unitario es el derivado —$833,33, con
+             * centavos que no cierran—. Multiplicar ese unitario por 12 en la
+             * pantalla daría $9.999,96: un cartel que contradice al que lo
+             * puso. Viaja el exacto, que es el que el POS tiene que mostrar.
+             */
+            finalFormato: pv.finalFormato,
           };
         })
         .sort((a, b) => a.orden - b.orden);
@@ -1256,9 +1287,7 @@ export class VentasService {
          * escanear el código de la caja, la caja registradora carga las N
          * unidades de una — y el motor de listas hace el resto.
          */
-        formatosVenta: efectivas
-          .filter((ef) => ef.codigoBarras || ef.unidades > 1)
-          .map((ef) => ({ listaId: ef.listaId, codigoBarras: ef.codigoBarras, unidades: ef.unidades })),
+        formatosVenta: formatosConIdentidad(efectivas),
         stock: money(stockDe.get(clave(p.id, null, sucursalId)) ?? 0),
         stockSucursales: desglose(p.id, null),
       });
@@ -1306,9 +1335,7 @@ export class VentasService {
             unidades: ef.unidades,
           })),
           /** La caja de N paquetes tiene su propio código, igual que en el producto. */
-          formatosVenta: suyas
-            .filter((ef) => ef.codigoBarras || ef.unidades > 1)
-            .map((ef) => ({ listaId: ef.listaId, codigoBarras: ef.codigoBarras, unidades: ef.unidades })),
+          formatosVenta: formatosConIdentidad(suyas),
           stock: money(stockDe.get(clave(p.id, pres.id, sucursalId)) ?? 0),
           stockSucursales: desglose(p.id, pres.id),
         });
