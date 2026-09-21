@@ -666,6 +666,13 @@
       "when": 1789643742689,
       "tag": "0094_versiones_del_inventario",
       "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1789956503975,
+      "tag": "0095_cuentas_disponibles",
+      "breakpoints": true
     }
   ]
 }

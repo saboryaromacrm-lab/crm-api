@@ -27,13 +27,16 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
 import { cajaSesiones, cobranzaImputaciones, cobranzaPagos, cobranzas, ventas } from '../db/schema';
+import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { CajaModule, CajaService } from '../caja/caja.module';
 import { VentasModule, VentasService, fechaDeDocumento, money } from '../ventas/ventas.module';
 import { resolverOperador } from '../usuarios/usuarios.module';
 
-const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
+// 0095: 'transferencia_proveedor' — el cliente le transfiere directo a un
+// proveedor (Cuentas disponibles). Lleva `cuentaDisponibleId`.
+const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'transferencia_proveedor'] as const;
 
 /** Tolerancia de comparación monetaria (medio centavo). */
 const EPS = 0.005;
@@ -52,6 +55,7 @@ class PagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
   @IsNumber() @Min(0) @Max(MAX_IMPORTE) importe!: number;
   @IsOptional() @IsString() referencia?: string;
+  @IsOptional() @IsInt() cuentaDisponibleId?: number;
 }
 
 class ImputacionDto {
@@ -108,6 +112,7 @@ export class CobranzasService {
     private readonly cfg: ConfiguracionService,
     private readonly vtas: VentasService,
     private readonly caja: CajaService,
+    private readonly ctasDisp: CuentasDisponiblesService,
   ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
@@ -235,6 +240,9 @@ export class CobranzasService {
     if (!pagos.length) throw new BadRequestException('Cargá al menos un medio de pago con importe.');
     const total = money(pagos.reduce((a, p) => a + Number(p.importe), 0));
     if (total <= 0) throw new BadRequestException('El total de la cobranza debe ser mayor a 0.');
+    if (pagos.some((p) => p.medio === 'transferencia_proveedor' && !p.cuentaDisponibleId)) {
+      throw new BadRequestException('Elegí a qué cuenta del proveedor va la transferencia.');
+    }
 
     /*
      * EL TURNO DE CAJA, resuelto acá y no aceptado del cliente.
@@ -353,9 +361,19 @@ export class CobranzasService {
         total, aCuenta, estado: 'confirmada', observaciones: dto.observaciones ?? '',
       }).returning();
 
-      await tx.insert(cobranzaPagos).values(pagos.map((p) => ({
+      const filasPago = await tx.insert(cobranzaPagos).values(pagos.map((p) => ({
         cobranzaId: c.id, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
-      })));
+      }))).returning({ id: cobranzaPagos.id });
+      // El puente con Cuentas disponibles (0095): en la misma transacción.
+      const tercerizados = pagos
+        .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), cobranzaPagoId: filasPago[i].id, medio: p.medio }))
+        .filter((p) => p.medio === 'transferencia_proveedor');
+      if (tercerizados.length) {
+        await this.ctasDisp.registrarDeCobranza(tx, tercerizados, {
+          sucursalId, usuarioId: autor,
+          documento: `Recibo ${puntoVenta}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+        });
+      }
 
       if (imputaciones.length) {
         await tx.insert(cobranzaImputaciones).values(imputaciones.map((i) => ({
@@ -415,6 +433,8 @@ export class CobranzasService {
           );
         }
       }
+      // Sus transferencias a proveedor (0095) mueren con el recibo — o lo frenan.
+      await this.ctasDisp.anularDeCobranza(tx, id, razon);
       await tx.update(cobranzas).set({
         estado: 'anulada',
         anuladoPor: usuarioId ?? null,
@@ -468,7 +488,7 @@ export class CobranzasController {
 }
 
 @Module({
-  imports: [ClientesModule, ConfiguracionModule, CajaModule, VentasModule],
+  imports: [ClientesModule, ConfiguracionModule, CajaModule, VentasModule, CuentasDisponiblesModule],
   controllers: [CobranzasController],
   providers: [CobranzasService],
   exports: [CobranzasService],

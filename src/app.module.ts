@@ -9,6 +9,7 @@ import { FacturasModule } from './facturas/facturas.module';
 import { ProductosModule } from './productos/productos.module';
 import { CatalogosModule } from './catalogos/catalogos.module';
 import { ProveedoresModule } from './proveedores/proveedores.module';
+import { CuentasDisponiblesModule } from './proveedores/cuentas-disponibles.module';
 import { PedidosProveedorModule } from './proveedores/pedidos.module';
 import { FinanzasProveedorModule } from './proveedores/finanzas.module';
 import { PreciosModule } from './precios/precios.module';
@@ -49,6 +50,7 @@ import { RespaldosModule } from './respaldos/respaldos.module';
     ProveedoresModule,
     PedidosProveedorModule,
     FinanzasProveedorModule,
+    CuentasDisponiblesModule,
     PreciosModule,
     ListasModule,
     SucursalesModule,

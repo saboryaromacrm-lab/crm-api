@@ -226,6 +226,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'proveedores.ctasctes', nombre: 'Cuentas corrientes' },
       { clave: 'proveedores.echeqs', nombre: 'Echeqs' },
       { clave: 'proveedores.edoc', nombre: 'Estados de cuenta' },
+      { clave: 'proveedores.cuentas', nombre: 'Cuentas disponibles (transferencias de clientes a proveedores)' },
       { clave: 'proveedores.padron', nombre: 'Ficha de proveedores' },
     ],
     acciones: [],

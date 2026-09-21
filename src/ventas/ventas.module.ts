@@ -47,6 +47,7 @@ import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
+import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
@@ -65,7 +66,9 @@ const TIPOS = [
  * lo único que sabe qué se está devolviendo y por cuánto.
  */
 const TIPOS_CREABLES = ['ticket', 'factura_a', 'factura_b', 'factura_c'] as const;
-const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
+// 0095: 'transferencia_proveedor' es la transferencia del cliente DIRECTO a la
+// cuenta de un proveedor (Cuentas disponibles). Lleva `cuentaDisponibleId`.
+const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'transferencia_proveedor'] as const;
 
 /**
  * Las secciones del módulo Ventas, con las mismas claves del catálogo de
@@ -353,6 +356,8 @@ class VentaPagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
   @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
   @IsOptional() @IsString() @MaxLength(120) referencia?: string;
+  /** A qué cuenta disponible va, cuando el medio es 'transferencia_proveedor'. */
+  @IsOptional() @IsInt() cuentaDisponibleId?: number;
 }
 
 export class CreateVentaDto {
@@ -480,6 +485,7 @@ export class VentasService {
     private readonly listas: ListasService,
     private readonly ofertas: OfertasService,
     private readonly arca: ArcaService,
+    private readonly ctasDisp: CuentasDisponiblesService,
   ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
@@ -1264,6 +1270,21 @@ export class VentasService {
         soloCafeteria: p.soloCafeteria,
         unidad: p.tipo === 'granel' ? 'kg' : 'u',
         fraccionable: p.tipo === 'granel',   // admite cantidad decimal
+        /*
+         * EL BULTO DE LA FICHA (21/9/2026): cuántas unidades trae la caja que
+         * identifica el DUN. Viaja para que la caja registradora pueda sumar
+         * de a un bulto tambien en MOSTRADOR — donde la lista vende suelto y
+         * el "vende por N" del formato no existe.
+         *
+         * Es una COMODIDAD para cargar, no una regla: a diferencia del "vende
+         * por N" de la lista, vender 5 sueltos de una caja de 10 es normal y
+         * no se avisa nada. Solo viaja si aporta (> 1), y no en el granel: un
+         * bulto de N unidades no significa nada para algo que se vende por kg.
+         *
+         * Los PAQUETES fraccionados no lo llevan: este número es el de la caja
+         * de la madre y no dice nada de cuántos paquetes entran en un bulto.
+         */
+        unidadesPorBulto: p.tipo === 'granel' || !(p.unidadesPorBulto > 1) ? 0 : p.unidadesPorBulto,
         iva: p.iva,
         codigoBarras: p.codigoBarras,
         precio: money(filaBase?.netoUnitario ?? 0),
@@ -2077,7 +2098,32 @@ export class VentasService {
     } else if (validos.length) {
       throw new BadRequestException('Una venta en cuenta corriente no lleva pagos: se cobra con un recibo.');
     }
+    for (const p of validos) {
+      if (p.medio === 'transferencia_proveedor' && !p.cuentaDisponibleId) {
+        throw new BadRequestException('Elegí a qué cuenta del proveedor va la transferencia.');
+      }
+    }
     return validos;
+  }
+
+  /**
+   * Los renglones de pago de la venta, y el puente con Cuentas disponibles
+   * (0095): cada 'transferencia_proveedor' deja su pago al proveedor en la
+   * MISMA transacción. Corre en los dos caminos de emisión (`crear` y
+   * `confirmar`) para que ninguno pueda quedarse con una regla distinta.
+   */
+  private async insertarPagos(
+    tx: any, ventaId: number, pagos: VentaPagoDto[],
+    ctx: { sucursalId: number; usuarioId?: number | null; documento: string; clienteNombre: string },
+  ) {
+    if (!pagos.length) return;
+    const filas = await tx.insert(ventaPagos).values(pagos.map((p) => ({
+      ventaId, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
+    }))).returning({ id: ventaPagos.id });
+    const tercerizados = pagos
+      .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), ventaPagoId: filas[i].id, medio: p.medio }))
+      .filter((p) => p.medio === 'transferencia_proveedor');
+    if (tercerizados.length) await this.ctasDisp.registrarDeVenta(tx, tercerizados, ctx);
   }
 
   /**
@@ -2615,11 +2661,10 @@ export class VentasService {
 
       await tx.insert(ventaItems).values(tot.items.map((it) => ({ ...it, ventaId: v.id })));
       if (tot.extras.length) await tx.insert(ventaExtras).values(tot.extras.map((e) => ({ ...e, ventaId: v.id })));
-      if (pagos.length) {
-        await tx.insert(ventaPagos).values(pagos.map((p) => ({
-          ventaId: v.id, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
-        })));
-      }
+      await this.insertarPagos(tx, v.id, pagos, {
+        sucursalId, usuarioId: autor ?? dto.usuarioId,
+        documento: `Venta ${puntoVentaFinal}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+      });
 
       if (dto.presupuestoId) {
         await this.cerrarPresupuesto(tx, Number(dto.presupuestoId), v.id, sucursalId, cliente.id, autor ?? dto.usuarioId);
@@ -3026,11 +3071,10 @@ export class VentasService {
         observaciones: dto.observaciones ?? borrador.observaciones,
       }).where(eq(ventas.id, id));
 
-      if (pagos.length) {
-        await tx.insert(ventaPagos).values(pagos.map((p) => ({
-          ventaId: id, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
-        })));
-      }
+      await this.insertarPagos(tx, id, pagos, {
+        sucursalId, usuarioId: cobrador ?? borrador.usuarioId,
+        documento: `Venta ${puntoVentaFinal}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+      });
 
       // El borrador nació de un presupuesto: este cobro lo cierra.
       if (borrador.presupuestoId) {
@@ -3768,6 +3812,8 @@ export class VentasService {
           );
         }
       }
+      // Sus transferencias a proveedor (0095) mueren con ella — o la frenan.
+      await this.ctasDisp.anularDeVenta(tx, id, razon);
       await tx.update(ventas).set({
         estado: 'anulada',
         anuladoPor: usuarioId ?? null,
@@ -4259,7 +4305,7 @@ export class DescuentosController {
 @Module({
   imports: [
     InventarioModule, ConfiguracionModule, ClientesModule, CajaModule,
-    ListasModule, OfertasModule, ArcaModule,
+    ListasModule, OfertasModule, ArcaModule, CuentasDisponiblesModule,
   ],
   controllers: [VentasController, DescuentosController],
   providers: [VentasService, DescuentosService],

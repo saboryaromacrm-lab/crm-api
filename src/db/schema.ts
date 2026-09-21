@@ -176,6 +176,13 @@ export const proveedores = pgTable('proveedores', {
   medioHabitual: medioHabitualProvEnum('medio_habitual'),
   /** Plazo en días cuando el medio habitual es diferido ("Cta cte 15"). */
   diasPago: integer('dias_pago'),
+  /**
+   * "Menos de $50.000 no me transfieras" (0095). Es la regla del proveedor
+   * para las transferencias de clientes a sus cuentas disponibles: cada
+   * transferencia tiene que llegar a este piso, salvo la que CIERRA la cuenta
+   * (el resto final es lo que es). 0 = sin mínimo.
+   */
+  minimoTransferencia: doublePrecision('minimo_transferencia').notNull().default(0),
   modoCuenta: modoCuentaProvEnum('modo_cuenta').notNull().default('facturas'),
   /** "Cuadré contra el resumen del proveedor hasta esta fecha" — con quién y cuándo. */
   conciliadoHasta: timestamp('conciliado_hasta', { withTimezone: true }),
@@ -1679,6 +1686,12 @@ export const medioPagoEnum = pgEnum('medio_pago', [
   // 0068 · para PAGOS A PROVEEDOR (el POS no los ofrece — cada DTO whitelistea
   // sus medios): el depósito bancario y el echeq de la cartera propia.
   'deposito', 'echeq',
+  // 0095 · TRANSFERENCIA A CUENTA DE PROVEEDOR: el cliente le transfiere
+  // directo al proveedor y esa plata nunca pasa por la cuenta propia. Es un
+  // medio distinto de 'transferencia' a propósito: en el arqueo, en los
+  // reportes y en la conciliación bancaria no puede contarse como plata
+  // que entró al banco.
+  'transferencia_proveedor',
 ]);
 
 /* ============================================================================
@@ -2676,6 +2689,9 @@ export const proveedorCuentas = pgTable('proveedor_cuentas', {
   id: serial('id').primaryKey(),
   proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
   cbuAlias: text('cbu_alias').notNull().default(''),
+  /** A nombre de quién está (0095): "3 Arroyos" cobra en la cuenta de una
+   *  persona, y es lo que el cliente necesita ver antes de transferir. */
+  titular: text('titular').notNull().default(''),
   descripcion: text('descripcion').notNull().default(''),
 }, (t) => ({
   ixProv: index('ix_proveedor_cuentas_prov').on(t.proveedorId),
@@ -2781,6 +2797,74 @@ export const proveedorAjustes = pgTable('proveedor_ajustes', {
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixProv: index('ix_proveedor_ajustes_prov').on(t.proveedorId),
+}));
+
+/* ============================================================================
+ * CUENTAS DISPONIBLES (0095) — la transferencia tercerizada.
+ * ============================================================================
+ * Se le debe a un proveedor y, en vez de pagarle de la cuenta propia, se le da
+ * a los clientes SU alias: el cliente transfiere directo al proveedor. Cada
+ * transferencia es dos cosas a la vez —un cobro de la venta y un pago al
+ * proveedor— y las dos nacen en la misma transacción.
+ *
+ * La CUENTA es el balde: "a esta cuenta bancaria de este proveedor hay que
+ * hacerle llegar $X". El PAGO es cada transferencia que cae en el balde.
+ *
+ *   · `pagado`, `falta` y `cant` NO se guardan: son la suma de los pagos vivos.
+ *     Un número que no existe como dato no puede desincronizarse.
+ *   · El titular y el alias se CONGELAN al crear la cuenta: es a dónde
+ *     transfirieron los clientes, y eso no cambia si el proveedor cambia de
+ *     banco mañana. `cuentaId` queda como referencia (SET NULL si se borra).
+ *   · Un pago no se carga a mano: nace del cobro (venta o recibo). Por eso
+ *     apunta a `venta_pagos` o a `cobranza_pagos` —una y solo una— y a la fila
+ *     de `proveedor_pagos` que es su espejo en la cuenta del proveedor.
+ *   · Se anula SOLO con su venta/recibo; desde Proveedores está bloqueado.
+ */
+export const cuentasDisponibles = pgTable('cuentas_disponibles', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  cuentaId: integer('cuenta_id').references(() => proveedorCuentas.id, { onDelete: 'set null' }),
+  titular: text('titular').notNull().default(''),
+  cbuAlias: text('cbu_alias').notNull().default(''),
+  /** Cuánto hay que hacerle llegar. Editable, nunca por debajo de lo pagado. */
+  importe: doublePrecision('importe').notNull().default(0),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /** La estrella: se ofrece primero al cobrar. */
+  prioritaria: boolean('prioritaria').notNull().default(false),
+  /** Ya se le mandó el resumen de transferencias al proveedor. */
+  enviado: boolean('enviado').notNull().default(false),
+  /** Cerrada aunque no esté completa: deja de ofrecerse al cobrar. */
+  corte: boolean('corte').notNull().default(false),
+  corteEn: timestamp('corte_en', { withTimezone: true }),
+  observaciones: text('observaciones').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixProveedor: index('ix_cuentas_disp_proveedor').on(t.proveedorId, t.corte),
+  ixFecha: index('ix_cuentas_disp_fecha').on(t.fecha),
+}));
+
+export const cuentaDisponiblePagos = pgTable('cuenta_disponible_pagos', {
+  id: serial('id').primaryKey(),
+  cuentaId: integer('cuenta_id').notNull().references(() => cuentasDisponibles.id, { onDelete: 'restrict' }),
+  importe: doublePrecision('importe').notNull().default(0),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /* De dónde nació: el renglón de pago de una venta o de un recibo. Una y solo
+   * una (CHECK en la migración), como `proveedor_imputaciones`. */
+  ventaPagoId: integer('venta_pago_id').references(() => ventaPagos.id, { onDelete: 'restrict' }),
+  cobranzaPagoId: integer('cobranza_pago_id').references(() => cobranzaPagos.id, { onDelete: 'restrict' }),
+  /** Su espejo en la cuenta del proveedor. */
+  proveedorPagoId: integer('proveedor_pago_id').notNull().references(() => proveedorPagos.id, { onDelete: 'restrict' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  observaciones: text('observaciones').notNull().default(''),
+  /** Muere con su venta o recibo. NULL = vivo. */
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+}, (t) => ({
+  ixCuenta: index('ix_cta_disp_pagos_cuenta').on(t.cuentaId, t.anuladoEn),
+  ixVentaPago: index('ix_cta_disp_pagos_venta_pago').on(t.ventaPagoId),
+  ixCobranzaPago: index('ix_cta_disp_pagos_cobranza_pago').on(t.cobranzaPagoId),
+  ixProvPago: uniqueIndex('uq_cta_disp_pagos_prov_pago').on(t.proveedorPagoId),
+  ixFecha: index('ix_cta_disp_pagos_fecha').on(t.fecha),
 }));
 
 /**

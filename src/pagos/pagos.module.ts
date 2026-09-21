@@ -35,6 +35,7 @@ import {
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { esJefe } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -208,7 +209,10 @@ export class CambiarDestinoDto {
 
 @Injectable()
 export class PagosProveedorService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly ctasDisp: CuentasDisponiblesService,
+  ) {}
 
   /* ==================================================================== *
    * Recálculo — el corazón de la consistencia
@@ -1371,6 +1375,15 @@ export class PagosProveedorService {
         .where(eq(proveedorPagos.id, id)).limit(1).for('update');
       if (!p) throw new NotFoundException('Pago inexistente.');
       if (p.estado === 'anulado') throw new BadRequestException('Ese pago ya está anulado.');
+      /* El espejo de una transferencia de cliente (0095) no se anula desde
+       * acá: quedaría la venta cobrada y el proveedor sin su pago. Se anula
+       * el cobro, y ese camino anula los dos juntos. */
+      const origen = await this.ctasDisp.origenDe(tx, id);
+      if (origen) {
+        throw new BadRequestException(
+          `Este pago es la transferencia de un cliente a la cuenta disponible del proveedor: se anula anulando ${origen}, no desde acá.`,
+        );
+      }
       if (p.aplicado > EPS) {
         throw new BadRequestException('El pago está aplicado a un documento: desaplicalo antes de anularlo.');
       }
@@ -1523,6 +1536,7 @@ export class PagosProveedorController {
 }
 
 @Module({
+  imports: [CuentasDisponiblesModule],
   controllers: [PagosProveedorController],
   providers: [PagosProveedorService],
   exports: [PagosProveedorService],

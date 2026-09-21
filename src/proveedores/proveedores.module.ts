@@ -47,6 +47,9 @@ class UpsertProveedorDto {
    * que manda para el costo es siempre el del formato.
    */
   @IsOptional() @IsNumber() @Min(0) @Max(100) porcSinFactura?: number;
+  /** "Menos de $50.000 no me transfieras" (0095): piso de cada transferencia
+   *  de cliente a sus cuentas disponibles. 0 = sin mínimo. */
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) minimoTransferencia?: number;
 }
 
 /** Tope de filas por importación de proveedores (el padrón real son ~170). */
@@ -85,6 +88,7 @@ export class ProveedoresService {
       diasPago: p.diasPago ? `${p.diasPago} día(s)` : 'Sin plazo',
       modoCuenta: p.modoCuenta === 'libre' ? 'Libre' : 'Por facturas',
       porcSinFactura: `${Number(p.porcSinFactura) || 0}%`,
+      minimoTransferencia: Number(p.minimoTransferencia) > 0 ? `$${Number(p.minimoTransferencia)}` : 'Sin mínimo',
     };
   }
 
@@ -137,6 +141,7 @@ export class ProveedoresService {
       modoCuenta: (dto.modoCuenta ?? 'facturas') as any,
       // Sin número explícito, "emite liquidación" solo puede querer decir 100.
       porcSinFactura: dto.porcSinFactura ?? (dto.condicionCompra === 'liquidacion' ? 100 : 0),
+      minimoTransferencia: dto.minimoTransferencia ?? 0,
     }).returning();
     return p;
   }
@@ -166,6 +171,7 @@ export class ProveedoresService {
       diasPago: dto.diasPago === undefined ? actual.diasPago : (dto.diasPago || null),
       modoCuenta: (dto.modoCuenta ?? actual.modoCuenta) as any,
       porcSinFactura: dto.porcSinFactura ?? actual.porcSinFactura,
+      minimoTransferencia: dto.minimoTransferencia ?? actual.minimoTransferencia,
     }).where(eq(proveedores.id, id)).returning();
 
     /* AUDITORÍA (0086): la identidad y la ficha comercial, campo por campo.
@@ -178,6 +184,7 @@ export class ProveedoresService {
         condicionCompra: 'Condición de compra', medioHabitual: 'Medio de pago habitual',
         diasPago: 'Plazo de pago', modoCuenta: 'Modo de cuenta',
         porcSinFactura: 'Sin factura % (default de sus formatos)',
+        minimoTransferencia: 'Mínimo de transferencia (cuentas disponibles)',
       },
     ));
     return p;
@@ -201,19 +208,38 @@ export class ProveedoresService {
       .orderBy(proveedorCuentas.id);
   }
 
+  /*
+   * Sigue siendo full-replace para quien llama, pero por dentro es un UPSERT
+   * por alias (0095): las cuentas disponibles apuntan a estas filas por id, y
+   * borrar-y-recrear en cada guardado de la ficha les cortaba la referencia.
+   * La que sigue en la lista se actualiza; la que ya no está, se borra.
+   */
   async setCuentas(proveedorId: number, filas: any[]) {
     await this.get(proveedorId);
+    const vistos = new Set<string>();
     const validas = (filas || [])
-      .filter((f) => (f?.cbuAlias ?? '').trim())
       .map((f) => ({
         proveedorId,
-        cbuAlias: String(f.cbuAlias).trim().slice(0, 120),
-        descripcion: String(f.descripcion ?? '').trim().slice(0, 100),
-      }));
+        cbuAlias: String(f?.cbuAlias ?? '').trim().slice(0, 120),
+        titular: String(f?.titular ?? '').trim().slice(0, 120),
+        descripcion: String(f?.descripcion ?? '').trim().slice(0, 100),
+      }))
+      .filter((f) => f.cbuAlias && !vistos.has(f.cbuAlias) && vistos.add(f.cbuAlias));
     if (validas.length > 5) throw new BadRequestException('Hasta 5 cuentas bancarias por proveedor.');
     await this.db.transaction(async (tx) => {
-      await tx.delete(proveedorCuentas).where(eq(proveedorCuentas.proveedorId, proveedorId));
-      if (validas.length) await tx.insert(proveedorCuentas).values(validas);
+      const actuales = await tx.select().from(proveedorCuentas).where(eq(proveedorCuentas.proveedorId, proveedorId));
+      const porAlias = new Map(actuales.map((c) => [c.cbuAlias, c] as const));
+      const quedan = new Set(validas.map((v) => v.cbuAlias));
+      const sobran = actuales.filter((c) => !quedan.has(c.cbuAlias)).map((c) => c.id);
+      if (sobran.length) await tx.delete(proveedorCuentas).where(inArray(proveedorCuentas.id, sobran));
+      for (const v of validas) {
+        const ya = porAlias.get(v.cbuAlias);
+        if (!ya) await tx.insert(proveedorCuentas).values(v);
+        else if (ya.titular !== v.titular || ya.descripcion !== v.descripcion) {
+          await tx.update(proveedorCuentas).set({ titular: v.titular, descripcion: v.descripcion })
+            .where(eq(proveedorCuentas.id, ya.id));
+        }
+      }
     });
     return this.cuentas(proveedorId);
   }

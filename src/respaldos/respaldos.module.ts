@@ -75,6 +75,10 @@ const TABLAS_PRACTICA = [
   'proveedor_pagos', 'pago_formas', 'proveedor_imputaciones',
   'proveedor_compromisos', 'proveedor_echeqs', 'proveedor_ajustes',
   'pedidos_proveedor',
+  // cuentas disponibles (0095): el balde y sus transferencias. Los pagos
+  // referencian a proveedor_pagos, venta_pagos y cobranza_pagos: sin ellos
+  // acá, el TRUNCATE sin CASCADE se niega — que es la idea.
+  'cuentas_disponibles', 'cuenta_disponible_pagos',
   // gastos (los cargados; las plantillas recurrentes y los rubros quedan)
   'gastos', 'gasto_items', 'gasto_adjuntos',
   // cafetería
