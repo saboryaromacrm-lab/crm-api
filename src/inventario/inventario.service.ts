@@ -1,5 +1,5 @@
 import { Inject, Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
+import { and, asc, eq, getTableColumns, gte, inArray, isNotNull, isNull, lte, ne, or, desc, sql } from 'drizzle-orm';
 import { fechaLocal } from '../common/documentos';
 import { agruparPor, grupo } from '../common/agrupar';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -8,7 +8,7 @@ import {
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
-  conteos, conteoItems,
+  conteos, conteoItems, ventas, clientes,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
@@ -60,6 +60,11 @@ export class InventarioService {
   /* ------------------------- Utilidades de dominio ------------------------- */
   private fmtTam(kg: number): string {
     return kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`;
+  }
+  /** Cantidades a 3 decimales (el granel llega hasta el gramo). Corta el ruido
+   *  binario de restar dos doubles: 10 − 3 puede dar 6.999999999999999. */
+  private cant3(n: number): number {
+    return Math.round((Number(n) || 0) * 1000) / 1000;
   }
   private unidadDe(tipo: string, presId: number | null): 'kg' | 'u' {
     return tipo === 'granel' && !presId ? 'kg' : 'u';
@@ -266,6 +271,27 @@ export class InventarioService {
   }
 
   /* ------------------------- Movimiento ------------------------- */
+  /**
+   * EL TIPO DE LA INCIDENCIA QUE DEJA UNA VENTA SIN STOCK (0096).
+   *
+   * No se llama "error de stock": el sistema no se equivocó, vendió lo que se
+   * le pidió. Lo que dice es que el inventario tenía MENOS de lo que había en
+   * la góndola, y que hay que ir a contar.
+   */
+  static readonly TIPO_VENTA_SIN_STOCK = 'venta_sin_stock';
+
+  /**
+   * Cuántas RESUELTAS viajan en el listado. Las abiertas van todas siempre —
+   * son las que hay que cerrar y las que alimentan el contador del menú.
+   *
+   * Existe porque `incidencias` viajaba ENTERA en la foto del inventario, que
+   * es la llamada que abre Almacén y Compras. Mientras las incidencias eran un
+   * faltante de transferencia cada tanto eso estaba acotado; con las ventas sin
+   * stock pasa a ser algo de todos los días, y esa tabla se volvía una bola de
+   * nieve que hace más lenta la apertura de dos módulos cada mes que pasa.
+   */
+  static readonly TOPE_INCIDENCIAS_RESUELTAS = 300;
+
   private async mov(tx: any, campos: any) {
     const [m] = await tx.insert(movimientos).values(campos).returning();
     return m;
@@ -638,10 +664,29 @@ export class InventarioService {
       const prod = prodDe.get(Number(it.productoId));
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, estado);
-      if (!o.permitirNegativo && cantidad > disp + 1e-9) {
-        throw new BadRequestException(
-          `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`,
-        );
+      const faltante = cantidad - disp;
+      if (faltante > 1e-9) {
+        if (!o.permitirNegativo) {
+          throw new BadRequestException(
+            `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`,
+          );
+        }
+        /*
+         * SE VENDE IGUAL, PERO QUEDA EL RASTRO (0096).
+         *
+         * Solo por el camino de una VENTA (`ventaId`): la Cafetería y la
+         * devolución a proveedor no pasan `permitirNegativo`, y aunque alguien
+         * se lo pasara mañana, sin venta no hay a qué atar la incidencia — y
+         * una incidencia que no dice de dónde salió no sirve para investigar,
+         * que es TODO lo que esta incidencia viene a hacer.
+         */
+        if (o.ventaId) {
+          await this.incidenciaVentaSinStock(tx, {
+            prod, presentacionId: presId, sucursalId: o.sucursalId,
+            disponible: disp, vendido: cantidad, faltante,
+            ventaId: o.ventaId, documento: o.descripcion || 'Venta', usuarioId: o.usuarioId ?? null,
+          });
+        }
       }
       await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado }, -cantidad);
       const esGranelSuelto = prod.tipo === 'granel' && !presId;
@@ -652,6 +697,74 @@ export class InventarioService {
         usuarioId: o.usuarioId ?? null, descripcion: o.descripcion || 'Egreso por documento',
       });
     }
+  }
+
+  /**
+   * LA INCIDENCIA DE UNA VENTA SIN STOCK (0096).
+   *
+   * Corre DENTRO de la transacción de la venta: si la venta se cae, esto se cae
+   * con ella y no queda una incidencia de algo que no pasó.
+   *
+   * NO escribe movimiento de stock. El egreso de la venta ya escribe el suyo
+   * por la cantidad entera —eso ES el registro de que la mercadería salió— y
+   * sumarle otro contaría la misma salida dos veces en el libro del almacén.
+   *
+   * Cuesta dos sentencias (el alta, y el `codigo` que necesita el id ya
+   * asignado), igual que el faltante de una transferencia. Es el ÚNICO costo
+   * que este cambio agrega, y solo se paga en el renglón que se fue a negativo:
+   * la venta que tiene stock no hace ni una consulta de más, porque el
+   * disponible ya estaba leído para el chequeo de siempre.
+   */
+  private async incidenciaVentaSinStock(tx: any, o: {
+    prod: any; presentacionId: number | null; sucursalId: number;
+    disponible: number; vendido: number; faltante: number;
+    ventaId: number; documento: string; usuarioId: number | null;
+  }) {
+    const unidad = this.unidadDe(o.prod.tipo, o.presentacionId);
+    const f = (n: number) => this.fmtCant(o.prod.tipo, o.presentacionId, n);
+    const [inc] = await tx.insert(incidencias).values({
+      codigo: '',
+      tipo: InventarioService.TIPO_VENTA_SIN_STOCK,
+      estado: 'pendiente',
+      /* Quién la destapó: el cajero que cobró. No es "el culpable" — es por
+       * dónde empezar a preguntar. */
+      responsableId: o.usuarioId,
+      motivo: `${o.documento}: se vendieron ${f(o.vendido)} de ${o.prod.nombre} y el sistema tenía ${f(o.disponible)}. `
+        + `Faltan ${f(o.faltante)}: hay que contar la góndola.`,
+      productoId: o.prod.id,
+      sucursalId: o.sucursalId,
+      presentacionId: o.presentacionId,
+      /** La DIFERENCIA, no lo vendido: si había 3 y se vendieron 10, faltan 7. */
+      cantidad: this.cant3(o.faltante),
+      unidad,
+      ventaId: o.ventaId,
+      disponibleAntes: this.cant3(o.disponible),
+      vendido: this.cant3(o.vendido),
+    }).returning({ id: incidencias.id });
+    await tx.update(incidencias)
+      .set({ codigo: `INC${String(inc.id).padStart(4, '0')}` })
+      .where(eq(incidencias.id, inc.id));
+  }
+
+  /**
+   * ANULAR LA VENTA CIERRA SUS INCIDENCIAS (0096).
+   *
+   * La anulación devuelve el stock, así que el negativo que la incidencia
+   * denunciaba dejó de existir: dejarla abierta sería un pendiente falso, y un
+   * pendiente falso es lo que enseña a ignorar la lista. Una sola sentencia, y
+   * solo toca las que siguen abiertas.
+   */
+  async cerrarIncidenciasDeVenta(tx: any, ventaId: number, motivo: string) {
+    await tx.update(incidencias).set({
+      estado: 'resuelta',
+      resolucion: 'venta_anulada',
+      fechaResolucion: new Date(),
+      activa: false,
+      motivo: sql`${incidencias.motivo} || ' · Cerrada al anularse la venta: ' || ${motivo}`,
+    }).where(and(
+      eq(incidencias.ventaId, ventaId),
+      ne(incidencias.estado, 'resuelta'),
+    ));
   }
 
   /**
@@ -1734,7 +1847,7 @@ export class InventarioService {
     return { ok: true };
   }
 
-  async resolverIncidencia(id: number, resolucion: string, autorId?: number, soloSuc?: number | null) {
+  async resolverIncidencia(id: number, resolucion: string, autorId?: number, soloSuc?: number | null, contado?: number) {
     return this.db.transaction(async (tx) => {
       /*
        * LA ÚNICA TRANSICIÓN DEL MÓDULO QUE NO RECLAMABA SU ESTADO, y con eso
@@ -1765,6 +1878,18 @@ export class InventarioService {
         .returning({ id: incidencias.id });
       if (!reclamada.length) throw new BadRequestException('La incidencia ya está resuelta.');
       const prod = await this.getProducto(tx, inc.productoId);
+      /*
+       * LA VENTA SIN STOCK SE CIERRA DISTINTO (0096), y esto no es un detalle.
+       *
+       * Todo lo de abajo está construido sobre mercadería RETENIDA en
+       * `comprometido`: descuenta de ahí y la libera o la da de baja. Una venta
+       * sin stock no retuvo nada —la mercadería ya salió por la puerta—, así
+       * que por ese camino o rebota con "el stock comprometido cambió", o peor,
+       * inventa unidades que no existen. Va por el suyo.
+       */
+      if (inc.tipo === InventarioService.TIPO_VENTA_SIN_STOCK) {
+        return this.cerrarVentaSinStock(tx, inc, prod, resolucion, contado, autorId);
+      }
       const c = inc.cantidad;
       const comprom = await this.cant(tx, prod.id, inc.sucursalId, inc.presentacionId, 'comprometido');
       if (c > comprom + 1e-9) throw new BadRequestException('El stock comprometido cambió; revisá manualmente.');
@@ -1799,6 +1924,105 @@ export class InventarioService {
       });
       return { ok: true };
     });
+  }
+
+  /**
+   * CERRAR UNA VENTA SIN STOCK (0096). Dos salidas, y ninguna toca
+   * `comprometido` porque acá nunca hubo nada retenido:
+   *
+   *   · `ajustado` — se contó la góndola. Se pone el stock EN LO CONTADO, no
+   *     se le suma lo que faltaba: entre la venta y este momento pudo entrar
+   *     mercadería, y sumar a ciegas dejaría el número peor que antes. El
+   *     delta sale contra lo que hay AHORA, leído adentro de la transacción.
+   *   · `error_carga` — el negativo era de otra cosa (el producto estaba
+   *     cargado dos veces, la compra no se había asentado). Cierra sin tocar
+   *     un solo peso de stock, con el motivo escrito.
+   */
+  private async cerrarVentaSinStock(
+    tx: any, inc: any, prod: any, resolucion: string, contado?: number, autorId?: number,
+  ) {
+    if (resolucion !== 'ajustado' && resolucion !== 'error_carga') {
+      throw new BadRequestException('Resolución inválida para una venta sin stock.');
+    }
+    const cerrar = (extra: string) => tx.update(incidencias).set({
+      resolucion, fechaResolucion: new Date(), activa: false,
+      motivo: `${inc.motivo} · ${extra}`,
+    }).where(eq(incidencias.id, inc.id));
+
+    if (resolucion === 'error_carga') {
+      await cerrar('Cerrada sin tocar stock: el negativo no era de la góndola.');
+      return { ok: true, ajuste: 0 };
+    }
+
+    const n = Number(contado);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new BadRequestException('Poné cuántas unidades contaste en la góndola (0 o más).');
+    }
+    const objetivo = this.cant3(n);
+    const actual = await this.cant(tx, prod.id, inc.sucursalId, inc.presentacionId, 'disponible');
+    const delta = this.cant3(objetivo - actual);
+    if (Math.abs(delta) > 1e-9) {
+      await this.addDelta(tx, {
+        productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId, estado: 'disponible',
+      }, delta);
+      /* UN movimiento de ajuste, con su firma y el vínculo a la incidencia: es
+       * lo que hace que el número corregido se pueda explicar dentro de un mes. */
+      await this.mov(tx, {
+        tipo: 'ajuste', productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId,
+        signo: delta > 0 ? 1 : -1, cantidad: Math.abs(delta), unidad: inc.unidad,
+        estadoDesde: 'disponible', estadoHacia: 'disponible',
+        motivo: `Incidencia ${inc.codigo} · venta sin stock`,
+        usuarioId: autorId ?? null, refIncidenciaId: inc.id,
+        descripcion: `${inc.codigo} resuelta: contado ${this.fmtCant(prod.tipo, inc.presentacionId, objetivo)} `
+          + `(el sistema tenía ${this.fmtCant(prod.tipo, inc.presentacionId, actual)})`,
+      });
+    }
+    await cerrar(
+      `Contado ${this.fmtCant(prod.tipo, inc.presentacionId, objetivo)} contra `
+      + `${this.fmtCant(prod.tipo, inc.presentacionId, actual)} del sistema: ajuste de ${this.cant3(delta)}.`,
+    );
+    return { ok: true, ajuste: delta };
+  }
+
+  /**
+   * LAS INCIDENCIAS QUE VIAJAN A LA PANTALLA (0096).
+   *
+   * TODAS las abiertas —son las que hay que cerrar, y las que cuenta el badge
+   * del menú— más las últimas `TOPE_INCIDENCIAS_RESUELTAS` cerradas, como
+   * historia reciente. Antes iban todas, sin techo, y esta lista viaja en la
+   * foto del inventario que abre Almacén y Compras: con las ventas sin stock
+   * pasando a ser cosa de todos los días, eso se volvía más lento cada mes.
+   *
+   * Dos consultas cortas y las dos por índice (`ix_incidencias_estado`), en
+   * paralelo. La historia completa sigue en la base y en los reportes.
+   */
+  private async incidenciasVigentes(soloSuc?: number | null) {
+    const deSucursal = soloSuc != null ? eq(incidencias.sucursalId, soloSuc) : undefined;
+    /*
+     * El COMPROBANTE viaja resuelto, no el id pelado: la pantalla de Almacén no
+     * tiene las ventas en memoria (crecen sin techo y por eso no están en la
+     * foto), así que sin esto el "¿de qué venta salió?" obligaría a una consulta
+     * por fila. Es un LEFT JOIN por clave foránea indexada sobre un conjunto que
+     * ya está acotado — y `null` cuando la incidencia no es de una venta.
+     */
+    const columnas = {
+      ...getTableColumns(incidencias),
+      comprobante: sql<string>`case when ${ventas.id} is null then ''
+        else ${ventas.puntoVenta} || '-' || lpad(${ventas.numero}::text, 8, '0') end`,
+      ventaTipo: sql<string>`coalesce(${ventas.tipo}::text, '')`,
+      ventaEstado: sql<string>`coalesce(${ventas.estado}::text, '')`,
+      clienteNombre: sql<string>`coalesce(${clientes.nombre}, '')`,
+    };
+    const base = () => this.db.select(columnas).from(incidencias)
+      .leftJoin(ventas, eq(ventas.id, incidencias.ventaId))
+      .leftJoin(clientes, eq(clientes.id, ventas.clienteId));
+    const [abiertas, resueltas] = await Promise.all([
+      base().where(and(ne(incidencias.estado, 'resuelta'), deSucursal)).orderBy(desc(incidencias.id)),
+      base().where(and(eq(incidencias.estado, 'resuelta'), deSucursal))
+        .orderBy(desc(incidencias.id))
+        .limit(InventarioService.TOPE_INCIDENCIAS_RESUELTAS),
+    ]);
+    return [...abiertas, ...resueltas].sort((a, b) => b.id - a.id);
   }
 
   /**
@@ -2013,9 +2237,7 @@ export class InventarioService {
   }
 
   async listIncidencias(soloSuc?: number | null) {
-    return this.db.select().from(incidencias)
-      .where(soloSuc != null ? eq(incidencias.sucursalId, soloSuc) : undefined)
-      .orderBy(desc(incidencias.id));
+    return this.incidenciasVigentes(soloSuc);
   }
 
   /**
@@ -2114,7 +2336,7 @@ export class InventarioService {
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
       this.listas.catalogo(),
       this.listTransferencias(),
-      this.db.select().from(incidencias).orderBy(desc(incidencias.id)),
+      this.incidenciasVigentes(),
       this.db.select().from(marcas),
       this.db.select().from(categorias),
       this.db.select().from(subcategorias),

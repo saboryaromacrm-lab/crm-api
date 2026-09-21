@@ -203,6 +203,12 @@ class CrearIncidenciaDto {
 
 class ResolverIncidenciaDto {
   @IsString() @MaxLength(40) resolucion!: string;
+  /**
+   * Cuántas unidades hay EN LA GÓNDOLA, para la resolución `ajustado` de una
+   * venta sin stock (0096). El stock queda en este número — no se le suma lo
+   * que faltaba: entre la venta y este momento pudo entrar mercadería.
+   */
+  @IsOptional() @IsNumber() @Min(0) @Max(MAX_CANT) contado?: number;
 }
 
 /* ------------------------------ Lecturas ------------------------------ */
@@ -549,7 +555,7 @@ export class IncidenciasController {
   @Post(':id/resolver')
   @Permiso('inventario')
   resolver(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverIncidenciaDto, @Auth() sesion: Sesion) {
-    return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion));
+    return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion), dto.contado);
   }
 }
 

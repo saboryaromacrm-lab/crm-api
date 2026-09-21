@@ -1276,7 +1276,30 @@ export const incidencias = pgTable('incidencias', {
   resolucion: text('resolucion'),
   fechaResolucion: timestamp('fecha_resolucion', { withTimezone: true }),
   activa: boolean('activa').notNull().default(true),
-});
+  /* ---- VENTA SIN STOCK (0096) ----------------------------------------
+   * La caja vendió algo que el sistema daba por agotado. No es un error del
+   * sistema —vendió lo que se le pidió— sino la prueba de que el inventario
+   * tenía MENOS de lo que había en la góndola, y hay que ir a contar.
+   *
+   * `cantidad` guarda la DIFERENCIA (lo que no estaba), igual que en el
+   * faltante de una transferencia; estos tres dicen de dónde salió esa
+   * diferencia, que es lo único con lo que se puede investigar después.
+   */
+  /** La venta que lo destapó. `set null`: la venta no se borra nunca, pero la
+   *  incidencia es historia y no puede depender de que siga existiendo. */
+  ventaId: integer('venta_id').references(() => ventas.id, { onDelete: 'set null' }),
+  /** Cuánto decía el sistema que había JUSTO ANTES de esa venta. */
+  disponibleAntes: doublePrecision('disponible_antes').notNull().default(0),
+  /** Cuánto se vendió en ese renglón (cantidad + disponibleAntes = vendido). */
+  vendido: doublePrecision('vendido').notNull().default(0),
+}, (t) => ({
+  /* Al anular una venta hay que encontrar y cerrar las suyas. */
+  ixVenta: index('ix_incidencias_venta').on(t.ventaId),
+  /* El listado trae SIEMPRE todas las abiertas y solo las últimas resueltas
+   * (ver `incidenciasVigentes`): sin este índice, acotar costaba recorrer la
+   * tabla entera — justo lo que acotar vino a evitar. */
+  ixEstado: index('ix_incidencias_estado').on(t.estado, t.id),
+}));
 
 /* ---------------- Facturación / comprobantes de compra ---------------- */
 /**

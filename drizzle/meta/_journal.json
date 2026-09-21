@@ -673,6 +673,13 @@
       "when": 1789956503975,
       "tag": "0095_cuentas_disponibles",
       "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1790000000000,
+      "tag": "0096_ventas_sin_stock",
+      "breakpoints": true
     }
   ]
 }

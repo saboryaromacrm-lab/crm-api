@@ -2674,6 +2674,9 @@ export class VentasService {
         sucursalId,
         usuarioId: autor ?? dto.usuarioId,
         permitirNegativo: !!config.permitirStockNegativo,
+        /* 0096: con quién atar la incidencia si algún renglón se va a negativo.
+         * Sin esto la venta pasa igual, pero sin rastro — que es el punto. */
+        ventaId: v.id,
         descripcion: `Venta ${puntoVenta}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
         items: tot.items,
       });
@@ -3086,6 +3089,7 @@ export class VentasService {
         // Acá sí va QUIEN COBRÓ: es el que ejecutó el movimiento de stock.
         usuarioId: cobrador ?? borrador.usuarioId,
         permitirNegativo: !!config.permitirStockNegativo,
+        ventaId: id,
         descripcion: `Venta ${borrador.puntoVenta}-${String(numero).padStart(8, '0')} · ${cliente.nombre}`,
         items: borrador.items,
       });
@@ -3814,6 +3818,11 @@ export class VentasService {
       }
       // Sus transferencias a proveedor (0095) mueren con ella — o la frenan.
       await this.ctasDisp.anularDeVenta(tx, id, razon);
+      /* Y sus incidencias por vender sin stock (0096): la anulación devuelve el
+       * stock, así que el negativo que denunciaban dejó de existir. Dejarlas
+       * abiertas sería un pendiente falso — y un pendiente falso es lo que
+       * enseña a ignorar la lista. */
+      await this.inv.cerrarIncidenciasDeVenta(tx, id, razon);
       await tx.update(ventas).set({
         estado: 'anulada',
         anuladoPor: usuarioId ?? null,
