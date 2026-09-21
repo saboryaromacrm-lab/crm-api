@@ -58,6 +58,17 @@ export interface Sesion {
   permisos: string[];
   sucursalId: number;
   sucursalNombre: string;
+  /**
+   * EL PUESTO TRABAJA FUERA DE LAS SUCURSALES (0098) — hoy, la cafetería.
+   *
+   * `sucursalId` sigue trayendo un número porque la fila de la sesión necesita
+   * una clave foránea, pero para esta sesión ESE NÚMERO NO SIGNIFICA NADA: no
+   * eligió sucursal y no está en ninguna. Las dos funciones que deciden con
+   * qué sucursal se opera —`sucursalDeOperacion` y `soloSuSucursal`— cortan
+   * acá, así que ese número no puede llegar a ningún registro del negocio ni
+   * a ningún filtro. Quien lea `sucursalId` a mano tiene que mirar esto antes.
+   */
+  sinSucursal: boolean;
 }
 
 /**

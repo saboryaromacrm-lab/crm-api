@@ -97,6 +97,9 @@ class UpsertProductoDto {
    * motivo y la venta lo rechaza en el confirm.
    */
   @IsOptional() @IsBoolean() soloCafeteria?: boolean;
+  /** Lo elabora la cafetería (0097): habilita que llegue por un envío de
+   *  entrada, y su costo lo declara ella en cada envío. */
+  @IsOptional() @IsBoolean() origenCafeteria?: boolean;
 
   /** Solo en el alta: después el tipo no se cambia (hay stock atado a él). */
   @IsOptional() @IsBoolean() esGranel?: boolean;
@@ -539,6 +542,26 @@ export class ProductosService {
   }
 
   private valores(dto: UpsertProductoDto, previo?: any) {
+    /*
+     * LAS DOS MARCAS DE CAFETERÍA SON EXCLUYENTES y se validan acá, sobre el
+     * valor RESUELTO: `soloCafeteria` es lo que la cafetería CONSUME (no se
+     * vende en el mostrador) y `origenCafeteria` es lo que la cafetería
+     * PRODUCE (no se compra a un proveedor). Un producto que es las dos cosas
+     * no tiene sentido y rompe los dos circuitos: el POS lo bloquea y a la vez
+     * el envío de entrada lo ofrece.
+     *
+     * Sobre el valor resuelto y no sobre el `dto` porque una edición parcial
+     * manda una sola marca: prender "lo elabora" en un producto que ya era
+     * exclusivo dejaba las dos prendidas sin que nada las mirara juntas.
+     */
+    const soloCafeteria = dto.soloCafeteria ?? previo?.soloCafeteria ?? false;
+    const origenCafeteria = dto.origenCafeteria ?? previo?.origenCafeteria ?? false;
+    if (soloCafeteria && origenCafeteria) {
+      throw new BadRequestException(
+        'Un producto no puede ser las dos cosas: "uso exclusivo de Cafetería" es lo que ella consume '
+        + 'y "lo elabora la cafetería" es lo que ella produce. Dejá una sola marca.',
+      );
+    }
     return {
       nombre: dto.nombre.trim(),
       descripcion: (dto.descripcion ?? previo?.descripcion ?? '').trim(),
@@ -566,7 +589,8 @@ export class ProductosService {
       redondeo: dto.redondeo === undefined ? (previo?.redondeo ?? null) : dto.redondeo,
       publicado: dto.publicado ?? previo?.publicado ?? false,
       soloFraccionar: dto.soloFraccionar ?? previo?.soloFraccionar ?? false,
-      soloCafeteria: dto.soloCafeteria ?? previo?.soloCafeteria ?? false,
+      soloCafeteria,
+      origenCafeteria,
       idExterno: (dto.idExterno ?? previo?.idExterno ?? '').trim(),
     };
   }

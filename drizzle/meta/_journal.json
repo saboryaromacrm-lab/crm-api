@@ -680,6 +680,27 @@
       "when": 1790000000000,
       "tag": "0096_ventas_sin_stock",
       "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1790010000000,
+      "tag": "0097_cafeteria_entrada",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1790020000000,
+      "tag": "0098_pedido_sucursal",
+      "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1790030000000,
+      "tag": "0099_costo_cafeteria",
+      "breakpoints": true
     }
   ]
 }

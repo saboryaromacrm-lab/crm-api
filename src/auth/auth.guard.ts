@@ -140,9 +140,14 @@ export function esJefe(sesion: { rolClave?: string; permisos?: string[] }): bool
  * apertura de caja). Un solo lugar para que las tres no puedan discrepar.
  */
 export function sucursalDeOperacion(
-  sesion: { rolClave?: string; permisos?: string[]; sucursalId?: number },
+  sesion: { rolClave?: string; permisos?: string[]; sucursalId?: number; sinSucursal?: boolean },
   pedida?: number | null,
 ): number | undefined {
+  /* El puesto que trabaja fuera de las sucursales no aporta ninguna: lo que
+   * grabe tiene que decir a qué sucursal va, explícitamente y en el formulario
+   * (0098). Devolver la de su sesión sería sellar todo con una sucursal que
+   * nadie eligió. */
+  if (sesion?.sinSucursal) return pedida ?? undefined;
   if (esJefe(sesion) && pedida) return pedida;
   return sesion?.sucursalId ?? undefined;
 }
@@ -157,7 +162,11 @@ export function sucursalDeOperacion(
  * sucursal para corregir lo que había cargado otro mostrador.
  */
 export function soloSuSucursal(
-  sesion: { rolClave?: string; permisos?: string[]; sucursalId?: number },
+  sesion: { rolClave?: string; permisos?: string[]; sucursalId?: number; sinSucursal?: boolean },
 ): number | null {
+  /* Sin sucursal no hay a qué limitarlo: la cafetería ve TODOS sus pedidos,
+   * que es lo mismo que pasa con el jefe pero por el motivo contrario — él
+   * porque está por encima de las sucursales, ella porque está afuera. */
+  if (sesion?.sinSucursal) return null;
   return esJefe(sesion) ? null : (sesion?.sucursalId ?? null);
 }

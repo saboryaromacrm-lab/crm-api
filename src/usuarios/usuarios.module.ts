@@ -18,7 +18,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
-import { and, eq, ne } from 'drizzle-orm';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
 import { SesionesService } from '../auth/sesiones.service';
@@ -170,6 +170,7 @@ export const CATALOGO_PERMISOS = [
        * pedido detrás está "+ Nuevo envío" en `almacen.cafeteria`.
        */
       { clave: 'almacen.cafeteria-pedidos', nombre: 'Pedido a la distribuidora (SOLO para el rol Cafetería)' },
+      { clave: 'almacen.cafeteria-entradas', nombre: 'Envíos DE la cafetería a las sucursales (rol Cafetería)' },
     ],
     acciones: [
       { clave: 'pedidos', nombre: 'Pedir y recibir mercadería' },
@@ -655,7 +656,29 @@ export class UsuariosService {
      * contexto de trabajo y de arqueo. Y en un equipo registrado la terminal
      * manda para todos, superadmin incluido (0081): ahí tampoco hay pregunta.
      */
-    if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
+    /*
+     * EL PUESTO QUE TRABAJA FUERA DE LAS SUCURSALES (0098) NO ELIGE NINGUNA.
+     *
+     * La cafetería no está adentro de un local: habla CON los locales. Pedirle
+     * que declare uno al entrar era pedirle que invente un dato, y ese dato
+     * después se colaba en lo que graba y en lo que ve.
+     *
+     * LO DECIDE EL ROL, NO LA PANTALLA: lo que venga en el body se descarta,
+     * incluso lo que ponga una terminal registrada. Un candado que se abre
+     * mandando un número distinto desde afuera no es un candado.
+     *
+     * La fila de la sesión necesita igual una clave foránea y se para en la
+     * primera sucursal, pero ese número queda marcado como lo que es: el
+     * `sinSucursal` de la sesión hace que `sucursalDeOperacion` y
+     * `soloSuSucursal` corten antes de mirarlo, y abajo se devuelve
+     * `sucursal: null` para que el encabezado tampoco lo muestre.
+     */
+    const sinSucursal = !!r?.sinSucursal;
+    if (sinSucursal) {
+      const [primera] = await this.db.select().from(sucursales).orderBy(sucursales.id).limit(1);
+      if (!primera) throw new UnauthorizedException('No hay sucursales cargadas.');
+      sucursalId = primera.id;
+    } else if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
       const esSuper = r?.clave === 'superadmin' || (Array.isArray(r?.permisos) && (r.permisos as string[]).includes('*'));
       if (!esSuper) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
       const [central] = await this.db.select().from(sucursales).orderBy(sucursales.id).limit(1);
@@ -693,7 +716,9 @@ export class UsuariosService {
        * login devolvía menos claves que el refresco siguiente, y la sesión
        * recién abierta se comportaba distinto que al minuto. */
       usuario: { ...publico(u, r), permisos: conPermisosBase(r?.permisos, r?.clave ?? '') },
-      sucursal: { id: suc.id, nombre: suc.nombre },
+      /* `null` para el puesto sin sucursal: el encabezado no muestra ninguna y
+       * el contexto del frontend nace vacío, que es la verdad. */
+      sucursal: sinSucursal ? null : { id: suc.id, nombre: suc.nombre },
       /* Para que el POS pueda mostrar "Caja 2" en el encabezado sin volver a
        * preguntar quién es este equipo. */
       terminal: terminal ? { id: terminal.id, nombre: terminal.nombre } : null,
@@ -720,8 +745,18 @@ export class UsuariosService {
       // público y la pantalla de login no lo usa (el único que lo muestra es
       // Gerencia, que va con permiso). Decirle a cualquiera desde internet qué
       // cuentas están sin contraseña es regalar la lista de por dónde empezar.
-      this.db.select({ id: usuarios.id, nombre: usuarios.nombre })
-        .from(usuarios).where(eq(usuarios.activo, true)).orderBy(usuarios.nombre),
+      /* `pideSucursal` es lo único que se suma (0098): la pantalla tiene que
+       * saber si al elegir esta persona corresponde mostrar el desplegable de
+       * sucursal o no. No dice qué rol es ni qué puede hacer, y el desplegable
+       * de usuarios ya muestra los nombres — el servidor valida igual. */
+      this.db.select({
+        id: usuarios.id,
+        nombre: usuarios.nombre,
+        pideSucursal: sql<boolean>`not ${roles.sinSucursal}`,
+      })
+        .from(usuarios)
+        .innerJoin(roles, eq(roles.id, usuarios.rolId))
+        .where(eq(usuarios.activo, true)).orderBy(usuarios.nombre),
       this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).orderBy(sucursales.id),
     ]);
     return { usuarios: us, sucursales: ss };
@@ -991,7 +1026,10 @@ export class AuthController {
         rolClave: sesion.rolClave, rolNombre: sesion.rolNombre,
         permisos: sesion.permisos, activo: true,
       },
-      sucursal: { id: sesion.sucursalId, nombre: sesion.sucursalNombre },
+      /* Igual que el login: `null` para el puesto que trabaja fuera de las
+       * sucursales. Si acá viajara la sucursal de relleno, el primer F5 se la
+       * devolvería al encabezado y el login habría servido de poco. */
+      sucursal: sesion.sinSucursal ? null : { id: sesion.sucursalId, nombre: sesion.sucursalNombre },
     };
   }
 

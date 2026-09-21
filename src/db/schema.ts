@@ -64,6 +64,10 @@ export const estadoIncidenciaEnum = pgEnum('estado_incidencia', [
 export const tipoMovEnum = pgEnum('tipo_movimiento', [
   'compra', 'fraccionamiento', 'venta_granel', 'venta_fraccionada', 'devolucion',
   'ajuste', 'merma', 'vencido', 'defectuoso', 'transferencia', 'envio_cafeteria',
+  // 0097 · el camino de vuelta: lo que la cafetería ELABORA y manda a una
+  // sucursal para venderse en el mostrador. Tipo propio y no 'compra',
+  // porque no hay factura ni proveedor: es el otro negocio del mismo dueño.
+  'ingreso_cafeteria',
 ]);
 /**
  * Condición frente al IVA. La usan las DOS puntas: en el cliente define la
@@ -213,6 +217,16 @@ export const roles = pgTable('roles', {
   descripcion: text('descripcion').notNull().default(''),
   permisos: jsonb('permisos').$type<string[]>().notNull().default([]),
   esSistema: boolean('es_sistema').notNull().default(false),
+  /**
+   * EL PUESTO TRABAJA FUERA DE LAS SUCURSALES (0098). La cafetería no está
+   * adentro de ninguna: habla CON ellas. Pedirle que elija una al entrar es
+   * pedirle que invente un dato, y ese dato después se cuela en lo que graba.
+   *
+   * Va en el ROL y no en el usuario porque es una propiedad del puesto, no de
+   * la persona. La pantalla de login deja de pedir sucursal y el servidor la
+   * ignora aunque la manden: la decisión es del servidor, no del navegador.
+   */
+  sinSucursal: boolean('sin_sucursal').notNull().default(false),
 });
 
 export const usuarios = pgTable('usuarios', {
@@ -468,6 +482,37 @@ export const productos = pgTable('productos', {
    * vendible; por eso es un campo de la ficha y no una etiqueta blanda.
    */
   soloCafeteria: boolean('solo_cafeteria').notNull().default(false),
+  /**
+   * LO ELABORA LA CAFETERÍA (0097). La medialuna, el sándwich, el café
+   * molido: entran al catálogo por un envío de ENTRADA de la cafetería y se
+   * venden en el mostrador como cualquier otro producto.
+   *
+   * Es lo INVERSO de `soloCafeteria` y no se pisan: aquel dice "esto no se
+   * vende acá", este dice "esto no se compra acá". Un producto marcado así
+   * NO tiene formato de compra ni proveedor —su costo lo declara la
+   * cafetería en cada envío— y es la lista blanca de lo que un envío de
+   * entrada puede traer: sin eso, cualquiera mandaría harina "desde la
+   * cafetería" y el costo declarado pisaría el costo real del proveedor.
+   */
+  origenCafeteria: boolean('origen_cafeteria').notNull().default(false),
+  /**
+   * CUÁNTO LE CUESTA A LA CAFETERÍA HACERLO (0099). Solo tiene sentido con
+   * `origenCafeteria`: es el costo de algo que no se compra, así que no sale
+   * de ningún formato de compra ni de ningún proveedor — lo declara ella.
+   *
+   * Es el costo de REFERENCIA, no el del documento: el envío lo propone y
+   * después CONGELA en el renglón el que se haya usado. Cambiarlo acá no toca
+   * lo ya enviado, que es lo que hace que la rentabilidad de un período
+   * cerrado no se mueva nunca.
+   */
+  costoCafeteria: doublePrecision('costo_cafeteria').notNull().default(0),
+  /**
+   * Cuándo se tocó ese número por última vez. NULA = nunca se cargó, que es
+   * distinto de "vale cero". Solo se mueve cuando el valor CAMBIA: volver a
+   * guardar lo mismo no reinicia el reloj, si no el dato no serviría para lo
+   * único que sirve — ver cuál quedó viejo.
+   */
+  costoCafeteriaActualizado: timestamp('costo_cafeteria_actualizado', { withTimezone: true }),
   stockMin: doublePrecision('stock_min').notNull().default(0),
   /**
    * Redondeo de góndola propio. NULL = hereda el de configuración, que es lo
@@ -2342,6 +2387,22 @@ export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['enviado', 'anul
  *   unidad  → cantidad en UNIDADES de producto entero (tamKg = 0: no aplica)
  */
 export const modoEnvioCafeEnum = pgEnum('modo_envio_cafe', ['granel', 'paquete', 'unidad']);
+/**
+ * HACIA DÓNDE VA LA MERCADERÍA (0097). El documento es el MISMO en los dos
+ * sentidos —cabecera, renglones, remito, versión, anulación—; lo único que
+ * cambia es de qué lado se mueve el stock y de dónde sale el costo:
+ *
+ *   · `salida`  — la distribuidora le manda al café. El stock EGRESA y el
+ *     costo lo sabe el CRM (el del formato de compra).
+ *   · `entrada` — el café manda lo que elabora a una sucursal, para
+ *     venderse en el mostrador. El stock INGRESA y el costo lo DECLARA la
+ *     cafetería, porque es la única que lo sabe.
+ *
+ * Un sentido nuevo en vez de una tabla nueva: duplicar la tabla habría
+ * duplicado el remito, el editar, el anular, la métrica y el sync — cinco
+ * lugares que después hay que acordarse de cambiar juntos.
+ */
+export const sentidoEnvioCafeEnum = pgEnum('sentido_envio_cafe', ['salida', 'entrada']);
 
 /**
  * EL PEDIDO DE LA CAFETERÍA — la demanda, no el envío.
@@ -2362,6 +2423,15 @@ export const pedidosCafeteria = pgTable('pedidos_cafeteria', {
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   /** Quién lo pidió (el usuario del rol Cafetería). */
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /**
+   * A QUÉ SUCURSAL SE LE PIDE (0098). Es obligatoria para los pedidos nuevos
+   * —la API la exige— y NULA para los que ya existían, que iban "a la
+   * distribuidora" implícitamente.
+   *
+   * Manda: cada sucursal ve solo los suyos, y el envío que cumple el pedido
+   * sale de ESTA sucursal y de ninguna otra. El jefe los ve todos.
+   */
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'restrict' }),
   estado: estadoPedidoCafeEnum('estado').notNull().default('pendiente'),
   observaciones: text('observaciones').notNull().default(''),
   motivoAnulacion: text('motivo_anulacion').notNull().default(''),
@@ -2369,6 +2439,8 @@ export const pedidosCafeteria = pgTable('pedidos_cafeteria', {
 }, (t) => ({
   // El badge y el aviso del admin preguntan esto en cada poll.
   ixEstado: index('ix_pedidos_cafe_estado').on(t.estado),
+  // Las dos juntas porque siempre se preguntan juntas: "los pendientes DE ESTA sucursal".
+  ixSucursal: index('ix_pedidos_cafe_sucursal').on(t.sucursalId, t.estado),
 }));
 
 export const pedidoCafeteriaItems = pgTable('pedido_cafeteria_items', {
@@ -2390,6 +2462,8 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   estado: estadoEnvioCafeEnum('estado').notNull().default('enviado'),
+  /** 'salida' es lo que existía; 'entrada' es el camino de vuelta (0097). */
+  sentido: sentidoEnvioCafeEnum('sentido').notNull().default('salida'),
   /** Suma de renglones a costo — lo que este envío le "cuesta" a la cafetería. */
   totalCosto: doublePrecision('total_costo').notNull().default(0),
   observaciones: text('observaciones').notNull().default(''),

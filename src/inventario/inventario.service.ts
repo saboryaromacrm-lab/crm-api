@@ -873,7 +873,12 @@ export class InventarioService {
       if (!prod) continue;
       await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado: 'disponible' }, cantidad);
       await this.mov(tx, {
-        tipo: 'devolucion', productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: 1,
+        /* El tipo por defecto es la devolución, que es para lo que nació este
+         * helper. Un llamador puede pedir el suyo (0097: la mercadería que
+         * LLEGA de la cafetería no es una devolución de nada) — sin esto, esos
+         * ingresos apareceriían en el libro del almacén como devoluciones. */
+        tipo: o.tipoMovimiento || 'devolucion',
+        productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: 1,
         cantidad, unidad: this.unidadDe(prod.tipo, presId), estadoHacia: 'disponible',
         usuarioId: o.usuarioId ?? null, descripcion: o.descripcion || 'Reingreso por anulación',
       });
@@ -2330,7 +2335,7 @@ export class InventarioService {
   /** Lo chico y estable: sucursales, usuarios, listas, catálogos, remitos, avisos. */
   async bootstrapBase() {
     const [suc, prov, usr, listasCat, transfs, incs, ms, cs, ss, es, rolesCat,
-      pendientesLectura, pendientesPedidoCafe, urgentesVenc] = await Promise.all([
+      pendientesLectura, urgentesVenc] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
@@ -2344,9 +2349,6 @@ export class InventarioService {
       this.db.select().from(roles),
       this.db.select({ n: sql<number>`count(*)` }).from(facturaLecturas)
         .where(eq(facturaLecturas.estado, 'pendiente')),
-      // La demanda del café que espera: alimenta el globito de Almacén › Cafetería.
-      this.db.select({ n: sql<number>`count(*)` }).from(pedidosCafeteria)
-        .where(inArray(pedidosCafeteria.estado, ['pendiente', 'armando'])),
       // Lo que apura del vigía de fechas: vencido sin procesar + vence en ≤7
       // días. El día se compara contra ARGENTINA, no contra el reloj UTC del
       // server (a la noche UTC ya es mañana y adelantaría los vencidos).
@@ -2369,8 +2371,18 @@ export class InventarioService {
        * el cajón.
        */
       lecturasPendientes: Number(pendientesLectura?.[0]?.n) || 0,
-      /** Pedidos del café sin resolver (pendiente + armando): el globito de Cafetería. */
-      pedidosCafeteriaPendientes: Number(pendientesPedidoCafe?.[0]?.n) || 0,
+      /*
+       * ACÁ VIAJABA EL CONTADOR DE PEDIDOS DEL CAFÉ, y se fue en el 0098.
+       *
+       * Este snapshot es COMPARTIDO: la misma respuesta con el mismo ETag para
+       * todos. Desde que cada sucursal ve solo los pedidos que le hicieron a
+       * ella, un número acá sería el total de todas — y a Norte le habría
+       * sonado la campana por un pedido del Depósito.
+       *
+       * El globito ahora lee el mismo poller que el aviso del encabezado
+       * (`/cafeteria/pedidos-pendientes`), que sí mira la sesión. Un solo
+       * número y una sola fuente, en vez de dos que no coincidían.
+       */
       vencimientosUrgentes: Number(urgentesVenc?.[0]?.n) || 0,
       // El frontend replica el cálculo de precios: necesita el mismo redondeo
       // para no mostrar un número distinto al de la API.
