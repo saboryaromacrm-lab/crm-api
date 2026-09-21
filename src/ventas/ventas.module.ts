@@ -344,6 +344,21 @@ class VentaItemDto {
    */
 }
 
+/**
+ * LOS PLANES DE CUOTAS QUE EXISTEN. Lista cerrada y no un rango: son los que
+ * se ofrecen en el mostrador y los que tienen % cargado. Con un campo libre se
+ * podría cobrar "en 4" sin tener porcentaje para 4, y el recargo saldría 0 sin
+ * que nadie se entere -- que es la peor forma de perder plata.
+ */
+const PLANES_CUOTAS = [1, 3, 6] as const;
+
+/** El % configurado para un plan. Sin plan o sin config, no hay recargo. */
+function porcentajeRecargo(config: any, cuotas?: number | null): number {
+  if (!cuotas) return 0;
+  const v = Number(config?.[`recargoCuotas${cuotas}`]);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 class VentaExtraDto {
   @IsString() @MaxLength(120) concepto!: string;
   @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
@@ -354,8 +369,22 @@ class VentaExtraDto {
 
 class VentaPagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
+  /**
+   * Lo que se cobra por este medio, RECARGO INCLUIDO: es el número que pasa
+   * por el posnet y el que tiene que cerrar contra el total de la venta.
+   */
   @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
   @IsOptional() @IsString() @MaxLength(120) referencia?: string;
+  /**
+   * EL PLAN DE CUOTAS (0100), solo para tarjeta de crédito. Del plan sale el %
+   * de recargo, y del % sale cuánto de `importe` es financiación.
+   *
+   * El cliente manda el PLAN, nunca el porcentaje ni el monto: si mandara el
+   * recargo, cualquiera podría cobrar una venta declarando que la mitad es
+   * financiación. El servidor lo calcula con el % de configuración y con eso
+   * arma el cargo, valida los pagos y congela el número en el cobro.
+   */
+  @IsOptional() @IsInt() @IsIn(PLANES_CUOTAS) cuotas?: number;
   /** A qué cuenta disponible va, cuando el medio es 'transferencia_proveedor'. */
   @IsOptional() @IsInt() cuentaDisponibleId?: number;
 }
@@ -2084,6 +2113,63 @@ export class VentasService {
     };
   }
 
+  /* --------------------------- Recargo por cuotas --------------------------- */
+
+  /**
+   * EL RECARGO POR FINANCIACIÓN, calculado ENTERO por el servidor (0100).
+   *
+   * El cliente manda el plan de cuotas y nada más. Ni el porcentaje ni el
+   * monto: si mandara el recargo, cualquiera podría cobrar una venta
+   * declarando que la mitad es financiación, y ese dinero saldría del margen
+   * de los productos sin que ningún reporte lo notara.
+   *
+   * LA CUENTA, Y POR QUÉ ASÍ. La base es lo que queda para la tarjeta después
+   * de los otros medios: si el cliente paga $5.000 en efectivo de una venta de
+   * $10.000, el recargo corre sobre los $5.000 que van al posnet y no sobre
+   * los $10.000 — cobrarle financiación a la plata que pagó en mano sería
+   * cobrarle de más. De ahí sale el importe final de ese pago, y el servidor
+   * lo PISA: dejar el que mandó la pantalla abriría un cent de diferencia
+   * contra el total, y la caja rebotaría con un mensaje que nadie entiende.
+   *
+   * UN SOLO PLAN POR VENTA. Dos tarjetas con cuotas distintas dejan la base
+   * sin repartir de forma única, y adivinarla es inventar plata. El caso real
+   * es uno: el cliente financia con una tarjeta.
+   */
+  private aplicarRecargoCuotas(
+    pagos: VentaPagoDto[], totalMercaderia: number, config: any,
+  ): { pagos: VentaPagoDto[]; recargo: number; cuotas: number | null; porcentaje: number } {
+    const conPlan = (pagos ?? []).filter((p) => p.cuotas && Number(p.importe) > 0);
+    if (!conPlan.length) return { pagos, recargo: 0, cuotas: null, porcentaje: 0 };
+    if (conPlan.length > 1) {
+      throw new BadRequestException('Una venta lleva un solo plan de cuotas: cobrá el resto con otro medio.');
+    }
+    const pago = conPlan[0];
+    if (pago.medio !== 'tarjeta_credito') {
+      throw new BadRequestException('Las cuotas son de la tarjeta de crédito.');
+    }
+    const porcentaje = porcentajeRecargo(config, pago.cuotas);
+    /* Plan sin recargo cargado: es válido y frecuente (1 cuota al 0%). Queda
+     * anotado igual —para saber en qué plan se cobró— pero no suma nada. */
+    if (porcentaje <= 0) return { pagos, recargo: 0, cuotas: pago.cuotas ?? null, porcentaje: 0 };
+
+    const otros = money((pagos ?? [])
+      .filter((p) => p !== pago)
+      .reduce((a, p) => a + (Number(p.importe) || 0), 0));
+    const base = money(totalMercaderia - otros);
+    if (base <= 0) {
+      throw new BadRequestException('Los otros medios ya cubren la venta: no queda nada para financiar.');
+    }
+    const recargo = money((base * porcentaje) / 100);
+    return {
+      pagos: (pagos ?? []).map((p) => (p === pago
+        ? { ...p, importe: money(base + recargo), recargo } as VentaPagoDto
+        : p)),
+      recargo,
+      cuotas: pago.cuotas ?? null,
+      porcentaje,
+    };
+  }
+
   /* ------------------------------ Validaciones ------------------------------ */
 
   /** Al contado los pagos cubren el total exacto; en cta. cte. no hay pagos. */
@@ -2119,6 +2205,12 @@ export class VentasService {
     if (!pagos.length) return;
     const filas = await tx.insert(ventaPagos).values(pagos.map((p) => ({
       ventaId, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
+      /* El plan y su recargo quedan CONGELADOS en el pago (0100): cambiar el %
+       * en configuración mañana no puede mover lo que ya se cobró. Es lo que
+       * hace que "cuánto me llevó la financiación" se responda sumando, sin
+       * volver a calcular nada sobre datos que ya cambiaron. */
+      cuotas: p.cuotas ?? null,
+      recargo: money((p as any).recargo ?? 0),
     }))).returning({ id: ventaPagos.id });
     const tercerizados = pagos
       .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), ventaPagoId: filas[i].id, medio: p.medio }))
@@ -2932,7 +3024,45 @@ export class VentasService {
       borrador.total = money(borrador.total - quitar);
     }
 
-    const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], borrador.total);
+    /*
+     * EL RECARGO POR CUOTAS ENTRA ACÁ, justo antes de validar los pagos.
+     *
+     * Es el único momento posible: el plan de cuotas se elige al cobrar, no al
+     * cargar los productos, y el recargo SUBE EL TOTAL de la venta. Se guarda
+     * como un cargo propio (`venta_extras`) y no metido dentro de los precios:
+     * el cliente tiene derecho a ver en su comprobante cuánto le costó pagar
+     * en cuotas, y el reporte necesita poder separar esa plata de la venta de
+     * mercadería -- si se mezclara con los renglones, el margen de cada
+     * producto quedaría inflado por algo que no es margen.
+     *
+     * Va en el borrador (base y memoria) antes de seguir, igual que el bloque
+     * del redondeo viejo de arriba: de ahí en más los pagos, el crédito y ARCA
+     * se validan contra el total que el cliente de verdad va a pagar.
+     */
+    const fin = this.aplicarRecargoCuotas(dto.pagos ?? [], borrador.total, config);
+    if (fin.recargo > 0) {
+      const concepto = `Recargo ${fin.cuotas} cuota${fin.cuotas === 1 ? '' : 's'} (${fin.porcentaje}%)`;
+      /* El extra se guarda NETO y la alícuota va aparte: la financiación de
+       * una venta gravada tributa igual que la venta. `money(recargo / 1.21)`
+       * puede dejar un centavo de diferencia contra el recargo redondeado, y
+       * por eso `validarPagos` tolera exactamente eso -- lo que no puede pasar
+       * es que el total se aleje del número que vio el cliente. */
+      const neto = money(fin.recargo / 1.21);
+      await this.db.transaction(async (tx) => {
+        await tx.insert(ventaExtras).values({ ventaId: id, concepto, importe: neto, iva: 21 });
+        await tx.update(ventas).set({
+          subtotalNeto: money(borrador.subtotalNeto + neto),
+          ivaTotal: money(borrador.ivaTotal + money(fin.recargo - neto)),
+          total: money(borrador.total + fin.recargo),
+        }).where(eq(ventas.id, id));
+      });
+      borrador.extras = [...(borrador.extras ?? []), { concepto, importe: neto, iva: 21 }] as any;
+      borrador.subtotalNeto = money(borrador.subtotalNeto + neto);
+      borrador.ivaTotal = money(borrador.ivaTotal + money(fin.recargo - neto));
+      borrador.total = money(borrador.total + fin.recargo);
+    }
+
+    const pagos = this.validarPagos(condicionPago, fin.pagos, borrador.total);
     this.validarMediosPagoMonto(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
     /*

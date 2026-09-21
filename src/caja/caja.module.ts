@@ -115,7 +115,15 @@ export class CajaService {
     const sesion = await this.get(id);
 
     const [porVenta, porCobranza, movs, controles] = await Promise.all([
-      this.db.select({ medio: ventaPagos.medio, total: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)` })
+      this.db.select({
+        medio: ventaPagos.medio,
+        total: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)`,
+        /* Cuánto de lo que entró por ese medio NO es venta de mercadería sino
+         * recargo por financiación (0100). Viaja con el medio y no aparte
+         * porque es plata del MISMO cobro: separarla en otra consulta obligaría
+         * a cruzarlas de nuevo para leer cualquiera de los dos números. */
+        recargo: sql<number>`coalesce(sum(${ventaPagos.recargo}), 0)`,
+      })
         .from(ventaPagos)
         .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
         .where(and(eq(ventas.cajaSesionId, id), eq(ventas.estado, 'confirmada')))
@@ -129,17 +137,28 @@ export class CajaService {
       this.db.select().from(cajaControles).where(eq(cajaControles.cajaSesionId, id)).orderBy(cajaControles.id),
     ]);
 
-    /** { efectivo: {ventas, cobranzas, total}, … } */
-    const medios: Record<string, { ventas: number; cobranzas: number; total: number }> = {};
+    /** { efectivo: {ventas, cobranzas, total, recargo}, … } */
+    const medios: Record<string, { ventas: number; cobranzas: number; total: number; recargo: number }> = {};
     const acumular = (filas: any[], campo: 'ventas' | 'cobranzas') => {
       for (const f of filas) {
-        const m = (medios[f.medio] ??= { ventas: 0, cobranzas: 0, total: 0 });
+        const m = (medios[f.medio] ??= { ventas: 0, cobranzas: 0, total: 0, recargo: 0 });
         m[campo] = money(Number(f.total) || 0);
+        if (f.recargo != null) m.recargo = money(Number(f.recargo) || 0);
         m.total = money(m.ventas + m.cobranzas);
       }
     };
     acumular(porVenta, 'ventas');
     acumular(porCobranza, 'cobranzas');
+
+    /*
+     * LO QUE ENTRÓ POR FINANCIAR, separado de lo que entró por vender.
+     *
+     * Es el número que el turno no tenía: sin esto, el recargo se mezcla con
+     * la venta en el total de la tarjeta y el día cierra igual, pero nadie
+     * puede decir cuánto de eso fue mercadería. Y no es un detalle contable:
+     * ese dinero es el que la tarjeta se va a quedar cuando liquide.
+     */
+    const recargos = money(Object.values(medios).reduce((a, m) => a + (m.recargo || 0), 0));
 
     const ingresos = money(movs.filter((m) => m.tipo === 'ingreso').reduce((a, m) => a + m.importe, 0));
     const egresos = money(movs.filter((m) => m.tipo === 'egreso').reduce((a, m) => a + m.importe, 0));
@@ -171,6 +190,8 @@ export class CajaService {
       montoInicial: sesion.montoInicial,
       esperadoEfectivo,
       totalCobrado: money(Object.values(medios).reduce((a, m) => a + m.total, 0)),
+      /** De lo cobrado, cuánto fue recargo por cuotas y no venta (0100). */
+      recargos,
       ctaCte: { total: money(Number(ctaCte?.total) || 0), cantidad: Number(ctaCte?.n) || 0 },
     };
   }

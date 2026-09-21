@@ -115,6 +115,24 @@ export const VENTAS_DEFAULTS = {
    */
   mediosFacturar: [] as string[],
 
+  /* Recargo por financiacion (tarjeta de credito) ------------------------
+   *
+   * EL RECARGO SE LE TRASLADA AL CLIENTE (21/9/2026, decision del dueno): en
+   * 6 cuotas el ticket sube, y ese % es el que la tarjeta descuenta. No es un
+   * descuento al reves ni un costo escondido -- entra a la venta como un cargo
+   * propio, con su renglon y su IVA, igual que un flete.
+   *
+   * TRES PLANES Y NO UN RANGO: 1, 3 y 6 cuotas son los que se ofrecen en el
+   * mostrador. Un campo libre "cuotas" habria dejado cobrar en 4 sin tener %
+   * cargado para 4, y ahi el recargo sale 0 sin que nadie se entere.
+   *
+   * En CERO no recarga nada y el plan sigue existiendo: cobrar en 1 cuota sin
+   * recargo es el caso normal, y es distinto de no poder elegir 1 cuota.
+   */
+  recargoCuotas1: 0 as number,          // % sobre el importe que va a la tarjeta
+  recargoCuotas3: 0 as number,
+  recargoCuotas6: 0 as number,
+
   /* Lector de códigos / balanza ----------------------------------------- */
   lectorHabilitado: true as boolean,
   lectorSufijoEnter: true as boolean,   // el lector envía Enter al final

@@ -2012,8 +2012,24 @@ export const ventaPagos = pgTable('venta_pagos', {
   id: serial('id').primaryKey(),
   ventaId: integer('venta_id').notNull().references(() => ventas.id, { onDelete: 'cascade' }),
   medio: medioPagoEnum('medio').notNull().default('efectivo'),
+  /** Lo que se cobra por este medio, RECARGO INCLUIDO: es lo que pasa por el posnet. */
   importe: doublePrecision('importe').notNull().default(0),
   referencia: text('referencia').notNull().default(''),
+  /**
+   * EL PLAN DE CUOTAS (0100). Nula = no corresponde (efectivo, débito) o una
+   * tarjeta cobrada sin plan; no es lo mismo que 1, que es "se eligió una
+   * cuota". Solo puede ser uno de los planes que existen en configuración.
+   */
+  cuotas: integer('cuotas'),
+  /**
+   * CUÁNTO DE `importe` ES RECARGO, congelado al cobrar igual que el costo en
+   * un renglón. Cambiar el % en configuración mañana no puede mover lo que ya
+   * se cobró: la caja de un día cerrado dejaría de cerrar.
+   *
+   * Es la parte del cobro que NO es venta de mercadería, y es lo que permite
+   * responder "cuánto me llevó la financiación este mes" sin estimar nada.
+   */
+  recargo: doublePrecision('recargo').notNull().default(0),
 }, (t) => ({
   ixVenta: index('ix_venta_pagos_venta').on(t.ventaId),
 }));

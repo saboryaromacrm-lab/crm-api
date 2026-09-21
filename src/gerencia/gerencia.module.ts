@@ -24,7 +24,7 @@ import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, comprobantes, gastos, marcas, productoProveedores, productos, proveedores,
-  stock, ventaItems, ventas,
+  stock, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { costosFormato, formatoActivo } from '../inventario/pricing';
 
@@ -51,11 +51,12 @@ export class RentabilidadService {
     const hastaEx = new Date(hastaInc.getFullYear(), hastaInc.getMonth(), hastaInc.getDate() + 1);
     const suc = q.sucursalId || null;
 
-    const [filasVenta, fiscalVentas, filasCompra, filaGastos, provRows, prods, ms, cs] = await Promise.all([
+    const [filasVenta, fiscalVentas, filasCompra, filaGastos, financiacion, provRows, prods, ms, cs] = await Promise.all([
       this.ventasPorProducto(desde, hastaEx, suc),
       this.fiscalVentas(desde, hastaEx, suc),
       this.comprasPorProveedor(desde, hastaEx),
       this.creditoGastos(desde, hastaEx),
+      this.recargoFinanciacion(desde, hastaEx, suc),
       this.db.select().from(proveedores),
       this.db.select().from(productos).where(ne(productos.estado, 'archivado' as any)),
       this.db.select().from(marcas),
@@ -140,6 +141,19 @@ export class RentabilidadService {
         ? r2((sf.reduce((a, x) => a + x.ventaNeta, 0) / totales.ventaNeta) * 100) : 0,
     };
 
+    /*
+     * EL RECARGO POR CUOTAS, EN SU PROPIO RENGLÓN. No se suma al margen de los
+     * productos ni se resta de ningún lado: es plata que entró por financiar,
+     * y mezclarla con la de vender haría que un mes con muchas cuotas pareciera
+     * un mes de mejores márgenes.
+     */
+    const recargoCuotas = {
+      total: financiacion.total,
+      cobros: financiacion.cantidad,
+      /** Cuánto pesa sobre lo vendido: sirve para ver si la financiación se fue de escala. */
+      sobreVentaPct: totales.ventaNeta > 0 ? r2((financiacion.total / totales.ventaNeta) * 100) : 0,
+    };
+
     /* ---- La posición fiscal del período ---- */
     const creditoCompras = r2(filasCompra.reduce((a: number, c: any) => a + c.ivaCredito, 0));
     const fiscal = {
@@ -193,6 +207,8 @@ export class RentabilidadService {
       },
       totales,
       sinFactura,
+      /** Lo que entró por financiar, aparte de lo que entró por vender (0100). */
+      recargoCuotas,
       fiscal,
       compras,
       porProveedor,
@@ -290,6 +306,32 @@ export class RentabilidadService {
   }
 
   /** El IVA de los gastos facturados: también es crédito, también cubre. */
+  /**
+   * LO QUE ENTRÓ POR FINANCIAR, que NO es venta de mercadería (0100).
+   *
+   * El recargo por cuotas vive en `venta_pagos` y no en los renglones, así que
+   * nunca se mezcló con el margen de ningún producto — y ese es el punto: si
+   * estuviera adentro de los precios, cada producto vendido en 6 cuotas
+   * mostraría un margen inflado por plata que se va a quedar la tarjeta.
+   *
+   * Acá se lo suma aparte, para poder mirarlo como lo que es: una cuenta
+   * distinta de la de vender.
+   */
+  private async recargoFinanciacion(desde: Date, hastaEx: Date, suc: number | null) {
+    const conds: any[] = [
+      gte(ventas.fecha, desde), lt(ventas.fecha, hastaEx),
+      eq(ventas.estado, 'confirmada' as any),
+    ];
+    if (suc) conds.push(eq(ventas.sucursalId, suc));
+    const [r] = await this.db.select({
+      total: sql<number>`coalesce(sum(${ventaPagos.recargo}), 0)`,
+      cantidad: sql<number>`count(*) filter (where ${ventaPagos.recargo} > 0)`,
+    }).from(ventaPagos)
+      .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
+      .where(and(...conds));
+    return { total: r2(Number(r?.total) || 0), cantidad: Number(r?.cantidad) || 0 };
+  }
+
   private async creditoGastos(desde: Date, hastaEx: Date) {
     const [r] = await this.db.select({
       iva: sql<number>`coalesce(sum(${gastos.iva}), 0)`,
