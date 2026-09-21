@@ -33,6 +33,21 @@ export const PERMISOS_BASE = Object.freeze([
   /* Cafetería: armar y anular los envíos de mercadería a coffit. */
   'almacen.cafeteria',
   /*
+   * CARTELES DE GÓNDOLA (21/9/2026, pedido del dueño: "es algo que podemos
+   * usar todos"). Rehacer el cartel de un estante es trabajo de mostrador, no
+   * un privilegio: el que repone es el que ve el cartel viejo.
+   *
+   * Es una clave PROPIA y no `ventas.cambios` —que era la que pedía la
+   * sección— porque esa otra abre los CAMBIOS DE PRECIO. Darle esa llave a
+   * todos para que puedan imprimir un cartel habría sido abrir de más por la
+   * puerta de al lado.
+   *
+   * Lo que se puede hacer con esto es acotado a propósito: escribir el texto
+   * del cartel e imprimirlo. El PRECIO no se tipea nunca —lo pone el sistema—
+   * así que un cartel no puede contradecir a la caja.
+   */
+  'ventas.carteles',
+  /*
    * Las tres acciones que hacen falta para CERRAR el circuito de vencimientos.
    * Sin ellas la pantalla se ve pero no se puede procesar lo que ya venció, que
    * es exactamente para lo que existe:

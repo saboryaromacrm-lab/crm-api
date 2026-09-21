@@ -1584,8 +1584,13 @@ export class ProductosController {
    * dar de baja un producto—; darle el update completo para que pueda escribir
    * dos líneas de texto sería abrir de más. **Qué**: este endpoint no puede
    * tocar ninguna otra cosa del producto ni aunque le manden el body entero.
+   *
+   * Desde el 21/9/2026 acepta además `ventas.carteles`, que es de fábrica para
+   * todos los roles: rehacer el cartel de un estante es trabajo de mostrador.
+   * Abrirlo es seguro justamente por el **qué** de arriba — de acá no sale
+   * ningún precio ni ningún dato del producto, solo el texto del cartel.
    */
-  @Permiso('compras.productos', 'ventas.cambios')
+  @Permiso('compras.productos', 'ventas.cambios', 'ventas.carteles')
   @Patch(':id/cartel') cartel(@Param('id', ParseIntPipe) id: number, @Body() dto: CartelDto) {
     return this.svc.guardarCartel(id, dto);
   }
