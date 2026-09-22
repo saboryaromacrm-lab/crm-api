@@ -29,7 +29,7 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
-import { clientes, presupuestoItems, presupuestos, stock } from '../db/schema';
+import { clientes, presupuestoItems, presupuestos, productos, stock } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -171,6 +171,25 @@ export class PresupuestosService {
     return { limpios, subtotalNeto: money(neto), ivaTotal: money(iva), total: money(neto + iva) };
   }
 
+  /**
+   * EL MISMO CANDADO QUE LA VENTA (0101). Un artículo de uso exclusivo de la
+   * cafetería no se vende en el mostrador, y el presupuesto es la promesa de
+   * esa venta: cotizarlo era prometer algo que el POS iba a rechazar recién al
+   * cobrar, con el cliente adelante.
+   */
+  private async validarCotizables(items: Array<{ productoId: number }>) {
+    const ids = [...new Set(items.map((it) => it.productoId))];
+    if (!ids.length) return;
+    const [p] = await this.db.select({ nombre: productos.nombre }).from(productos)
+      .where(and(inArray(productos.id, ids), eq(productos.soloCafeteria, true))).limit(1);
+    if (p) {
+      throw new BadRequestException(
+        `${p.nombre} es de uso exclusivo de la Cafetería: no se vende en el mostrador y no se puede presupuestar. `
+        + 'Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
+      );
+    }
+  }
+
   private async getRow(id: number) {
     const [p] = await this.db.select().from(presupuestos).where(eq(presupuestos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Presupuesto inexistente.');
@@ -214,6 +233,7 @@ export class PresupuestosService {
     if (!dto?.clienteId) throw new BadRequestException('Elegí el cliente del presupuesto.');
     const { limpios, subtotalNeto, ivaTotal, total } = this.totales(dto.items);
     if (!limpios.length) throw new BadRequestException('Agregá al menos un renglón.');
+    await this.validarCotizables(limpios);
     const entrega = ENTREGAS.has(dto.entrega as string) ? dto.entrega! : 'retiro';
     return this.db.transaction(async (tx) => {
       const [p] = await tx.insert(presupuestos).values({
@@ -275,6 +295,7 @@ export class PresupuestosService {
     if (p.estado !== 'borrador') throw new BadRequestException('Solo un borrador se edita — usá "Reabrir" para re-cotizar.');
     const { limpios, subtotalNeto, ivaTotal, total } = this.totales(dto.items ?? []);
     if (!limpios.length) throw new BadRequestException('Agregá al menos un renglón.');
+    await this.validarCotizables(limpios);
     await this.db.transaction(async (tx) => {
       await tx.update(presupuestos).set({
         clienteId: dto.clienteId != null ? Number(dto.clienteId) : p.clienteId,

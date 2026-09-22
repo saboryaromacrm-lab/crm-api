@@ -708,6 +708,13 @@
       "when": 1790040000000,
       "tag": "0100_recargo_cuotas",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1790050000000,
+      "tag": "0101_compras_coffit",
+      "breakpoints": true
     }
   ]
 }

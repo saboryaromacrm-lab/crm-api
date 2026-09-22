@@ -570,17 +570,34 @@ export class ComprobantesService {
    * reactivarlo (un clic, conserva precios e historial), no cargarlo como si
    * nunca se hubiera dado de baja — así el estado no miente.
    */
-  private async validarProductosComprables(items: Array<{ productoId: number }>) {
+  /**
+   * Valida que todo lo que se compra siga activo y devuelve QUÉ productos son
+   * de uso exclusivo de la cafetería (0101): una sola lectura para las dos
+   * cosas, porque se hace en el camino de cada alta.
+   */
+  private async productosComprables(items: Array<{ productoId: number }>): Promise<Set<number>> {
     const ids = [...new Set((items ?? []).map((it) => it.productoId).filter(Boolean))];
-    if (!ids.length) return;
-    const dados = await this.db.select({ nombre: productos.nombre, estado: productos.estado })
-      .from(productos).where(and(inArray(productos.id, ids), ne(productos.estado, 'activo')));
+    if (!ids.length) return new Set();
+    const filas = await this.db.select({
+      id: productos.id, nombre: productos.nombre, estado: productos.estado, soloCafeteria: productos.soloCafeteria,
+    }).from(productos).where(inArray(productos.id, ids));
+    const dados = filas.filter((f) => f.estado !== 'activo');
     if (dados.length) {
       const nombres = dados.map((d) => `${d.nombre} (${d.estado})`).join(', ');
       throw new BadRequestException(
         `Estos productos ya no se compran: ${nombres}. Si volvés a traerlos, reactivalos en Compras › Productos y cargá la factura de nuevo.`,
       );
     }
+    return new Set(filas.filter((f) => f.soloCafeteria).map((f) => f.id));
+  }
+
+  /**
+   * LA PARTE DE COFFIT DE UN PIE (0101): el neto YA BONIFICADO de los renglones
+   * del café. Sale de los mismos `items` que devuelve `armarPie`, así que cierra
+   * al centavo con el neto gravado del documento.
+   */
+  private netoCafeteriaDe(items: Array<{ subtotal: number }>, esDelCafe: (it: any) => boolean) {
+    return r2(items.reduce((a, it) => a + (esDelCafe(it) ? it.subtotal : 0), 0));
   }
 
   /* ------------------------- EL PIE DE LA FACTURA -------------------------
@@ -859,7 +876,7 @@ export class ComprobantesService {
     const [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
     if (!dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
-    await this.validarProductosComprables(dto.items);
+    const delCafe = await this.productosComprables(dto.items);
 
     // Un proveedor monotributista o exento NO discrimina IVA: asumir 21% inflaría
     // el total del comprobante y ensuciaría el libro de IVA compras.
@@ -874,6 +891,8 @@ export class ComprobantesService {
     const {
       items, bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total,
     } = this.armarPie(dto, fiscal, ivaDefault);
+    /* Lo que de este papel es del café, congelado con el documento (0101). */
+    const netoCafeteria = this.netoCafeteriaDe(items, (it) => delCafe.has(it.productoId));
     /*
      * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
      *
@@ -1010,6 +1029,7 @@ export class ComprobantesService {
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
         subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
+        netoCafeteria,
         /* Un comprobante no fiscal NO GUARDA CAE. Se podía cargar el papel de una
          * factura A real (con su CAE y su IVA) eligiendo tipo liquidación: la
          * API forzaba IVA 0 y letra X pero se guardaba el CAE igual, y quedaba un
@@ -1024,6 +1044,7 @@ export class ComprobantesService {
         comprobanteId: c.id, productoId: it.productoId, presentacionId: it.presentacionId ?? null,
         cantidad: Number(it.cantidad) || 0, costoUnitario: Number(it.costoUnitario) || 0,
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
+        paraCafeteria: delCafe.has(it.productoId),
       })));
 
       /*
@@ -1286,6 +1307,10 @@ export class ComprobantesService {
     if (pieReal.total <= 0) {
       throw new BadRequestException(`El total de la factura da ${r2(pieReal.total)}: revisá los costos y la bonificación.`);
     }
+    /* La marca del renglón se congeló al cargar el remito; acá solo cambian
+     * los precios, así que la parte del café se recalcula sobre esa marca. */
+    const delCafe = new Set(filasRemito.filter((f) => f.paraCafeteria).map((f) => f.id));
+    const netoCafeteria = this.netoCafeteriaDe(pieReal.items, (it) => delCafe.has(it.itemId));
 
     const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? c.puntoVenta ?? '0001');
     // La factura resultante tampoco se puede duplicar contra las ya cargadas.
@@ -1333,6 +1358,7 @@ export class ComprobantesService {
         ivaTotal: pieReal.ivaTotal,
         percepcionesTotal: r2(pieReal.percepcionesTotal),
         total: pieReal.total,
+        netoCafeteria,
         cae: String(dto.cae ?? '').slice(0, 32),
         observaciones: [String(dto.observaciones ?? '').trim(), String(c.observaciones ?? '').trim(), rastro]
           .filter(Boolean).join('\n'),

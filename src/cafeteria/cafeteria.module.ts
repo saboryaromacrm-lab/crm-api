@@ -46,8 +46,9 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, ClaveServicio, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal, tienePermiso } from '../auth/auth.guard';
 import {
-  enviosCafeteria, envioCafeteriaItems, gastos, listasVenta, pedidoCafeteriaItems, pedidosCafeteria,
-  precioHistorial, presentaciones, productoListas, productoProveedores, productos, sucursales, usuarios,
+  comprobantes, enviosCafeteria, envioCafeteriaItems, gastos, listasVenta, pedidoCafeteriaItems,
+  pedidosCafeteria, precioHistorial, presentaciones, productoListas, productoProveedores, productos,
+  stock, sucursales, usuarios,
 } from '../db/schema';
 import { ProductosModule, ProductosService } from '../productos/productos.module';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -55,6 +56,14 @@ import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoEntry, formatoActivo } from '../inventario/pricing';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * Con qué signo entra cada tipo de comprobante de compra a una suma (0101):
+ * la nota de crédito RESTA (mercadería devuelta o precio corregido); el
+ * remito y la orden de compra no son compra hasta que se facturan.
+ */
+const SIGNO_COMPRA = sql`(case when ${comprobantes.tipo} in ('factura', 'liquidacion', 'nota_debito') then 1
+  when ${comprobantes.tipo} = 'nota_credito' then -1 else 0 end)`;
 const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 
 class EnvioItemDto {
@@ -272,6 +281,9 @@ export class CafeteriaService {
         unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
         codigoBarras: (pres?.codigoBarras || prod.codigoBarras || ''),
         codigoPropio: prod.codigoPropio || '',
+        /* Congelado acá (0101): de qué stock salió decide si este envío mueve
+         * plata entre los dos negocios o solo cruza la calle. */
+        exclusivo: !!prod.soloCafeteria,
       });
     }
     return { filas, total: r2(total) };
@@ -1297,16 +1309,35 @@ export class CafeteriaService {
       total: sql<number>`coalesce(sum(${enviosCafeteria.totalCosto}), 0)`,
       cantidad: sql<number>`count(*)::int`,
     }).from(enviosCafeteria).where(and(...condsEnvio)).groupBy(enviosCafeteria.sentido);
-    const [g] = await this.db.select({
-      total: sql<number>`coalesce(sum(${gastos.total}), 0)`,
-      cantidad: sql<number>`count(*)`,
-    }).from(gastos).where(and(...condsGasto));
+    /*
+     * LO COMPRADO DIRECTO PARA EL CAFÉ (0101): la parte de las facturas de
+     * compra que era de artículos exclusivos, con el signo del documento.
+     */
+    const condsCompra: any[] = [eq(comprobantes.estado, 'confirmado'), gt(comprobantes.netoCafeteria, 0)];
+    if (desde) condsCompra.push(gte(comprobantes.fecha, desde));
+    if (hasta) condsCompra.push(lte(comprobantes.fecha, hasta));
+    const [[g], [compra], deposito] = await Promise.all([
+      this.db.select({
+        total: sql<number>`coalesce(sum(${gastos.total}), 0)`,
+        cantidad: sql<number>`count(*)`,
+      }).from(gastos).where(and(...condsGasto)),
+      this.db.select({
+        total: sql<number>`coalesce(sum(${comprobantes.netoCafeteria} * ${SIGNO_COMPRA}), 0)`,
+        cantidad: sql<number>`count(*) filter (where ${comprobantes.tipo} in ('factura', 'liquidacion'))::int`,
+      }).from(comprobantes).where(and(...condsCompra)),
+      this.existenciasDelCafe(),
+    ]);
 
     const de = (s: string) => porSentido.find((x) => x.sentido === s);
     const enviado = Number(de('salida')?.total ?? 0);
     const recibido = Number(de('entrada')?.total ?? 0);
     const gastosCafe = Number(g?.total ?? 0);
     return {
+      /** Comprado a proveedores directo para el café en el período (neto). */
+      compradoDirecto: r2(Number(compra?.total ?? 0)),
+      comprasCantidad: Number(compra?.cantidad ?? 0),
+      /** Mercadería del café guardada HOY en las sucursales, a costo. Es una foto, no un período. */
+      enDeposito: r2(deposito.reduce((a, f) => a + f.valor, 0)),
       enviado: r2(enviado),
       enviosCantidad: Number(de('salida')?.cantidad ?? 0),
       /** Lo que la cafetería mandó a las sucursales, al costo que ella declaró. */
@@ -1317,6 +1348,91 @@ export class CafeteriaService {
       gastos: r2(gastosCafe),
       gastosCantidad: Number(g?.cantidad ?? 0),
       costoTotal: r2(enviado + gastosCafe),
+    };
+  }
+
+  /* ==================================================================== *
+   * EL DEPÓSITO DEL CAFÉ — lo que es suyo y está guardado acá (0101)
+   * ==================================================================== *
+   * Todo el stock disponible de los artículos de USO EXCLUSIVO de la
+   * cafetería, en todas las sucursales, valuado al costo real de hoy. Es lo
+   * que la compra directa ya le imputó al café y todavía no cruzó la calle:
+   * el casillero del medio entre "comprado" y "consumido".
+   *
+   * Sin depósito paralelo ni estado de stock nuevo: la marca de la ficha
+   * dice de quién es cada unidad, y con eso alcanza porque un artículo
+   * exclusivo es del café entero — no hay que partirlo.
+   */
+  private async existenciasDelCafe() {
+    const prods = await this.db.select({
+      id: productos.id, nombre: productos.nombre, tipo: productos.tipo, iva: productos.iva,
+      codigoPropio: productos.codigoPropio,
+    }).from(productos)
+      .where(and(eq(productos.soloCafeteria, true), ne(productos.estado, 'archivado')));
+    if (!prods.length) return [];
+    const ids = prods.map((p) => p.id);
+
+    const [filas, provs, press] = await Promise.all([
+      this.db.select({
+        productoId: stock.productoId, presentacionId: stock.presentacionId,
+        sucursalId: stock.sucursalId, cantidad: stock.cantidad,
+      }).from(stock).where(and(
+        inArray(stock.productoId, ids), eq(stock.estado, 'disponible'), gt(stock.cantidad, 1e-9),
+      )),
+      this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
+      this.db.select().from(presentaciones).where(inArray(presentaciones.productoId, ids)),
+    ]);
+    const prodDe = new Map(prods.map((p) => [p.id, p]));
+    const presDe = new Map(press.map((p) => [p.id, p]));
+    /* El costo de hoy, una vez por producto y no por fila. */
+    const costoKg = new Map<number, number>();
+    for (const p of prods) {
+      costoKg.set(p.id, costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)) as any, p.iva));
+    }
+
+    /* Un renglón por artículo (producto + presentación), con su stock por sucursal. */
+    const porArticulo = new Map<string, any>();
+    for (const f of filas) {
+      const prod = prodDe.get(f.productoId)!;
+      const pres = f.presentacionId ? presDe.get(f.presentacionId) : null;
+      if (f.presentacionId && !pres) continue;
+      const clave = `${f.productoId}-${f.presentacionId ?? 0}`;
+      let a = porArticulo.get(clave);
+      if (!a) {
+        const esGranel = prod.tipo === 'granel' && !pres;
+        const tam = pres ? (pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`) : '';
+        const cnKg = costoKg.get(prod.id) ?? 0;
+        a = {
+          productoId: prod.id, presentacionId: pres?.id ?? null,
+          nombre: pres ? `${prod.nombre} · ${tam}` : prod.nombre,
+          codigoPropio: prod.codigoPropio || '',
+          unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
+          costoU: r2(pres ? cnKg * (pres.tamKg ?? 1) : cnKg),
+          porSucursal: {} as Record<number, number>,
+          total: 0, valor: 0,
+        };
+        porArticulo.set(clave, a);
+      }
+      a.porSucursal[f.sucursalId] = (a.porSucursal[f.sucursalId] ?? 0) + f.cantidad;
+      a.total += f.cantidad;
+      a.valor = r2(a.total * a.costoU);
+    }
+    return [...porArticulo.values()].sort((x, y) => y.valor - x.valor);
+  }
+
+  /** La pantalla: qué hay guardado para el café, dónde y cuánto vale. */
+  async deposito() {
+    const [articulos, sucs] = await Promise.all([
+      this.existenciasDelCafe(),
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).orderBy(asc(sucursales.id)),
+    ]);
+    /* Solo las sucursales que tienen algo: seis columnas vacías no dicen nada. */
+    const conStock = new Set<number>();
+    for (const a of articulos) for (const k of Object.keys(a.porSucursal)) conStock.add(Number(k));
+    return {
+      sucursales: sucs.filter((s) => conStock.has(s.id)),
+      articulos,
+      valor: r2(articulos.reduce((a, f) => a + f.valor, 0)),
     };
   }
 }
@@ -1394,6 +1510,15 @@ export class CafeteriaController {
     @Body() body: { activar?: boolean },
   ) {
     return this.svc.bajaProductoDelCafe(id, !!body?.activar);
+  }
+
+  /* Lo que es del café y está guardado en las sucursales. Lo mira la
+   * distribuidora y lo mira el café —es SU mercadería—, así que acepta las
+   * llaves de las dos puntas. */
+  @Get('deposito')
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos', 'almacen.cafeteria-entradas')
+  deposito() {
+    return this.svc.deposito();
   }
 
   @Get('costos-entrada')

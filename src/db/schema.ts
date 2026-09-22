@@ -1424,6 +1424,13 @@ export const comprobantes = pgTable('comprobantes', {
    * la cuenta corriente del proveedor solo podía crecer.
    */
   pagado: doublePrecision('pagado').notNull().default(0),
+  /**
+   * LA PARTE DE COFFIT (0101): el neto bonificado de los renglones marcados
+   * `paraCafeteria`. Desnormalizado porque Gerencia y el resumen del café lo
+   * suman por período en cada apertura. Sin IVA a propósito: el crédito
+   * fiscal es del CUIT, y el CUIT es uno solo.
+   */
+  netoCafeteria: doublePrecision('neto_cafeteria').notNull().default(0),
   // NC/ND referencian la factura que ajustan (sin FK dura para evitar autorreferencia).
   refComprobanteId: integer('ref_comprobante_id'),
   observaciones: text('observaciones').notNull().default(''),
@@ -1520,6 +1527,12 @@ export const comprobanteItems = pgTable('comprobante_items', {
   descuento: doublePrecision('descuento').notNull().default(0),
   iva: doublePrecision('iva').notNull().default(21),
   subtotal: doublePrecision('subtotal').notNull().default(0),
+  /**
+   * EL RENGLÓN ES DE COFFIT (0101): el producto era de uso exclusivo de la
+   * cafetería cuando se cargó. CONGELADO acá y no leído de la ficha, porque la
+   * marca puede cambiar mañana y esta factura ya dijo de quién fue.
+   */
+  paraCafeteria: boolean('para_cafeteria').notNull().default(false),
 }, (t) => ({
   /**
    * Igual que `venta_items`: los renglones se piden siempre por su documento.
@@ -2531,6 +2544,14 @@ export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
   /* Snapshot para el remito y para que la pantalla de matcheo en coffit sea legible. */
   nombre: text('nombre').notNull().default(''),
   unidad: text('unidad').notNull().default(''),
+  /**
+   * SALIÓ DEL STOCK EXCLUSIVO DEL CAFÉ (0101): el producto era `soloCafeteria`
+   * al enviar, o sea que su costo YA se le imputó a Coffit al comprarlo. Lo
+   * que NO lleva la marca salió del stock propio de la distribuidora y es
+   * recién este envío el que le mueve la plata. Congelado por el mismo motivo
+   * que el costo: la marca de la ficha cambia, la historia no.
+   */
+  exclusivo: boolean('exclusivo').notNull().default(false),
   codigoBarras: text('codigo_barras').notNull().default(''),
   codigoPropio: text('codigo_propio').notNull().default(''),
 });

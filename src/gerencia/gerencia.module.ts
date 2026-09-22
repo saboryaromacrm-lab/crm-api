@@ -23,8 +23,8 @@ import { and, asc, eq, gt, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-
 import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, comprobantes, gastos, marcas, productoProveedores, productos, proveedores,
-  stock, ventaItems, ventaPagos, ventas,
+  categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, gastos, marcas, productoProveedores,
+  productos, proveedores, stock, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { costosFormato, formatoActivo } from '../inventario/pricing';
 
@@ -51,12 +51,13 @@ export class RentabilidadService {
     const hastaEx = new Date(hastaInc.getFullYear(), hastaInc.getMonth(), hastaInc.getDate() + 1);
     const suc = q.sucursalId || null;
 
-    const [filasVenta, fiscalVentas, filasCompra, filaGastos, financiacion, provRows, prods, ms, cs] = await Promise.all([
+    const [filasVenta, fiscalVentas, filasCompra, filaGastos, financiacion, coffit, provRows, prods, ms, cs] = await Promise.all([
       this.ventasPorProducto(desde, hastaEx, suc),
       this.fiscalVentas(desde, hastaEx, suc),
       this.comprasPorProveedor(desde, hastaEx),
       this.creditoGastos(desde, hastaEx),
       this.recargoFinanciacion(desde, hastaEx, suc),
+      this.parteDeCoffit(desde, hastaEx),
       this.db.select().from(proveedores),
       this.db.select().from(productos).where(ne(productos.estado, 'archivado' as any)),
       this.db.select().from(marcas),
@@ -195,6 +196,20 @@ export class RentabilidadService {
       facturadoNeto: r2(filasCompra.reduce((a: number, c: any) => a + c.facturadoNeto, 0)),
       liquidado: r2(filasCompra.reduce((a: number, c: any) => a + c.liquidado, 0)),
     };
+    /*
+     * LA PLATA SIGUE A LA MERCADERÍA (0101). De todo lo comprado a proveedores
+     * en el período, qué parte NO es de la distribuidora: lo que se compró
+     * directo para el café (artículos exclusivos, imputado en la factura) y
+     * lo que salió del stock propio hacia el café (imputado en el envío). Lo
+     * que queda es lo que la distribuidora compró para ella.
+     */
+    const comprasBrutas = r2(compras.facturadoNeto + compras.liquidado);
+    const coffitOut = {
+      compradoDirecto: coffit.compradoDirecto,
+      enviadoDesdeStock: coffit.enviadoDesdeStock,
+      comprasPropias: r2(comprasBrutas - coffit.compradoDirecto - coffit.enviadoDesdeStock),
+      comprasBrutas,
+    };
 
     /* ---- El stock sin factura que espera en el depósito ---- */
     const stockSinFactura = await this.stockSinFactura(prods, hoyDe);
@@ -211,6 +226,8 @@ export class RentabilidadService {
       recargoCuotas,
       fiscal,
       compras,
+      /** Qué parte de las compras del período es del café, y cuánto quedó para la distribuidora. */
+      coffit: coffitOut,
       porProveedor,
       stockSinFactura,
       /* Ordenado por venta y con techo: el panel agrupa y filtra sobre esto.
@@ -330,6 +347,42 @@ export class RentabilidadService {
       .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
       .where(and(...conds));
     return { total: r2(Number(r?.total) || 0), cantidad: Number(r?.cantidad) || 0 };
+  }
+
+  /**
+   * LO QUE DE LAS COMPRAS ES DE COFFIT (0101), en dos números que no se pisan:
+   *
+   *  · compradoDirecto — la parte de las facturas que era de artículos
+   *    exclusivos del café (congelada en el documento, con signo por tipo).
+   *  · enviadoDesdeStock — los renglones de envíos que salieron del stock
+   *    PROPIO (no exclusivo), al costo congelado del envío. Los exclusivos no
+   *    entran acá: su plata ya se movió arriba, y contarla dos veces es
+   *    exactamente lo que este par de números vino a evitar.
+   */
+  private async parteDeCoffit(desde: Date, hastaEx: Date) {
+    const [[directo], [envios]] = await Promise.all([
+      this.db.select({
+        total: sql<number>`coalesce(sum(${comprobantes.netoCafeteria} * (case
+          when ${comprobantes.tipo} in ('factura', 'liquidacion', 'nota_debito') then 1
+          when ${comprobantes.tipo} = 'nota_credito' then -1 else 0 end)), 0)`,
+      }).from(comprobantes).where(and(
+        gte(comprobantes.fecha, desde), lt(comprobantes.fecha, hastaEx),
+        eq(comprobantes.estado, 'confirmado' as any), gt(comprobantes.netoCafeteria, 0),
+      )),
+      this.db.select({
+        total: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad} * ${envioCafeteriaItems.costoUnitario}), 0)`,
+      }).from(envioCafeteriaItems)
+        .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
+        .where(and(
+          gte(enviosCafeteria.fecha, desde), lt(enviosCafeteria.fecha, hastaEx),
+          eq(enviosCafeteria.estado, 'enviado' as any), eq(enviosCafeteria.sentido, 'salida' as any),
+          eq(envioCafeteriaItems.exclusivo, false),
+        )),
+    ]);
+    return {
+      compradoDirecto: r2(Number(directo?.total) || 0),
+      enviadoDesdeStock: r2(Number(envios?.total) || 0),
+    };
   }
 
   private async creditoGastos(desde: Date, hastaEx: Date) {

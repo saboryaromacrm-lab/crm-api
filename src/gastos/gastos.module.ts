@@ -482,6 +482,9 @@ export class GastosService {
     if (q.desde) conds.push(gte(gastos.fecha, fechaLocal(q.desde)!));
     if (q.hasta) conds.push(lte(gastos.fecha, new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`)));
     if (q.sucursalId) conds.push(eq(gastos.sucursalId, Number(q.sucursalId)));
+    /* El mismo filtro que el listado (0101): sin él, "cuánto gasté" sumaba
+     * los dos negocios sin forma de separarlos. */
+    if (q.negocio) conds.push(eq(gastos.negocio, q.negocio));
     const where = and(...conds);
 
     const [[totales], porCategoria, porMes, porProveedor] = await Promise.all([
