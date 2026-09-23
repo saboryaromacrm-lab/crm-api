@@ -1500,8 +1500,9 @@ export class ProductosService {
         }
       }
     });
-    // El costo pudo cambiar → el precio también. Queda en la evolución.
-    await this.evolucion.snapshot([id], 'formato_compra');
+    // El costo pudo cambiar → el precio también. Queda en la evolución, FIRMADA:
+    // el cartel que le salta al cajero dice de quién vino el precio nuevo.
+    await this.evolucion.snapshot([id], 'formato_compra', { usuarioId: usuarioAudit ?? null });
     return this.get(id);
   }
 
@@ -1510,12 +1511,18 @@ export class ProductosService {
    * markup y desde cuántas unidades. La lista aporta solo su identidad; el
    * precio lo define esta tabla.
    */
-  async setListas(id: number, items: any[]) {
+  async setListas(id: number, items: any[], usuarioId?: number | null) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
     await this.listas.setFormato(id, items || []);
-    // Markup nuevo o lista nueva = precio nuevo. Queda en la evolución.
-    await this.evolucion.snapshot([id], 'formato_venta');
+    /*
+     * Markup nuevo o lista nueva = precio nuevo. Queda en la evolución, y
+     * FIRMADA (23/9/2026): esta es LA puerta por la que se cambia un precio a
+     * mano, y el historial la guardaba sin autor. El cartel del cajero decía
+     * "actualizó un precio" —así, huérfano— cuando lo que necesita es saber a
+     * quién preguntarle: "Ana actualizó un precio".
+     */
+    await this.evolucion.snapshot([id], 'formato_venta', { usuarioId: usuarioId ?? null });
     return this.get(id);
   }
 
@@ -1625,8 +1632,8 @@ export class ProductosController {
 
   @Permiso('precios', 'ventas.listas')
   @Put(':id/listas')
-  setListas(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.setListas(id, body?.listas ?? body?.listasPrecio ?? body);
+  setListas(@Param('id', ParseIntPipe) id: number, @Body() body: any, @Auth() sesion: Sesion) {
+    return this.svc.setListas(id, body?.listas ?? body?.listasPrecio ?? body, sesion?.usuarioId ?? null);
   }
 
   /**

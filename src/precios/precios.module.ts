@@ -30,7 +30,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
 import {
   listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
-  productoProveedorCostos, productoProveedores, productos, proveedores, roles, usuarios,
+  productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { costoPrecioEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
@@ -144,14 +144,16 @@ export class HistorialPreciosService {
    * confunden. `productos` cuenta los distintos de ESA tanda — `snapshot()`
    * inserta todo en una transacción, así que comparten el `now()`.
    *
-   * Del AUTOR viajan tres datos y cada uno decide algo en el aviso:
+   * Del AUTOR viajan dos datos y cada uno decide algo en el aviso:
    *   - `usuarioId`: para no avisarle a quien hizo el cambio — ya lo sabe, y un
    *     cartel sobre lo que él mismo acaba de hacer entrena a ignorar carteles.
-   *   - `usuarioRol`: el aviso salta solo si lo cambió la ADMINISTRACIÓN, que es
-   *     la única que toca precios. Un `null` acá significa cambio sin autor
-   *     registrado, que también es de administración (un cajero no tiene con
-   *     qué mover un precio), así que ese caso también avisa.
    *   - `usuarioNombre`: para que el cartel diga de quién vino.
+   *
+   * El ROL del autor viajaba y ya no: el aviso lo usaba como filtro ("solo si
+   * lo cambió la administración") comparando contra dos claves escritas a mano,
+   * y eso apagaba el cartel en silencio el día que un rol nuevo con la llave de
+   * precios tocara uno. Mover precios ya exige `precios`: quién puede hacerlo
+   * lo decide el permiso, no una lista de nombres de rol.
    */
   async ultimoCambio() {
     const [ultimo] = await this.db
@@ -162,18 +164,16 @@ export class HistorialPreciosService {
         detalle: precioHistorial.detalle,
         usuarioId: precioHistorial.usuarioId,
         usuarioNombre: usuarios.nombre,
-        usuarioRol: roles.clave,
       })
       .from(precioHistorial)
       .leftJoin(usuarios, eq(usuarios.id, precioHistorial.usuarioId))
-      .leftJoin(roles, eq(roles.id, usuarios.rolId))
       .orderBy(desc(precioHistorial.id))
       .limit(1);
 
     if (!ultimo) {
       return {
         id: 0, fecha: null, origen: null, detalle: '',
-        usuarioId: null, usuarioNombre: null, usuarioRol: null, productos: 0,
+        usuarioId: null, usuarioNombre: null, productos: 0,
       };
     }
 
@@ -643,8 +643,20 @@ export class PreciosController {
   /**
    * Firma del último cambio de precio. Lo pollea cada CRM abierto para avisarle
    * al cajero que su catálogo quedó viejo; por eso tiene que ser barato.
+   *
+   * LLAVE PROPIA, Y ES TODO EL PUNTO (23/9/2026). La clase pide `precios` —la
+   * llave de QUIEN TOCA los precios— y este endpoint es para QUIEN LOS COBRA,
+   * que es justo el que no la tiene: el cajero recibía 403, el poller del
+   * navegador se lo tragaba en silencio y el cartel no aparecía nunca. El aviso
+   * llegaba solo a los dos roles que no lo necesitan.
+   *
+   * Abrirlo no filtra nada del mundo de precios: viajan la firma (un id), la
+   * fecha, cuántos productos entraron en la tanda y quién la hizo. Ningún
+   * precio, ningún costo y ningún margen — eso sigue detrás de `precios`, en
+   * `evolucion` e `historial`, acá al lado.
    */
   @Get('ultimo-cambio')
+  @Permiso('precios', 'ventas.pos')
   ultimoCambio() { return this.evolucionSvc.ultimoCambio(); }
 
   /** Evolución del PRECIO DE VENTA (no del costo): para Alt+F5 y la pestaña del producto. */

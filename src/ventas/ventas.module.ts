@@ -1821,10 +1821,26 @@ export class VentasService {
        */
       const honraCotizado = !!congelado && Math.abs(pedido - congelado.precioLista) <= 0.01;
       const pisado = difiere && !honraCotizado;
+      /*
+       * EL MENSAJE NOMBRA LA CAUSA DE VERDAD (23/9/2026).
+       *
+       * Quien llega acá NO puede pisar precios, o sea que tampoco pudo tipear
+       * ese número: el POS le tiene el campo cerrado. Si el precio que manda
+       * difiere del de la lista es porque su catálogo quedó viejo — alguien
+       * cambió los precios con su caja abierta. Decirle "hace falta el permiso
+       * para pisar precios" lo mandaba a pedir una llave que no arregla nada,
+       * con el cliente enfrente.
+       *
+       * Y se le dice QUÉ HACER, que no es obvio: actualizar los precios no
+       * re-valúa lo ya cargado (a propósito — al cliente se le dijo un número),
+       * así que ese renglón hay que volver a cargarlo.
+       */
       if (pisado && !puedePisarPrecio) {
         throw new BadRequestException(
-          `${etiqueta}: el precio de la lista ${elegida.lista.nombre} es $${netoLista.toFixed(2)} `
-          + `y se está cobrando $${pedido.toFixed(2)}. Hace falta el permiso para pisar precios.`,
+          `${etiqueta}: la lista ${elegida.lista.nombre} está a $${netoLista.toFixed(2)} `
+          + `y el ticket lo trae a $${pedido.toFixed(2)} — los precios cambiaron desde que abriste la caja. `
+          + 'Actualizá los precios, borrá ese renglón y volvé a cargarlo. '
+          + 'Si el precio lo pusiste a mano, hace falta el permiso para pisarlo.',
         );
       }
       if (pisado && pedido < 0) throw new BadRequestException(`${etiqueta}: el precio no puede ser negativo.`);
