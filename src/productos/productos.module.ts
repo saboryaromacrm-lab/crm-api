@@ -194,6 +194,27 @@ class ImportarCostosDto {
   }) items!: CostoItemDto[];
 }
 
+/**
+ * UN RENGLÓN DEL ARCHIVO DE CLASIFICACIÓN (23/9/2026). Mismo espíritu que
+ * `CostoItemDto`: el único dato que identifica al producto es su código
+ * interno, y cada campo es OPCIONAL — una columna vacía significa "no tocar
+ * esto", no "vaciarlo". Pensado para el ida y vuelta con el propio "Exportar
+ * CSV": se exporta, se edita Categoría/Subcategoría/Etiquetas en la
+ * planilla, y se vuelve a subir.
+ */
+class ClasificacionItemDto {
+  @IsString() codigoPropio!: string;
+  @IsOptional() @IsString() categoria?: string;
+  @IsOptional() @IsString() subcategoria?: string;
+  @IsOptional() @IsArray() @IsString({ each: true }) etiquetas?: string[];
+}
+
+class ActualizarClasificacionDto {
+  @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
+    message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
+  }) items!: ClasificacionItemDto[];
+}
+
 @Injectable()
 export class ProductosService {
   constructor(
@@ -1103,6 +1124,139 @@ export class ProductosService {
     };
   }
 
+  /**
+   * ACTUALIZAR CATEGORÍA Y ETIQUETAS DE MUCHOS PRODUCTOS, SIN EL MAESTRO
+   * (23/9/2026). El pedido del dueño después de "Actualizar costos": no
+   * quería reexportar el catálogo entero del sistema viejo para retocar
+   * cómo están clasificados. Pensado para el mismo archivo que ya genera
+   * "Exportar CSV" — se exporta, se editan las columnas Categoría,
+   * Subcategoría y Etiquetas en la planilla, y se vuelve a subir.
+   *
+   * Igual que `importarCostos`: matchea por código interno contra lo que ya
+   * existe y NO CREA PRODUCTOS — un código sin match queda en
+   * `noEncontrados` para cargarlo primero en Compras › Productos.
+   *
+   * Cada columna es independiente y OPCIONAL: una celda vacía significa "no
+   * tocar este campo", nunca "vaciarlo". Mandar categoría sin etiquetas deja
+   * las etiquetas como estaban, y viceversa — así una planilla que solo
+   * trae la columna Etiquetas llena no le pisa la categoría a nadie.
+   *
+   * Etiquetas SÍ reemplaza el juego completo del producto cuando la columna
+   * viene con algo: es la misma semántica que ya tiene el selector de la
+   * ficha (`setEtiquetas`), y una fusión aditiva sorprendería más de lo que
+   * ayudaría (¿cómo se saca una etiqueta por planilla, si no?).
+   *
+   * Categoría y etiqueta que no existen se CREAN por nombre, igual que hace
+   * el alta de un producto nuevo — es lo que evita que la primera vez que
+   * alguien tipeó "Sin TACC" en la ficha y ahora escribe "sin tacc" en la
+   * planilla, tenga que ir a buscar el nombre exacto.
+   */
+  async actualizarClasificacion(dto: ActualizarClasificacionDto) {
+    const items = dto.items || [];
+    if (!items.length) throw new BadRequestException('No hay nada para importar.');
+
+    const codigos = [...new Set(items.map((it) => (it.codigoPropio ?? '').trim()).filter(Boolean))];
+    const encontrados = codigos.length
+      ? await this.db.select({ id: productos.id, codigoPropio: productos.codigoPropio, nombre: productos.nombre, estado: productos.estado })
+        .from(productos).where(inArray(productos.codigoPropio, codigos))
+      : [];
+    const porCodigo = new Map(encontrados.map((p) => [p.codigoPropio, p]));
+
+    const noEncontrados: { codigo: string; motivo: string }[] = [];
+    const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
+    const aAplicar: { productoId: number; nombre: string; codigo: string; it: ClasificacionItemDto }[] = [];
+    const vistos = new Set<string>();
+
+    for (const it of items) {
+      const codigo = (it.codigoPropio ?? '').trim();
+      if (!codigo) { noEncontrados.push({ codigo: '', motivo: 'renglón sin código' }); continue; }
+      if (vistos.has(codigo)) { saltados.push({ codigo, nombre: '', motivo: 'código repetido en el archivo' }); continue; }
+      const prod = porCodigo.get(codigo);
+      if (!prod) {
+        noEncontrados.push({ codigo, motivo: 'no hay ningún producto con este código — cargalo primero en Compras › Productos' });
+        continue;
+      }
+      if (prod.estado === 'archivado') {
+        saltados.push({ codigo, nombre: prod.nombre, motivo: 'está archivado — reactivalo antes de reclasificarlo' });
+        continue;
+      }
+      const tocaAlgo = (it.categoria ?? '').trim() || (it.subcategoria ?? '').trim() || (it.etiquetas ?? []).some((e) => e.trim());
+      if (!tocaAlgo) { saltados.push({ codigo, nombre: prod.nombre, motivo: 'sin categoría, subcategoría ni etiquetas en el renglón' }); continue; }
+      vistos.add(codigo);
+      aAplicar.push({ productoId: prod.id, nombre: prod.nombre, codigo, it });
+    }
+
+    if (!aAplicar.length) return { ok: true, actualizados: [], categoriasCreadas: [], etiquetasCreadas: [], noEncontrados, saltados };
+
+    const categoriasCreadas: string[] = [];
+    const etiquetasCreadas: string[] = [];
+    const clave = (s: string) => s.trim().toLowerCase();
+
+    await this.db.transaction(async (tx) => {
+      const catPorNombre = new Map((await tx.select().from(categorias)).map((c: any) => [clave(c.nombre), c]));
+      const subPorNombre = new Map((await tx.select().from(subcategorias)).map((s: any) => [`${s.categoriaId}:${clave(s.nombre)}`, s]));
+      const etqPorNombre = new Map((await tx.select().from(etiquetas)).map((e: any) => [clave(e.nombre), e]));
+
+      const idCategoria = async (nombre: string) => {
+        const k = clave(nombre);
+        if (catPorNombre.has(k)) return catPorNombre.get(k)!.id;
+        const [c] = await tx.insert(categorias).values({ nombre: nombre.trim() }).returning();
+        catPorNombre.set(k, c);
+        categoriasCreadas.push(c.nombre);
+        return c.id;
+      };
+      const idSubcategoria = async (nombre: string, categoriaId: number) => {
+        const k = `${categoriaId}:${clave(nombre)}`;
+        if (subPorNombre.has(k)) return subPorNombre.get(k)!.id;
+        const [s] = await tx.insert(subcategorias).values({ nombre: nombre.trim(), categoriaId }).returning();
+        subPorNombre.set(k, s);
+        return s.id;
+      };
+      const idEtiqueta = async (nombre: string) => {
+        const k = clave(nombre);
+        if (etqPorNombre.has(k)) return etqPorNombre.get(k)!.id;
+        const [e] = await tx.insert(etiquetas).values({ nombre: nombre.trim() }).returning();
+        etqPorNombre.set(k, e);
+        etiquetasCreadas.push(e.nombre);
+        return e.id;
+      };
+
+      for (const v of aAplicar) {
+        const catNombre = (v.it.categoria ?? '').trim();
+        const subNombre = (v.it.subcategoria ?? '').trim();
+        const patch: Record<string, unknown> = {};
+        if (catNombre) {
+          const categoriaId = await idCategoria(catNombre);
+          patch.categoriaId = categoriaId;
+          // La subcategoría solo se puede resolver colgada de UNA categoría:
+          // si el renglón no trae categoría, no hay de dónde colgarla y se
+          // ignora en silencio antes que adivinar mal.
+          if (subNombre) patch.subcategoriaId = await idSubcategoria(subNombre, categoriaId);
+        }
+        if (Object.keys(patch).length) {
+          await tx.update(productos).set(patch).where(eq(productos.id, v.productoId));
+        }
+
+        const nombresEtq = (v.it.etiquetas ?? []).map((e) => e.trim()).filter(Boolean);
+        if (nombresEtq.length) {
+          const ids = new Set<number>();
+          for (const n of nombresEtq) ids.add(await idEtiqueta(n));
+          await tx.delete(productoEtiquetas).where(eq(productoEtiquetas.productoId, v.productoId));
+          await tx.insert(productoEtiquetas).values([...ids].map((etiquetaId) => ({ productoId: v.productoId, etiquetaId })));
+        }
+      }
+    });
+
+    return {
+      ok: true,
+      actualizados: aAplicar.map((v) => ({ codigo: v.codigo, nombre: v.nombre })),
+      categoriasCreadas,
+      etiquetasCreadas,
+      noEncontrados,
+      saltados,
+    };
+  }
+
   async update(id: number, dto: UpsertProductoDto) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -1735,6 +1889,14 @@ export class ProductosController {
   importarCostos(@Body() dto: ImportarCostosDto, @Auth() sesion: Sesion) {
     return this.svc.importarCostos(dto, sesion?.usuarioId ?? null);
   }
+
+  /** Solo categoría y etiquetas, sin el maestro: ver el comentario del servicio. */
+  @Permiso('compras.productos')
+  @Post('actualizar-clasificacion')
+  actualizarClasificacion(@Body() dto: ActualizarClasificacionDto) {
+    return this.svc.actualizarClasificacion(dto);
+  }
+
   @Permiso('compras.productos')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
     return this.svc.update(id, dto);
