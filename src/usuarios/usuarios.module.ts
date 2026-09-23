@@ -176,6 +176,9 @@ export const CATALOGO_PERMISOS = [
       { clave: 'pedidos', nombre: 'Pedir y recibir mercadería' },
       { clave: 'preparar', nombre: 'Preparar envíos (lista Enteros)' },
       { clave: 'fraccionar', nombre: 'Fraccionar granel (y su lista en envíos)' },
+      /* Los operadores fraccionan sin usuario propio (0102). Darlos de alta es
+       * del encargado: la cuenta compartida del puesto no se inventa nombres. */
+      { clave: 'fraccion_operadores', nombre: 'Fraccionamiento: alta y baja de operadores' },
       { clave: 'inventario', nombre: 'Ajustes de inventario' },
       /* La llave del que revisa: ver diferencias, marcar recontar y APLICAR.
        * Es la del encargado — contar puede cualquiera con la sección. */

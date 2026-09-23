@@ -9,6 +9,7 @@ import {
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   conteos, conteoItems, ventas, clientes,
+  fraccionOperadores, fraccionamientos, fraccionamientoItems,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
@@ -41,7 +42,12 @@ const TIPOS_MOV: Record<string, { label: string; dir: number }> = {
   envio_cafeteria: { label: 'Envío a Cafetería', dir: -1 },
 };
 
-type EstadoStock = 'disponible' | 'comprometido' | 'retenido' | 'defectuoso' | 'vencido' | 'en_transito';
+/** Fraccionado (0102): la mañana va hasta las 14; de ahí en adelante, la tarde. */
+const TURNO_TARDE_DESDE = 14;
+/** Cuánto para atrás se puede asentar un fraccionado que se olvidó cargar. */
+const DIAS_ASENTAR_ATRAS = 30;
+
+type EstadoStock ='disponible' | 'comprometido' | 'retenido' | 'defectuoso' | 'vencido' | 'en_transito';
 type Coord = { productoId: number; sucursalId: number; presentacionId: number | null; estado: EstadoStock };
 
 /**
@@ -301,6 +307,93 @@ export class InventarioService {
     const [p] = await tx.select().from(productos).where(eq(productos.id, id)).limit(1);
     return p;
   }
+
+  /**
+   * QUIÉN FRACCIONÓ (0102). El operador es obligatorio en cuanto existe al
+   * menos uno activo que pueda trabajar en esa sucursal; antes de cargar el
+   * primero, fraccionar sigue andando sin él (si no, el sistema se trabaría
+   * el día que se instala). Con `obligatorio` en falso (la corrección) solo
+   * se valida el que venga.
+   */
+  private async operadorDeFraccion(tx: any, operadorId: number | null | undefined, sucursalId: number, obligatorio: boolean): Promise<number | null> {
+    if (operadorId) {
+      const [op] = await tx.select().from(fraccionOperadores).where(eq(fraccionOperadores.id, operadorId)).limit(1);
+      if (!op) throw new BadRequestException('Ese operador no existe.');
+      if (!op.activo) throw new BadRequestException(`${op.nombre} está dado de baja como operador.`);
+      if (op.sucursalId != null && op.sucursalId !== sucursalId) {
+        throw new BadRequestException(`${op.nombre} no fracciona en esta sucursal.`);
+      }
+      return op.id;
+    }
+    if (!obligatorio) return null;
+    const [hay] = await tx.select({ id: fraccionOperadores.id }).from(fraccionOperadores)
+      .where(and(
+        eq(fraccionOperadores.activo, true),
+        or(isNull(fraccionOperadores.sucursalId), eq(fraccionOperadores.sucursalId, sucursalId)),
+      )).limit(1);
+    if (hay) throw new BadRequestException('Elegí quién fraccionó.');
+    return null;
+  }
+
+  /**
+   * El registro del historial (cabecera) y sus renglones: dos INSERT, en la
+   * misma transacción que movió el stock. Paquetes y kilos con signo.
+   */
+  private turnoDe(d: Date): 'manana' | 'tarde' {
+    return d.getHours() < TURNO_TARDE_DESDE ? 'manana' : 'tarde';
+  }
+
+  /**
+   * CUÁNDO SE HIZO. Sin día ni turno —o con los de este momento— es ahora
+   * (`fecha` null: la pone la base, igual a `registrado_en`). Asentado
+   * después, la fecha es el COMIENZO de ese turno: no se inventa una hora que
+   * nadie anotó. No se asienta un turno que todavía no empezó, ni más atrás de
+   * 30 días: eso ya no es un olvido, es un error de tipeo del año o del mes.
+   */
+  private momentoDeFraccionado(dia?: string, turno?: 'manana' | 'tarde') {
+    const ahora = new Date();
+    const iso = (x: Date) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+    const hoy = iso(ahora);
+    const t = turno ?? this.turnoDe(ahora);
+    const d = dia ?? hoy;
+    if (d === hoy && t === this.turnoDe(ahora)) return { fecha: null as Date | null, turno: t };
+    const fecha = new Date(`${d}T${t === 'manana' ? '08:00:00' : `${TURNO_TARDE_DESDE}:00:00`}`);
+    if (Number.isNaN(fecha.getTime()) || iso(fecha) !== d) throw new BadRequestException(`La fecha ${d} no existe.`);
+    if (fecha.getTime() > ahora.getTime()) throw new BadRequestException('Ese turno todavía no empezó: no se puede asentar a futuro.');
+    // Por DÍA, como el calendario de la pantalla: "30 días atrás" incluye la mañana de ese día.
+    const minimo = iso(new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate() - DIAS_ASENTAR_ATRAS));
+    if (d < minimo) throw new BadRequestException(`Solo se puede asentar hasta ${DIAS_ASENTAR_ATRAS} días atrás.`);
+    return { fecha, turno: t };
+  }
+
+  private async registrarFraccionamiento(tx: any, f: {
+    origen: 'manual' | 'correccion' | 'pedido';
+    sucursalId: number; operadorId: number | null; usuarioId?: number | null;
+    transferenciaId?: number | null; motivo?: string;
+    /** Asentado después: comienzo del turno. Sin esto, es ahora. */
+    fecha?: Date | null; turno?: 'manana' | 'tarde';
+    items: { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number | null }[];
+  }) {
+    const items = f.items.filter((i) => i.paquetes !== 0);
+    if (!items.length) return null;
+    const [h] = await tx.insert(fraccionamientos).values({
+      ...(f.fecha ? { fecha: f.fecha } : {}),
+      turno: f.turno ?? this.turnoDe(new Date()),
+      origen: f.origen,
+      sucursalId: f.sucursalId,
+      operadorId: f.operadorId,
+      usuarioId: f.usuarioId ?? null,
+      kg: this.cant3(items.reduce((a, i) => a + i.paquetes * i.tamKg, 0)),
+      paquetes: items.reduce((a, i) => a + i.paquetes, 0),
+      transferenciaId: f.transferenciaId ?? null,
+      motivo: f.motivo ?? '',
+    }).returning({ id: fraccionamientos.id });
+    await tx.insert(fraccionamientoItems).values(items.map((i) => ({
+      fraccionamientoId: h.id, productoId: i.productoId, presentacionId: i.presentacionId,
+      tamKg: i.tamKg, paquetes: i.paquetes, movimientoId: i.movimientoId,
+    })));
+    return h.id as number;
+  }
   /**
    * Los productos de un lote de renglones en UNA consulta, por id. Es lo que
    * usan las operaciones que recorren los ítems de un documento (la venta que
@@ -406,35 +499,104 @@ export class InventarioService {
     });
   }
 
-  /** Fraccionamiento: descuenta granel y crea paquetes (misma sucursal). */
+  /**
+   * Fraccionamiento de UN producto: descuenta granel y crea paquetes (misma
+   * sucursal). Lo usan los seeds y los CRM que todavía no tienen el registro
+   * con renglones (el que queda abierto durante el deploy): por dentro es un
+   * registro de un solo producto.
+   */
   async opFraccionar(o: any) {
+    const items = (o.asignaciones || []).map((a: any) => ({ productoId: o.productoId, presId: a.presId, cant: a.cant }));
+    const r = await this.opFraccionarRegistro({ ...o, items });
+    const foto = r.fotos.find((f: any) => f.producto?.id === o.productoId) ?? r.fotos[0];
+    return { ok: true, movimiento: r.movimientos[0], ...foto };
+  }
+
+  /**
+   * REGISTRAR FRACCIONADO: la tanda de trabajo, con cabecera (sucursal,
+   * operador, observaciones) y renglones de uno o varios productos.
+   *
+   * TODO O NADA: una sola transacción. Si a un producto no le alcanza el
+   * granel, no queda registrado ninguno — la mitad de una tanda cargada es
+   * peor que ninguna, porque el que la cargó cree que quedó entera.
+   *
+   * Un movimiento de stock por producto (el libro del almacén es por
+   * producto) y UN registro en el historial con todos los renglones.
+   * Los productos se recorren por id: dos registros simultáneos que tocan los
+   * mismos productos toman los candados de stock en el mismo orden.
+   */
+  async opFraccionarRegistro(o: {
+    sucursalId: number; usuarioId?: number; operadorId?: number; motivo?: string;
+    dia?: string; turno?: 'manana' | 'tarde';
+    items: { productoId: number; presId: number; cant: number }[];
+  }) {
+    // Antes de abrir la transacción: una fecha imposible no toca nada.
+    const momento = this.momentoDeFraccionado(o.dia, o.turno);
     return this.db.transaction(async (tx) => {
-      const prod = await this.getProducto(tx, o.productoId);
-      if (!prod || prod.tipo !== 'granel') throw new BadRequestException('Solo productos a granel se fraccionan.');
       const sucId = o.sucursalId;
-      const presList = await tx.select().from(presentaciones).where(eq(presentaciones.productoId, prod.id));
-      const byId = new Map<number, any>(presList.map((p: any) => [p.id, p]));
-      let total = 0;
-      const asign: { pres: any; q: number }[] = [];
-      for (const a of o.asignaciones || []) {
-        const pres = byId.get(Number(a.presId));
-        const q = Math.round(Number(a.cant) || 0);
-        if (pres && q > 0) { total += q * pres.tamKg; asign.push({ pres, q }); }
+      /* Renglones agrupados por producto y tamaño: el mismo paquete cargado
+       * dos veces suma, no se registra dos veces. */
+      const porProducto = new Map<number, Map<number, number>>();
+      for (const it of o.items || []) {
+        const q = Math.round(Number(it.cant) || 0);
+        if (!(q > 0)) continue;
+        const pid = Number(it.productoId);
+        const m = porProducto.get(pid) ?? new Map<number, number>();
+        m.set(Number(it.presId), (m.get(Number(it.presId)) ?? 0) + q);
+        porProducto.set(pid, m);
       }
-      if (total <= 0) throw new BadRequestException('Indicá al menos un paquete a fraccionar.');
-      const disp = await this.cant(tx, prod.id, sucId, null, 'disponible');
-      if (total > disp + 1e-9) throw new BadRequestException(`No alcanza el granel disponible. Disponible: ${disp} kg, necesario: ${total} kg.`);
-      await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: null, estado: 'disponible' }, -total);
-      for (const { pres, q } of asign) {
-        await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: pres.id, estado: 'disponible' }, q);
+      if (!porProducto.size) throw new BadRequestException('Agregá al menos un paquete a fraccionar.');
+      const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, true);
+
+      const ids = [...porProducto.keys()].sort((a, b) => a - b);
+      const [prods, presList] = await Promise.all([
+        this.productosDe(tx, ids),
+        tx.select().from(presentaciones).where(inArray(presentaciones.productoId, ids)),
+      ]);
+      const presPorId = new Map<number, any>(presList.map((p: any) => [p.id, p]));
+
+      const renglones: { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number | null }[] = [];
+      const movimientos: any[] = [];
+      for (const pid of ids) {
+        const prod = prods.get(pid);
+        if (!prod || prod.tipo !== 'granel') throw new BadRequestException('Solo productos a granel se fraccionan.');
+        const asign: { pres: any; q: number }[] = [];
+        for (const [presId, q] of porProducto.get(pid)!) {
+          const pres = presPorId.get(presId);
+          if (!pres || pres.productoId !== pid) throw new BadRequestException(`Ese paquete no es de ${prod.nombre}.`);
+          asign.push({ pres, q });
+        }
+        asign.sort((a, b) => b.pres.tamKg - a.pres.tamKg);
+        const total = this.cant3(asign.reduce((a, x) => a + x.q * x.pres.tamKg, 0));
+        const disp = await this.cant(tx, pid, sucId, null, 'disponible');
+        if (total > disp + 1e-9) {
+          throw new BadRequestException(`No alcanza el granel de ${prod.nombre}: hay ${this.cant3(disp)} kg y se necesitan ${total} kg.`);
+        }
+        await this.addDelta(tx, { productoId: pid, sucursalId: sucId, presentacionId: null, estado: 'disponible' }, -total);
+        for (const { pres, q } of asign) {
+          await this.addDelta(tx, { productoId: pid, sucursalId: sucId, presentacionId: pres.id, estado: 'disponible' }, q);
+        }
+        const m = await this.mov(tx, {
+          tipo: 'fraccionamiento', productoId: pid, sucursalId: sucId, signo: 0, cantidad: total, unidad: 'kg',
+          presLabel: 'Granel → paquetes', usuarioId: o.usuarioId ?? null,
+          descripcion: `Fraccionó ${total} kg en ${asign.map(({ pres, q }) => `${q}×${this.fmtTam(pres.tamKg)}`).join(', ')}`,
+        });
+        movimientos.push(m);
+        for (const { pres, q } of asign) {
+          renglones.push({ productoId: pid, presentacionId: pres.id, tamKg: pres.tamKg, paquetes: q, movimientoId: m.id });
+        }
       }
-      const detalle = asign.map(({ pres, q }) => `${q}×${this.fmtTam(pres.tamKg)}`).join(', ');
-      const m = await this.mov(tx, {
-        tipo: 'fraccionamiento', productoId: prod.id, sucursalId: sucId, signo: 0, cantidad: total, unidad: 'kg',
-        presLabel: 'Granel → paquetes', usuarioId: o.usuarioId ?? null,
-        descripcion: `Fraccionó ${total} kg en ${detalle}`,
+
+      const registroId = await this.registrarFraccionamiento(tx, {
+        origen: 'manual', sucursalId: sucId, operadorId, usuarioId: o.usuarioId,
+        motivo: (o.motivo ?? '').trim(), items: renglones, fecha: momento.fecha, turno: momento.turno,
       });
-      return { ok: true, movimiento: m, ...(await this.fotoProducto(tx, prod.id)) };
+      const fotos = await Promise.all(ids.map((pid) => this.fotoProducto(tx, pid)));
+      return {
+        ok: true, registroId, movimientos, fotos,
+        paquetes: renglones.reduce((a, r) => a + r.paquetes, 0),
+        kg: this.cant3(renglones.reduce((a, r) => a + r.paquetes * r.tamKg, 0)),
+      };
     });
   }
 
@@ -469,6 +631,8 @@ export class InventarioService {
       const actual = await this.cant(tx, prod.id, sucId, pres.id, 'disponible');
       const delta = real - actual;
       if (Math.abs(delta) < 1e-9) return { ok: true, sinCambios: true, ...(await this.fotoProducto(tx, prod.id)) };
+      // Opcional: el que corrige días después puede no saber de quién era la tanda.
+      const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, false);
 
       const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
       if (delta > 0) {
@@ -491,6 +655,11 @@ export class InventarioService {
         signo: 0, cantidad: kg, unidad: 'kg', presLabel: `Corrección · ${tam}`,
         usuarioId: o.usuarioId ?? null, motivo: (o.motivo ?? '').trim(),
         descripcion: `Corrigió ${tam}: ${actual} → ${real} paquetes (${kg} kg ${delta > 0 ? 'salen del' : 'vuelven al'} granel)`,
+      });
+      await this.registrarFraccionamiento(tx, {
+        origen: 'correccion', sucursalId: sucId, operadorId, usuarioId: o.usuarioId,
+        motivo: (o.motivo ?? '').trim(),
+        items: [{ productoId: prod.id, presentacionId: pres.id, tamKg: pres.tamKg, paquetes: Math.round(delta), movimientoId: m.id }],
       });
       return { ok: true, movimiento: m, delta, kg, ...(await this.fotoProducto(tx, prod.id)) };
     });
@@ -1393,7 +1562,7 @@ export class InventarioService {
    * El reclamo del flag es atómico (`WHERE flag = <contrario>`): dos clics
    * simultáneos en Confirmar reservarían dos veces — solo uno gana el UPDATE.
    */
-  async confirmarListaTransferencia(id: number, o: { tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number }, soloSuc?: number | null) {
+  async confirmarListaTransferencia(id: number, o: { tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number; operadorId?: number }, soloSuc?: number | null) {
     if (o.tipo !== 'enteros' && o.tipo !== 'granel') throw new BadRequestException('Lista inválida.');
     return this.db.transaction(async (tx) => {
       const t = await this.transferEnPreparacion(tx, id, soloSuc);
@@ -1435,7 +1604,7 @@ export class InventarioService {
        */
       let armados: string[] = [];
       let recortes: string[] = [];
-      if (o.listo) ({ armados, recortes } = await this.completarPreparado(tx, t, mios, o.usuarioId));
+      if (o.listo) ({ armados, recortes } = await this.completarPreparado(tx, t, mios, o.usuarioId, o.operadorId));
 
       const etiqueta = o.tipo === 'enteros' ? 'Enteros' : 'Fraccionados';
       for (const { it, prod } of mios) {
@@ -1485,9 +1654,16 @@ export class InventarioService {
     t: any,
     mios: { it: any; prod: any }[],
     usuarioId?: number,
+    operadorPedido?: number,
   ): Promise<{ armados: string[]; recortes: string[] }> {
     const armados: string[] = [];
     const recortes: string[] = [];
+    /* El operador se resuelve la PRIMERA vez que hace falta armar: una lista
+     * que ya tenía los paquetes hechos no fracciona nada y no tiene por qué
+     * pedirlo. `undefined` = todavía no se preguntó. */
+    let operadorId: number | null | undefined;
+    /* Todo lo que esta confirmación arme va a UN registro del historial. */
+    const renglonesArmados: { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number }[] = [];
 
     const presIds = Array.from(
       new Set(mios.map(({ it }) => it.presentacionId).filter((x: any) => x != null)),
@@ -1507,16 +1683,22 @@ export class InventarioService {
         const granel = await this.cant(tx, it.productoId, t.origenId, null, 'disponible');
         const armar = Math.min(faltan, Math.floor(granel / pres.tamKg + 1e-9));
         if (armar > 0) {
+          if (operadorId === undefined) {
+            operadorId = await this.operadorDeFraccion(tx, operadorPedido, t.origenId, true);
+          }
           const kg = Math.round(armar * pres.tamKg * 1000) / 1000;
           const base = { productoId: it.productoId, sucursalId: t.origenId, estado: 'disponible' as const };
           await this.addDelta(tx, { ...base, presentacionId: null }, -kg);
           await this.addDelta(tx, { ...base, presentacionId: it.presentacionId }, armar);
-          await this.mov(tx, {
+          const m = await this.mov(tx, {
             tipo: 'fraccionamiento', productoId: it.productoId, sucursalId: t.origenId,
             presentacionId: it.presentacionId, signo: 0, cantidad: kg, unidad: 'kg',
             presLabel: `Granel → ${this.fmtTam(pres.tamKg)}`,
             refTransferenciaId: t.id, usuarioId: usuarioId ?? null,
             descripcion: `${t.codigo}: fraccionó ${kg} kg en ${armar}×${this.fmtTam(pres.tamKg)} para completar el pedido`,
+          });
+          renglonesArmados.push({
+            productoId: it.productoId, presentacionId: it.presentacionId, tamKg: pres.tamKg, paquetes: armar, movimientoId: m.id,
           });
           armados.push(`${prod.nombre}: ${armar}×${this.fmtTam(pres.tamKg)} (${kg} kg de granel)`);
           disp += armar;
@@ -1540,6 +1722,12 @@ export class InventarioService {
       recortes.push(
         `${prod.nombre}: quedó en ${this.fmtCant(prod.tipo, it.presentacionId, hay)} (faltó para ${this.fmtCant(prod.tipo, it.presentacionId, antes)})`,
       );
+    }
+    if (renglonesArmados.length) {
+      await this.registrarFraccionamiento(tx, {
+        origen: 'pedido', sucursalId: t.origenId, operadorId: operadorId ?? null, usuarioId,
+        transferenciaId: t.id, items: renglonesArmados,
+      });
     }
     return { armados, recortes };
   }

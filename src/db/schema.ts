@@ -1149,6 +1149,65 @@ export const movimientos = pgTable('movimientos', {
   ixSucTipoFecha: index('ix_mov_suc_tipo_fecha').on(t.sucursalId, t.tipo, t.fecha.desc()),
 }));
 
+/* ---------------- Historial de fraccionamiento (0102) ---------------- */
+/**
+ * Las personas que fraccionan, sin usuario ni clave: el puesto trabaja con una
+ * cuenta compartida. No se borran (el historial las nombra), se desactivan.
+ * `sucursalId` null = trabaja en cualquier sucursal. El nombre es único sin
+ * mirar mayúsculas (índice sobre `lower(btrim(nombre))`, en la migración).
+ */
+export const fraccionOperadores = pgTable('fraccion_operadores', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  activo: boolean('activo').notNull().default(true),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * El REGISTRO de fraccionado, como un comprobante: cabecera + renglones, y un
+ * registro puede traer varios productos. `origen`: manual | correccion |
+ * pedido. `kg` y `paquetes` van con SIGNO (una corrección puede devolver kilos
+ * al granel) y desnormalizados para pintar la fila; los totales salen de los
+ * renglones.
+ */
+export const fraccionamientos = pgTable('fraccionamientos', {
+  id: serial('id').primaryKey(),
+  /** Cuándo se HIZO. Asentado después, es el comienzo de ese turno. */
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  turno: text('turno').$type<'manana' | 'tarde'>().notNull(),
+  /** Cuándo se CARGÓ. Igual a `fecha` si se cargó en el momento. */
+  registradoEn: timestamp('registrado_en', { withTimezone: true }).notNull().defaultNow(),
+  origen: text('origen').$type<'manual' | 'correccion' | 'pedido'>().notNull(),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  operadorId: integer('operador_id').references(() => fraccionOperadores.id, { onDelete: 'restrict' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  kg: doublePrecision('kg').notNull().default(0),
+  paquetes: integer('paquetes').notNull().default(0),
+  transferenciaId: integer('transferencia_id').references(() => transferencias.id, { onDelete: 'set null' }),
+  motivo: text('motivo').notNull().default(''),
+}, (t) => ({
+  ixFecha: index('ix_fracc_fecha').on(t.fecha.desc(), t.id.desc()),
+  ixSucFecha: index('ix_fracc_suc_fecha').on(t.sucursalId, t.fecha.desc()),
+  ixOperFecha: index('ix_fracc_oper_fecha').on(t.operadorId, t.fecha.desc()),
+}));
+
+/**
+ * Qué producto, de qué tamaño y cuántos paquetes. El tamaño se CONGELA al
+ * fraccionar. `movimientoId`: el movimiento de stock de ese producto.
+ */
+export const fraccionamientoItems = pgTable('fraccionamiento_items', {
+  id: serial('id').primaryKey(),
+  fraccionamientoId: integer('fraccionamiento_id').notNull().references(() => fraccionamientos.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').references(() => productos.id, { onDelete: 'set null' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
+  tamKg: doublePrecision('tam_kg').notNull(),
+  paquetes: integer('paquetes').notNull(),
+  movimientoId: integer('movimiento_id').references(() => movimientos.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixProd: index('ix_fracc_items_prod').on(t.productoId, t.fraccionamientoId),
+}));
+
 /* ---------------- Control de stock (0066) ---------------- */
 /**
  * El físico contra el virtual, como SESIÓN de trabajo: dura horas, se

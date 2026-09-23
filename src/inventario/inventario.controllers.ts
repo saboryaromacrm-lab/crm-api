@@ -39,7 +39,7 @@ import {
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
-  Max, MaxLength, Min, ValidateNested,
+  Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
@@ -102,6 +102,26 @@ class FraccionarDto {
   @IsOptional() @IsInt() sucursalId?: number;
   @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => AsignacionDto)
   asignaciones!: AsignacionDto[];
+  /** Quién fraccionó (0102): obligatorio en cuanto hay operadores cargados. */
+  @IsOptional() @IsInt() operadorId?: number;
+}
+
+class RenglonFraccionadoDto {
+  @IsInt() productoId!: number;
+  @IsInt() presId!: number;
+  @IsInt() @Min(1) @Max(MAX_CANT) cant!: number;
+}
+
+/** Registrar fraccionado: la cabecera y los renglones de la tanda (0102). */
+class FraccionarRegistroDto {
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() operadorId?: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  /** Para asentar un fraccionado que se olvidó cargar: el día y el turno en que se hizo. */
+  @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/) dia?: string;
+  @IsOptional() @IsIn(['manana', 'tarde']) turno?: 'manana' | 'tarde';
+  @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => RenglonFraccionadoDto)
+  items!: RenglonFraccionadoDto[];
 }
 
 class CorregirFraccionadoDto {
@@ -120,6 +140,7 @@ class CorregirFraccionadoDto {
    */
   @IsNumber() @Min(0) @Max(MAX_CANT) cantidadReal!: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  @IsOptional() @IsInt() operadorId?: number;
 }
 
 class MovimientoDto {
@@ -173,6 +194,8 @@ class AgregarItemDto {
 class ConfirmarListaDto {
   @IsIn(['enteros', 'granel']) tipo!: 'enteros' | 'granel';
   @IsBoolean() listo!: boolean;
+  /** Solo lo mira la lista de granel, y solo si confirmar tiene que fraccionar. */
+  @IsOptional() @IsInt() operadorId?: number;
 }
 
 class ItemRecibidoDto {
@@ -352,6 +375,13 @@ export class OperacionesController {
   @Permiso('fraccionar')
   fraccionar(@Body() dto: FraccionarDto, @Auth() sesion: Sesion) {
     return this.inv.opFraccionar({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+  }
+
+  /** Registrar fraccionado: uno o varios productos, todo o nada. */
+  @Post('fraccionar-registro')
+  @Permiso('fraccionar')
+  fraccionarRegistro(@Body() dto: FraccionarRegistroDto, @Auth() sesion: Sesion) {
+    return this.inv.opFraccionarRegistro({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId)! });
   }
 
   /** "Puse 20 paquetes y son 19": ajusta los paquetes Y el granel de una vez. */
