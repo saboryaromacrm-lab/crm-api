@@ -166,6 +166,34 @@ class ImportarDto {
   }) items!: any[];
 }
 
+/**
+ * UN RENGLÓN DEL ARCHIVO DE COSTOS, sin nada del producto (23/9/2026). Es lo
+ * que pidió el dueño: actualizar solo el formato de compra de un proveedor
+ * sin volver a exportar ni a subir el listado de productos, que ya está
+ * cargado. El único dato que identifica al producto es su código interno —
+ * el mismo con el que ya existe en el catálogo.
+ */
+class CostoItemDto {
+  @IsString() codigoPropio!: string;
+  @IsOptional() @IsNumber() @Min(0) cantidad?: number;
+  @IsOptional() @IsNumber() @Min(0) costo?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento2?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento3?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100) descuento4?: number;
+  @IsOptional() @IsNumber() @Min(0) flete?: number;
+  @IsOptional() @IsIn(['lista', 'final']) modoCosto?: 'lista' | 'final';
+  @IsOptional() @IsNumber() @Min(0) costoFinal?: number;
+  @IsOptional() @IsString() @MaxLength(40) codigoProveedor?: string;
+}
+
+class ImportarCostosDto {
+  @IsInt() proveedorId!: number;
+  @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
+    message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
+  }) items!: CostoItemDto[];
+}
+
 @Injectable()
 export class ProductosService {
   constructor(
@@ -952,6 +980,129 @@ export class ProductosService {
     };
   }
 
+  /**
+   * ACTUALIZAR SOLO COSTOS DE UN PROVEEDOR (23/9/2026), sin el listado de
+   * productos. El pedido del dueño: cuando el catálogo ya está cargado, volver
+   * a exportar y subir el maestro entero para cambiar un precio de lista es
+   * doble trabajo — acá alcanza con el código, que es el mismo que el producto
+   * ya tiene.
+   *
+   * Regla fijada con el dueño: si el producto YA tenía el formato de compra de
+   * este proveedor, el archivo nuevo LO PISA (costo, descuentos, flete, código
+   * del proveedor) — es una lista de precios que reemplaza a la anterior, no
+   * una alternativa más. Si no lo tenía, se lo agrega.
+   *
+   * Un código que no matchea ningún producto NO CREA NADA: sin el maestro no
+   * hay nombre, marca ni categoría de dónde sacarlo, y una ficha a medias es
+   * peor que no importarla. Se informa aparte para que se cargue el producto
+   * primero, en Compras › Productos.
+   */
+  async importarCostos(dto: ImportarCostosDto, usuarioId: number | null) {
+    const items = dto.items || [];
+    if (!items.length) throw new BadRequestException('No hay nada para importar.');
+
+    const [prov] = await this.db.select().from(proveedores)
+      .where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
+    if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
+
+    const codigos = [...new Set(items.map((it) => (it.codigoPropio ?? '').trim()).filter(Boolean))];
+    const encontrados = codigos.length
+      ? await this.db.select({ id: productos.id, codigoPropio: productos.codigoPropio, nombre: productos.nombre, estado: productos.estado })
+        .from(productos).where(inArray(productos.codigoPropio, codigos))
+      : [];
+    const porCodigo = new Map(encontrados.map((p) => [p.codigoPropio, p]));
+
+    const idsEncontrados = encontrados.map((p) => p.id);
+    const formatosDeEstos = idsEncontrados.length
+      ? await this.db.select({ id: productoProveedores.id, productoId: productoProveedores.productoId, proveedorId: productoProveedores.proveedorId })
+        .from(productoProveedores).where(inArray(productoProveedores.productoId, idsEncontrados))
+      : [];
+    const formatoDe = new Map(
+      formatosDeEstos.filter((f) => f.proveedorId === prov.id).map((f) => [f.productoId, f.id]),
+    );
+    const cantidadFormatos = new Map<number, number>();
+    for (const f of formatosDeEstos) cantidadFormatos.set(f.productoId, (cantidadFormatos.get(f.productoId) ?? 0) + 1);
+
+    const noEncontrados: { codigo: string; motivo: string }[] = [];
+    const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
+    const aActualizar: { id: number; productoId: number; nombre: string; codigo: string; it: CostoItemDto }[] = [];
+    const aAgregar: { productoId: number; nombre: string; codigo: string; esPrimero: boolean; it: CostoItemDto }[] = [];
+    const vistos = new Set<string>();
+
+    for (const it of items) {
+      const codigo = (it.codigoPropio ?? '').trim();
+      if (!codigo) { noEncontrados.push({ codigo: '', motivo: 'renglón sin código' }); continue; }
+      if (vistos.has(codigo)) { saltados.push({ codigo, nombre: '', motivo: 'código repetido en el archivo' }); continue; }
+      const prod = porCodigo.get(codigo);
+      if (!prod) {
+        noEncontrados.push({ codigo, motivo: 'no hay ningún producto con este código — cargalo primero en Compras › Productos' });
+        continue;
+      }
+      if (prod.estado === 'archivado') {
+        saltados.push({ codigo, nombre: prod.nombre, motivo: 'está archivado — reactivalo antes de cargarle un costo' });
+        continue;
+      }
+      vistos.add(codigo);
+      const formatoId = formatoDe.get(prod.id);
+      if (formatoId) {
+        aActualizar.push({ id: formatoId, productoId: prod.id, nombre: prod.nombre, codigo, it });
+      } else {
+        aAgregar.push({ productoId: prod.id, nombre: prod.nombre, codigo, esPrimero: !cantidadFormatos.get(prod.id), it });
+      }
+    }
+
+    if (!aActualizar.length && !aAgregar.length) {
+      return { ok: true, actualizados: 0, agregados: [], noEncontrados, saltados };
+    }
+
+    const valores = (it: CostoItemDto) => ({
+      cantidad: Number(it.cantidad) > 0 ? Number(it.cantidad) : 1,
+      costo: Number(it.costo) || 0,
+      descuento: Number(it.descuento) || 0,
+      descuento2: Number(it.descuento2) || 0,
+      descuento3: Number(it.descuento3) || 0,
+      descuento4: Number(it.descuento4) || 0,
+      flete: Number(it.flete) || 0,
+      modoCosto: (it.modoCosto === 'final' ? 'final' : 'lista') as 'lista' | 'final',
+      costoFinal: Number(it.costoFinal) || 0,
+      codigoProveedor: (it.codigoProveedor ?? '').trim(),
+    });
+
+    await this.db.transaction(async (tx) => {
+      for (const v of aActualizar) {
+        await tx.update(productoProveedores).set(valores(v.it)).where(eq(productoProveedores.id, v.id));
+      }
+      for (const v of aAgregar) {
+        await tx.insert(productoProveedores).values({
+          productoId: v.productoId, proveedorId: prov.id, usarParaPrecio: v.esPrimero, ...valores(v.it),
+        });
+      }
+    });
+
+    /*
+     * LA EVOLUCIÓN SE FIRMA, y con TODOS los tocados — actualizados y nuevos.
+     * Sin esto el cambio de costo mueve el precio (si la lista es por margen)
+     * pero no queda registrado en ningún lado, y el aviso de cambio de
+     * precios nunca le llega al cajero. Es el mismo snapshot que dispara
+     * `setFormatosCompra`, con la misma firma de autor.
+     */
+    const idsTocados = [...new Set([...aActualizar.map((v) => v.productoId), ...aAgregar.map((v) => v.productoId)])];
+    if (idsTocados.length) {
+      await this.evolucion.snapshot(idsTocados, 'formato_compra', {
+        usuarioId, detalle: `Importación de costos · ${prov.nombre}`,
+      });
+    }
+
+    return {
+      ok: true,
+      proveedor: prov.nombre,
+      actualizados: aActualizar.map((v) => ({ codigo: v.codigo, nombre: v.nombre })),
+      agregados: aAgregar.map((v) => ({ codigo: v.codigo, nombre: v.nombre, fijaPrecio: v.esPrimero })),
+      noEncontrados,
+      saltados,
+    };
+  }
+
   async update(id: number, dto: UpsertProductoDto) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -1577,6 +1728,13 @@ export class ProductosController {
   /** Catálogo completo de un proveedor, en una sola transacción. */
   @Permiso('compras.productos')
   @Post('importar') importar(@Body() dto: ImportarDto) { return this.svc.importar(dto); }
+
+  /** Solo costos, sin el maestro: ver el comentario del servicio. */
+  @Permiso('compras.productos')
+  @Post('importar-costos')
+  importarCostos(@Body() dto: ImportarCostosDto, @Auth() sesion: Sesion) {
+    return this.svc.importarCostos(dto, sesion?.usuarioId ?? null);
+  }
   @Permiso('compras.productos')
   @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
     return this.svc.update(id, dto);
