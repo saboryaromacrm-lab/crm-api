@@ -60,6 +60,10 @@ const TABLAS_PRACTICA = [
   'transferencias', 'transferencia_items', 'transferencia_hist',
   'incidencias',
   'vencimiento_sesiones', 'vencimientos',
+  // historial de fraccionamiento (0102): referencia a movimientos y a
+  // transferencias, así que sin él acá el TRUNCATE se niega y la limpieza
+  // entera no corre. Los OPERADORES quedan: son personas, como los usuarios.
+  'fraccionamientos', 'fraccionamiento_items',
   // compras: comprobantes (facturas, remitos, liquidaciones) y la bandeja
   'comprobantes', 'comprobante_items', 'comprobante_percepciones',
   'factura_lecturas', 'factura_archivos',
