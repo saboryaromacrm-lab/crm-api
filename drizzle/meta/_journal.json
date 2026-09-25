@@ -729,6 +729,13 @@
       "when": 1790070000000,
       "tag": "0103_stock_practica_granel",
       "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1790080000000,
+      "tag": "0104_cajero_cobra_cuentas",
+      "breakpoints": true
     }
   ]
 }

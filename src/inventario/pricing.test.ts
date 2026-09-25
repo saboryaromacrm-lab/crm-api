@@ -117,6 +117,27 @@ test('precioVentaFila: modo precio — el final del formato es exacto, sin gónd
   cerca(p.netoUnitario, 10000 / 1.21 / 12, 'neto unitario', 0.01);
 });
 
+test('precioVentaFila: el neto exacto vuelve al final de la góndola en el ticket', () => {
+  // La cuenta del renglón de `calcularTotales`: neto e IVA redondeados por separado.
+  const m = (n: number) => Math.round(n * 100) / 100;
+  const ticket = (q: number, neto: number, iva: number) => m(m(q * neto) + m((q * neto * iva) / 100));
+  // El caso que encontró la cajera: $676 con 10,5% cobraba $675,99.
+  const sal = precioVentaFila(0, { modoPrecio: 'precio', precioFijo: 676 }, { iva: 10.5 });
+  assert.equal(ticket(1, sal.netoUnitario, 10.5), 675.99, 'con el neto de 2 decimales se perdía el centavo');
+  assert.equal(ticket(1, sal.netoExacto, 10.5), 676);
+  let fallas = 0;
+  for (const iva of [21, 10.5, 27, 0]) {
+    for (let final = 1; final <= 3000; final++) {
+      const pv = precioVentaFila(0, { modoPrecio: 'precio', precioFijo: final }, { iva });
+      for (const q of [1, 2, 3, 7, 12, 100, 1000, 0.25, 1.5]) if (ticket(q, pv.netoExacto, iva) !== m(final * q)) fallas++;
+    }
+  }
+  assert.equal(fallas, 0, 'ningún precio entero, alícuota ni cantidad cobra distinto del cartel');
+  // La caja de 12 a $10.000: 12 unidades sueltas suman exacto los $10.000.
+  const caja = precioVentaFila(0, { unidades: 12, modoPrecio: 'precio', precioFijo: 10000 }, { iva: 21 });
+  assert.equal(ticket(12, caja.netoExacto, 21), 10000);
+});
+
 test('formatoActivo: el marcado para precio, si no el primero', () => {
   const a = { id: 'a', usarParaPrecio: false };
   const b = { id: 'b', usarParaPrecio: true };

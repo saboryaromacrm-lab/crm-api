@@ -313,6 +313,16 @@ export interface PrecioVenta {
   finalUnitario: number;
   /** Lo que ve el cliente por el formato entero (la caja). */
   finalFormato: number;
+  /**
+   * EL NETO QUE COBRA LA CAJA: el final de la góndola dividido por el IVA, sin
+   * cortarlo a 2 decimales. `netoUnitario` redondeado no vuelve al final: $676
+   * con 10,5% es 611,764… → 611,76 → × 1,105 = $675,99, y la caja cobraba un
+   * centavo distinto del cartel. Va SIN redondear, a propósito: cortarlo en 6
+   * decimales fabrica empates de medio centavo (×100, ×1000) que vuelven a
+   * errarle por uno. Sin cortar, 800.000 combinaciones de precio, IVA y
+   * cantidad dan el cartel exacto (ver pricing.test).
+   */
+  netoExacto: number;
 }
 
 /**
@@ -340,6 +350,7 @@ export function precioVentaFila(costoNetoUnitario: number, fila: FilaVenta, opts
       netoUnitario: money(finalFormato / (1 + iva / 100) / unidades),
       finalUnitario,
       finalFormato,
+      netoExacto: finalFormato / (1 + iva / 100) / unidades,
     };
   }
 
@@ -350,6 +361,7 @@ export function precioVentaFila(costoNetoUnitario: number, fila: FilaVenta, opts
     netoUnitario,
     finalUnitario,
     finalFormato: money(finalUnitario * unidades),
+    netoExacto: finalUnitario / (1 + iva / 100),
   };
 }
 
@@ -362,6 +374,8 @@ export interface OpcionesPrecio {
 }
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+/** 6 decimales: para un precio tipeado a mano (el de lista va sin cortar). */
+export const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
 
 /**
  * El COSTO REAL unitario: lo que la mercadería cuesta de verdad. Es el que

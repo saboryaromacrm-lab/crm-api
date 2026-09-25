@@ -117,8 +117,10 @@ export class CobranzasService {
 
   /* ------------------------------ Lectura ------------------------------ */
 
-  async list(q: { clienteId?: number; estado?: string; limit?: number }) {
+  async list(q: { clienteId?: number; estado?: string; limit?: number; sucursalId?: number }) {
     const conds: any[] = [];
+    // El cajero ve los recibos de SU sucursal: lo pone el controlador desde la sesión.
+    if (q.sucursalId) conds.push(eq(cobranzas.sucursalId, Number(q.sucursalId)));
     if (q.clienteId) conds.push(eq(cobranzas.clienteId, Number(q.clienteId)));
     if (q.estado) conds.push(eq(cobranzas.estado, q.estado as any));
 
@@ -160,7 +162,14 @@ export class CobranzasService {
 
   /* ------------------------------ Escritura ------------------------------ */
 
+  /**
+   * Correlativo del recibo. Mismo turno consultivo que la numeración de ventas
+   * (25/9/2026): desde que el cajero cobra cuentas corrientes, varias cajas
+   * emiten recibos a la vez con el mismo punto de venta, y "el máximo + 1" leído
+   * en paralelo repetía el número contra `uq_cobranzas_numero`.
+   */
   private async siguienteNumero(tx: any, puntoVenta: string) {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cobranzas_numero:${puntoVenta}`}))`);
     const [r] = await tx
       .select({ max: sql<number>`coalesce(max(${cobranzas.numero}), 0)` })
       .from(cobranzas)
@@ -451,15 +460,30 @@ export class CobranzasService {
 export class CobranzasController {
   constructor(private readonly svc: CobranzasService) {}
 
+  /*
+   * LAS LECTURAS TAMBIÉN SON POR SUCURSAL (25/9/2026). Con el cajero cobrando
+   * cuentas corrientes, el listado sin filtro le mostraba los recibos de todos
+   * los locales con cliente, importe y medio. Mismo criterio que Caja y el
+   * listado de Ventas: el jefe ve todo, el cajero lo de su sucursal.
+   */
   @Get()
-  list(@Query('clienteId') clienteId?: string, @Query('estado') estado?: string, @Query('limit') limit?: string) {
+  list(
+    @Auth() sesion: Sesion,
+    @Query('clienteId') clienteId?: string, @Query('estado') estado?: string, @Query('limit') limit?: string,
+  ) {
     return this.svc.list({
       clienteId: clienteId ? Number(clienteId) : undefined,
       estado, limit: limit ? Number(limit) : undefined,
+      sucursalId: this.opciones(sesion).soloSuSucursal,
     });
   }
 
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Get(':id') async get(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    const c = await this.svc.get(id);
+    const mia = this.opciones(sesion).soloSuSucursal;
+    if (mia && c.sucursalId !== mia) throw new ForbiddenException('Ese recibo es de otra sucursal.');
+    return c;
+  }
 
   /** Lo que la sesión habilita, en un solo lugar (igual que en Ventas). */
   private opciones(sesion: Sesion): OpcionesCobranza {

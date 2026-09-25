@@ -124,6 +124,22 @@ export class ClientesService {
    */
   private async validarDocumento(dto: UpsertClienteDto, excluirId?: number) {
     const tipoDoc = dto.tipoDoc ?? 'dni';
+    /*
+     * EL DNI VA CON NÚMEROS (25/9/2026). `soloDigitos` limpiaba todo lo que no
+     * fuera número, así que "abc" quedaba en vacío y el cliente se guardaba SIN
+     * documento, sin ningún aviso. Se aceptan puntos, espacios y guiones (así se
+     * tipea), y entre 6 y 8 dígitos: 8 los actuales, 7 y 6 los más viejos.
+     */
+    if (tipoDoc === 'dni') {
+      const crudo = (dto.numeroDoc ?? '').trim();
+      if (crudo && /[^\d.\s-]/.test(crudo)) {
+        throw new BadRequestException('El DNI va solo con números (puede llevar puntos).');
+      }
+      const digitos = soloDigitos(crudo);
+      if (digitos && (digitos.length < 6 || digitos.length > 8)) {
+        throw new BadRequestException(`El DNI tiene entre 6 y 8 dígitos: llegó con ${digitos.length}.`);
+      }
+    }
     const numeroDoc = soloDigitos(dto.numeroDoc);
     if (!numeroDoc) return { tipoDoc, numeroDoc: '' };
 

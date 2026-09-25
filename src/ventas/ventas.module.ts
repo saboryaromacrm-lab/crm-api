@@ -45,7 +45,7 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila, r6 } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
@@ -351,6 +351,10 @@ class VentaItemDto {
  * que nadie se entere -- que es la peor forma de perder plata.
  */
 const PLANES_CUOTAS = [1, 3, 6] as const;
+
+/** El renglón que agrega el plan de cuotas al cobrar: "Recargo 3 cuotas (20%)". */
+const RE_RECARGO_CUOTAS = /^Recargo \d+ cuotas? \(/;
+const esRecargoCuotas = (concepto?: string | null) => RE_RECARGO_CUOTAS.test(String(concepto ?? ''));
 
 /** El % configurado para un plan. Sin plan o sin config, no hay recargo. */
 function porcentajeRecargo(config: any, cuotas?: number | null): number {
@@ -1249,6 +1253,8 @@ export class VentasService {
             ...f,
             orden: porLista.get(f.listaId)!.orden,
             netoUnitario: pv.netoUnitario,
+            /* El que cobra la caja: vuelve EXACTO al final de la góndola. */
+            netoExacto: pv.netoExacto,
             finalUnitario: pv.finalUnitario,
             /*
              * EL PRECIO DEL BULTO ENTERO, y no el unitario multiplicado.
@@ -1316,7 +1322,7 @@ export class VentasService {
         unidadesPorBulto: p.tipo === 'granel' || !(p.unidadesPorBulto > 1) ? 0 : p.unidadesPorBulto,
         iva: p.iva,
         codigoBarras: p.codigoBarras,
-        precio: money(filaBase?.netoUnitario ?? 0),
+        precio: filaBase?.netoExacto ?? 0,
         /** El de la etiqueta: lo que paga el cliente. Solo para MOSTRAR. */
         precioFinal: money(filaBase?.finalUnitario ?? 0),
         /* El texto del cartel de góndola (0083). Viaja acá y no en su propio
@@ -1327,7 +1333,7 @@ export class VentasService {
         etiquetaNombre: p.etiquetaNombre ?? null,
         precios: efectivas.map((ef) => ({
           listaId: ef.listaId,
-          precio: money(ef.netoUnitario),
+          precio: ef.netoExacto,
           precioFinal: money(ef.finalUnitario),
           unidadesMinimas: ef.unidadesMinimas,
           unidades: ef.unidades,
@@ -1373,13 +1379,13 @@ export class VentasService {
           fraccionable: false,
           iva: p.iva,
           codigoBarras: pres.codigoBarras,
-          precio: pisoPres ? money(pisoPres.netoUnitario) : 0,
+          precio: pisoPres ? pisoPres.netoExacto : 0,
           precioFinal: pisoPres ? money(pisoPres.finalUnitario) : 0,
           /** Sin formato de venta cargado: el POS lo muestra y explica por qué no se puede vender. */
           sinFormato: suyas.length === 0,
           precios: suyas.map((ef) => ({
             listaId: ef.listaId,
-            precio: money(ef.netoUnitario),
+            precio: ef.netoExacto,
             precioFinal: money(ef.finalUnitario),
             unidadesMinimas: ef.unidadesMinimas,
             unidades: ef.unidades,
@@ -1801,9 +1807,17 @@ export class VentasService {
       }
 
       /* -- El precio: el de la fila, salvo que se pise con permiso -- */
-      const netoLista = money(precioVentaFila(costo, elegida.fila, { iva: prod.iva, redondeo }).netoUnitario);
-      const pedido = it.precioUnitario != null ? money(it.precioUnitario) : netoLista;
-      const difiere = Math.abs(pedido - netoLista) > 0.01;
+      /*
+       * EL NETO EXACTO, NO EL DE 2 DECIMALES (25/9/2026, pedido del dueño). La
+       * góndola dice $676 y la caja tiene que cobrar $676: con el neto cortado a
+       * 2 decimales, al sumarle el IVA daba $675,99. Un precio que llega a menos
+       * de un centavo de la lista ES la lista (un catálogo viejo que todavía
+       * traía el neto redondeado): se cobra la lista exacta.
+       */
+      const netoLista = precioVentaFila(costo, elegida.fila, { iva: prod.iva, redondeo: prod.redondeo ?? redondeo }).netoExacto;
+      const tipeado = it.precioUnitario != null ? r6(it.precioUnitario) : netoLista;
+      const difiere = Math.abs(tipeado - netoLista) > 0.01;
+      const pedido = difiere ? tipeado : netoLista;
       /*
        * EL PRECIO COTIZADO NO ES UN PRECIO PISADO.
        *
@@ -2579,8 +2593,26 @@ export class VentasService {
     return this.caja.exigirTurno(sucursalId, condicionPago === 'contado' && !!config.cajaObligatoria);
   }
 
-  /** Correlativo siguiente para ese tipo y punto de venta. */
+  /**
+   * Correlativo siguiente para ese tipo y punto de venta.
+   *
+   * CON TURNO, NO A LA CARRERA (25/9/2026). "El máximo + 1" leído a la vez por
+   * dos cobros daba el MISMO número: el segundo reventaba contra
+   * `uq_ventas_numero` y la cajera veía "Internal server error". Pasaba de
+   * verdad porque el punto de venta de los tickets es uno solo para todas las
+   * sucursales: dos locales cobrando en el mismo segundo — 4 de 10 en la
+   * prueba. (Dentro de una sucursal ya no chocaban: el candado del turno de
+   * caja los ponía en fila.)
+   *
+   * El candado consultivo es por SERIE (tipo + punto de venta) y dura hasta el
+   * fin de la transacción: el segundo cobro espera los milisegundos que tarda
+   * el primero en terminar y recién ahí lee el máximo, que ya incluye al
+   * primero. Series distintas no se esperan entre sí. Todos los caminos lo
+   * piden DESPUÉS de los candados de venta y turno (nunca antes), y quien
+   * espera acá no tiene tomada ninguna fila de stock: no pueden abrazarse.
+   */
   private async siguienteNumero(tx: any, tipo: string, puntoVenta: string) {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ventas_numero:${tipo}:${puntoVenta}`}))`);
     const [r] = await tx
       .select({ max: sql<number>`coalesce(max(${ventas.numero}), 0)` })
       .from(ventas)
@@ -2606,6 +2638,37 @@ export class VentasService {
       throw new BadRequestException(
         `${prohibido.nombre} no se vende suelto: es solo para fraccionar. Vendé sus paquetes.`,
       );
+    }
+  }
+
+  /**
+   * LO QUE SE VENDE POR UNIDAD, SE VENDE ENTERO (25/9/2026, decisión del dueño:
+   * "un producto por unidad no se puede vender por decimales").
+   *
+   * Solo el GRANEL SUELTO (sin presentación) va por peso y admite decimales. Un
+   * producto entero y el paquete de un fraccionado son unidades: 0,5 de un
+   * paquete de sal es media bolsa que no existe, y dejaba el stock con
+   * decimales en un producto que se cuenta de a uno. La pantalla ya ofrece el
+   * paso de a 1, pero el paso es una sugerencia del navegador, no un candado.
+   */
+  private async validarCantidadesEnteras(items: Array<{ productoId: number; presentacionId?: number | null; cantidad: number | string }>) {
+    const conDecimales = (items ?? []).filter((it) => {
+      const c = Number(it.cantidad) || 0;
+      return Math.abs(c - Math.round(c)) > 1e-9;
+    });
+    if (!conDecimales.length) return;
+    const ids = [...new Set(conDecimales.map((it) => Number(it.productoId)))];
+    const filas = await this.db.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo })
+      .from(productos).where(inArray(productos.id, ids));
+    const prod = new Map(filas.map((p) => [p.id, p]));
+    for (const it of conDecimales) {
+      const p = prod.get(Number(it.productoId));
+      const porPeso = p?.tipo === 'granel' && !it.presentacionId;
+      if (!porPeso) {
+        throw new BadRequestException(
+          `${p?.nombre ?? 'Ese producto'} se vende por unidad: la cantidad tiene que ser entera (llegó ${String(it.cantidad).replace('.', ',')}).`,
+        );
+      }
     }
   }
 
@@ -2660,6 +2723,7 @@ export class VentasService {
     // tiene por qué poder armarse.
     await this.validarSoloFraccionar(dto.items ?? []);
     await this.validarEstadoVendible(dto.items ?? []);
+    await this.validarCantidadesEnteras(dto.items ?? []);
 
     // La sucursal se resuelve ANTES del portero: el presupuesto que el ticket
     // dice cerrar se valida contra ella.
@@ -2923,6 +2987,7 @@ export class VentasService {
     const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
     const config = await this.cfg.get('ventas');
     const cliente = dto.clienteId ? await this.cli.get(dto.clienteId) : await this.cli.get(actual.clienteId);
+    await this.validarCantidadesEnteras(dto.items ?? []);
     /* Mismo portero que en el alta: el borrador se edita en cada tecla del POS y
      * es de donde `confirmar` toma los precios sin volver a calcularlos. El
      * presupuesto sale del BORRADOR GUARDADO y no del DTO: el cajero sigue
@@ -2991,6 +3056,7 @@ export class VentasService {
     // fraccionar" o se archivara: se re-valida acá, que es donde el stock sale.
     await this.validarSoloFraccionar(borrador.items);
     await this.validarEstadoVendible(borrador.items);
+    await this.validarCantidadesEnteras(borrador.items);
 
     const config = await this.cfg.get('ventas');
     const cliente = await this.cli.get(borrador.clienteId);
@@ -3041,38 +3107,52 @@ export class VentasService {
     }
 
     /*
-     * EL RECARGO POR CUOTAS ENTRA ACÁ, justo antes de validar los pagos.
+     * EL RECARGO POR CUOTAS: SE CALCULA ACÁ, SE GUARDA RECIÉN AL COBRAR (25/9/2026).
      *
-     * Es el único momento posible: el plan de cuotas se elige al cobrar, no al
-     * cargar los productos, y el recargo SUBE EL TOTAL de la venta. Se guarda
-     * como un cargo propio (`venta_extras`) y no metido dentro de los precios:
-     * el cliente tiene derecho a ver en su comprobante cuánto le costó pagar
-     * en cuotas, y el reporte necesita poder separar esa plata de la venta de
-     * mercadería -- si se mezclara con los renglones, el margen de cada
-     * producto quedaría inflado por algo que no es margen.
+     * El plan de cuotas se elige al cobrar, y el recargo SUBE EL TOTAL: va como
+     * cargo propio (`venta_extras`) para que el cliente vea cuánto le costó
+     * financiar y los reportes lo separen del margen de la mercadería.
      *
-     * Va en el borrador (base y memoria) antes de seguir, igual que el bloque
-     * del redondeo viejo de arriba: de ahí en más los pagos, el crédito y ARCA
-     * se validan contra el total que el cliente de verdad va a pagar.
+     * Hasta esta fecha se guardaba en su propia transacción ANTES de validar el
+     * cobro. Si algo fallaba después —caja cerrada, número de ticket ocupado, un
+     * dato del pago—, el recargo quedaba pegado al borrador: el reintento lo
+     * volvía a sumar sobre el total ya recargado (un 44% en vez del 20%) y el
+     * cliente que cambiaba a efectivo pagaba la financiación igual. Ahora:
+     *
+     *   1. Un recargo que haya quedado de un intento anterior NO cuenta: la base
+     *      es la mercadería, recalculada como la guarda el borrador.
+     *   2. El recargo de ESTE cobro se suma en memoria: pagos, crédito y ARCA se
+     *      validan contra el total que el cliente de verdad va a pagar.
+     *   3. Se escribe en la MISMA transacción que confirma la venta: si el cobro
+     *      falla, no queda nada — ni el nuevo ni el viejo.
      */
+    const recargosViejos = (borrador.extras ?? []).filter((e: any) => esRecargoCuotas(e.concepto));
+    if (recargosViejos.length) {
+      const limpio = this.calcularTotales(
+        borrador.items as any,
+        (borrador.extras ?? []).filter((e: any) => !esRecargoCuotas(e.concepto)) as any,
+      );
+      borrador.extras = borrador.extras.filter((e: any) => !esRecargoCuotas(e.concepto)) as any;
+      borrador.subtotalNeto = limpio.subtotalNeto;
+      borrador.descuentoTotal = limpio.descuentoTotal;
+      borrador.ivaTotal = limpio.ivaTotal;
+      borrador.total = limpio.total;
+    }
     const fin = this.aplicarRecargoCuotas(dto.pagos ?? [], borrador.total, config);
+    let recargoNuevo: { concepto: string; importe: number; iva: number } | null = null;
     if (fin.recargo > 0) {
-      const concepto = `Recargo ${fin.cuotas} cuota${fin.cuotas === 1 ? '' : 's'} (${fin.porcentaje}%)`;
       /* El extra se guarda NETO y la alícuota va aparte: la financiación de
        * una venta gravada tributa igual que la venta. `money(recargo / 1.21)`
        * puede dejar un centavo de diferencia contra el recargo redondeado, y
        * por eso `validarPagos` tolera exactamente eso -- lo que no puede pasar
        * es que el total se aleje del número que vio el cliente. */
       const neto = money(fin.recargo / 1.21);
-      await this.db.transaction(async (tx) => {
-        await tx.insert(ventaExtras).values({ ventaId: id, concepto, importe: neto, iva: 21 });
-        await tx.update(ventas).set({
-          subtotalNeto: money(borrador.subtotalNeto + neto),
-          ivaTotal: money(borrador.ivaTotal + money(fin.recargo - neto)),
-          total: money(borrador.total + fin.recargo),
-        }).where(eq(ventas.id, id));
-      });
-      borrador.extras = [...(borrador.extras ?? []), { concepto, importe: neto, iva: 21 }] as any;
+      recargoNuevo = {
+        concepto: `Recargo ${fin.cuotas} cuota${fin.cuotas === 1 ? '' : 's'} (${fin.porcentaje}%)`,
+        importe: neto,
+        iva: 21,
+      };
+      borrador.extras = [...(borrador.extras ?? []), recargoNuevo] as any;
       borrador.subtotalNeto = money(borrador.subtotalNeto + neto);
       borrador.ivaTotal = money(borrador.ivaTotal + money(fin.recargo - neto));
       borrador.total = money(borrador.total + fin.recargo);
@@ -3191,10 +3271,22 @@ export class VentasService {
           );
         }
       }
+      /* El recargo (ver arriba), recién ahora y en esta transacción: el viejo
+       * que hubiera quedado se va, el de este cobro entra, y el total de la fila
+       * pasa a ser el validado. Si algo de acá abajo falla, no queda ninguno. */
+      if (recargosViejos.length) {
+        await tx.delete(ventaExtras).where(inArray(ventaExtras.id, recargosViejos.map((e: any) => e.id)));
+      }
+      if (recargoNuevo) await tx.insert(ventaExtras).values({ ventaId: id, ...recargoNuevo });
+
       // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
       await tx.update(ventas).set({
         tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago,
+        subtotalNeto: borrador.subtotalNeto,
+        descuentoTotal: borrador.descuentoTotal,
+        ivaTotal: borrador.ivaTotal,
+        total: borrador.total,
         puntoVenta: puntoVentaFinal,
         cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
         facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
@@ -3533,6 +3625,9 @@ export class VentasService {
           : 'De esta venta ya se devolvió todo: no queda nada para acreditar.',
       );
     }
+    /* Lo que se tipea para devolver, por unidad, va entero. "Todo lo que queda"
+     * no se revisa: una venta vieja con decimales tiene que poder devolverse. */
+    if (elegidos) await this.validarCantidadesEnteras(renglones as any);
 
     /* Los extras (envío, packaging) solo viajan en la nota TOTAL: devolver
      * medio envío no significa nada, y prorratearlo sería inventar un número.

@@ -36,7 +36,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
-import { esJefe } from '../auth/auth.guard';
+import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
@@ -174,8 +174,14 @@ export class ListarPagosDto {
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
+/* EL MOTIVO ES OBLIGATORIO (25/9/2026): anular un pago devuelve plata al
+ * cajón o a la cuenta del proveedor, y sin el porqué no se distingue una
+ * corrección de un faltante tapado. Las tres pantallas que anulan ya lo pedían;
+ * el servidor no. */
 export class AnularPagoDto {
-  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+  @IsString({ message: 'Escribí por qué se anula el pago.' })
+  @Matches(/\S/, { message: 'Escribí por qué se anula el pago.' })
+  @MaxLength(300) motivo!: string;
 }
 
 /**
@@ -387,6 +393,8 @@ export class PagosProveedorService {
 
   async list(q: any = {}) {
     const conds: any[] = [];
+    // El mostrador ve solo lo suyo: lo pone el controlador desde la sesión, nunca el query.
+    if (q.usuarioId) conds.push(eq(proveedorPagos.usuarioId, Number(q.usuarioId)));
     if (q.proveedorId) conds.push(eq(proveedorPagos.proveedorId, Number(q.proveedorId)));
     if (q.sucursalId) conds.push(eq(proveedorPagos.sucursalId, Number(q.sucursalId)));
     if (q.cajaSesionId) conds.push(eq(proveedorPagos.cajaSesionId, Number(q.cajaSesionId)));
@@ -1478,59 +1486,95 @@ export class PagosProveedorService {
  * cierra el candado de `crear`, que exige que el turno sea de la sucursal de la
  * sesión.
  */
+/**
+ * ADMINISTRACIÓN vs MOSTRADOR (25/9/2026).
+ *
+ * El permiso de clase deja entrar a los tres caminos, pero `ventas.caja` —la
+ * cajera— estaba entrando a TODO: listaba los pagos de la empresa entera, veía
+ * la cuenta corriente de cualquier proveedor y podía anular, desimputar o mover
+ * de bandeja un pago bancario de otra sucursal. Anular borra el egreso del
+ * cajón de donde salió: el arqueo de OTRA cajera cambiaba sin que ella tocara
+ * nada.
+ *
+ * Regla del dueño: el mostrador ve y toca SOLO LOS PAGOS QUE HIZO ÉL.
+ *   · crear — como siempre (el candado de `crear` ya fija la sucursal y el turno).
+ *   · listar / ver / anular / completar el papel — solo los suyos.
+ *   · imputar, desimputar, descontar fletes, mover de bandeja, resúmenes y
+ *     cuentas de proveedor — solo administración (la caja no los usa).
+ */
+const ADMIN_PAGOS = ['compras.pagos', 'gastos.pagos_proveedor'] as const;
+const esAdminPagos = (s: Sesion) => tienePermiso(s?.permisos ?? [], [...ADMIN_PAGOS]);
+
 @Controller('pagos-proveedor')
 @Permiso('compras.pagos', 'gastos.pagos_proveedor', 'ventas.caja')
 export class PagosProveedorController {
   constructor(private readonly svc: PagosProveedorService) {}
 
-  /* Rutas fijas antes de `:id` — Nest resuelve por orden de declaración. */
-  @Get('sin-aplicar') sinAplicar(@Query('destino') destino?: string) {
+  /** Para el mostrador: el pago tiene que ser suyo. Administración pasa siempre. */
+  private async exigirPropio(id: number, auth: Sesion) {
+    if (esAdminPagos(auth)) return;
+    const p = await this.svc.get(id);
+    if (p.usuarioId !== auth.usuarioId) {
+      throw new ForbiddenException('Solo podés ver y corregir los pagos que hiciste vos.');
+    }
+  }
+
+  /* Rutas fijas antes de `:id` — Nest resuelve por orden de declaración.
+   * Un `@Permiso` de método REEMPLAZA al de la clase: estas quedan sin `ventas.caja`. */
+  @Get('sin-aplicar') @Permiso(...ADMIN_PAGOS) sinAplicar(@Query('destino') destino?: string) {
     return this.svc.resumenSinAplicar(destino);
   }
-  @Get('disponibles/:proveedorId') disponibles(
+  @Get('disponibles/:proveedorId') @Permiso(...ADMIN_PAGOS) disponibles(
     @Param('proveedorId', ParseIntPipe) id: number,
     @Query('destino') destino?: string,
   ) {
     return this.svc.disponibles(id, destino);
   }
-  @Get('pendientes/:proveedorId') pendientes(
+  @Get('pendientes/:proveedorId') @Permiso(...ADMIN_PAGOS) pendientes(
     @Param('proveedorId', ParseIntPipe) id: number,
     @Query('destino') destino?: string,
   ) {
     return this.svc.documentosPendientes(id, destino);
   }
-  @Get('cuenta/:proveedorId') cuenta(@Param('proveedorId', ParseIntPipe) id: number) {
+  @Get('cuenta/:proveedorId') @Permiso(...ADMIN_PAGOS) cuenta(@Param('proveedorId', ParseIntPipe) id: number) {
     return this.svc.cuenta(id);
   }
 
-  @Delete('imputaciones/:id') desimputar(@Param('id', ParseIntPipe) id: number) {
+  @Delete('imputaciones/:id') @Permiso(...ADMIN_PAGOS) desimputar(@Param('id', ParseIntPipe) id: number) {
     return this.svc.desimputar(id);
   }
 
-  @Get() list(@Query() q: ListarPagosDto) { return this.svc.list(q ?? {}); }
+  @Get() list(@Query() q: ListarPagosDto, @Auth() auth: Sesion) {
+    return this.svc.list(esAdminPagos(auth) ? (q ?? {}) : { ...(q ?? {}), usuarioId: auth.usuarioId });
+  }
   // La sucursal sale de la SESIÓN, no del body: es con lo que se compara el
   // turno de caja para que el egreso no pueda salir del cajón de otra sucursal.
   @Post() crear(@Body() dto: CrearPagoDto, @Auth() auth: Sesion) {
     return this.svc.crear(dto, auth.sucursalId, esJefe(auth));
   }
 
-  @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
+  @Get(':id') async get(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
+    await this.exigirPropio(id, auth);
+    return this.svc.get(id);
+  }
   // El jefe puede imputar cruzando sucursales; el mostrador, no (ver `aplicar`).
-  @Post(':id/imputar') imputar(
+  @Post(':id/imputar') @Permiso(...ADMIN_PAGOS) imputar(
     @Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto, @Auth() auth: Sesion,
   ) {
     return this.svc.imputar(id, dto, esJefe(auth));
   }
-  @Post('descontar-fletes') descontarFletes(@Body() dto: DescontarFletesDto, @Auth() auth: Sesion) {
+  @Post('descontar-fletes') @Permiso(...ADMIN_PAGOS) descontarFletes(@Body() dto: DescontarFletesDto, @Auth() auth: Sesion) {
     return this.svc.descontarFletes(dto.proveedorId, dto.fletes, dto.usuarioId, esJefe(auth));
   }
-  @Post(':id/anular') anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPagoDto) {
-    return this.svc.anular(id, dto?.motivo);
+  @Post(':id/anular') async anular(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPagoDto, @Auth() auth: Sesion) {
+    await this.exigirPropio(id, auth);
+    return this.svc.anular(id, dto.motivo);
   }
-  @Patch(':id/destino') destino(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarDestinoDto) {
+  @Patch(':id/destino') @Permiso(...ADMIN_PAGOS) destino(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarDestinoDto) {
     return this.svc.cambiarDestino(id, dto.destino);
   }
-  @Patch(':id/papel') papel(@Param('id', ParseIntPipe) id: number, @Body() dto: PapelPagoDto) {
+  @Patch(':id/papel') async papel(@Param('id', ParseIntPipe) id: number, @Body() dto: PapelPagoDto, @Auth() auth: Sesion) {
+    await this.exigirPropio(id, auth);
     return this.svc.actualizarPapel(id, dto);
   }
 }

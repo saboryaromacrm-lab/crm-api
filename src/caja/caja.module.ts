@@ -14,13 +14,13 @@
  */
 import {
   Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Post, Query,
+  NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import { IsIn, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
+import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
@@ -55,6 +55,10 @@ class ControlCajaDto {
   @IsOptional() @IsInt() operadorId?: number;
 }
 
+class ExplicarControlDto {
+  @IsString() observaciones!: string;
+}
+
 class MovimientoCajaDto {
   @IsIn(['ingreso', 'egreso']) tipo!: 'ingreso' | 'egreso';
   @IsNumber() importe!: number;
@@ -62,6 +66,28 @@ class MovimientoCajaDto {
   @IsOptional() @IsInt() usuarioId?: number;
   /** Ídem `ControlCajaDto`: el relevo firma el movimiento manual. */
   @IsOptional() @IsInt() operadorId?: number;
+}
+
+/**
+ * EL ARQUEO SIN EL EFECTIVO ESPERADO, para el turno abierto de quien cuenta.
+ *
+ * No alcanza con borrar `esperadoEfectivo`: se deduce de lo que queda. Por eso
+ * se van también el efectivo cobrado (con fondo + movimientos da el esperado),
+ * el total cobrado (menos los otros medios da el efectivo) y el esperado y la
+ * diferencia de los controles ya hechos (con los movimientos posteriores, lo
+ * mismo). Queda lo que el cajero ya sabe o no le sirve para adivinar: el fondo,
+ * sus movimientos manuales, los otros medios y lo que él contó.
+ */
+function arqueoCiego<T extends { medios: Record<string, unknown>; controles: any[] }>(a: T) {
+  const { efectivo: _efectivo, ...otrosMedios } = a.medios;
+  return {
+    ...a,
+    medios: otrosMedios,
+    esperadoEfectivo: null,
+    totalCobrado: null,
+    controles: a.controles.map((c) => ({ ...c, esperadoEfectivo: null, diferencia: null })),
+    ciego: true,
+  };
 }
 
 @Injectable()
@@ -111,7 +137,7 @@ export class CajaService {
    * en el cajón. Se calcula siempre en vivo (nunca se cachea) para que el
    * cajero vea el número real al momento de contar.
    */
-  async arqueo(id: number) {
+  async arqueo(id: number, opts: { ciego?: boolean } = {}) {
     const sesion = await this.get(id);
 
     const [porVenta, porCobranza, movs, controles] = await Promise.all([
@@ -180,7 +206,7 @@ export class CajaService {
         eq(ventas.condicionPago, 'cuenta_corriente'),
       ));
 
-    return {
+    const completo = {
       sesion,
       medios,
       movimientos: movs,
@@ -193,7 +219,61 @@ export class CajaService {
       /** De lo cobrado, cuánto fue recargo por cuotas y no venta (0100). */
       recargos,
       ctaCte: { total: money(Number(ctaCte?.total) || 0), cantidad: Number(ctaCte?.n) || 0 },
+      ciego: false,
     };
+    return opts.ciego && sesion.estado === 'abierta' ? arqueoCiego(completo) : completo;
+  }
+
+  /**
+   * EL CONTEO DEL CIERRE, A CIEGAS (25/9/2026, pedido del dueño).
+   *
+   * Es la única puerta por la que el cajero ve el efectivo esperado de su turno
+   * abierto: declara lo que contó y recién ahí recibe el arqueo completo. Si el
+   * conteo NO coincide, queda registrado como control del turno ANTES de mostrar
+   * el esperado — así, si después "vuelve a contar" y aparece justo el número
+   * del sistema, el primer conteo sigue ahí para quien revise. Si coincide no se
+   * registra nada: el cierre mismo ya lo firma, y un control repetido sería ruido.
+   */
+  async conteoCierre(id: number, dto: ControlCajaDto, sucursalSesion: number | null) {
+    const sesion = await this.get(id);
+    if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+    if (sesion.estado !== 'abierta') throw new BadRequestException('El turno ya está cerrado.');
+    const contado = money(dto.contadoEfectivo);
+    if (contado < 0) throw new BadRequestException('El efectivo contado no puede ser negativo.');
+
+    const a = await this.arqueo(id);
+    const diferencia = money(contado - a.esperadoEfectivo);
+    let control: typeof cajaControles.$inferSelect | null = null;
+    if (Math.abs(diferencia) > 0.009) {
+      const extra = (dto.observaciones ?? '').trim();
+      [control] = await this.db.insert(cajaControles).values({
+        cajaSesionId: id,
+        esperadoEfectivo: a.esperadoEfectivo,
+        contadoEfectivo: contado,
+        diferencia,
+        observaciones: `Conteo del cierre, antes de ver el esperado${extra ? ` · ${extra}` : ''}`,
+        usuarioId: await resolverOperador(this.db, dto.operadorId, dto.usuarioId),
+      }).returning();
+      a.controles = [...a.controles, control];
+    }
+    return { arqueo: a, contado, diferencia, control };
+  }
+
+  /**
+   * La explicación de un control con diferencia. A ciegas, el cajero se entera
+   * de la diferencia DESPUÉS de registrar el conteo, así que el porqué llega en
+   * un segundo paso. Solo el texto: el conteo y el esperado no se tocan nunca.
+   */
+  async explicarControl(id: number, controlId: number, dto: ExplicarControlDto, sucursalSesion: number | null) {
+    const sesion = await this.get(id);
+    if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+    if (sesion.estado !== 'abierta') throw new BadRequestException('El turno ya está cerrado: la explicación va en el cierre.');
+    const texto = (dto.observaciones ?? '').trim();
+    if (!texto) throw new BadRequestException('Escribí por qué hay diferencia.');
+    const [c] = await this.db.update(cajaControles).set({ observaciones: texto })
+      .where(and(eq(cajaControles.id, controlId), eq(cajaControles.cajaSesionId, id))).returning();
+    if (!c) throw new NotFoundException('Ese control no es de este turno.');
+    return c;
   }
 
   /* ------------------------------ Escritura ------------------------------ */
@@ -272,12 +352,21 @@ export class CajaService {
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
 
       const a = await this.arqueo(id);
+      const diferencia = money(declarado - a.esperadoEfectivo);
+      const nota = (dto.observaciones ?? '').trim();
+      /* Con diferencia, el porqué es obligatorio (25/9/2026): el control
+       * intermedio ya lo pedía y el cierre —el que queda— no. */
+      if (Math.abs(diferencia) > 0.009 && !nota) {
+        throw new BadRequestException(
+          `El cierre da una diferencia de ${diferencia > 0 ? '+' : '−'}$${Math.abs(diferencia).toFixed(2)}: escribí en observaciones por qué.`,
+        );
+      }
 
       const [c] = await tx.update(cajaSesiones).set({
         cierre: new Date(),
         declaradoEfectivo: declarado,
         sistemaEfectivo: a.esperadoEfectivo,
-        diferencia: money(declarado - a.esperadoEfectivo),
+        diferencia,
         totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
         estado: 'cerrada',
         /*
@@ -288,7 +377,12 @@ export class CajaService {
          * borraba sola al cerrar, y es una nota que despues sale impresa en el
          * comprobante con el que se rinde la plata.
          */
-        observaciones: dto.observaciones || sesion.observaciones,
+        /* Se SUMA a la nota de la apertura, no la reemplaza: ahora que el
+         * cierre con diferencia exige su nota, reemplazar borraría seguido la
+         * de la apertura, que también sale en el comprobante. */
+        observaciones: nota
+          ? (sesion.observaciones ? `${sesion.observaciones} · Cierre: ${nota}` : nota)
+          : sesion.observaciones,
       }).where(eq(cajaSesiones.id, id)).returning();
       return c;
     });
@@ -403,10 +497,15 @@ export class CajaController {
     });
   }
 
+  /*
+   * A CIEGAS PARA EL QUE CUENTA: con el turno abierto, quien no es jefe recibe
+   * el arqueo SIN el efectivo esperado (ver `arqueoCiego`). Lo ve después de
+   * declarar su conteo, en el cierre (`conteo-cierre`) o en un control.
+   */
   @Get(':id/arqueo')
   async arqueo(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     await this.exigirMiTurno(id, sesion);
-    return this.svc.arqueo(id);
+    return this.svc.arqueo(id, { ciego: !esJefe(sesion) });
   }
 
   @Get(':id')
@@ -446,6 +545,21 @@ export class CajaController {
   @Post(':id/control')
   control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
     return this.svc.control(id, dto, soloSuSucursal(sesion));
+  }
+
+  @Patch(':id/control/:controlId')
+  explicarControl(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('controlId', ParseIntPipe) controlId: number,
+    @Body() dto: ExplicarControlDto,
+    @Auth() sesion: Sesion,
+  ) {
+    return this.svc.explicarControl(id, controlId, dto, soloSuSucursal(sesion));
+  }
+
+  @Post(':id/conteo-cierre')
+  conteoCierre(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
+    return this.svc.conteoCierre(id, dto, soloSuSucursal(sesion));
   }
 
   /*
