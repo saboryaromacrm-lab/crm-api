@@ -245,6 +245,11 @@ export const usuarios = pgTable('usuarios', {
   relevoCaja: boolean('relevo_caja').notNull().default(false),
   /** PIN del relevo, mismo formato que passwordHash. Vacío = sin PIN. */
   pinHash: text('pin_hash').notNull().default(''),
+  /**
+   * EN QUÉ SUCURSALES PUEDE ENTRAR (0105). Vacía = todas. La administración
+   * (admin/superadmin) entra a todas igual: cruza por el selector del encabezado.
+   */
+  sucursales: jsonb('sucursales').$type<number[]>().notNull().default([]),
 });
 
 /**

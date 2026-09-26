@@ -457,6 +457,11 @@ export class ProveedoresController {
   @Get(':id/percepciones') percepciones(@Param('id', ParseIntPipe) id: number) {
     return this.svc.percepciones(id);
   }
+  /* Las CUENTAS BANCARIAS no son del padrón que lee medio sistema (26/9/2026):
+   * alias y CBU los usan quien administra proveedores y quien arma una cuenta
+   * disponible. La caja cobra con la cuenta disponible, que congela su propio
+   * alias, así que no pasa por acá. */
+  @Permiso('compras.proveedores', 'gastos.proveedores', 'proveedores.padron', 'proveedores.cuentas')
   @Get(':id/cuentas') cuentas(@Param('id', ParseIntPipe) id: number) {
     return this.svc.cuentas(id);
   }

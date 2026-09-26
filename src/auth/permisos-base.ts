@@ -27,6 +27,20 @@
 /** Roles que NO reciben la base (ver el encabezado). */
 const AJENOS = new Set(['cafeteria']);
 
+/**
+ * LO QUE LA BASE NO LE DA A UN ROL (25/9/2026, pedido del dueño).
+ *
+ * `inventario` abre la devolución (+stock), el ajuste (±) y la "venta" sin
+ * ticket ni caja. Al fraccionador no le toca ninguna: su trabajo es convertir
+ * granel en paquetes, y con esa llave podía inflar el stock con una
+ * "devolución" y sacarlo como venta sin que pasara por ninguna caja. Lo único
+ * que esa llave le daba de verdad —procesar un vencimiento, que es dar de baja
+ * lo vencido— ahora pide también `merma`, que sí conserva.
+ */
+const QUITADOS_POR_ROL: Record<string, readonly string[]> = Object.freeze({
+  fraccionador: ['inventario'],
+});
+
 export const PERMISOS_BASE = Object.freeze([
   /* Vencimientos, la sección: control de góndola, alertas y reportes. */
   'almacen.vencimientos',
@@ -73,5 +87,6 @@ export const PERMISOS_BASE = Object.freeze([
 export function conPermisosBase(delRol: string[] | null | undefined, rolClave = ''): string[] {
   const propios = Array.isArray(delRol) ? delRol : [];
   if (propios.includes('*') || AJENOS.has(rolClave)) return propios;
-  return [...new Set([...propios, ...PERMISOS_BASE])];
+  const quitados = QUITADOS_POR_ROL[rolClave] ?? [];
+  return [...new Set([...propios, ...PERMISOS_BASE.filter((k) => !quitados.includes(k))])];
 }

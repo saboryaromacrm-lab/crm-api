@@ -42,7 +42,10 @@ import {
   Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
+import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
+
+/** Quién ve el detalle de compra en la carga inicial (ver `bootstrapCatalogo`). */
+const verCostos = (sesion: Sesion) => tienePermiso(sesion?.permisos ?? [], ['precios', 'compras.productos']);
 import { InventarioService } from './inventario.service';
 
 /*
@@ -92,24 +95,15 @@ class VentaDto {
   @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
 }
 
-class AsignacionDto {
-  @IsInt() presId!: number;
-  @IsNumber() @Min(0) @Max(MAX_CANT) cant!: number;
-}
-
-class FraccionarDto {
-  @IsInt() productoId!: number;
-  @IsOptional() @IsInt() sucursalId?: number;
-  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => AsignacionDto)
-  asignaciones!: AsignacionDto[];
-  /** Quién fraccionó (0102): obligatorio en cuanto hay operadores cargados. */
-  @IsOptional() @IsInt() operadorId?: number;
-}
-
 class RenglonFraccionadoDto {
   @IsInt() productoId!: number;
   @IsInt() presId!: number;
-  @IsInt() @Min(1) @Max(MAX_CANT) cant!: number;
+  /* En castellano (26/9/2026): el mensaje por defecto era "items.0.cant must
+   * be an integer number", y eso le llegaba tal cual a quien fraccionaba. */
+  @IsInt({ message: 'La cantidad de paquetes tiene que ser un número entero.' })
+  @Min(1, { message: 'Cada renglón lleva al menos 1 paquete.' })
+  @Max(MAX_CANT, { message: `No se registran más de ${MAX_CANT} paquetes en un renglón.` })
+  cant!: number;
 }
 
 /** Registrar fraccionado: la cabecera y los renglones de la tanda (0102). */
@@ -141,6 +135,10 @@ class CorregirFraccionadoDto {
   @IsNumber() @Min(0) @Max(MAX_CANT) cantidadReal!: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
   @IsOptional() @IsInt() operadorId?: number;
+  /** Al BAJAR paquetes, qué pasó con los que faltan (ver `opCorregirFraccionado`). */
+  @IsOptional() @IsIn(['conteo', 'faltante']) causa?: 'conteo' | 'faltante';
+  @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/) dia?: string;
+  @IsOptional() @IsIn(['manana', 'tarde']) turno?: 'manana' | 'tarde';
 }
 
 class MovimientoDto {
@@ -260,8 +258,8 @@ export class BootstrapController {
    * porque toca lo que consumen cuatro pantallas.
    */
   @Get()
-  bootstrap() {
-    return this.inv.bootstrap();
+  bootstrap(@Auth() sesion: Sesion) {
+    return this.inv.bootstrap(soloSuSucursal(sesion), verCostos(sesion));
   }
 
   /*
@@ -279,24 +277,33 @@ export class BootstrapController {
    * lee antes y no después por lo que explica `versiones()`: la versión no
    * puede ser más nueva que el contenido que viaja con ella.
    */
+  /*
+   * LA VERSIÓN LLEVA A QUIÉN SE LE ARMÓ (25/9/2026). Desde que base y catálogo
+   * dependen de la sesión (pedidos de su sucursal, detalle de compra según la
+   * llave), el mismo número de versión ya no alcanza para decir "es la misma
+   * respuesta": la variante va en el ETag, y un navegador que cambia de
+   * usuario no reutiliza lo que se le armó al anterior.
+   */
   @Get('base')
-  base(@Req() req: any, @Res() res: any) {
-    return this.parte(req, res, 'base', () => this.inv.bootstrapBase());
+  base(@Req() req: any, @Res() res: any, @Auth() sesion: Sesion) {
+    const suc = soloSuSucursal(sesion);
+    return this.parte(req, res, 'base', `s${suc ?? 'todas'}`, () => this.inv.bootstrapBase(suc));
   }
 
   @Get('catalogo')
-  catalogo(@Req() req: any, @Res() res: any) {
-    return this.parte(req, res, 'catalogo', () => this.inv.bootstrapCatalogo());
+  catalogo(@Req() req: any, @Res() res: any, @Auth() sesion: Sesion) {
+    const ve = verCostos(sesion);
+    return this.parte(req, res, 'catalogo', ve ? 'costos' : 'sin-costos', () => this.inv.bootstrapCatalogo(ve));
   }
 
   @Get('stock')
   stock(@Req() req: any, @Res() res: any) {
-    return this.parte(req, res, 'stock', () => this.inv.bootstrapStock());
+    return this.parte(req, res, 'stock', 'todos', () => this.inv.bootstrapStock());
   }
 
-  private async parte(req: any, res: any, nombre: 'base' | 'catalogo' | 'stock', armar: () => Promise<unknown>) {
+  private async parte(req: any, res: any, nombre: 'base' | 'catalogo' | 'stock', variante: string, armar: () => Promise<unknown>) {
     const v = await this.inv.versiones();
-    const etag = `"inv-${nombre}-${v[nombre]}"`;
+    const etag = `"inv-${nombre}-${v[nombre]}-${variante}"`;
     res.setHeader('ETag', etag);
     res.setHeader('Cache-Control', 'private, no-cache');
     // `If-None-Match` puede traer varios, separados por coma.
@@ -371,11 +378,13 @@ export class OperacionesController {
     return this.inv.opVenta({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
   }
 
-  @Post('fraccionar')
-  @Permiso('fraccionar')
-  fraccionar(@Body() dto: FraccionarDto, @Auth() sesion: Sesion) {
-    return this.inv.opFraccionar({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
-  }
+  /*
+   * `POST /operaciones/fraccionar` (la de un solo producto) SE RETIRÓ el
+   * 26/9/2026. Quedaba abierta para el CRM viejo durante el deploy del 0102, y
+   * aceptaba "2,5 paquetes" redondeándolos en silencio a 3. El CRM usa
+   * `fraccionar-registro` desde entonces; `opFraccionar` sigue en el servicio
+   * solo para las semillas.
+   */
 
   /** Registrar fraccionado: uno o varios productos, todo o nada. */
   @Post('fraccionar-registro')
@@ -488,7 +497,7 @@ export class TransferenciasController {
   @Post(':id/avanzar')
   @Permiso('preparar')
   avanzar(@Param('id', ParseIntPipe) id: number, @Body() dto: AvanzarDto, @Auth() sesion: Sesion) {
-    return this.inv.avanzarTransferencia(id, sesion.usuarioId, dto?.desde, soloSuSucursal(sesion));
+    return this.inv.avanzarTransferencia(id, sesion.usuarioId, dto?.desde, soloSuSucursal(sesion), esJefe(sesion));
   }
 
   /* --- Preparación en dos listas (fase "preparada"): siempre contra el ORIGEN --- */
@@ -538,14 +547,14 @@ export class TransferenciasController {
   @Post(':id/recibir')
   @Permiso('pedidos')
   recibir(@Param('id', ParseIntPipe) id: number, @Body() dto: RecibirDto, @Auth() sesion: Sesion) {
-    return this.inv.recibirTransferencia(id, { ...(dto ?? {}), usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
+    return this.inv.recibirTransferencia(id, { ...(dto ?? {}), usuarioId: sesion.usuarioId }, soloSuSucursal(sesion), esJefe(sesion));
   }
 
-  /** Cancelar libera la reserva del ORIGEN, así que es de quien la preparó. */
+  /** Cancelar libera la reserva del ORIGEN. Es de administración (ver el servicio). */
   @Post(':id/cancelar')
   @Permiso('preparar')
   cancelar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
-    return this.inv.cancelarTransferencia(id, sesion.usuarioId, soloSuSucursal(sesion));
+    return this.inv.cancelarTransferencia(id, sesion.usuarioId, soloSuSucursal(sesion), esJefe(sesion));
   }
 }
 

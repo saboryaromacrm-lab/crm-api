@@ -292,8 +292,8 @@ async function main() {
   await inv.avanzarTransferencia(t1.id, ana.id, 'pendiente');
   await inv.confirmarListaTransferencia(t1.id, { tipo: 'enteros', listo: true, usuarioId: ana.id });
   await inv.confirmarListaTransferencia(t1.id, { tipo: 'granel', listo: true, usuarioId: bruno.id });
-  await inv.avanzarTransferencia(t1.id, ana.id, 'preparada');
-  await inv.recibirTransferencia(t1.id, { usuarioId: ana.id });
+  await inv.avanzarTransferencia(t1.id, ana.id, 'preparada', null, true);
+  await inv.recibirTransferencia(t1.id, { usuarioId: ana.id }, null, true);
 
   await inv.crearTransferencia({ origenId: dist.id, destinoId: ex2.id, usuarioId: ana.id, items: [{ productoId: avena.id, cantidad: 5 }] });
 

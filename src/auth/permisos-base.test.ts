@@ -51,3 +51,10 @@ test('la base NO reparte llaves de caja, precios ni usuarios', () => {
     assert.ok(!PERMISOS_BASE.includes(clave), `${clave} NO puede venir de fábrica`);
   }
 });
+
+test('al fraccionador la base no le da inventario (devolución, ajuste, venta sin ticket), sí merma', () => {
+  const p = conPermisosBase(['fraccionar', 'preparar'], 'fraccionador');
+  assert.ok(!p.includes('inventario'), 'el fraccionador no puede tener inventario de fábrica');
+  assert.ok(p.includes('merma') && p.includes('almacen.vencimientos'), 'conserva merma y vencimientos');
+  assert.ok(conPermisosBase([], 'cajero').includes('inventario'), 'el resto de los roles sigue igual');
+});

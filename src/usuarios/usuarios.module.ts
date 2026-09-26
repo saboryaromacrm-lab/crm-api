@@ -18,7 +18,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
 import { SesionesService } from '../auth/sesiones.service';
@@ -347,7 +347,15 @@ function publico(u: any, r: any) {
      * jamás viaja, ni siquiera hasheado. */
     relevoCaja: !!u.relevoCaja,
     tienePin: !!u.pinHash,
+    /** Sucursales en las que puede entrar (0105). Vacía = todas. */
+    sucursales: Array.isArray(u.sucursales) ? u.sucursales : [],
   };
+}
+
+/** Admin y superadmin cruzan sucursales: la lista de `usuarios.sucursales` no los ata. */
+function rolQueCruza(r: any) {
+  return r?.clave === 'admin' || r?.clave === 'superadmin'
+    || (Array.isArray(r?.permisos) && (r.permisos as string[]).includes('*'));
 }
 
 /** El PIN del relevo: corto a propósito (se tipea con un cliente esperando),
@@ -562,9 +570,10 @@ export class UsuariosService {
     if (relevoCaja && !pin) {
       throw new BadRequestException('Para habilitarlo como relevo de caja definile un PIN.');
     }
+    const suc = o?.sucursales != null ? await this.sucursalesValidas(o.sucursales) : [];
     const [u] = await this.db.insert(usuarios).values({
       nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
-      relevoCaja, pinHash: pin ? hashPassword(pin) : '',
+      relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc,
     }).returning();
     return { ok: true, id: u.id };
   }
@@ -693,6 +702,23 @@ export class UsuariosService {
     if (!suc) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
 
     /*
+     * CADA UNO ENTRA EN LAS SUYAS (0105). La sucursal se elegía libre: el
+     * fraccionador entraba como el Depósito para despachar y como la sucursal
+     * que pedía para recibir, y todos los candados "solo tu sucursal" quedaban
+     * en lo que eligiera. Vale también con terminal registrada: un equipo de
+     * una sucursal ajena no le abre la puerta. Lista vacía = todas; la
+     * administración cruza igual. El puesto sin sucursal no elige ninguna.
+     */
+    const permitidas: number[] = Array.isArray(u.sucursales) ? u.sucursales : [];
+    if (!sinSucursal && permitidas.length && !rolQueCruza(r) && !permitidas.includes(suc.id)) {
+      const nombres = await this.db.select({ nombre: sucursales.nombre }).from(sucursales)
+        .where(inArray(sucursales.id, permitidas)).orderBy(sucursales.id);
+      throw new UnauthorizedException(
+        `${u.nombre} no trabaja en ${suc.nombre}: entrá en ${nombres.map((x) => x.nombre).join(' o ')}.`,
+      );
+    }
+
+    /*
      * ACÁ NACE LA CREDENCIAL. Antes esto devolvía el usuario y terminaba: el
      * frontend lo guardaba y la API no volvía a preguntar nada nunca más. El
      * token es lo que hace que el resto de las 224 llamadas puedan verificarse.
@@ -756,6 +782,10 @@ export class UsuariosService {
         id: usuarios.id,
         nombre: usuarios.nombre,
         pideSucursal: sql<boolean>`not ${roles.sinSucursal}`,
+        /* Las sucursales en las que puede entrar (0105), para que el
+         * desplegable no ofrezca las ajenas. Vacía = todas. Es la misma
+         * información que el desplegable ya muestra, filtrada: no dice rol. */
+        sucursales: sql<number[]>`case when ${roles.clave} in ('admin', 'superadmin') or ${roles.permisos} ? '*' then '[]'::jsonb else ${usuarios.sucursales} end`,
       })
         .from(usuarios)
         .innerJoin(roles, eq(roles.id, usuarios.rolId))
@@ -923,6 +953,12 @@ export class UsuariosService {
       }
       patch.relevoCaja = !!o.relevoCaja;
     }
+    let sucursalesCambiaron = false;
+    if (o?.sucursales != null) {
+      const nuevas = await this.sucursalesValidas(o.sucursales);
+      const antes = (Array.isArray(u.sucursales) ? u.sucursales : []).slice().sort((a: number, b: number) => a - b);
+      if (JSON.stringify(nuevas) !== JSON.stringify(antes)) { patch.sucursales = nuevas; sucursalesCambiaron = true; }
+    }
     if (Object.keys(patch).length) await this.db.update(usuarios).set(patch).where(eq(usuarios.id, id));
 
     /*
@@ -931,10 +967,23 @@ export class UsuariosService {
      * en que se cambia con urgencia: la sesión abierta en la sucursal seguiría
      * andando con la vieja.
      */
-    if (patch.passwordHash || patch.activo === false) {
+    /* Lo mismo al cambiarle las sucursales: su sesión abierta puede estar en
+     * una que ya no le corresponde. Vuelve a entrar y elige entre las suyas. */
+    if (patch.passwordHash || patch.activo === false || sucursalesCambiaron) {
       await this.sesiones.cerrarTodasDe(id);
     }
     return { ok: true };
+  }
+
+  /** Ids de sucursales existentes, sin repetir y en orden. Vacío = todas. */
+  private async sucursalesValidas(v: any): Promise<number[]> {
+    if (!Array.isArray(v)) throw new BadRequestException('Las sucursales del usuario van en una lista.');
+    const ids = [...new Set(v.map((x: any) => Number(x)))].sort((a, b) => a - b);
+    if (ids.some((x) => !Number.isInteger(x) || x <= 0)) throw new BadRequestException('Hay una sucursal inválida en la lista.');
+    if (!ids.length) return [];
+    const hay = await this.db.select({ id: sucursales.id }).from(sucursales).where(inArray(sucursales.id, ids));
+    if (hay.length !== ids.length) throw new BadRequestException('Alguna de esas sucursales no existe.');
+    return ids;
   }
 }
 

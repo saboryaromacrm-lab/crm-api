@@ -27,9 +27,9 @@
  * CURRENT_DATE del server en UTC — a la noche UTC ya es "mañana" y los
  * vencidos se adelantarían un día.
  */
-import { Body, Controller, Delete, Get, Inject, Injectable, Module, Param, ParseIntPipe, Post, Put, Query, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Injectable, Module, Param, ParseIntPipe, Post, Put, Query, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { sucursalDeOperacion } from '../auth/auth.guard';
+import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, ValidateNested,
@@ -253,9 +253,15 @@ export class VencimientosService {
     return rows.map((r) => ({ ...r.v, diasParaVencer: Number(r.diasParaVencer) }));
   }
 
-  async editar(id: number, o: EditarVencimientoDto) {
+  /** El registro tiene que ser de MI sucursal, salvo el jefe (`null`). */
+  private exigirMio(reg: any, soloSuc?: number | null) {
+    if (soloSuc != null && reg.sucursalId !== soloSuc) throw new ForbiddenException('Ese registro es de otra sucursal.');
+  }
+
+  async editar(id: number, o: EditarVencimientoDto, soloSuc?: number | null) {
     const [reg] = await this.db.select().from(vencimientos).where(eq(vencimientos.id, id)).limit(1);
     if (!reg) throw new NotFoundException('Registro inexistente.');
+    this.exigirMio(reg, soloSuc);
     if (reg.procesado) throw new BadRequestException('Ya se procesó: el cierre no se edita.');
     const patch: any = {};
     if (o.cantidad !== undefined) {
@@ -269,9 +275,10 @@ export class VencimientosService {
     return out;
   }
 
-  async eliminar(id: number) {
+  async eliminar(id: number, soloSuc?: number | null) {
     const [reg] = await this.db.select().from(vencimientos).where(eq(vencimientos.id, id)).limit(1);
     if (!reg) throw new NotFoundException('Registro inexistente.');
+    this.exigirMio(reg, soloSuc);
     if (reg.procesado) throw new BadRequestException('Ya se procesó: dejó pérdida real asentada y no se borra.');
     await this.db.delete(vencimientos).where(eq(vencimientos.id, id));
     return { ok: true };
@@ -284,10 +291,12 @@ export class VencimientosService {
    * en la MISMA transacción. El claim del registro va con FOR UPDATE: dos
    * personas procesando lo mismo, una sola gana.
    */
-  async procesar(id: number, o: ProcesarDto) {
+  async procesar(id: number, o: ProcesarDto, soloSuc?: number | null) {
     return this.db.transaction(async (tx) => {
       const [reg] = await tx.select().from(vencimientos).where(eq(vencimientos.id, id)).limit(1).for('update');
       if (!reg) throw new NotFoundException('Registro inexistente.');
+      // Dar de baja lo vencido de OTRA sucursal era posible con solo el id.
+      this.exigirMio(reg, soloSuc);
       if (reg.procesado) throw new BadRequestException('Ya estaba procesado.');
       const uv = Number(o.unidadesVendidas);
       if (!(uv >= 0)) throw new BadRequestException('Las unidades vendidas no pueden ser negativas.');
@@ -846,11 +855,20 @@ export class VencimientosController {
     return this.svc.crearSesion({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) as number });
   }
   @Get(':id/borrador-oferta') borradorOferta(@Param('id', ParseIntPipe) id: number) { return this.svc.borradorOferta(id); }
-  @Put(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarVencimientoDto) { return this.svc.editar(id, dto); }
-  @Delete(':id') eliminar(@Param('id', ParseIntPipe) id: number) { return this.svc.eliminar(id); }
+  @Put(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarVencimientoDto, @Auth() sesion: Sesion) {
+    return this.svc.editar(id, dto, soloSuSucursal(sesion));
+  }
+  @Delete(':id') eliminar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.eliminar(id, soloSuSucursal(sesion));
+  }
+  /* Procesar = dar de baja lo vencido, que es una MERMA (el movimiento sale
+   * como `vencido`, que pide `merma` en el movimiento manual). Con `merma`
+   * alcanza: el fraccionador perdió `inventario` y no pierde esto. */
   @Post(':id/procesar')
-  @Permiso('inventario')
-  procesar(@Param('id', ParseIntPipe) id: number, @Body() dto: ProcesarDto) { return this.svc.procesar(id, dto); }
+  @Permiso('inventario', 'merma')
+  procesar(@Param('id', ParseIntPipe) id: number, @Body() dto: ProcesarDto, @Auth() sesion: Sesion) {
+    return this.svc.procesar(id, dto, soloSuSucursal(sesion));
+  }
   @Post(':id/vincular-oferta') vincularOferta(@Param('id', ParseIntPipe) id: number, @Body() dto: VincularOfertaDto) {
     return this.svc.vincularOferta(id, dto);
   }

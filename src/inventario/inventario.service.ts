@@ -72,6 +72,18 @@ export class InventarioService {
   private cant3(n: number): number {
     return Math.round((Number(n) || 0) * 1000) / 1000;
   }
+  /**
+   * PAQUETES Y UNIDADES SE CUENTAN ENTEROS (25/9/2026). Solo el granel suelto
+   * va en kilos con decimales; "2,5 paquetes" no sube a ningún camión y "2,5
+   * recibidos" es un faltante que no se puede investigar.
+   */
+  private exigirEntero(prod: any, presId: number | null, c: number) {
+    if (this.unidadDe(prod.tipo, presId) === 'kg') return;
+    if (Math.abs(c - Math.round(c)) > 1e-9) {
+      throw new BadRequestException(`${prod.nombre}: ${presId ? 'los paquetes' : 'las unidades'} van enteros (llegó ${String(c).replace('.', ',')}).`);
+    }
+  }
+
   private unidadDe(tipo: string, presId: number | null): 'kg' | 'u' {
     return tipo === 'granel' && !presId ? 'kg' : 'u';
   }
@@ -90,7 +102,9 @@ export class InventarioService {
     );
   }
   private async getEntry(tx: any, c: Coord) {
-    const rows = await tx.select().from(stock).where(this.coordWhere(c)).limit(1);
+    /* `orderBy(id)`: si una coordenada quedó con dos filas, todos leen y tocan
+     * la MISMA (la más vieja) — la misma que toma `cantConCandado`. */
+    const rows = await tx.select().from(stock).where(this.coordWhere(c)).orderBy(stock.id).limit(1);
     return rows[0];
   }
   private async getOrCreate(tx: any, c: Coord) {
@@ -148,6 +162,32 @@ export class InventarioService {
   private async cant(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
     const e = await this.getEntry(tx, { productoId, sucursalId, presentacionId, estado });
     return e ? e.cantidad : 0;
+  }
+
+  /**
+   * LEER CON CANDADO: el saldo de una coordenada, tomando su fila hasta el fin
+   * de la transacción (25/9/2026).
+   *
+   * Fraccionar LEÍA el granel, comparaba y después descontaba. Entre la lectura
+   * y el descuento no había nada: dos registros al mismo tiempo leían los dos
+   * "hay 126 kg", los dos pasaban y el granel quedaba en −74 kg — mercadería
+   * fraccionada que no existía. Con `FOR UPDATE` el segundo ESPERA a que el
+   * primero termine y recién ahí lee, ya con el número descontado.
+   *
+   * Es para las lecturas que deciden un descuento (fraccionar, corregir, armar
+   * un pedido). Las demás siguen con `cant`, sin candado: no hace falta frenar
+   * a nadie para mostrar un número.
+   */
+  private async cantConCandado(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
+    const r: any = await tx.execute(sql`
+      SELECT cantidad FROM stock
+       WHERE producto_id = ${productoId} AND sucursal_id = ${sucursalId}
+         AND ${presentacionId == null ? sql`presentacion_id IS NULL` : sql`presentacion_id = ${presentacionId}`}
+         AND estado = ${estado}
+       ORDER BY id
+       FOR UPDATE`);
+    const filas = r.rows ?? r;
+    return filas.length ? Number(filas[0].cantidad) : 0;
   }
   /**
    * MUEVE STOCK DE UN ESTADO A OTRO, o **corta la operación entera**.
@@ -568,7 +608,8 @@ export class InventarioService {
         }
         asign.sort((a, b) => b.pres.tamKg - a.pres.tamKg);
         const total = this.cant3(asign.reduce((a, x) => a + x.q * x.pres.tamKg, 0));
-        const disp = await this.cant(tx, pid, sucId, null, 'disponible');
+        // Con candado: ver `cantConCandado` (los productos van en orden de id).
+        const disp = await this.cantConCandado(tx, pid, sucId, null, 'disponible');
         if (total > disp + 1e-9) {
           throw new BadRequestException(`No alcanza el granel de ${prod.nombre}: hay ${this.cant3(disp)} kg y se necesitan ${total} kg.`);
         }
@@ -605,17 +646,29 @@ export class InventarioService {
    *
    * Mueve las DOS puntas: los paquetes y el granel del que salieron. Editar solo
    * los paquetes cambiaría los kilos totales del producto de la nada, y el
-   * fraccionamiento no crea ni destruye mercadería: la convierte. Con 19 en vez
-   * de 20, el medio kilo que nunca se envasó **vuelve al granel**.
+   * fraccionamiento no crea ni destruye mercadería: la convierte.
    *
-   * Es para el ERROR DE CARGA. Si el paquete se rompió o se perdió, eso es una
-   * merma o una incidencia: ahí la mercadería no volvió a ningún lado y tiene que
-   * quedar registrada como pérdida, con su costo.
+   * AL BAJAR, SE PREGUNTA QUÉ PASÓ (25/9/2026). Antes bajar a 0 devolvía todos
+   * los kilos al granel, sin preguntar: 23 paquetes que se rompieron o se
+   * llevaron se convertían en 11,5 kg de granel que no existían, y la pérdida
+   * no quedaba en ningún lado. Ahora hay dos respuestas, y las dos exigen motivo:
+   *
+   *   · `conteo`   — se cargaron de más, nunca se envasaron: los kilos SIGUEN en
+   *                  el granel y vuelven ahí (lo de siempre).
+   *   · `faltante` — se rompieron, se perdieron o faltan: los paquetes se dan de
+   *                  baja como MERMA, con su costo congelado, y el granel no se
+   *                  toca. No es un fraccionamiento: no entra al historial.
+   *
+   * Subir paquetes es fraccionar más: pide operador como el registro. Los dos
+   * asientan día y turno como el registro (se corrige después, "lo de ayer").
    *
    * Toca solo el DISPONIBLE. Lo comprometido está apartado para un envío ya
    * confirmado: bajarlo por acá rompería esa reserva sin que el envío se enterara.
    */
   async opCorregirFraccionado(o: any) {
+    // Antes de abrir la transacción: una fecha imposible no toca nada.
+    const momento = this.momentoDeFraccionado(o.dia, o.turno);
+    const motivo = String(o.motivo ?? '').trim();
     return this.db.transaction(async (tx) => {
       const prod = await this.getProducto(tx, o.productoId);
       if (!prod || prod.tipo !== 'granel') {
@@ -628,37 +681,57 @@ export class InventarioService {
       const real = Math.round(Number(o.cantidadReal));
       if (!Number.isFinite(real) || real < 0) throw new BadRequestException('La cantidad real no puede ser negativa.');
 
-      const actual = await this.cant(tx, prod.id, sucId, pres.id, 'disponible');
+      /* Con candado, primero el granel y después el paquete (el mismo orden que
+       * registrar): dos correcciones a la vez calculaban el delta sobre el mismo
+       * "actual" y el segundo absoluto no quedaba en lo que se escribió. */
+      const granel = await this.cantConCandado(tx, prod.id, sucId, null, 'disponible');
+      const actual = await this.cantConCandado(tx, prod.id, sucId, pres.id, 'disponible');
       const delta = real - actual;
       if (Math.abs(delta) < 1e-9) return { ok: true, sinCambios: true, ...(await this.fotoProducto(tx, prod.id)) };
-      // Opcional: el que corrige días después puede no saber de quién era la tanda.
-      const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, false);
+      const tam = this.fmtTam(pres.tamKg);
 
-      const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
-      if (delta > 0) {
-        // Sumar paquetes es fraccionar más: tiene que haber granel para eso.
-        const granel = await this.cant(tx, prod.id, sucId, null, 'disponible');
-        if (kg > granel + 1e-9) {
+      if (delta < 0) {
+        const n = Math.round(-delta);
+        if (o.causa !== 'conteo' && o.causa !== 'faltante') {
           throw new BadRequestException(
-            `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCant(prod.tipo, null, granel)}.`,
+            `Bajás ${n} paquete(s) de ${tam}: decí qué pasó — se cargaron de más (los kilos siguen en el granel) o se rompieron o faltan (van a merma).`,
           );
         }
+        if (!motivo) throw new BadRequestException('Contá en una línea qué pasó con esos paquetes: queda en el historial.');
+        if (o.causa === 'faltante') {
+          const r = await this.opSimpleTx(tx, {
+            productoId: prod.id, sucursalId: sucId, presId: pres.id, tipo: 'merma', cantidad: n,
+            usuarioId: o.usuarioId, motivo: `Faltan al corregir el fraccionado de ${tam} · ${motivo}`,
+          });
+          return { ok: true, merma: true, movimiento: r.movimiento, delta, kg: 0, ...(await this.fotoProducto(tx, prod.id)) };
+        }
+      }
+
+      // Subir es fraccionar más: el operador se pide igual que al registrar.
+      // Bajar por conteo: opcional — el que corrige días después puede no saberlo.
+      const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, delta > 0);
+
+      const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
+      if (delta > 0 && kg > granel + 1e-9) {
+        // Sumar paquetes es fraccionar más: tiene que haber granel para eso.
+        throw new BadRequestException(
+          `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCant(prod.tipo, null, granel)}.`,
+        );
       }
 
       const base = { productoId: prod.id, sucursalId: sucId };
       await this.addDelta(tx, { ...base, presentacionId: pres.id, estado: 'disponible' }, delta);
       await this.addDelta(tx, { ...base, presentacionId: null, estado: 'disponible' }, delta > 0 ? -kg : kg);
 
-      const tam = this.fmtTam(pres.tamKg);
       const m = await this.mov(tx, {
         tipo: 'fraccionamiento', productoId: prod.id, sucursalId: sucId, presentacionId: pres.id,
         signo: 0, cantidad: kg, unidad: 'kg', presLabel: `Corrección · ${tam}`,
-        usuarioId: o.usuarioId ?? null, motivo: (o.motivo ?? '').trim(),
+        usuarioId: o.usuarioId ?? null, motivo,
         descripcion: `Corrigió ${tam}: ${actual} → ${real} paquetes (${kg} kg ${delta > 0 ? 'salen del' : 'vuelven al'} granel)`,
       });
       await this.registrarFraccionamiento(tx, {
-        origen: 'correccion', sucursalId: sucId, operadorId, usuarioId: o.usuarioId,
-        motivo: (o.motivo ?? '').trim(),
+        origen: 'correccion', sucursalId: sucId, operadorId, usuarioId: o.usuarioId, motivo,
+        fecha: momento.fecha, turno: momento.turno,
         items: [{ productoId: prod.id, presentacionId: pres.id, tamKg: pres.tamKg, paquetes: Math.round(delta), movimientoId: m.id }],
       });
       return { ok: true, movimiento: m, delta, kg, ...(await this.fotoProducto(tx, prod.id)) };
@@ -1348,7 +1421,7 @@ export class InventarioService {
       const presIds = crudos.map((it) => (it.presId ? Number(it.presId) : 0)).filter((n) => Number.isInteger(n) && n > 0);
       const [prods, press] = await Promise.all([
         prodIds.length
-          ? tx.select({ id: productos.id }).from(productos).where(inArray(productos.id, [...new Set(prodIds)]))
+          ? tx.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo }).from(productos).where(inArray(productos.id, [...new Set(prodIds)]))
           : [],
         presIds.length
           ? tx.select({ id: presentaciones.id, productoId: presentaciones.productoId })
@@ -1356,6 +1429,7 @@ export class InventarioService {
           : [],
       ]);
       const existe = new Set(prods.map((p: any) => p.id));
+      const prodDe = new Map<number, any>(prods.map((p: any): [number, any] => [p.id, p]));
       const duenoDePres = new Map<number, number>(press.map((p: any): [number, number] => [p.id, p.productoId]));
 
       const filas: any[] = [];
@@ -1371,6 +1445,7 @@ export class InventarioService {
           // "5 paquetes de 250 g" de algo que no los tiene.
           if (duenoDePres.get(presId) !== prodId) throw new BadRequestException('Una presentación elegida no es de su producto.');
         }
+        this.exigirEntero(prodDe.get(prodId), presId, cant);
         filas.push({
           transferenciaId: t.id, productoId: prodId, presentacionId: presId,
           cantidad: cant, cantidadPreparada: cant,
@@ -1475,7 +1550,11 @@ export class InventarioService {
    * tocarla hay que desconfirmar primero).
    */
   private async transferEnPreparacion(tx: any, id: number, soloSuc?: number | null) {
-    const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
+    /* Con candado (25/9/2026): editar un renglón leía "lista sin confirmar" de
+     * una foto, y una confirmación en paralelo reservaba stock con el número
+     * viejo — lo reservado y lo preparado quedaban distintos. Así se ponen en
+     * fila con `confirmarLista`, que toma la misma fila. */
+    const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1).for('update');
     if (!t) throw new NotFoundException('Transferencia inexistente.');
     // Contra el ORIGEN: preparar es sacar mercadería del propio depósito.
     this.exigirLado(t, soloSuc, 'origenId');
@@ -1502,6 +1581,20 @@ export class InventarioService {
       if (o.cantidadPreparada != null) {
         const c = Number(o.cantidadPreparada);
         if (!Number.isFinite(c) || c < 0) throw new BadRequestException('Cantidad preparada inválida.');
+        this.exigirEntero(prod, it.presentacionId, c);
+        /*
+         * PREPARAR MÁS DE LO PEDIDO (25/9/2026). Se puede —una caja cerrada de
+         * 12 cuando pidieron 10— pero no en silencio: sin tope ni aviso se
+         * podían preparar 999 de un renglón que pidió 4 y reservarlos. Pide el
+         * motivo, que queda en el remito. Los renglones AGREGADOS no tienen
+         * "pedido" (es 0): ya nacen con su motivo.
+         */
+        const motivo = String(o.motivo ?? it.motivo ?? '').trim();
+        if (!it.agregado && c > Number(it.cantidad) + 1e-9 && !motivo) {
+          throw new BadRequestException(
+            `Pidieron ${this.fmtCant(prod.tipo, it.presentacionId, Number(it.cantidad))} y estás preparando ${this.fmtCant(prod.tipo, it.presentacionId, c)}: poné el motivo de mandar de más.`,
+          );
+        }
         patch.cantidadPreparada = c;
       }
       if (o.motivo != null) patch.motivo = String(o.motivo).trim();
@@ -1522,11 +1615,21 @@ export class InventarioService {
       const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const prod = await this.getProducto(tx, o.productoId);
       if (!prod) throw new BadRequestException('Producto inválido.');
+      /* El paquete tiene que ser DE ESTE producto (25/9/2026), igual que al armar
+       * el pedido y al registrar un fraccionado. Sin esto se podía agregar
+       * "Lentejas" con el paquete de 1 kg de Arroz, y al confirmar la lista se
+       * fraccionaban Lentejas en un paquete que es de otro producto. */
+      if (o.presId) {
+        const [pres] = await tx.select({ id: presentaciones.id }).from(presentaciones)
+          .where(and(eq(presentaciones.id, o.presId), eq(presentaciones.productoId, prod.id))).limit(1);
+        if (!pres) throw new BadRequestException(`Ese paquete no es de ${prod.nombre}.`);
+      }
       if (this.listaBloqueada(t, this.listaDe(prod.tipo))) {
         throw new BadRequestException('Esa lista ya está confirmada — desconfirmala para agregar.');
       }
       const c = Number(o.cantidad);
       if (!Number.isFinite(c) || c <= 0) throw new BadRequestException('Ingresá la cantidad que se agrega.');
+      this.exigirEntero(prod, o.presId || null, c);
       const [row] = await tx.insert(transferenciaItems).values({
         transferenciaId: id, productoId: prod.id, presentacionId: o.presId || null,
         cantidad: 0, cantidadPreparada: c, agregado: true,
@@ -1679,8 +1782,11 @@ export class InventarioService {
 
       const pres = it.presentacionId != null ? porId.get(it.presentacionId) : null;
       if (prod.tipo === 'granel' && pres && pres.tamKg > 0) {
+        // Va a fraccionar: granel y paquete con candado, y el paquete se relee.
+        const granel = await this.cantConCandado(tx, it.productoId, t.origenId, null, 'disponible');
+        disp = await this.cantConCandado(tx, it.productoId, t.origenId, it.presentacionId, 'disponible');
+        if (it.cantidadPreparada <= disp + 1e-9) continue;
         const faltan = Math.ceil(it.cantidadPreparada - disp - 1e-9);
-        const granel = await this.cant(tx, it.productoId, t.origenId, null, 'disponible');
         const armar = Math.min(faltan, Math.floor(granel / pres.tamKg + 1e-9));
         if (armar > 0) {
           if (operadorId === undefined) {
@@ -1771,12 +1877,22 @@ export class InventarioService {
    * pendiente. Sin eso, el doble clic en Preparar ejecutaba dos pasos — el
    * segundo request encontraba la transferencia ya preparada y la despachaba.
    */
-  async avanzarTransferencia(id: number, usuarioId?: number, desde?: string, soloSuc?: number | null) {
+  /**
+   * `esJefe`: DESPACHAR es de administración (25/9/2026). La pantalla ya le
+   * escondía el botón al que prepara, pero el servidor lo aceptaba: el mismo
+   * fraccionador preparaba, despachaba y —entrando como la otra sucursal—
+   * recibía su propio pedido. Separar quién arma de quién despacha es lo que
+   * hace que un faltante tenga dos firmas y no una.
+   */
+  async avanzarTransferencia(id: number, usuarioId?: number, desde?: string, soloSuc?: number | null, esJefe = false) {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
       // Avanzar es preparar y despachar: sale del depósito del ORIGEN.
       this.exigirLado(t, soloSuc, 'origenId');
+      if (t.estado === 'preparada' && !esJefe) {
+        throw new ForbiddenException('Despachar es de administración: avisá que el pedido está listo para salir.');
+      }
       if (desde && t.estado !== desde) {
         throw new BadRequestException('La transferencia cambió de estado — actualizá la pantalla.');
       }
@@ -1839,7 +1955,7 @@ export class InventarioService {
    * merma/vencido/defectuoso), así que el faltante se cierra con el circuito
    * que ya existe, sin uno nuevo.
    */
-  async recibirTransferencia(id: number, o: { items?: { itemId: number; cantidadRecibida: number }[]; usuarioId?: number; observaciones?: string } = {}, soloSuc?: number | null) {
+  async recibirTransferencia(id: number, o: { items?: { itemId: number; cantidadRecibida: number }[]; usuarioId?: number; observaciones?: string } = {}, soloSuc?: number | null, esJefe = false) {
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
@@ -1848,6 +1964,27 @@ export class InventarioService {
        * incidencias que alguien tenía que investigar. */
       this.exigirLado(t, soloSuc, 'destinoId');
       if (t.estado !== 'transito') throw new BadRequestException('Solo se recibe lo que está en tránsito.');
+      /*
+       * QUIEN LO PREPARÓ NO LO RECIBE (25/9/2026). El que armó el pedido y el
+       * que lo cuenta al llegar son los dos controles del envío: si son la misma
+       * persona, un faltante queda firmado por el mismo que lo produjo (la
+       * incidencia salía con él de responsable). "Preparó" es cualquier huella
+       * suya en el ORIGEN de este pedido: pasarlo a preparación, reservar una
+       * lista, fraccionar para completarlo. La administración queda afuera: es
+       * la que despacha, y en un negocio chico a veces también recibe.
+       */
+      if (!esJefe && o.usuarioId) {
+        const r: any = await tx.execute(sql`
+          SELECT 1 FROM transferencia_hist
+           WHERE transferencia_id = ${t.id} AND usuario_id = ${o.usuarioId} AND estado IN ('preparada', 'transito')
+          UNION ALL
+          SELECT 1 FROM movimientos
+           WHERE ref_transferencia_id = ${t.id} AND usuario_id = ${o.usuarioId} AND sucursal_id = ${t.origenId}
+          LIMIT 1`);
+        if ((r.rows ?? r).length) {
+          throw new ForbiddenException('Este pedido lo preparaste vos: lo tiene que recibir y contar otra persona.');
+        }
+      }
       // Mismo reclamo atómico que en avanzar: dos recepciones simultáneas del
       // mismo remito duplicarían el ingreso al destino.
       const gano = await tx.update(transferencias)
@@ -1859,6 +1996,22 @@ export class InventarioService {
       const [origen] = await tx.select().from(sucursales).where(eq(sucursales.id, t.origenId)).limit(1);
       const [destino] = await tx.select().from(sucursales).where(eq(sucursales.id, t.destinoId)).limit(1);
       const contado = new Map((o.items ?? []).map((x) => [Number(x.itemId), Number(x.cantidadRecibida)]));
+      /*
+       * SE CUENTA TODO LO QUE VIAJÓ (25/9/2026). Un renglón que no venía en el
+       * conteo se tomaba como recibido COMPLETO: alcanzaba con no mandarlo para
+       * dar por llegado algo que nadie contó. Ahora cada renglón que subió al
+       * camión tiene que traer su número. La administración puede cerrar sin
+       * conteo ("llegó todo", `items` ausente): es la que despacha.
+       */
+      if (!(esJefe && o.items == null)) {
+        const sinContar = items.filter((it: any) => it.cantidadPreparada > 1e-9 && !contado.has(it.id));
+        if (sinContar.length) {
+          const nombres = await this.productosDe(tx, [...new Set(sinContar.map((it: any) => it.productoId as number))]);
+          throw new BadRequestException(
+            `Falta contar ${sinContar.length === 1 ? 'un renglón' : `${sinContar.length} renglones`}: ${sinContar.slice(0, 3).map((it: any) => nombres.get(it.productoId)?.nombre ?? `#${it.productoId}`).join(', ')}${sinContar.length > 3 ? '…' : ''}.`,
+          );
+        }
+      }
 
       const incidenciasCreadas: string[] = [];
       for (const it of items) {
@@ -1871,7 +2024,8 @@ export class InventarioService {
         }
         const prod = await this.getProducto(tx, it.productoId);
         const unidad = this.unidadDe(prod.tipo, it.presentacionId);
-        // Sin conteo explícito se asume completo; jamás más de lo enviado.
+        if (contado.has(it.id)) this.exigirEntero(prod, it.presentacionId, contado.get(it.id)!);
+        // Sin conteo explícito (solo la administración) se asume completo; jamás más de lo enviado.
         const rec = Math.min(Math.max(contado.get(it.id) ?? enviado, 0), enviado);
         const faltante = enviado - rec;
         await tx.update(transferenciaItems).set({ cantidadRecibida: rec }).where(eq(transferenciaItems.id, it.id));
@@ -1944,7 +2098,9 @@ export class InventarioService {
     });
   }
 
-  async cancelarTransferencia(id: number, usuarioId?: number, soloSuc?: number | null) {
+  /** `esJefe`: cancelar es de administración, como en la pantalla (ver `avanzarTransferencia`). */
+  async cancelarTransferencia(id: number, usuarioId?: number, soloSuc?: number | null, esJefe = false) {
+    if (!esJefe) throw new ForbiddenException('Cancelar un pedido es de administración.');
     return this.db.transaction(async (tx) => {
       const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
       if (!t) throw new NotFoundException('Transferencia inexistente.');
@@ -1980,7 +2136,8 @@ export class InventarioService {
           });
         }
       }
-      await tx.insert(transferenciaHist).values({ transferenciaId: t.id, estado: 'cancelada' });
+      // Con quién: la cancelación no decía quién la hizo.
+      await tx.insert(transferenciaHist).values({ transferenciaId: t.id, estado: 'cancelada', usuarioId: usuarioId ?? null });
       return { ok: true };
     });
   }
@@ -2520,16 +2677,23 @@ export class InventarioService {
     return { stock: await this.db.select().from(stock) };
   }
 
-  /** Lo chico y estable: sucursales, usuarios, listas, catálogos, remitos, avisos. */
-  async bootstrapBase() {
+  /**
+   * Lo chico y estable: sucursales, usuarios, listas, catálogos, remitos, avisos.
+   *
+   * `soloSuc` (25/9/2026): los pedidos y las incidencias, solo los de esa
+   * sucursal — `null` = todos (el jefe). El listado de pedidos ya estaba
+   * acotado, pero esta carga los traía todos con sus renglones: el
+   * fraccionador del Depósito leía el pedido que Centro le hizo a Norte.
+   */
+  async bootstrapBase(soloSuc: number | null = null) {
     const [suc, prov, usr, listasCat, transfs, incs, ms, cs, ss, es, rolesCat,
       pendientesLectura, urgentesVenc] = await Promise.all([
       this.db.select().from(sucursales),
       this.db.select().from(proveedores),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
       this.listas.catalogo(),
-      this.listTransferencias(),
-      this.incidenciasVigentes(),
+      this.listTransferencias(soloSuc),
+      this.incidenciasVigentes(soloSuc),
       this.db.select().from(marcas),
       this.db.select().from(categorias),
       this.db.select().from(subcategorias),
@@ -2578,8 +2742,17 @@ export class InventarioService {
     };
   }
 
-  /** Los productos con sus precios ya resueltos: la parte pesada y estable. */
-  async bootstrapCatalogo() {
+  /**
+   * Los productos con sus precios ya resueltos: la parte pesada y estable.
+   *
+   * `verCostos` (25/9/2026): el DETALLE DE COMPRA —lista del proveedor,
+   * descuentos, flete— es de quien compra o fija precios (`/productos` ya se lo
+   * ocultaba a los demás; esta carga no). Sin la llave viaja solo quién provee
+   * cada producto (los filtros por proveedor lo usan) y el costo UNITARIO ya
+   * resuelto, que sí hace falta afuera de Compras: el envío a la cafetería es
+   * "a costo". `costosOcultos` le avisa a la pantalla que no lo recalcule.
+   */
+  async bootstrapCatalogo(verCostos = true) {
     const [prods, pres, provCostos, formatos, listasCat, ms, cs, ss, es, pes] = await Promise.all([
       this.db.select().from(productos),
       this.db.select().from(presentaciones),
@@ -2708,7 +2881,10 @@ export class InventarioService {
         }),
         // Cada formato con su cadena derivada. Mismo nombre que en
         // `/productos`: un producto tiene una sola forma, venga de donde venga.
-        formatosCompra: pp.map((e) => ({ ...e, ...costosFormato(e, p.iva), costoNeto: costoNetoEntry(e, p.iva) })),
+        formatosCompra: verCostos
+          ? pp.map((e) => ({ ...e, ...costosFormato(e, p.iva), costoNeto: costoNetoEntry(e, p.iva) }))
+          : pp.map((e) => ({ proveedorId: e.proveedorId, usarParaPrecio: (e as any).usarParaPrecio })),
+        ...(verCostos ? {} : { costosOcultos: true, costoPrecioNeto: cnPrecio }),
         listas: listasProd,
       };
     });
@@ -2720,9 +2896,9 @@ export class InventarioService {
    * usa el CRM que todavía no recargó después del deploy; el nuevo pide las
    * partes por separado (`/bootstrap/base`, `/catalogo`, `/stock`).
    */
-  async bootstrap() {
+  async bootstrap(soloSuc: number | null = null, verCostos = true) {
     const [base, catalogo, stk] = await Promise.all([
-      this.bootstrapBase(), this.bootstrapCatalogo(), this.bootstrapStock(),
+      this.bootstrapBase(soloSuc), this.bootstrapCatalogo(verCostos), this.bootstrapStock(),
     ]);
     return { ...base, ...catalogo, ...stk };
   }

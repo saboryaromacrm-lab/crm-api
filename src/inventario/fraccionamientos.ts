@@ -25,7 +25,7 @@ import {
 } from '@nestjs/common';
 import { Transform, Type } from 'class-transformer';
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
-import { asc, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -265,11 +265,20 @@ export class FraccionamientosService {
 
   /* ------------------------------ Operadores ------------------------------ */
 
-  operadores(todos: boolean) {
+  /**
+   * `soloSuc` (26/9/2026): quien no es jefe ve los operadores que pueden
+   * trabajar en SU sucursal (los de ella y los de todas). Antes llegaban los
+   * de todas las sucursales, y se podía elegir a alguien que el registro
+   * después rechazaba con "no fracciona en esta sucursal".
+   */
+  operadores(todos: boolean, soloSuc: number | null = null) {
     const O = fraccionOperadores;
     return this.db.select({ id: O.id, nombre: O.nombre, sucursalId: O.sucursalId, activo: O.activo })
       .from(O)
-      .where(todos ? undefined : eq(O.activo, true))
+      .where(and(
+        todos ? undefined : eq(O.activo, true),
+        soloSuc == null ? undefined : or(isNull(O.sucursalId), eq(O.sucursalId, soloSuc)),
+      ))
       .orderBy(desc(O.activo), asc(O.nombre));
   }
 
@@ -335,8 +344,8 @@ export class FraccionamientosController {
   /** Los activos para elegir al fraccionar; `todos=1` suma los dados de baja (el filtro del historial y el ABM). */
   @Get('operadores')
   @Permiso('almacen.fraccionamiento', 'fraccionar')
-  operadores(@Query('todos') todos?: string) {
-    return this.svc.operadores(todos === '1');
+  operadores(@Auth() sesion: Sesion, @Query('todos') todos?: string) {
+    return this.svc.operadores(todos === '1', soloSuSucursal(sesion));
   }
 
   @Post('operadores')

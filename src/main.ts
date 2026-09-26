@@ -1,12 +1,33 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { BadRequestException, ValidationPipe, type ValidationError } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { json } from 'express';
 import helmet from 'helmet';
 import compression from 'compression';
 import { AppModule } from './app.module';
 import { LoggerApi, RegistroInterceptor } from './common/registro';
+
+/**
+ * LOS MENSAJES DE VALIDACIÓN, COMO LOS LEE UNA PERSONA (26/9/2026).
+ *
+ * Nest le antepone la ruta del campo a los errores de un renglón: un mensaje
+ * escrito en castellano para el DTO llegaba como "items.0.La cantidad de
+ * paquetes tiene que ser un número entero.". Si el mensaje es nuestro (empieza
+ * en mayúscula: los de fábrica empiezan con el nombre del campo) sale limpio;
+ * los de fábrica quedan exactamente como estaban, con su ruta.
+ */
+function mensajesDeValidacion(errores: ValidationError[], padre = ''): string[] {
+  const out: string[] = [];
+  for (const e of errores) {
+    const ruta = padre ? `${padre}.${e.property}` : e.property;
+    for (const m of Object.values(e.constraints ?? {})) {
+      out.push(/^[A-ZÁÉÍÓÚÑ¿¡]/.test(m) || !padre ? m : `${padre}.${m}`);
+    }
+    if (e.children?.length) out.push(...mensajesDeValidacion(e.children, ruta));
+  }
+  return [...new Set(out)];
+}
 
 async function bootstrap() {
   // El logger propio calla el inventario de rutas del arranque cuando corre
@@ -98,7 +119,11 @@ async function bootstrap() {
   app.getHttpAdapter().getInstance().set('trust proxy', trustProxy);
 
   app.setGlobalPrefix('api');
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  app.useGlobalPipes(new ValidationPipe({
+    whitelist: true,
+    transform: true,
+    exceptionFactory: (errores) => new BadRequestException(mensajesDeValidacion(errores)),
+  }));
   // Deja escritas las peticiones LENTAS (>2 s) y las que fallan por el lado del
   // servidor. Es el rastro que no existía cuando hubo que buscar por qué las
   // cajas veían "no se pudo conectar".
