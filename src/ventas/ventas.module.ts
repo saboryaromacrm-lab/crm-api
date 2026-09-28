@@ -45,7 +45,7 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioVentaFila, r6 } from '../inventario/pricing';
+import { costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila, r6 } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
@@ -69,6 +69,11 @@ const TIPOS_CREABLES = ['ticket', 'factura_a', 'factura_b', 'factura_c'] as cons
 // 0095: 'transferencia_proveedor' es la transferencia del cliente DIRECTO a la
 // cuenta de un proveedor (Cuentas disponibles). Lleva `cuentaDisponibleId`.
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'transferencia_proveedor'] as const;
+/** Cómo se dice cada medio en un mensaje al cajero. */
+const NOMBRE_MEDIO: Record<string, string> = {
+  efectivo: 'efectivo', transferencia: 'transferencia', tarjeta_debito: 'débito', tarjeta_credito: 'crédito',
+  cheque: 'cheque', qr: 'QR', otro: 'otro medio', transferencia_proveedor: 'transferencia a proveedor',
+};
 
 /**
  * Las secciones del módulo Ventas, con las mismas claves del catálogo de
@@ -106,6 +111,10 @@ function ofertaAlcanza(
   r: { productoId: number; presentacionId: number | null; marcaId: number | null;
     categoriaId: number | null; etiquetas: number[] },
 ): boolean {
+  /* La oferta AL TICKET no tiene alcance: corre sobre todo el ticket (26/9/2026).
+   * Se guarda sin alcances a propósito, así que el `.some([])` de abajo la
+   * rechazaba siempre y rompía la venta con la promo que la caja ofrecía. */
+  if (o.tipo === 'ticket') return true;
   // El alcance del COMBO son sus componentes, no la tabla de alcances.
   if (o.tipo === 'combo') {
     return (o.componentes ?? []).some((c) => c.productoId === r.productoId);
@@ -145,6 +154,9 @@ function techoDeOferta(
 
   switch (o.tipo) {
     case 'porcentaje':
+    /* La de ticket reparte su % renglón por renglón (`resolverOfertas` del
+     * POS): su techo en cada renglón es exactamente el de un porcentaje. */
+    case 'ticket':
       return money(c * p * ((Number(o.porcentaje) || 0) / 100));
     case 'segunda_unidad':
       // Un par por cada dos unidades, y el descuento cae sobre la segunda.
@@ -163,9 +175,123 @@ function techoDeOferta(
       return ahorro <= 0 ? 0 : money(Math.floor(c / lleva) * ahorro);
     }
     default:
-      // 'ticket' y 'combo': el importe no se deriva de este renglón solo.
+      // 'combo': el importe no se deriva de este renglón solo (ver errorTechoCombos).
       return null;
   }
+}
+
+/**
+ * ¿LA OFERTA ESTÁ VIVA AHORA, ACÁ? (26/9/2026) La MISMA regla que la caja
+ * (`ofertaVigente` en domain/ofertas.js): fechas, días de la semana y
+ * sucursal. El servidor solo miraba el tilde "activa", así que una promo del
+ * 50% cargada para enero se seguía aplicando en septiembre por la API, y un
+ * ticket armado a las 23:50 se cobraba con la promo a las 00:10.
+ */
+export function ofertaVigenteAhora(o: any, ahora: Date, sucursalId?: number | null): boolean {
+  if (!o || o.activa === false) return false;
+  if (o.desde && ahora < new Date(o.desde)) return false;
+  if (o.hasta && ahora > new Date(o.hasta)) return false;
+  const dias = String(o.dias ?? '');
+  if (dias.length === 7 && dias[(ahora.getDay() + 6) % 7] !== '1') return false;
+  if (o.sucursales && sucursalId != null) {
+    const ids = String(o.sucursales).split(',').map((x) => x.trim()).filter(Boolean);
+    if (ids.length && !ids.includes(String(sucursalId))) return false;
+  }
+  return true;
+}
+
+/**
+ * LA OFERTA AL TICKET PIDE SU MONTO MÍNIMO (26/9/2026). La caja la sugiere
+ * cuando el total la alcanza; el servidor no lo miraba, así que "10% desde
+ * $50.000" se podía colgar de un ticket de $2.000. Se mide como la caja: el
+ * total final ANTES de esta oferta (con las otras promos ya restadas).
+ */
+export function errorMontoOfertaTicket(
+  renglones: Array<{ cantidad: number; precioUnitario: number; descuento: number; iva: number;
+    ofertaId?: number | null; ofertaDescuento?: number }>,
+  ofertasActivas: Map<number, any>,
+): string | null {
+  const deTicket = new Set(renglones
+    .filter((r) => r.ofertaId != null && ofertasActivas.get(r.ofertaId)?.tipo === 'ticket' && (Number(r.ofertaDescuento) || 0) > 0)
+    .map((r) => r.ofertaId as number));
+  if (!deTicket.size) return null;
+  if (deTicket.size > 1) return 'Hay dos ofertas al ticket aplicadas a la vez: el ticket lleva una sola.';
+  const o = ofertasActivas.get([...deTicket][0]);
+  const total = renglones.reduce((a, r) => {
+    const neto = (Number(r.cantidad) || 0) * (Number(r.precioUnitario) || 0) * (1 - (Number(r.descuento) || 0) / 100);
+    const otra = r.ofertaId != null && r.ofertaId !== o.id ? Number(r.ofertaDescuento) || 0 : 0;
+    return a + (neto - otra) * (1 + (Number(r.iva) || 0) / 100);
+  }, 0);
+  const minimo = Number(o.montoMinimo) || 0;
+  return total + 0.01 < minimo
+    ? `La oferta "${o.nombre}" es para tickets desde $${minimo.toFixed(2)} y este suma $${total.toFixed(2)}.`
+    : null;
+}
+
+/**
+ * EL TECHO DEL COMBO, medido sobre el TICKET ENTERO (26/9/2026).
+ *
+ * El combo era la única oferta sin tope: su ahorro se reparte entre renglones
+ * de productos distintos, así que renglón por renglón no se puede acotar, y el
+ * techo quedaba en el bruto. Con un combo "Aceite + Lino" vivo, tres aceites
+ * SIN el lino se cobraban $0 con la etiqueta de la promo — cualquiera que
+ * pueda vender, sin el permiso de pisar precios.
+ *
+ * Es la misma cuenta que hace la caja (`aplicarCombos` en domain/ofertas.js):
+ * cuántos conjuntos COMPLETOS se arman con los renglones que llevan el combo, lo
+ * que valen esas unidades a precio final, menos el precio del combo por
+ * conjunto. El valor se toma de los renglones más caros primero: si el mismo
+ * producto está dos veces con precios distintos, el techo nunca queda por
+ * debajo de lo que la caja pudo calcular.
+ *
+ * Devuelve el texto del error, o null si el combo cierra.
+ */
+export function errorTechoCombos(
+  renglones: Array<{ productoId: number; cantidad: number; precioUnitario: number; iva: number;
+    ofertaId?: number | null; ofertaDescuento?: number }>,
+  ofertasActivas: Map<number, any>,
+  nombreDe: (productoId: number) => string,
+): string | null {
+  const porCombo = new Map<number, typeof renglones>();
+  for (const r of renglones) {
+    const o = r.ofertaId != null ? ofertasActivas.get(r.ofertaId) : null;
+    if (!o || o.tipo !== 'combo' || !((Number(r.ofertaDescuento) || 0) > 0)) continue;
+    const arr = porCombo.get(o.id) ?? [];
+    arr.push(r);
+    porCombo.set(o.id, arr);
+  }
+  for (const [id, rs] of porCombo) {
+    const o = ofertasActivas.get(id);
+    const comps: Array<{ productoId: number; cantidad: number }> = o.componentes ?? [];
+    const precioCombo = Number(o.precio) || 0;
+    const cantidadDe = (pid: number) => rs.filter((r) => r.productoId === pid)
+      .reduce((a, r) => a + (Number(r.cantidad) || 0), 0);
+    const conjuntos = comps.length < 2 || !(precioCombo > 0) ? 0
+      : Math.min(...comps.map((c) => Math.floor((cantidadDe(c.productoId) + 1e-9) / (Number(c.cantidad) || 1))));
+    if (!(conjuntos >= 1)) {
+      const receta = comps.map((c) => `${c.cantidad} ${nombreDe(c.productoId)}`).join(' + ');
+      return `El combo "${o.nombre}" es ${receta}: en este ticket no se completa ninguno, así que no descuenta nada.`;
+    }
+    let valorFinal = 0;
+    for (const c of comps) {
+      let falta = (Number(c.cantidad) || 1) * conjuntos;
+      const suyos = rs.filter((r) => r.productoId === c.productoId)
+        .sort((a, b) => b.precioUnitario * (1 + b.iva / 100) - a.precioUnitario * (1 + a.iva / 100));
+      for (const r of suyos) {
+        if (falta <= 1e-9) break;
+        const toma = Math.min(Number(r.cantidad) || 0, falta);
+        valorFinal += toma * r.precioUnitario * (1 + (Number(r.iva) || 0) / 100);
+        falta -= toma;
+      }
+    }
+    const techo = Math.max(0, valorFinal - conjuntos * precioCombo);
+    const aplicado = rs.reduce((a, r) => a + (Number(r.ofertaDescuento) || 0) * (1 + (Number(r.iva) || 0) / 100), 0);
+    if (aplicado > techo + 0.02 * rs.length) {
+      return `El combo "${o.nombre}" (${conjuntos} ${conjuntos > 1 ? 'conjuntos' : 'conjunto'} a $${precioCombo.toFixed(2)}) `
+        + `descuenta hasta $${techo.toFixed(2)} y se está aplicando $${aplicado.toFixed(2)}.`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -216,7 +342,16 @@ export function tipoVentaPara(cliente: { condicionIva: string }, config: Record<
 export function letraFacturaPara(cliente: { condicionIva: string }, config: Record<string, any>) {
   const empresa = config.condicionIvaEmpresa;
   if (empresa === 'monotributo' || empresa === 'exento') return 'factura_c';
-  return cliente.condicionIva === 'responsable_inscripto' ? 'factura_a' : 'factura_b';
+  /*
+   * AL MONOTRIBUTISTA, FACTURA A (26/9/2026). Desde la RG 5003 (2021) un
+   * Responsable Inscripto le emite comprobantes clase A al monotributista —con
+   * su CUIT y la condición "Responsable Monotributo" (6)—. Salía B, que ARCA
+   * rechaza con la condición del receptor informada (RG 5616): la venta quedaba
+   * trabada como ticket provisorio y "Facturar" reintentaba la misma letra para
+   * siempre. B queda para consumidor final, exento y no categorizado.
+   */
+  return cliente.condicionIva === 'responsable_inscripto' || cliente.condicionIva === 'monotributo'
+    ? 'factura_a' : 'factura_b';
 }
 
 /* ------------------------------- DTOs ------------------------------- */
@@ -878,6 +1013,7 @@ export class VentasService {
     for (const p of filasPres) tamDe.set(p.id, p.tamKg);
     const tam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
 
+    const devueltoRenglon = this.devueltoPorRenglon(items, nc.renglonesNotas);
     const itemsSalida = items.map((it) => {
       const p = prods.get(it.productoId);
       const kg = it.presentacionId ? tamDe.get(it.presentacionId) : undefined;
@@ -885,7 +1021,7 @@ export class VentasService {
       /* Cuánto de ESTE renglón ya volvió por una nota anterior. Sale del mismo
        * cálculo que valida la nota nueva (`acreditado()`), así que la pantalla
        * no puede ofrecer una cantidad que la API vaya a rechazar. */
-      const devuelto = nc.porClave.get(`${it.productoId}:${it.presentacionId ?? ''}`) ?? 0;
+      const devuelto = devueltoRenglon.get(it.id) ?? 0;
       return {
         ...it,
         nombre: kg !== undefined ? `${base} · ${tam(kg)}` : base,
@@ -986,6 +1122,7 @@ export class VentasService {
     const porClave = new Map<string, number>();
     let total = 0;
     let extras = false;
+    let renglonesNotas: any[] = [];
     for (const n of notas) total += n.total;
     if (notas.length) {
       const ids = notas.map((n) => n.id);
@@ -994,6 +1131,7 @@ export class VentasService {
         db.select({ id: ventaExtras.id }).from(ventaExtras)
           .where(inArray(ventaExtras.ventaId, ids)).limit(1),
       ]);
+      renglonesNotas = its;
       for (const it of its) {
         const k = `${it.productoId}:${it.presentacionId ?? ''}`;
         porClave.set(k, (porClave.get(k) ?? 0) + Number(it.cantidad));
@@ -1002,7 +1140,41 @@ export class VentasService {
        * renglón. Si ya viajaron en una nota anterior, no vuelven a viajar. */
       extras = exs.length > 0;
     }
-    return { notas, porClave, total: money(total), extras };
+    return { notas, porClave, renglonesNotas, total: money(total), extras };
+  }
+
+  /**
+   * CUÁNTO VOLVIÓ DE CADA RENGLÓN (26/9/2026). Se contaba por PRODUCTO y se
+   * topeaba por RENGLÓN: con el mismo aceite en dos renglones (2 y 3 u.),
+   * devolver el primero entero dejaba al segundo con "quedan 1" en vez de 3.
+   *
+   * Las notas nuevas guardan de qué renglón vienen (`refItemId`). Las viejas no
+   * lo tienen: su cantidad se reparte entre los renglones de ese producto en
+   * orden, sin pasarse de lo que cada uno llevaba — el total por producto
+   * sigue siendo exacto, que es lo que importa para no devolver de más.
+   */
+  private devueltoPorRenglon(items: any[], renglonesNotas: any[]) {
+    const porRenglon = new Map<number, number>();
+    const sinRenglon = new Map<string, number>();
+    const ids = new Set(items.map((it) => it.id));
+    for (const n of renglonesNotas) {
+      const cant = Number(n.cantidad) || 0;
+      if (n.refItemId != null && ids.has(n.refItemId)) {
+        porRenglon.set(n.refItemId, (porRenglon.get(n.refItemId) ?? 0) + cant);
+      } else {
+        const k = `${n.productoId}:${n.presentacionId ?? ''}`;
+        sinRenglon.set(k, (sinRenglon.get(k) ?? 0) + cant);
+      }
+    }
+    for (const it of [...items].sort((a, b) => a.id - b.id)) {
+      const k = `${it.productoId}:${it.presentacionId ?? ''}`;
+      const resto = sinRenglon.get(k) ?? 0;
+      if (!(resto > 0)) continue;
+      const cabe = Math.max(0, Math.min(resto, Number(it.cantidad) - (porRenglon.get(it.id) ?? 0)));
+      porRenglon.set(it.id, (porRenglon.get(it.id) ?? 0) + cabe);
+      sinRenglon.set(k, resto - cabe);
+    }
+    return porRenglon;
   }
 
   /**
@@ -1185,7 +1357,7 @@ export class VentasService {
       const suyos = grupo(provsDe, p.id);
       // La BASE del precio (0072): la parte sin factura entra sin el IVA que
       // el negocio absorbe. El costo real no viaja al POS — acá se cotiza.
-      costoPorProd.set(p.id, costoPrecioEntry(formatoActivo(suyos), p.iva));
+      costoPorProd.set(p.id, costoPrecioEntry(formatoDeCosto(p, suyos) as any, p.iva));
     }
 
     /** Stock por (producto, presentación, sucursal); presentación `null` = suelto. */
@@ -1355,7 +1527,7 @@ export class VentasService {
          * no tiene precio y eso NO es cero: viaja `sinFormato` y el POS lo
          * bloquea con el motivo. Un cero se vendería.
          */
-        const suyas = efectivasDe(pres.id, costoNetoPresentacion(costoNeto, pres.tamKg));
+        const suyas = efectivasDe(pres.id, costoNetoPresentacion(costoNeto, pres.tamKg, p.merma));
         const pisoPres = suyas.find((ef) => ef.listaId === listaBase?.id) ?? suyas[suyas.length - 1] ?? null;
         items.push({
           key: `s${pres.id}`,
@@ -1634,7 +1806,9 @@ export class VentasService {
     puedePisarPrecio: boolean,
     congelados: Map<string, { precioLista: number; listaId: number | null }> = new Map(),
     descuentosPorLista: Map<number, DescuentoResuelto> = new Map(),
+    sucursalId: number | null = null,
   ): Promise<RenglonResuelto[]> {
+    const ahora = new Date();
     const items = itemsDto ?? [];
     if (!items.length) return [];
 
@@ -1701,9 +1875,30 @@ export class VentasService {
      * medirla sobre el bruto rechazaría ventas legítimas. El medio de pago que
      * esa modalidad exige lo sigue validando `validarMediosPagoMonto`.
      */
-    const brutoTicket = items.reduce(
-      (a, it) => a + (Number(it.cantidad) || 0) * (Number(it.precioUnitario ?? it.precioLista) || 0), 0,
-    );
+    /*
+     * CON PRECIOS DEL SERVIDOR, NO LOS QUE DECLARA EL TICKET (26/9/2026): se
+     * sumaba el `precioLista` que mandaba el navegador, así que un pedido por
+     * API con un precio inflado "llegaba" al monto y habilitaba la lista
+     * mayorista en un ticket de $2.000. Ahora cada renglón vale su precio de
+     * PISO (el de mostrador), que es la dirección generosa: nunca por debajo
+     * de lo que la caja mostró.
+     */
+    const netoPisoDe = (it: VentaItemDto) => {
+      const prod = prodDe.get(Number(it.productoId));
+      if (!prod) return 0;
+      const presId = it.presentacionId ?? null;
+      const pres = presId ? presDe.get(presId) : null;
+      if (presId && (!pres || pres.productoId !== prod.id)) return 0;
+      const cf = costosFormato(formatoDeCosto(prod, provs.filter((x) => x.productoId === prod.id)) as any, prod.iva);
+      const costo = pres ? costoNetoPresentacion(cf.costoPrecioUnitario, pres.tamKg, prod.merma) : cf.costoPrecioUnitario;
+      const suyas = filas
+        .filter((f) => f.productoId === prod.id && (f.presentacionId ?? null) === presId && listaDe.has(f.listaId))
+        .sort((a, b) => listaDe.get(a.listaId)!.orden - listaDe.get(b.listaId)!.orden);
+      if (!suyas.length) return 0;
+      const piso = suyas.find((f) => f.listaId === baseId) ?? suyas[suyas.length - 1];
+      return precioVentaFila(costo, piso, { iva: prod.iva, redondeo: prod.redondeo ?? redondeo }).netoExacto;
+    };
+    const brutoTicket = items.reduce((a, it) => a + (Number(it.cantidad) || 0) * netoPisoDe(it), 0);
     const modalidadPorMonto = config.montoMinimoMayorista > 0 && config.modalidadMontoId
       && brutoTicket + 1e-9 >= config.montoMinimoMayorista
       ? config.modalidadMontoId
@@ -1734,9 +1929,9 @@ export class VentasService {
 
       /* -- El costo con el que se cotiza, igual que en el catálogo del POS -- */
       const suyos = provs.filter((x) => x.productoId === prod.id);
-      const cf = costosFormato(formatoActivo(suyos) as any, prod.iva);
+      const cf = costosFormato(formatoDeCosto(prod, suyos) as any, prod.iva);
       const costo = pres
-        ? costoNetoPresentacion(cf.costoPrecioUnitario, pres.tamKg)
+        ? costoNetoPresentacion(cf.costoPrecioUnitario, pres.tamKg, prod.merma)
         : cf.costoPrecioUnitario;
       /*
        * Y EL COSTO QUE SE CONGELA EN EL RENGLÓN (0072), que es OTRO: el real,
@@ -1745,7 +1940,8 @@ export class VentasService {
        * marzo no puede cambiar porque en julio subió el catálogo. El paquete
        * hereda el del kilo por su tamaño, igual que su precio.
        */
-      const escala = pres ? Number(pres.tamKg) || 0 : 1;
+      /* El paquete consume sus kilos MÁS la merma del fraccionado (0110). */
+      const escala = pres ? escalaPaquete(pres.tamKg, prod.merma) : 1;
       const costoCongelado = cf.costoNetoUnitario * escala;
       const ivaAbsorbidoCongelado = cf.ivaAbsorbidoUnitario * escala;
 
@@ -1792,12 +1988,13 @@ export class VentasService {
        * rechazado por la API — y el cajero se enteraría al cobrar.
        */
       const llevadas = porProducto.get(prod.id) ?? cantidad;
-      const habilitada = esPiso
+      const porOtraPuerta = esPiso
         || !!congelado
         || delCliente.has(elegida.fila.listaId)
         || (minimo > 0 && llevadas + 1e-9 >= minimo)
-        || !!modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId)
-        || (modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto);
+        || !!modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId);
+      const porMonto = modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto;
+      const habilitada = porOtraPuerta || porMonto;
       if (!habilitada && !puedePisarPrecio) {
         throw new BadRequestException(
           `${etiqueta}: el ticket no habilita la lista ${elegida.lista.nombre}`
@@ -1885,6 +2082,11 @@ export class VentasService {
         const of = ofertaId ? ofertasActivas.get(ofertaId) : null;
         if (!of) {
           throw new BadRequestException(`${etiqueta}: la oferta que descuenta ese importe no está activa.`);
+        }
+        if (!ofertaVigenteAhora(of, ahora, sucursalId)) {
+          throw new BadRequestException(
+            `${etiqueta}: la oferta "${of.nombre}" no está vigente ahora (fuera de fecha, de día o de sucursal).`,
+          );
         }
         /*
          * PRIMERO EL ALCANCE, que no se miraba en absoluto: alcanzaba con que
@@ -1997,7 +2199,12 @@ export class VentasService {
          * el mostrador. Confundirlos volvería inútil esta columna, que existe
          * justamente para poder auditar quién regala precio mayorista.
          */
-        listaOrigen: honraCotizado ? 'presupuesto' : (pisado ? 'manual' : (esPiso ? 'base' : 'auto')),
+        /* 'monto' cuando SOLO el monto del ticket habilita la lista: es lo que
+         * dispara la regla de medios de pago de esa modalidad
+         * (`validarMediosPagoMonto`), que hasta el 26/9/2026 no corría nunca
+         * porque este origen no se escribía. */
+        listaOrigen: honraCotizado ? 'presupuesto'
+          : (pisado ? 'manual' : (esPiso ? 'base' : (!porOtraPuerta && porMonto ? 'monto' : 'auto'))),
         /*
          * `precioLista` es el de la fila... salvo en el cotizado, donde el precio
          * de referencia ES el que se prometió: si acá quedara el de hoy, el
@@ -2037,6 +2244,20 @@ export class VentasService {
         );
       }
     }
+    /* El combo se acota recién acá: su techo es del ticket, no del renglón. */
+    const nombres = new Map<number, string>(prods.map((p) => [p.id, p.nombre]));
+    const faltanNombres = [...new Set([...ofertasActivas.values()]
+      .filter((o: any) => o.tipo === 'combo' && resueltos.some((r) => r.ofertaId === o.id))
+      .flatMap((o: any) => (o.componentes ?? []).map((c: any) => Number(c.productoId))))]
+      .filter((pid) => !nombres.has(pid));
+    if (faltanNombres.length) {
+      for (const p of await this.db.select({ id: productos.id, nombre: productos.nombre }).from(productos)
+        .where(inArray(productos.id, faltanNombres))) nombres.set(p.id, p.nombre);
+    }
+    const errCombo = errorTechoCombos(resueltos, ofertasActivas, (pid) => nombres.get(pid) ?? `producto ${pid}`);
+    if (errCombo) throw new BadRequestException(errCombo);
+    const errTicket = errorMontoOfertaTicket(resueltos, ofertasActivas);
+    if (errTicket) throw new BadRequestException(errTicket);
     return resueltos;
   }
 
@@ -2112,6 +2333,7 @@ export class VentasService {
          * como si lo hubiera tipeado el vendedor: el autoguardado siguiente lo
          * rebotaría contra el tope y el ticket quedaría trabado. */
         descuentoBase: (it as any).descuentoBase ?? desc,
+        refItemId: (it as any).refItemId ?? null,
         /* El costo congelado (0072). `?? null`, no `?? 0`: si un camino no lo
          * resolvió, "sin dato" tiene que quedar como NULL — un cero acá es un
          * margen del 100% inventado en los reportes. */
@@ -2334,6 +2556,10 @@ export class VentasService {
       cae: '', caeVencimiento: null as Date | null,
       cbteNro: null as number | null, puntoVenta: null as string | null,
       facturarPendiente: false, facturarMotivo: '',
+      /* Por qué quedó pendiente (0109): 'caido' = ARCA no respondió, se
+       * reintenta igual; 'rechazo' = un dato que ARCA no acepta; 'config' =
+       * la facturación no está lista. Solo 'caido' dice "servicio caído". */
+      facturarCausa: '' as '' | 'caido' | 'rechazo' | 'config',
       facturarCbteNro: null as number | null, facturarCbteTipo: null as number | null,
     };
     if (!quiereFactura) return vacio;
@@ -2363,7 +2589,7 @@ export class VentasService {
      */
     if (!this.arca.disponible()) {
       return {
-        ...vacio, tipo: 'ticket', facturarPendiente: true,
+        ...vacio, tipo: 'ticket', facturarPendiente: true, facturarCausa: 'config' as const,
         facturarMotivo: this.arca.motivo() ?? 'La facturación electrónica no está configurada.',
       };
     }
@@ -2401,6 +2627,7 @@ export class VentasService {
       tipo: 'ticket',
       facturarPendiente: true,
       facturarMotivo: r.motivo,
+      facturarCausa: (r.reintentable === false ? 'rechazo' : 'caido') as 'rechazo' | 'caido',
     };
   }
 
@@ -2558,6 +2785,47 @@ export class VentasService {
       }
     }
     this.validarMediosPagoDescuentos(items, condicionPago, pagos, filas);
+  }
+
+  /**
+   * EL EFECTIVO QUE ENTRÓ POR COBRANZAS A ESTA VENTA (cuenta corriente). De
+   * cada recibo imputado a la venta, se cuenta como efectivo lo imputado hasta
+   * lo que ese recibo cobró en efectivo — si el recibo fue por transferencia,
+   * esa plata no está en ningún cajón.
+   */
+  private async efectivoDeCobranzas(ventaId: number) {
+    const filas = await this.db.select({
+      cobranzaId: cobranzaImputaciones.cobranzaId,
+      imputado: sql<number>`sum(${cobranzaImputaciones.importe})`,
+      efectivo: sql<number>`(select coalesce(sum(cp.importe), 0) from cobranza_pagos cp where cp.cobranza_id = ${cobranzaImputaciones.cobranzaId} and cp.medio = 'efectivo')`,
+    }).from(cobranzaImputaciones)
+      .innerJoin(cobranzas, eq(cobranzas.id, cobranzaImputaciones.cobranzaId))
+      .where(and(eq(cobranzaImputaciones.ventaId, ventaId), eq(cobranzas.estado, 'confirmada')))
+      .groupBy(cobranzaImputaciones.cobranzaId);
+    return money(filas.reduce((a: number, f: any) => a + Math.min(Number(f.imputado) || 0, Number(f.efectivo) || 0), 0));
+  }
+
+  /**
+   * LAS OFERTAS, RELEÍDAS AL COBRAR (26/9/2026) — el gemelo de los descuentos
+   * de arriba. Entre el último autoguardado y el cobro pueden pasar horas: la
+   * promo pudo vencer (el ticket de las 23:50 cobrado a las 00:10), apagarse o
+   * borrarse. Lo que vale es lo de AHORA; la caja recalcula sola al tocar el
+   * ticket, así que el mensaje dice exactamente eso.
+   */
+  private async validarOfertasAlCobrar(items: any[], sucursalId: number | null) {
+    const usadas = items.filter((it: any) => it.ofertaId && (Number(it.ofertaDescuento) || 0) > 0);
+    if (!usadas.length) return;
+    const vivas = new Map<number, any>(((await this.ofertas.activas()) as any[]).map((o) => [o.id, o]));
+    const ahora = new Date();
+    for (const it of usadas) {
+      const o = vivas.get(it.ofertaId);
+      if (!o || !ofertaVigenteAhora(o, ahora, sucursalId)) {
+        throw new BadRequestException(
+          `La oferta "${it.oferta || o?.nombre || 'aplicada'}" ya no está vigente y este ticket todavía la tiene. `
+          + 'Tocá cualquier renglón para que la caja recalcule, y volvé a cobrar.',
+        );
+      }
+    }
   }
 
   private async validarCredito(cliente: any, config: any, condicionPago: string, total: number) {
@@ -2745,7 +3013,7 @@ export class VentasService {
       dto.descuentos, sucursalId, !!opciones.puedePisarPrecio,
     );
     const items = await this.resolverRenglones(
-      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista,
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista, sucursalId,
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
@@ -2787,6 +3055,13 @@ export class VentasService {
     }
 
     /* -- Confirmada de una: el camino de la API y del seed -- */
+    /* Las cuotas CON RECARGO se cobran solo por la caja (26/9/2026): este
+     * camino no suma el recargo, así que la financiación se perdía entera. */
+    if ((dto.pagos ?? []).some((p) => p.cuotas && porcentajeRecargo(config, p.cuotas) > 0)) {
+      throw new BadRequestException(
+        'Una venta en cuotas con recargo se cobra desde la caja (armá el ticket y cobralo): así se suma la financiación.',
+      );
+    }
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
     // Sobre el tipo PEDIDO: si se pidió factura y ARCA cae, el ticket
     // provisorio pendiente cumple la regla (la intención quedó registrada).
@@ -2828,6 +3103,7 @@ export class VentasService {
         ivaTotal: tot.ivaTotal, total: tot.total,
         cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
         facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
+        facturarPorCaida: fiscal.facturarCausa !== 'rechazo' && fiscal.facturarCausa !== 'config',
         observaciones: dto.observaciones ?? '',
       }).returning();
 
@@ -3003,7 +3279,7 @@ export class VentasService {
       new Set((actual.items ?? []).map((it: any) => it.descuentoId).filter(Boolean) as number[]),
     );
     const items = await this.resolverRenglones(
-      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista,
+      dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista, actual.sucursalId,
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
 
@@ -3033,6 +3309,39 @@ export class VentasService {
    * que se confirma sea exactamente lo último que se guardó.
    */
   async confirmar(id: number, dto: ConfirmarVentaDto, opciones: OpcionesVenta = {}) {
+    return this.unaEmisionPorVenta(id, () => this.confirmarSinCandado(id, dto, opciones));
+  }
+
+  /**
+   * UNA EMISIÓN POR VENTA A LA VEZ (26/9/2026).
+   *
+   * El CAE se le pide a ARCA ANTES de la transacción (no se puede tener la
+   * caja trabada 15 segundos esperando un web service), y el candado de la
+   * fila recién se toma después. En ese hueco, un segundo pedido por la MISMA
+   * venta —la cajera que reintenta porque la pantalla no contestó, o "Facturar
+   * todas" apretado dos veces— pedía OTRO CAE: dos facturas en ARCA para una
+   * venta, y la segunda sin nada que la represente acá.
+   *
+   * Con esto el segundo pedido ESPERA a que termine el primero y recién ahí lee
+   * la venta: la encuentra cobrada (o facturada) y contesta eso, sin llamar a
+   * ARCA. Vive en memoria porque la API corre en un solo proceso; el candado
+   * de la base sigue abajo para todo lo demás.
+   */
+  private emisiones = new Map<number, Promise<unknown>>();
+  private async unaEmisionPorVenta<T>(id: number, fn: () => Promise<T>): Promise<T> {
+    while (this.emisiones.has(id)) {
+      try { await this.emisiones.get(id); } catch { /* el error es del otro pedido */ }
+    }
+    const p = fn();
+    this.emisiones.set(id, p);
+    try {
+      return await p;
+    } finally {
+      if (this.emisiones.get(id) === p) this.emisiones.delete(id);
+    }
+  }
+
+  private async confirmarSinCandado(id: number, dto: ConfirmarVentaDto, opciones: OpcionesVenta = {}) {
     /*
      * No usa `exigirBorrador` porque su mensaje —"La venta ya está emitida: no
      * se puede modificar"— es el correcto para editar un ticket y el PEOR
@@ -3139,22 +3448,42 @@ export class VentasService {
       borrador.total = limpio.total;
     }
     const fin = this.aplicarRecargoCuotas(dto.pagos ?? [], borrador.total, config);
-    let recargoNuevo: { concepto: string; importe: number; iva: number } | null = null;
+    const recargosNuevos: { concepto: string; importe: number; iva: number }[] = [];
     if (fin.recargo > 0) {
-      /* El extra se guarda NETO y la alícuota va aparte: la financiación de
-       * una venta gravada tributa igual que la venta. `money(recargo / 1.21)`
-       * puede dejar un centavo de diferencia contra el recargo redondeado, y
-       * por eso `validarPagos` tolera exactamente eso -- lo que no puede pasar
-       * es que el total se aleje del número que vio el cliente. */
-      const neto = money(fin.recargo / 1.21);
-      recargoNuevo = {
-        concepto: `Recargo ${fin.cuotas} cuota${fin.cuotas === 1 ? '' : 's'} (${fin.porcentaje}%)`,
-        importe: neto,
-        iva: 21,
-      };
-      borrador.extras = [...(borrador.extras ?? []), recargoNuevo] as any;
-      borrador.subtotalNeto = money(borrador.subtotalNeto + neto);
-      borrador.ivaTotal = money(borrador.ivaTotal + money(fin.recargo - neto));
+      /*
+       * EL RECARGO TRIBUTA CON EL IVA DE LO QUE FINANCIA (26/9/2026).
+       *
+       * La financiación de una venta gravada tributa igual que la venta, y
+       * estaba fija al 21%: en un ticket de semillas al 10,5% la factura A
+       * declaraba mal el IVA del recargo. Ahora se reparte en proporción a lo
+       * que cada alícuota pesa en el ticket (a precio final) y sale un cargo
+       * por alícuota. El total no cambia ni un centavo —el último tramo se
+       * lleva el redondeo—: es el mismo número que vio el cliente.
+       */
+      const porIva = new Map<number, number>();
+      const sumar = (neto: number, iva: number) => porIva.set(iva, (porIva.get(iva) ?? 0) + neto * (1 + iva / 100));
+      for (const it of borrador.items as any[]) sumar(Number(it.subtotal) || 0, Number(it.iva) || 0);
+      for (const e of (borrador.extras ?? []) as any[]) sumar(Number(e.importe) || 0, Number(e.iva ?? 21) || 0);
+      const tramos = [...porIva].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+      const pesoTotal = tramos.reduce((a, [, v]) => a + v, 0);
+      const concepto = `Recargo ${fin.cuotas} cuota${fin.cuotas === 1 ? '' : 's'} (${fin.porcentaje}%)`;
+      let resto = fin.recargo;
+      tramos.forEach(([iva, peso], i) => {
+        const parte = i === tramos.length - 1 ? money(resto) : money(fin.recargo * (peso / pesoTotal));
+        resto = money(resto - parte);
+        if (!(parte > 0)) return;
+        const neto = money(parte / (1 + iva / 100));
+        recargosNuevos.push({ concepto: tramos.length > 1 ? `${concepto} · IVA ${String(iva).replace('.', ',')}%` : concepto, importe: neto, iva });
+        borrador.subtotalNeto = money(borrador.subtotalNeto + neto);
+        borrador.ivaTotal = money(borrador.ivaTotal + money(parte - neto));
+      });
+      if (!tramos.length) {
+        const neto = money(fin.recargo / 1.21);
+        recargosNuevos.push({ concepto, importe: neto, iva: 21 });
+        borrador.subtotalNeto = money(borrador.subtotalNeto + neto);
+        borrador.ivaTotal = money(borrador.ivaTotal + money(fin.recargo - neto));
+      }
+      borrador.extras = [...(borrador.extras ?? []), ...recargosNuevos] as any;
       borrador.total = money(borrador.total + fin.recargo);
     }
 
@@ -3175,6 +3504,7 @@ export class VentasService {
      * dueño pudo agregarle una forma de pago. Lo que vale es lo de ahora.
      */
     await this.validarDescuentosAlCobrar(borrador.items, condicionPago, pagos);
+    await this.validarOfertasAlCobrar(borrador.items, sucursalId);
     await this.validarCredito(cliente, config, condicionPago, borrador.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
 
@@ -3201,11 +3531,17 @@ export class VentasService {
      * (el borrador): por eso acá SÍ se reserva el número antes de pedir el
      * CAE. Si el proceso muere con el pedido en vuelo, el rastro queda y el
      * reintento consulta ese número en vez de emitir una segunda factura. */
+    /* Si un cobro anterior de este ticket llegó a reservar un número y se cayó
+     * DESPUÉS de pedir el CAE (turno cerrado, stock, la red), ese comprobante
+     * puede existir en ARCA: se consulta y se adopta en vez de emitir otro. */
+    const [reserva] = await this.db.select({ nro: ventas.facturarCbteNro, tipo: ventas.facturarCbteTipo })
+      .from(ventas).where(eq(ventas.id, id)).limit(1);
     const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, config, {
       total: borrador.total, neto: borrador.subtotalNeto, iva: borrador.ivaTotal,
       items: borrador.items, extras: borrador.extras, fecha,
     }, {
       ptoVta: await this.ptoVtaFiscal(sucursalId),
+      reservado: reserva?.nro && reserva?.tipo ? { cbteNro: reserva.nro, cbteTipo: reserva.tipo } : null,
       reservar: async (nro, cbteTipo) => {
         await this.db.update(ventas)
           .set({ facturarCbteNro: nro, facturarCbteTipo: cbteTipo })
@@ -3277,7 +3613,7 @@ export class VentasService {
       if (recargosViejos.length) {
         await tx.delete(ventaExtras).where(inArray(ventaExtras.id, recargosViejos.map((e: any) => e.id)));
       }
-      if (recargoNuevo) await tx.insert(ventaExtras).values({ ventaId: id, ...recargoNuevo });
+      if (recargosNuevos.length) await tx.insert(ventaExtras).values(recargosNuevos.map((r) => ({ ventaId: id, ...r })));
 
       // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
@@ -3290,6 +3626,7 @@ export class VentasService {
         puntoVenta: puntoVentaFinal,
         cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
         facturarPendiente: fiscal.facturarPendiente, facturarMotivo: fiscal.facturarMotivo,
+        facturarPorCaida: fiscal.facturarCausa !== 'rechazo' && fiscal.facturarCausa !== 'config',
         /* La reserva se limpia al cerrar bien: si quedó pendiente, el número
          * SOBREVIVE para que el reintento pueda consultarlo. */
         facturarCbteNro: fiscal.facturarPendiente ? undefined : null,
@@ -3350,6 +3687,10 @@ export class VentasService {
    * nada, se puede apretar mil veces.
    */
   async facturarAhora(id: number, opciones: OpcionesVenta = {}) {
+    return this.unaEmisionPorVenta(id, () => this.facturarAhoraSinCandado(id, opciones));
+  }
+
+  private async facturarAhoraSinCandado(id: number, opciones: OpcionesVenta = {}) {
     const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
     if (!v) throw new NotFoundException('Esa venta no existe.');
     if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
@@ -3419,9 +3760,16 @@ export class VentasService {
     if (fiscal.facturarPendiente) {
       // Se guarda el motivo NUEVO: el de hace una hora puede no ser el de ahora.
       await this.db.update(ventas)
-        .set({ facturarMotivo: fiscal.facturarMotivo })
+        .set({ facturarMotivo: fiscal.facturarMotivo, facturarPorCaida: fiscal.facturarCausa === 'caido' })
         .where(eq(ventas.id, id));
-      throw new BadRequestException(`No se pudo facturar: ${fiscal.facturarMotivo}`);
+      /* La CAUSA viaja en la respuesta (0109): "Facturar todas" corta la tanda
+       * si ARCA sigue caído o no está configurado —las demás van a fallar
+       * igual— y sigue de largo si fue un rechazo de ESTA venta. */
+      throw new BadRequestException({
+        statusCode: 400, error: 'Bad Request',
+        message: `No se pudo facturar: ${fiscal.facturarMotivo}`,
+        causa: fiscal.facturarCausa || 'caido',
+      });
     }
     /*
      * SIN CAE NO HAY FACTURA, Y ACÁ NO HAY EXCEPCIÓN QUE VALGA.
@@ -3444,10 +3792,11 @@ export class VentasService {
      * estar.
      */
     if (!fiscal.cae) {
-      throw new BadRequestException(
-        'La facturación electrónica está apagada: no hay con qué emitir el comprobante fiscal. '
-        + 'Prendela en Ventas › Configuración y revisá el panel de diagnóstico.',
-      );
+      throw new BadRequestException({
+        statusCode: 400, error: 'Bad Request', causa: 'config',
+        message: 'La facturación electrónica está apagada: no hay con qué emitir el comprobante fiscal. '
+          + 'Prendela en Ventas › Configuración y revisá el panel de diagnóstico.',
+      });
     }
 
     const provisorio = `${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
@@ -3473,7 +3822,7 @@ export class VentasService {
       await tx.update(ventas).set({
         tipo: fiscal.tipo as any, numero, puntoVenta: puntoVentaFinal,
         cae: fiscal.cae, caeVencimiento: fiscal.caeVencimiento,
-        facturarPendiente: false, facturarMotivo: '',
+        facturarPendiente: false, facturarMotivo: '', facturarPorCaida: true,
         facturarCbteNro: null, facturarCbteTipo: null,
         /* El rastro del provisorio: sin esto, el ticket de papel que se llevó
          * el cliente apunta a un comprobante que ya no existe con ese número. */
@@ -3579,7 +3928,7 @@ export class VentasService {
 
     /* -- Lo ya acreditado por notas anteriores, renglón por renglón -- */
     const previo = await this.acreditado(ventaId);
-    const acreditado = previo.porClave;
+    const devueltoRenglon = this.devueltoPorRenglon(original.items, previo.renglonesNotas);
     const acreditadoTotal = previo.total;
 
     /* -- Los renglones que se devuelven -- */
@@ -3594,8 +3943,7 @@ export class VentasService {
 
     const renglones: RenglonResuelto[] = [];
     for (const it of original.items) {
-      const clave = `${it.productoId}:${it.presentacionId ?? ''}`;
-      const yaVuelto = acreditado.get(clave) ?? 0;
+      const yaVuelto = money(devueltoRenglon.get(it.id) ?? 0);
       const disponible = money(Number(it.cantidad) - yaVuelto);
       const cant = elegidos ? (pedidos.get(it.id) ?? 0) : disponible;
       if (!(cant > 0)) continue;
@@ -3607,6 +3955,9 @@ export class VentasService {
       }
       renglones.push({
         ...it,
+        /* De qué renglón viene (26/9/2026): con eso la próxima devolución
+         * sabe exactamente cuánto queda de CADA renglón. */
+        refItemId: it.id,
         cantidad: cant,
         /* El precio y el IVA son LOS DE LA VENTA ORIGINAL, no los de hoy: la
          * nota de crédito devuelve exactamente lo que se cobró. Si el producto
@@ -3699,8 +4050,21 @@ export class VentasService {
        * Y se descuenta lo que ya devolvieron notas anteriores, que llevan su
        * turno de caja anotado justamente porque sacaron plata.
        */
+      /*
+       * Y DEL CAJÓN SOLO SALE LO QUE ENTRÓ EN EFECTIVO (26/9/2026). El tope
+       * sumaba TODOS los medios: una venta pagada con débito se "devolvía" con
+       * billetes del cajón —plata que nunca entró ahí— y el arqueo lo daba por
+       * bueno porque el egreso quedaba registrado. Lo pagado con tarjeta,
+       * transferencia o QR se devuelve por el mismo medio (la anulación en el
+       * posnet, la transferencia de vuelta), fuera de la caja.
+       */
       const pagadoEnElActo = (original.pagos ?? [])
+        .filter((p: any) => p.medio === 'efectivo')
         .reduce((a: number, p: any) => a + (Number(p.importe) || 0), 0);
+      const pagadoOtrosMedios = money((original.pagos ?? [])
+        .filter((p: any) => p.medio !== 'efectivo')
+        .reduce((a: number, p: any) => a + (Number(p.importe) || 0), 0));
+      const efectivoCobranzas = await this.efectivoDeCobranzas(ventaId);
       const [yaDevuelto] = await this.db
         .select({ t: sql<number>`coalesce(sum(${ventas.total}), 0)` })
         .from(ventas)
@@ -3709,14 +4073,18 @@ export class VentasService {
           isNotNull(ventas.cajaSesionId),
           ne(ventas.estado, 'anulada'),
         ));
-      const entro = money(pagadoEnElActo + (original.cobrado ?? 0));
+      const entro = money(pagadoEnElActo + efectivoCobranzas);
       entroPorLaVenta = entro;
       const disponible = money(entro - (Number(yaDevuelto?.t) || 0));
 
       if (tot.total > disponible + 0.009) {
+        const otros = pagadoOtrosMedios > 0.009
+          ? ` El resto se cobró con ${[...new Set((original.pagos ?? []).filter((p: any) => p.medio !== 'efectivo').map((p: any) => NOMBRE_MEDIO[p.medio] ?? p.medio))].join(' y ')} `
+            + `(${money(pagadoOtrosMedios)}): eso se devuelve por el mismo medio, no del cajón.`
+          : '';
         throw new BadRequestException(
-          `No se puede devolver ${money(tot.total)} en efectivo: de esta venta entraron ${entro} `
-          + `y ya se devolvieron ${money(entro - disponible)}, así que quedan ${money(Math.max(disponible, 0))}. `
+          `No se puede devolver ${money(tot.total)} en efectivo: de esta venta entraron ${entro} en efectivo `
+          + `y ya se devolvieron ${money(entro - disponible)}, así que quedan ${money(Math.max(disponible, 0))}.${otros} `
           + (esTicket
             ? 'Registrá la devolución SIN plata: la deuda del cliente se ajusta igual.'
             : 'Emití la nota de crédito SIN devolución: la deuda del cliente se ajusta igual.'),
@@ -3757,14 +4125,10 @@ export class VentasService {
       }
 
       // (2) El tope por renglón: el total puede dar y la mercadería no.
-      const porOriginal = new Map<string, number>();
-      for (const it of original.items) {
-        const k = `${it.productoId}:${it.presentacionId ?? ''}`;
-        porOriginal.set(k, (porOriginal.get(k) ?? 0) + Number(it.cantidad));
-      }
+      const devueltoAhora = this.devueltoPorRenglon(original.items, ahora.renglonesNotas);
       for (const r of tot.items) {
-        const k = `${(r as any).productoId}:${(r as any).presentacionId ?? ''}`;
-        const queda = money((porOriginal.get(k) ?? 0) - (ahora.porClave.get(k) ?? 0));
+        const orig = original.items.find((it: any) => it.id === (r as any).refItemId);
+        const queda = money((Number(orig?.cantidad) || 0) - (devueltoAhora.get((r as any).refItemId) ?? 0));
         if (Number(r.cantidad) > queda + 1e-9) {
           throw new BadRequestException(
             `De "${(r as any).nombre}" ya no quedan ${r.cantidad} para devolver (quedan ${Math.max(queda, 0)}): `
@@ -4011,6 +4375,7 @@ export class VentasService {
     if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Esa venta es de otra sucursal.');
     }
+    this.exigirSinDevoluciones(v.notas, v.acreditable);
     const razon = (motivo ?? '').trim();
     if (!razon) throw new BadRequestException('Indicá por qué se anula la venta.');
 
@@ -4047,6 +4412,10 @@ export class VentasService {
       if (fresca.estado === 'anulada') {
         throw new BadRequestException('Esta venta ya se anuló recién desde otra pantalla.');
       }
+      /* Otra vez, con la venta tomada: `notaCredito` toma el mismo candado, así
+       * que una devolución que entró en el medio ya está a la vista acá. */
+      const ahora = await this.acreditado(id, tx);
+      this.exigirSinDevoluciones(ahora.notas, money(Number(fresca.total) - ahora.total));
       if (v.cajaSesionId && !opciones.esJefe) {
         const [sesion] = await tx.select().from(cajaSesiones)
           .where(eq(cajaSesiones.id, v.cajaSesionId)).limit(1).for('update');
@@ -4080,6 +4449,31 @@ export class VentasService {
       }
     });
     return this.get(id);
+  }
+
+  /**
+   * UNA VENTA CON DEVOLUCIONES NO SE ANULA (26/9/2026).
+   *
+   * Anular deshace la venta ENTERA: devuelve todos los renglones al stock y
+   * saca todo su efectivo del arqueo. Pero lo que ya volvió por una devolución
+   * ya reingresó al stock y ya salió del cajón (su egreso sigue en el turno):
+   * anular encima lo contaba dos veces. Vendés 5, devolvés 2 y anulás: el stock
+   * ganaba 2 unidades que no existen y el arqueo esperaba menos plata de la que
+   * hay — una diferencia que alguien se puede llevar sin que el cierre la vea.
+   *
+   * Lo que queda se deshace con OTRA devolución por el resto, que ya descuenta
+   * lo devuelto renglón por renglón. Mismo criterio que Compras: una factura con
+   * una nota viva no se anula.
+   */
+  private exigirSinDevoluciones(notas: any[] | undefined, acreditable: number) {
+    if (!notas?.length) return;
+    const nros = notas.map((n: any) => `${n.puntoVenta}-${String(n.numero ?? 0).padStart(8, '0')}`).join(', ');
+    throw new BadRequestException(
+      acreditable > 0.009
+        ? `Esta venta ya tiene ${notas.length > 1 ? 'devoluciones' : 'una devolución'} (${nros}): anularla devolvería otra vez `
+          + 'lo que ya volvió al stock y a la caja. Para deshacer lo que queda, hacé una Devolución por el resto.'
+        : `Esta venta ya se devolvió entera (${nros}): no queda nada para anular.`,
+    );
   }
 
   /**

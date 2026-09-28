@@ -116,6 +116,33 @@ export function tienePermiso(permisos: string[], claves: string[]): boolean {
 }
 
 /**
+ * QUIÉN NO VE NI EL COSTO UNITARIO de la distribuidora (26/9/2026).
+ *
+ * Tres niveles: quien compra o fija precios ve todo el detalle de compra; el
+ * resto del negocio ve el costo unitario ya resuelto, porque el envío a la
+ * cafetería sale "a costo" y cualquiera con la sección lo arma; y quien NO
+ * tiene ni eso —el rol Cafetería, que está del otro lado del puente— no ve el
+ * costo de nada que no sea suyo. Se bajaba el costo de los 2.700 productos y el
+ * buscador del pedido lo mostraba renglón por renglón.
+ */
+/**
+ * LAS MÉTRICAS DE LA CAFETERÍA SON SOLO DEL SUPERADMIN (27/9/2026, pedido del
+ * dueño): el resumen de plata de Almacén › Cafetería, su pestaña Métrica, el
+ * total del depósito del café y el bloque de Coffit en Gerencia › Rentabilidad.
+ * Ni el administrador ni el rol Cafetería los ven.
+ *
+ * Es una llave que NINGÚN rol tiene y que no figura en el catálogo de permisos:
+ * la única forma de pasarla es el comodín `*`, que es el del superadmin. Así
+ * nadie se la puede asignar desde la pantalla de roles.
+ */
+export const PERMISO_METRICAS_CAFE = 'almacen.cafeteria-metricas';
+export const veMetricasDelCafe = (permisos: string[] | undefined) => tienePermiso(permisos ?? [], [PERMISO_METRICAS_CAFE]);
+
+export function ocultaCostoUnitario(permisos: string[]): boolean {
+  return !tienePermiso(permisos ?? [], ['precios', 'compras.productos', 'almacen.cafeteria']);
+}
+
+/**
  * QUIÉN PUEDE OPERAR EN OTRA SUCURSAL.
  *
  * El cajero está clavado a la suya: la sucursal sale de su sesión y no del body,

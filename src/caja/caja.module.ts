@@ -16,14 +16,14 @@ import {
   Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
-import { IsIn, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString } from 'class-validator';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import {
-  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, ventaPagos, ventas,
+  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, sucursales, ventaPagos, ventas,
 } from '../db/schema';
 
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -36,9 +36,70 @@ class AbrirCajaDto {
    */
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
-  // Obligatorio: un turno SIEMPRE arranca declarando su fondo (ver `abrir`).
-  @IsNumber() montoInicial!: number;
+  /* El fondo con que arranca. Con FONDO FIJO en la sucursal (0111), el que no
+   * es jefe no lo escribe: confirma que está (`fondoCompleto`) o lo cuenta
+   * billete por billete (`billetes`). Ver `abrir`. */
+  @IsOptional() @IsNumber() montoInicial?: number;
+  @IsOptional() @IsBoolean() fondoCompleto?: boolean;
+  @IsOptional() @IsObject() billetes?: Record<string, number>;
   @IsOptional() @IsString() observaciones?: string;
+}
+
+/** El cierre del cajero (0111): el cajón contado billete por billete, confirmado dos veces. */
+class EnviarCierreDto {
+  @IsObject() billetes!: Record<string, number>;
+  /** La segunda confirmación de la pantalla, también exigida acá. */
+  @IsBoolean() confirmado!: boolean;
+  @IsOptional() @IsInt() usuarioId?: number;
+  @IsOptional() @IsInt() operadorId?: number;
+}
+
+/**
+ * LOS BILLETES QUE SE CUENTAN (0111), los mismos que el contador de la caja.
+ * De $10 para abajo no circula nada en el cajón (decisión del dueño).
+ */
+export const DENOMINACIONES = [20000, 10000, 2000, 1000, 500, 200, 100, 50, 20] as const;
+
+/**
+ * El total de un conteo por billete, validado: solo denominaciones que
+ * existen, cantidades enteras y no negativas. Es lo que hace que el monto NO se
+ * pueda tipear: el servidor recibe billetes y suma él.
+ */
+export function totalDeBilletes(billetes: Record<string, unknown> | null | undefined) {
+  const limpio: Record<string, number> = {};
+  let total = 0;
+  for (const [k, v] of Object.entries(billetes ?? {})) {
+    const d = Number(k);
+    if (!(DENOMINACIONES as readonly number[]).includes(d)) {
+      throw new BadRequestException(`No existe el billete de $${k}: se cuentan ${DENOMINACIONES.map((x) => `$${x.toLocaleString('es-AR')}`).join(', ')}.`);
+    }
+    const n = Number(v ?? 0);
+    if (!Number.isInteger(n) || n < 0 || n > 100000) {
+      throw new BadRequestException(`La cantidad de billetes de $${d.toLocaleString('es-AR')} tiene que ser un número entero (llegó ${String(v)}).`);
+    }
+    if (n > 0) { limpio[String(d)] = n; total += d * n; }
+  }
+  return { billetes: limpio, total };
+}
+
+/**
+ * EL TURNO SIN LOS NÚMEROS DEL SISTEMA, para el que no es jefe (0111).
+ * "En ningún momento ven el efectivo que tienen que tener": ni con el turno
+ * abierto ni después, en el historial. Se van el esperado, la diferencia y el
+ * efectivo de los totales guardados (con ese y el fondo se reconstruye el
+ * esperado). Queda lo que él mismo contó, envió y dejó de fondo.
+ */
+export function sesionCiega<T extends Record<string, any> | null | undefined>(s: T): T {
+  if (!s) return s;
+  const totales = (s as any).totales ?? {};
+  const { efectivo: _e, ...otros } = (totales.medios ?? {}) as Record<string, unknown>;
+  return {
+    ...s,
+    sistemaEfectivo: null,
+    diferencia: null,
+    totales: { ...totales, medios: otros },
+    ciego: true,
+  } as T;
 }
 
 class CerrarCajaDto {
@@ -82,6 +143,7 @@ function arqueoCiego<T extends { medios: Record<string, unknown>; controles: any
   const { efectivo: _efectivo, ...otrosMedios } = a.medios;
   return {
     ...a,
+    sesion: sesionCiega((a as any).sesion),
     medios: otrosMedios,
     esperadoEfectivo: null,
     totalCobrado: null,
@@ -221,7 +283,9 @@ export class CajaService {
       ctaCte: { total: money(Number(ctaCte?.total) || 0), cantidad: Number(ctaCte?.n) || 0 },
       ciego: false,
     };
-    return opts.ciego && sesion.estado === 'abierta' ? arqueoCiego(completo) : completo;
+    /* Ciego SIEMPRE para el que no es jefe (0111): también el turno cerrado,
+     * que antes mostraba el esperado y la diferencia en el historial. */
+    return opts.ciego ? arqueoCiego(completo) : completo;
   }
 
   /**
@@ -276,6 +340,37 @@ export class CajaService {
     return c;
   }
 
+  /**
+   * CON CUÁNTO DEBERÍA ABRIR LA CAJA (0111, pedido del dueño: "que quede por
+   * defecto lo que dejó de cambio en caja"). Lo que el último cierre por envío
+   * dejó apartado en el cajón; si el último turno lo cerró un jefe con el
+   * cierre de siempre (no se sabe cuánto quedó), el fondo fijo de la sucursal.
+   *
+   * Es la MISMA respuesta para la pantalla y para `abrir`: la pantalla la pide
+   * fresca cada vez que se abre el modal (la lista de sucursales del arranque
+   * puede estar vieja — fue el error del 26/9: la primera apertura fijó el
+   * fondo y la pantalla seguía creyendo que no había).
+   */
+  async datosApertura(sucursalId: number) {
+    const [suc] = await this.db.select({ fondo: sucursales.fondoCaja })
+      .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
+    const [ultimo] = await this.db.select({
+      id: cajaSesiones.id, cierre: cajaSesiones.cierre, fondoQueda: cajaSesiones.fondoQueda,
+    }).from(cajaSesiones)
+      .where(and(eq(cajaSesiones.sucursalId, sucursalId), eq(cajaSesiones.estado, 'cerrada')))
+      .orderBy(desc(cajaSesiones.id)).limit(1);
+    const fondoFijo = suc?.fondo != null ? money(suc.fondo) : null;
+    const dejadoEnCaja = ultimo?.fondoQueda != null ? money(ultimo.fondoQueda) : null;
+    return {
+      fondoFijo,
+      dejadoEnCaja,
+      ultimoTurnoId: ultimo?.id ?? null,
+      ultimoCierre: ultimo?.cierre ?? null,
+      /** Lo que se propone (y lo que el cajero confirma): lo que quedó, o el fondo fijo. */
+      propuesto: dejadoEnCaja ?? fondoFijo,
+    };
+  }
+
   /* ------------------------------ Escritura ------------------------------ */
 
   /**
@@ -283,15 +378,49 @@ export class CajaService {
    * cajero abría el turno de otra sucursal mandando otro número, y con eso le
    * arruinaba el fondo inicial del día o le bloqueaba la apertura.
    */
-  async abrir(dto: AbrirCajaDto, sucursalId: number) {
+  async abrir(dto: AbrirCajaDto, sucursalId: number, jefe = true) {
     const abierta = await this.actual(sucursalId);
     if (abierta) {
       throw new BadRequestException('Ya hay un turno de caja abierto en esta sucursal. Cerralo antes de abrir otro.');
     }
-    // El fondo inicial es OBLIGATORIO y positivo: un turno sin fondo declarado
-    // no se puede arquear (no hay punto de partida contra el cual comparar).
-    const montoInicial = money(dto.montoInicial);
-    if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
+    /*
+     * EL FONDO FIJO DE LA SUCURSAL (0111, pedido del dueño): "si abrí con
+     * $50.000, que quede eso". Con fondo cargado, el que no es jefe NO escribe
+     * el monto: confirma que están los $50.000 o, si no, los cuenta billete por
+     * billete — y lo que falte queda registrado como control del turno, que es
+     * lo que ve el administrador. El turno arranca con lo que HAY (no con lo que
+     * debería haber): si faltan $10.000, el faltante es de antes de abrir y no
+     * se le carga al que cierra hoy.
+     *
+     * Sin fondo cargado, la primera apertura lo fija. El jefe abre con el monto
+     * que quiera (viene propuesto el fondo) sin cambiarlo: el fondo lo cambia
+     * solo el superadmin, desde la sucursal.
+     */
+    /* Lo que debería haber: lo que dejó el último cierre, o el fondo fijo. */
+    const ap = await this.datosApertura(sucursalId);
+    const fondo = ap.fondoFijo;
+    const propuesto = ap.propuesto;
+    const $ = (n: number) => `$${n.toLocaleString('es-AR')}`;
+    let montoInicial: number;
+    let conteoApertura: number | null = null;
+    if (propuesto != null && !jefe) {
+      if (dto.fondoCompleto === true) {
+        montoInicial = propuesto;
+      } else {
+        if (!dto.billetes || !Object.keys(dto.billetes).length) {
+          throw new BadRequestException(
+            `Confirmá que están los ${$(propuesto)} ${ap.dejadoEnCaja != null ? 'que quedaron en la caja' : 'del fondo'}, o contalos billete por billete si no están.`,
+          );
+        }
+        conteoApertura = totalDeBilletes(dto.billetes).total;
+        montoInicial = conteoApertura;
+      }
+    } else {
+      montoInicial = money(dto.montoInicial ?? propuesto ?? 0);
+      // El fondo inicial es OBLIGATORIO y positivo: un turno sin fondo declarado
+      // no se puede arquear (no hay punto de partida contra el cual comparar).
+      if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
+    }
 
     /*
      * EL CHEQUEO DE ARRIBA ES CORTESÍA; EL CANDADO ES LA BASE (0085). Entre el
@@ -302,13 +431,35 @@ export class CajaService {
      * 23505, y acá se traduce al mismo mensaje amable del chequeo.
      */
     try {
-      const [c] = await this.db.insert(cajaSesiones).values({
-        sucursalId,
-        usuarioId: dto.usuarioId ?? null,
-        montoInicial,
-        estado: 'abierta',
-        observaciones: dto.observaciones ?? '',
-      }).returning();
+      const c = await this.db.transaction(async (tx) => {
+        const [nueva] = await tx.insert(cajaSesiones).values({
+          sucursalId,
+          usuarioId: dto.usuarioId ?? null,
+          montoInicial,
+          estado: 'abierta',
+          observaciones: dto.observaciones ?? '',
+        }).returning();
+        /* La primera apertura FIJA el fondo (solo si nadie lo cargó antes). */
+        if (fondo == null) {
+          await tx.update(sucursales).set({ fondoCaja: montoInicial })
+            .where(and(eq(sucursales.id, sucursalId), sql`${sucursales.fondoCaja} is null`));
+        }
+        /* El fondo no estaba completo: queda como control del turno, a la vista
+         * del administrador, con lo que debía haber y lo que se contó. */
+        if (conteoApertura != null && propuesto != null && Math.abs(conteoApertura - propuesto) > 0.009) {
+          const dif = money(conteoApertura - propuesto);
+          await tx.insert(cajaControles).values({
+            cajaSesionId: nueva.id,
+            esperadoEfectivo: propuesto,
+            contadoEfectivo: conteoApertura,
+            diferencia: dif,
+            observaciones: `Apertura: ${ap.dejadoEnCaja != null ? `el cierre anterior (turno #${ap.ultimoTurnoId}) dejó ${$(propuesto)} en la caja` : `el fondo fijo es ${$(propuesto)}`} `
+              + `y se contaron ${$(conteoApertura)} (${dif < 0 ? 'faltan' : 'sobran'} ${$(Math.abs(dif))}).`,
+            usuarioId: dto.usuarioId ?? null,
+          });
+        }
+        return nueva;
+      });
       return c;
     } catch (e: any) {
       const code = e?.code ?? e?.cause?.code;
@@ -385,6 +536,80 @@ export class CajaService {
           : sesion.observaciones,
       }).where(eq(cajaSesiones.id, id)).returning();
       return c;
+    });
+  }
+
+  /**
+   * EL CIERRE DEL CAJERO: CONTAR, DEJAR EL FONDO Y ENVIAR (0111, pedido del dueño).
+   *
+   * Es el cierre de todo el que no es jefe, y es A CIEGAS DE PUNTA A PUNTA: el
+   * cajero nunca ve cuánto debería haber — ni antes, ni después. Cuenta el
+   * cajón billete por billete (el servidor recibe los billetes y suma él: no
+   * hay monto tipeado posible), deja el fondo fijo para el turno siguiente y
+   * envía el resto. La diferencia contra el sistema se calcula y se guarda en
+   * el turno igual que siempre, pero SOLO la ve el administrador; por eso no se
+   * le piden observaciones al cajero, que no sabe si hubo diferencia.
+   *
+   * Si contó menos que el fondo, no se envía nada, queda todo como fondo y el
+   * turno lo dice ("fondo incompleto"): el que abra mañana lo va a encontrar
+   * al confirmar el fondo, y el administrador lo ve en el cierre.
+   *
+   * Misma transacción y mismo candado que `cerrar`: nada entra al turno
+   * mientras se cierra.
+   */
+  async enviarYCerrar(id: number, dto: EnviarCierreDto, sucursalSesion: number | null) {
+    if (dto.confirmado !== true) {
+      throw new BadRequestException('Confirmá el envío: el turno se cierra y no se puede reabrir.');
+    }
+    const { billetes, total: contado } = totalDeBilletes(dto.billetes);
+    const cerrador = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
+
+    return this.db.transaction(async (tx) => {
+      const [sesion] = await tx.select().from(cajaSesiones)
+        .where(eq(cajaSesiones.id, id)).limit(1).for('update');
+      if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+      if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+
+      const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
+        .where(eq(sucursales.id, sesion.sucursalId)).limit(1);
+      const fondo = money(suc?.fondo ?? sesion.montoInicial);
+      const queda = money(Math.min(contado, fondo));
+      const envio = money(contado - queda);
+      const faltaFondo = money(fondo - queda);
+
+      const a = await this.arqueo(id);
+      const diferencia = money(contado - a.esperadoEfectivo);
+      const $ = (n: number) => `$${n.toLocaleString('es-AR')}`;
+      const nota = `Cierre por envío: contó ${$(contado)}, envió ${$(envio)}, quedan ${$(queda)} de fondo`
+        + (faltaFondo > 0.009 ? ` · FONDO INCOMPLETO: faltan ${$(faltaFondo)} para los ${$(fondo)}` : '');
+
+      const [c] = await tx.update(cajaSesiones).set({
+        cierre: new Date(),
+        declaradoEfectivo: contado,
+        sistemaEfectivo: a.esperadoEfectivo,
+        diferencia,
+        totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
+        estado: 'cerrada',
+        billetes,
+        envioEfectivo: envio,
+        fondoQueda: queda,
+        observaciones: sesion.observaciones ? `${sesion.observaciones} · ${nota}` : nota,
+      }).where(eq(cajaSesiones.id, id)).returning();
+      /* El conteo del cierre también queda firmado por quien contó, como control
+       * del turno: es lo que el administrador revisa, con esperado y diferencia. */
+      await tx.insert(cajaControles).values({
+        cajaSesionId: id,
+        esperadoEfectivo: a.esperadoEfectivo,
+        contadoEfectivo: contado,
+        diferencia,
+        observaciones: `Cierre por envío (conteo por billetes): envió ${$(envio)}, quedan ${$(queda)} de fondo`,
+        usuarioId: cerrador ?? null,
+      });
+      return {
+        sesion: sesionCiega(c),
+        contado, envio, fondo, fondoQueda: queda, faltaFondo, billetes,
+      };
     });
   }
 
@@ -484,17 +709,19 @@ export class CajaController {
    * sobre la sucursal del contexto.
    */
   @Get()
-  list(
+  async list(
     @Auth() sesion: Sesion,
     @Query('sucursalId') sucursalId?: string,
     @Query('estado') estado?: string,
     @Query('limit') limit?: string,
   ) {
     const mia = soloSuSucursal(sesion);
-    return this.svc.list({
+    const filas = await this.svc.list({
       sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
       estado, limit: limit ? Number(limit) : undefined,
     });
+    // El historial también a ciegas para el que no es jefe (0111).
+    return esJefe(sesion) ? filas : filas.map((f) => sesionCiega(f));
   }
 
   /*
@@ -511,7 +738,8 @@ export class CajaController {
   @Get(':id')
   async get(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     await this.exigirMiTurno(id, sesion);
-    return this.svc.get(id);
+    const t = await this.svc.get(id);
+    return esJefe(sesion) ? t : sesionCiega(t);
   }
 
   /** El turno tiene que ser de mi sucursal, salvo que sea un jefe (`null`). */
@@ -530,21 +758,50 @@ export class CajaController {
    * mover plata la sucursal se compara contra la del turno, adentro del servicio
    * y bajo el mismo candado que ya tenía.
    */
+  /** Con cuánto debería abrir la caja de una sucursal (ver `datosApertura`). */
+  @Get('apertura/:sucursalId')
+  apertura(@Param('sucursalId', ParseIntPipe) sucursalId: number, @Auth() sesion: Sesion) {
+    const mia = soloSuSucursal(sesion);
+    if (mia != null && mia !== sucursalId) throw new ForbiddenException('Esa caja es de otra sucursal.');
+    return this.svc.datosApertura(sucursalId);
+  }
+
   @Post('abrir')
   abrir(@Body() dto: AbrirCajaDto, @Auth() sesion: Sesion) {
     const sucursalId = sucursalDeOperacion(sesion, dto.sucursalId);
     if (!sucursalId) throw new BadRequestException('Tu sesión no tiene sucursal: volvé a entrar eligiéndola.');
-    return this.svc.abrir(dto, sucursalId);
+    return this.svc.abrir(dto, sucursalId, esJefe(sesion));
   }
 
+  /*
+   * EL CIERRE CON MONTO DECLARADO Y EL "VER RESULTADO" SON DEL JEFE (0111).
+   * El que no es jefe cierra por `enviar`, contando billetes: con estas dos
+   * puertas abiertas podía tipear un monto y leer el esperado por la API.
+   */
   @Post(':id/cerrar')
   cerrar(@Param('id', ParseIntPipe) id: number, @Body() dto: CerrarCajaDto, @Auth() sesion: Sesion) {
+    this.soloJefe(sesion);
     return this.svc.cerrar(id, dto, soloSuSucursal(sesion));
   }
 
+  /** El cierre del cajero: contar billetes, dejar el fondo y enviar el resto (0111). */
+  @Post(':id/enviar')
+  enviar(@Param('id', ParseIntPipe) id: number, @Body() dto: EnviarCierreDto, @Auth() sesion: Sesion) {
+    return this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion));
+  }
+
+  private soloJefe(sesion: Sesion) {
+    if (!esJefe(sesion)) {
+      throw new ForbiddenException('Cerrá la caja con "Enviar": contando los billetes del cajón.');
+    }
+  }
+
+  /* El control intermedio del que no es jefe queda registrado igual, pero la
+   * respuesta vuelve SIN el esperado ni la diferencia (0111). */
   @Post(':id/control')
-  control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
-    return this.svc.control(id, dto, soloSuSucursal(sesion));
+  async control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
+    const c = await this.svc.control(id, dto, soloSuSucursal(sesion));
+    return esJefe(sesion) ? c : { ...c, esperadoEfectivo: null, diferencia: null, ciego: true };
   }
 
   @Patch(':id/control/:controlId')
@@ -559,6 +816,7 @@ export class CajaController {
 
   @Post(':id/conteo-cierre')
   conteoCierre(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
+    this.soloJefe(sesion);
     return this.svc.conteoCierre(id, dto, soloSuSucursal(sesion));
   }
 

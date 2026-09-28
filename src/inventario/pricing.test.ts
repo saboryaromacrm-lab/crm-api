@@ -16,6 +16,7 @@ import {
   costoNetoPresentacion,
   descuentoEfectivo,
   formatoActivo,
+  formatoDeCosto,
   precioFinal,
   precioLista,
   precioVentaFila,
@@ -144,6 +145,25 @@ test('formatoActivo: el marcado para precio, si no el primero', () => {
   assert.equal(formatoActivo([a, b]), b);
   assert.equal(formatoActivo([a]), a);
   assert.equal(formatoActivo([]), null);
+  // Sin ninguno marcado: el de id más bajo, no el primero que devolvió la base.
+  const f7 = { id: 7, usarParaPrecio: false };
+  const f3 = { id: 3, usarParaPrecio: false };
+  assert.equal(formatoActivo([f7, f3]), f3);
+});
+
+test('formatoDeCosto: lo que elabora la cafetería cuesta lo que ella declaró', () => {
+  const prov = { id: 1, usarParaPrecio: true, costo: 1000, descuento: 0, flete: 0 };
+  // Producto comprado: el formato de compra, como siempre.
+  assert.equal(formatoDeCosto({ origenCafeteria: false }, [prov]), prov);
+  // Del café con costo declarado: $700 netos, sin IVA absorbido ni flete.
+  const cf = costosFormato(formatoDeCosto({ origenCafeteria: true, costoCafeteria: 700, costoCafeteriaActualizado: new Date() }, []) as any, 21);
+  assert.equal(cf.costoNetoUnitario, 700);
+  assert.equal(cf.costoPrecioUnitario, 700);
+  assert.equal(cf.ivaAbsorbidoUnitario, 0);
+  // El 0 declarado a propósito es un costo; la ficha nunca declarada, no.
+  assert.equal(costosFormato(formatoDeCosto({ origenCafeteria: true, costoCafeteria: 0, costoCafeteriaActualizado: '2026-09-01' }, [prov]) as any, 21).costoNetoUnitario, 0);
+  assert.equal(formatoDeCosto({ origenCafeteria: true, costoCafeteria: 0, costoCafeteriaActualizado: null }, [prov]), prov);
+  assert.equal(formatoDeCosto({ origenCafeteria: true, costoCafeteriaActualizado: null }, []), null);
 });
 
 test('costoNetoPresentacion: el paquete hereda el costo del kilo por lo que consume', () => {

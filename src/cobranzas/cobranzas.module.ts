@@ -353,6 +353,19 @@ export class CobranzasService {
               'No se le imputa una cobranza a una nota de crédito: la nota ya descuenta de la cuenta del cliente.',
             );
           }
+          /*
+           * SOLO SE LE COBRA A LO QUE SE VENDIÓ A CUENTA (26/9/2026). Una venta
+           * de CONTADO ya se pagó en el mostrador (su plata está en los pagos del
+           * ticket, que el saldo de acá no mira): imputarle un recibo le cobraba
+           * dos veces la misma venta, el cliente quedaba con saldo a favor
+           * inventado y la venta ya no se podía anular por "tener cobranzas".
+           */
+          if (doc.condicionPago !== 'cuenta_corriente') {
+            throw new BadRequestException(
+              `El comprobante ${doc.puntoVenta}-${String(doc.numero).padStart(8, '0')} se pagó de contado en el mostrador: `
+              + 'no tiene deuda que cobrar. Imputá el recibo a una venta en cuenta corriente, o dejalo a cuenta.',
+            );
+          }
           if (i.importe > saldo + EPS) {
             throw new BadRequestException(
               `El comprobante ${doc.puntoVenta}-${String(doc.numero).padStart(8, '0')} debe $${saldo.toFixed(2)} y estás imputando $${i.importe.toFixed(2)}.`,

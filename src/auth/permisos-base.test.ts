@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { PERMISOS_BASE, conPermisosBase } from './permisos-base';
 
 /** Lo mínimo para que Vencimientos se vea Y se pueda cerrar el circuito. */
-const IMPRESCINDIBLES = ['almacen.vencimientos', 'almacen.cafeteria', 'inventario', 'merma', 'defectuoso'];
+const IMPRESCINDIBLES = ['almacen.vencimientos', 'almacen.cafeteria', 'merma', 'defectuoso'];
 
 test('la base trae lo que el dueño pidió: vencimientos completo y envíos al café', () => {
   for (const clave of IMPRESCINDIBLES) {
@@ -52,9 +52,11 @@ test('la base NO reparte llaves de caja, precios ni usuarios', () => {
   }
 });
 
-test('al fraccionador la base no le da inventario (devolución, ajuste, venta sin ticket), sí merma', () => {
-  const p = conPermisosBase(['fraccionar', 'preparar'], 'fraccionador');
-  assert.ok(!p.includes('inventario'), 'el fraccionador no puede tener inventario de fábrica');
-  assert.ok(p.includes('merma') && p.includes('almacen.vencimientos'), 'conserva merma y vencimientos');
-  assert.ok(conPermisosBase([], 'cajero').includes('inventario'), 'el resto de los roles sigue igual');
+test('NADIE recibe inventario de fábrica (ajuste ±, devolución, resolver incidencias): solo quien lo tenga en su rol', () => {
+  for (const rol of ['cajero', 'fraccionador', 'vendedor', '']) {
+    const p = conPermisosBase([], rol);
+    assert.ok(!p.includes('inventario'), `${rol || 'un rol nuevo'} no puede tener inventario de fábrica`);
+    assert.ok(p.includes('merma') && p.includes('almacen.vencimientos'), `${rol || 'un rol nuevo'} conserva merma y vencimientos`);
+  }
+  assert.ok(conPermisosBase(['inventario'], 'admin').includes('inventario'), 'el rol que la trae la conserva');
 });

@@ -13,7 +13,7 @@ import {
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
-import { costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, precioLista, precioVentaFila } from './pricing';
+import { costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioLista, precioVentaFila } from './pricing';
 import { conPermisosBase } from '../auth/permisos-base';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
@@ -55,6 +55,16 @@ type Coord = { productoId: number; sucursalId: number; presentacionId: number | 
  * incidencias. Cada operación que muta stock corre dentro de una transacción y
  * registra un movimiento. Los errores de validación lanzan BadRequestException.
  */
+/**
+ * LOS TIPOS DE INCIDENCIA QUE SE CARGAN A MANO (27/9/2026). Espejo de
+ * `TIPOS_INCIDENCIA` del dashboard. Los internos —faltante de transferencia,
+ * venta sin stock, faltante de envío de Cafetería— los escribe solo el sistema.
+ */
+export const TIPOS_INCIDENCIA_MANUAL = [
+  'Etiqueta incorrecta', 'Producto mal pesado', 'Bolsa rota',
+  'Diferencia de inventario', 'Producto defectuoso', 'Producto vencido',
+];
+
 @Injectable()
 export class InventarioService {
   constructor(
@@ -77,10 +87,55 @@ export class InventarioService {
    * va en kilos con decimales; "2,5 paquetes" no sube a ningún camión y "2,5
    * recibidos" es un faltante que no se puede investigar.
    */
-  private exigirEntero(prod: any, presId: number | null, c: number) {
+  /* Público desde el 27/9/2026: Vencimientos también lo usa (antes solo lo
+   * pedían las transferencias, y una merma de "2,5 aceites" pasaba igual). */
+  exigirEntero(prod: any, presId: number | null, c: number) {
     if (this.unidadDe(prod.tipo, presId) === 'kg') return;
     if (Math.abs(c - Math.round(c)) > 1e-9) {
       throw new BadRequestException(`${prod.nombre}: ${presId ? 'los paquetes' : 'las unidades'} van enteros (llegó ${String(c).replace('.', ',')}).`);
+    }
+  }
+
+  /**
+   * EL PAQUETE TIENE QUE SER DE ESE PRODUCTO (27/9/2026). Ningún camino a mano
+   * lo miraba: una devolución de aceite con el id de un paquete de avena creaba
+   * una fila de stock "aceite / paquete de avena" que no existe en ningún lado,
+   * y la pérdida se valuaba con el tamaño del paquete ajeno.
+   */
+  async exigirPresDelProducto(tx: any, prod: any, presId: number | null) {
+    if (!presId) return;
+    const [pres] = await tx.select({ productoId: presentaciones.productoId }).from(presentaciones)
+      .where(eq(presentaciones.id, presId)).limit(1);
+    if (!pres || pres.productoId !== prod.id) {
+      throw new BadRequestException(`Ese paquete no es de ${prod.nombre}: elegí una presentación del producto.`);
+    }
+  }
+
+  /**
+   * NADA DE CORREGIR A MANO LO QUE ESTÁ EN UN CONTROL ABIERTO (27/9/2026).
+   *
+   * El control aplica por DIFERENCIA (contado − lo que decía el sistema al
+   * contar) sobre el stock de ese momento. Si en el medio alguien corrige el
+   * mismo número a mano —un ajuste, "puse 20 paquetes y son 19", el cierre de
+   * una venta sin stock contando la góndola—, al aplicar el control la misma
+   * diferencia se descuenta DOS veces. Las bajas reales (merma, vencido,
+   * defectuoso, ventas) no entran acá: esas mueven la góndola y el número a la
+   * vez, y el control las absorbe bien.
+   *
+   * Un producto granel y sus paquetes van juntos: corregir el fraccionado
+   * mueve los dos.
+   */
+  async exigirSinControlAbierto(tx: any, productoId: number, sucursalId: number) {
+    const r: any = await tx.execute(sql`
+      SELECT c.nombre, c.id FROM conteo_items i JOIN conteos c ON c.id = i.conteo_id
+       WHERE c.sucursal_id = ${sucursalId} AND c.estado IN ('en_curso', 'cerrado') AND i.producto_id = ${productoId}
+       LIMIT 1`);
+    const f = (r.rows ?? r)[0];
+    if (f) {
+      throw new BadRequestException(
+        `Ese producto está en el control de stock «${f.nombre || `#${f.id}`}», que todavía no se aplicó: la corrección la hace ese control `
+        + 'al aplicarse. Si hace falta corregir ya, aplicalo o descartalo primero — si no, la diferencia se descontaría dos veces.',
+      );
     }
   }
 
@@ -89,7 +144,16 @@ export class InventarioService {
   }
   private fmtCant(tipo: string, presId: number | null, cant: number): string {
     if (this.unidadDe(tipo, presId) === 'kg') return `${cant} kg`;
-    return `${Math.round(cant)} ${presId ? 'paq.' : 'u.'}`;
+    /* SIN REDONDEAR (27/9/2026): "Disponible: 16 u." cuando había 15,5 escondía
+     * justo el decimal que no tenía que existir. Si hay media unidad (de antes
+     * de que se frenaran), se muestra — es la pista para ir a corregirla. */
+    const n = Math.round(cant * 1000) / 1000;
+    const txt = Number.isInteger(n) ? String(n) : String(n).replace('.', ',');
+    return `${txt} ${presId ? 'paq.' : 'u.'}`;
+  }
+  /** Lo mismo, para cerrar una oración: sin el punto de la abreviatura ("16 u.." → "16 u."). */
+  private fmtCantFin(tipo: string, presId: number | null, cant: number): string {
+    return this.fmtCant(tipo, presId, cant).replace(/\.$/, '');
   }
 
   /* ------------------------- Núcleo de stock ------------------------- */
@@ -190,6 +254,30 @@ export class InventarioService {
     return filas.length ? Number(filas[0].cantidad) : 0;
   }
   /**
+   * TOMA LAS FILAS DE VARIOS RENGLONES, SIEMPRE EN EL MISMO ORDEN (27/9/2026).
+   *
+   * Un documento de varios renglones que descuenta (una venta) tiene que leer
+   * cada saldo con candado — si no, dos ventas simultáneas del último paquete
+   * leen las dos "hay 1" y el stock queda en −1. Pero tomar los candados en el
+   * orden del ticket abre otra puerta: la venta A toma yerba y espera azúcar,
+   * la B toma azúcar y espera yerba, y la base mata a una. Tomarlos todos
+   * primero, ordenados por (producto, presentación), hace que dos documentos
+   * con los mismos productos esperen en fila en vez de trabarse.
+   */
+  private async bloquearEnOrden(
+    tx: any, sucursalId: number, estado: EstadoStock,
+    items: { productoId: number; presentacionId?: number | null }[],
+  ) {
+    const claves = new Map<string, { productoId: number; presentacionId: number | null }>();
+    for (const it of items) {
+      const presId = it.presentacionId || null;
+      claves.set(`${it.productoId}-${presId ?? 0}`, { productoId: Number(it.productoId), presentacionId: presId });
+    }
+    const orden = [...claves.values()].sort((a, b) => a.productoId - b.productoId || (a.presentacionId ?? 0) - (b.presentacionId ?? 0));
+    for (const c of orden) await this.cantConCandado(tx, c.productoId, sucursalId, c.presentacionId, estado);
+  }
+
+  /**
    * MUEVE STOCK DE UN ESTADO A OTRO, o **corta la operación entera**.
    *
    * Antes devolvía `false` cuando no había con qué mover, y **ninguno de sus
@@ -247,7 +335,7 @@ export class InventarioService {
    */
   private async ctxPrecio(tx: any, productoId: number) {
     const [prod] = await tx.select().from(productos).where(eq(productos.id, productoId)).limit(1);
-    if (!prod) return { cn: 0, iva: 0, markup: 0, tieneLista: false, redondeo: 0, listaBaseId: null as number | null };
+    if (!prod) return { cn: 0, iva: 0, markup: 0, tieneLista: false, redondeo: 0, listaBaseId: null as number | null, merma: 0 };
     const [provs, formato, cfg, listas] = await Promise.all([
       tx.select().from(productoProveedores).where(eq(productoProveedores.productoId, productoId)),
       // Las del producto SUELTO. Sin el `isNull` entrarían las de sus paquetes y
@@ -269,19 +357,20 @@ export class InventarioService {
         const ob = listas.findIndex((l: any) => l.id === b.listaId);
         return ob - oa;
       })[0] ?? null;
-    const active = formatoActivo(provs as any[]);
+    const active = formatoDeCosto(prod, provs as any[]);
     // La BASE del precio, no el costo real: la parte sin factura entra sin el
     // IVA que el negocio absorbe (0072) — mismo número que usa el POS.
     const cn = costoPrecioEntry(active, prod.iva);
     // Markup EQUIVALENTE de la fila: con precio definido el markup no manda,
     // así que se deriva desde el neto unitario del formato.
-    const pv = fila ? precioVentaFila(cn, fila as any, { iva: prod.iva, redondeo: cfg.redondeoPrecio }) : null;
+    const pv = fila ? precioVentaFila(cn, fila as any, { iva: prod.iva, redondeo: prod.redondeo ?? cfg.redondeoPrecio }) : null;
     return {
       cn,
       iva: prod.iva,
       markup: pv && cn > 0 ? ((pv.netoUnitario / cn) - 1) * 100 : (fila?.markup ?? 0),
       tieneLista: !!fila,
-      redondeo: cfg.redondeoPrecio,
+      redondeo: prod.redondeo ?? cfg.redondeoPrecio,
+      merma: Number(prod.merma) || 0,
       /** La lista del piso, para cotizar un paquete con el mismo criterio. */
       listaBaseId: (base?.id ?? null) as number | null,
     };
@@ -303,7 +392,7 @@ export class InventarioService {
   private async precioPres(tx: any, presentacionId: number): Promise<number> {
     const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presentacionId)).limit(1);
     if (!pres) throw new BadRequestException('Presentación inexistente.');
-    const { cn, iva, redondeo, listaBaseId } = await this.ctxPrecio(tx, pres.productoId);
+    const { cn, iva, redondeo, listaBaseId, merma } = await this.ctxPrecio(tx, pres.productoId);
     const suyas = await tx.select().from(productoListas)
       .where(eq(productoListas.presentacionId, presentacionId));
     if (!suyas.length) {
@@ -313,7 +402,7 @@ export class InventarioService {
       );
     }
     const fila = suyas.find((f: any) => f.listaId === listaBaseId) ?? suyas[suyas.length - 1];
-    return precioVentaFila(costoNetoPresentacion(cn, pres.tamKg), fila, { iva, redondeo }).netoUnitario;
+    return precioVentaFila(costoNetoPresentacion(cn, pres.tamKg, merma), fila, { iva, redondeo }).netoUnitario;
   }
 
   /* ------------------------- Movimiento ------------------------- */
@@ -325,6 +414,12 @@ export class InventarioService {
    * la góndola, y que hay que ir a contar.
    */
   static readonly TIPO_VENTA_SIN_STOCK = 'venta_sin_stock';
+  /**
+   * FALTANTE AL RECIBIR UN ENVÍO DE LA CAFETERÍA (0113). Como la venta sin
+   * stock, no retiene nada: en una entrada entró solo lo contado, y en una
+   * salida la mercadería ya había egresado al despachar. Se cierra revisando.
+   */
+  static readonly TIPO_RECEPCION_CAFE = 'recepcion_cafe';
 
   /**
    * Cuántas RESUELTAS viajan en el listado. Las abiertas van todas siempre —
@@ -523,8 +618,11 @@ export class InventarioService {
       const sucId = o.sucursalId;
       const c = Number(o.cantidad);
       if (!(c > 0)) throw new BadRequestException('Ingresá la cantidad.');
-      const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`Stock insuficiente. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`);
+      await this.exigirPresDelProducto(tx, prod, presId);
+      this.exigirEntero(prod, presId, c);
+      // Con candado (ver `cantConCandado`): dos a la vez no pasan las dos.
+      const disp = await this.cantConCandado(tx, prod.id, sucId, presId, 'disponible');
+      if (c > disp + 1e-9) throw new BadRequestException(`Stock insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
       await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, -c);
       const precioU = presId ? await this.precioPres(tx, presId) : await this.precioBase(tx, prod.id);
       const importe = c * precioU;
@@ -678,6 +776,7 @@ export class InventarioService {
         .where(and(eq(presentaciones.id, o.presId), eq(presentaciones.productoId, prod.id))).limit(1);
       if (!pres) throw new BadRequestException('Ese paquete no es de este producto.');
       const sucId = o.sucursalId;
+      await this.exigirSinControlAbierto(tx, prod.id, sucId);
       const real = Math.round(Number(o.cantidadReal));
       if (!Number.isFinite(real) || real < 0) throw new BadRequestException('La cantidad real no puede ser negativa.');
 
@@ -715,7 +814,7 @@ export class InventarioService {
       if (delta > 0 && kg > granel + 1e-9) {
         // Sumar paquetes es fraccionar más: tiene que haber granel para eso.
         throw new BadRequestException(
-          `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCant(prod.tipo, null, granel)}.`,
+          `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCantFin(prod.tipo, null, granel)}.`,
         );
       }
 
@@ -761,10 +860,10 @@ export class InventarioService {
   private async costoDePerdida(tx: any, prod: any, presId: number | null) {
     const provs = await tx.select().from(productoProveedores)
       .where(eq(productoProveedores.productoId, prod.id));
-    const cnKg = costoNetoEntry(formatoActivo(provs as any[]) as any, prod.iva);
+    const cnKg = costoNetoEntry(formatoDeCosto(prod, provs as any[]) as any, prod.iva);
     if (!presId) return cnKg;
     const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, presId)).limit(1);
-    return cnKg * (Number(pres?.tamKg) || 1);
+    return cnKg * escalaPaquete(Number(pres?.tamKg) || 1, prod.merma);
   }
 
   /**
@@ -782,19 +881,38 @@ export class InventarioService {
     const sucId = o.sucursalId;
     const c = Number(o.cantidad);
     if (!(c > 0)) throw new BadRequestException('Ingresá una cantidad mayor a 0.');
+    /* Media unidad no existe, y el paquete tiene que ser de este producto
+     * (27/9/2026): antes entraban "2,5 aceites" y la pantalla, que redondea,
+     * mostraba 3 — un decimal que después no cierra contra nada. */
+    await this.exigirPresDelProducto(tx, prod, presId);
+    this.exigirEntero(prod, presId, c);
     let signo = meta.dir;
     if (signo === 0) signo = Number(o.signo) === 1 ? 1 : -1;
+    // El ajuste corrige el número: no mientras un control lo está midiendo.
+    if (o.tipo === 'ajuste') await this.exigirSinControlAbierto(tx, prod.id, sucId);
     if (signo < 0) {
-      const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`);
+      /*
+       * CON CANDADO (27/9/2026). Leía el saldo sin tomar la fila, comparaba y
+       * después restaba: dos mermas de 8 cargadas a la vez sobre 10 unidades
+       * leían las dos "hay 10", pasaban las dos y el stock quedaba en −6 (se
+       * probó). Con `FOR UPDATE` la segunda espera a la primera y lee 2.
+       */
+      const disp = await this.cantConCandado(tx, prod.id, sucId, presId, 'disponible');
+      if (c > disp + 1e-9) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
     }
     await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, signo * c);
     let estadoHacia: EstadoStock | null = signo > 0 ? 'disponible' : null;
     if (o.tipo === 'vencido') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'vencido' }, c); estadoHacia = 'vencido'; }
     else if (o.tipo === 'defectuoso') { await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'defectuoso' }, c); estadoHacia = 'defectuoso'; }
 
-    const esPerdida = o.tipo === 'merma' || o.tipo === 'vencido' || o.tipo === 'defectuoso';
-    const costoUnitario = esPerdida ? await this.costoDePerdida(tx, prod, presId) : 0;
+    /*
+     * TODO MOVIMIENTO A MANO LLEVA SU COSTO (27/9/2026). Solo las bajas lo
+     * congelaban: un AJUSTE para abajo quedaba a $0, y era la forma de sacar
+     * mercadería sin que apareciera en ningún reporte de pérdidas en pesos. El
+     * ajuste para arriba y la devolución también se valúan: un sobrante de $0
+     * es tan falso como una pérdida de $0.
+     */
+    const costoUnitario = await this.costoDePerdida(tx, prod, presId);
 
     const m = await this.mov(tx, {
       tipo: o.tipo, productoId: prod.id, sucursalId: sucId, presentacionId: presId, signo, cantidad: c,
@@ -804,6 +922,48 @@ export class InventarioService {
       descripcion: `${meta.label} ${signo > 0 ? '+' : '−'}${this.fmtCant(prod.tipo, presId, c)}${o.motivo ? ' · ' + o.motivo : ''}`,
     });
     return { ok: true, movimiento: m };
+  }
+
+  /**
+   * TIRAR LO QUE YA ESTÁ COMO VENCIDO O DEFECTUOSO (27/9/2026).
+   *
+   * Esos estados no tenían salida: lo que se marcaba vencido o defectuoso
+   * quedaba para siempre en Existencias, valuado, aunque hiciera meses que
+   * estaba en la basura. Esto es la salida física.
+   *
+   * NO ES UNA PÉRDIDA NUEVA: la plata ya se contó cuando se marcó vencido o
+   * defectuoso (ese movimiento congeló su costo). Por eso va como un ajuste
+   * SIN costo — sumarlo de nuevo contaría la pérdida dos veces — y con el
+   * estado de origen, para que en la película se vea de dónde salió.
+   */
+  async opDescartarEstado(o: {
+    productoId: number; sucursalId: number; presId?: number | null; estado: 'vencido' | 'defectuoso';
+    cantidad: number; motivo?: string; usuarioId?: number | null;
+  }) {
+    return this.db.transaction(async (tx) => {
+      const prod = await this.getProducto(tx, o.productoId);
+      if (!prod) throw new BadRequestException('Producto inválido.');
+      if (o.estado !== 'vencido' && o.estado !== 'defectuoso') throw new BadRequestException('Solo se descarta lo vencido o lo defectuoso.');
+      const presId = o.presId || null;
+      const c = Number(o.cantidad);
+      if (!(c > 0)) throw new BadRequestException('Poné la cantidad que se tiró.');
+      await this.exigirPresDelProducto(tx, prod, presId);
+      this.exigirEntero(prod, presId, c);
+      const hay = await this.cantConCandado(tx, prod.id, o.sucursalId, presId, o.estado);
+      if (c > hay + 1e-9) {
+        throw new BadRequestException(`Como ${o.estado} hay ${this.fmtCant(prod.tipo, presId, hay)}: no se pueden descartar ${this.fmtCantFin(prod.tipo, presId, c)}.`);
+      }
+      await this.addDelta(tx, { productoId: prod.id, sucursalId: o.sucursalId, presentacionId: presId, estado: o.estado }, -c);
+      const motivo = (o.motivo ?? '').trim();
+      const m = await this.mov(tx, {
+        tipo: 'ajuste', productoId: prod.id, sucursalId: o.sucursalId, presentacionId: presId, signo: -1, cantidad: c,
+        unidad: this.unidadDe(prod.tipo, presId), estadoDesde: o.estado, estadoHacia: null,
+        costoUnitario: 0, usuarioId: o.usuarioId ?? null,
+        motivo: `Descarte de ${o.estado}${motivo ? ` · ${motivo}` : ''}`,
+        descripcion: `Se tiró lo ${o.estado === 'vencido' ? 'vencido' : 'defectuoso'}: −${this.fmtCant(prod.tipo, presId, c)} (la pérdida ya se había contado al marcarlo)`,
+      });
+      return { ok: true, movimiento: m, ...(await this.fotoProducto(tx, prod.id)) };
+    });
   }
 
   /**
@@ -899,6 +1059,9 @@ export class InventarioService {
     const estado: EstadoStock = o.estado || 'disponible';
     // Todos los productos del documento de una vez (ver `productosDe`).
     const prodDe = await this.productosDe(tx, (o.items || []).map((it: any) => Number(it.productoId)));
+    /* Los saldos que deciden, con candado y en orden (ver `bloquearEnOrden`):
+     * dos ventas del último paquete ya no pasan las dos. */
+    await this.bloquearEnOrden(tx, o.sucursalId, estado, (o.items || []).filter((it: any) => Number(it.cantidad) > 0));
     for (const it of o.items || []) {
       const presId = it.presentacionId || null;
       const cantidad = Number(it.cantidad) || 0;
@@ -910,7 +1073,7 @@ export class InventarioService {
       if (faltante > 1e-9) {
         if (!o.permitirNegativo) {
           throw new BadRequestException(
-            `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`,
+            `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`,
           );
         }
         /*
@@ -939,6 +1102,80 @@ export class InventarioService {
         usuarioId: o.usuarioId ?? null, descripcion: o.descripcion || 'Egreso por documento',
       });
     }
+  }
+
+  /**
+   * EL STOCK DE UN COMPROBANTE QUE SE ANULA (0106).
+   *
+   * `sentido` −1: sale lo que la factura/remito había ingresado. +1: vuelve lo
+   * que una nota de crédito había devuelto al proveedor. Con candado en cada
+   * fila (ver `cantConCandado`) y TODO O NADA: si de lo ingresado ya se vendió
+   * o se movió algo, no sale nada y el error dice qué falta y dónde — no se
+   * anula media factura ni se deja stock negativo. El movimiento es un ajuste
+   * con la etiqueta del comprobante: el libro dice por qué se movió.
+   */
+  async revertirStockComprobante(tx: any, o: {
+    sucursalId: number; sentido: 1 | -1; descripcion: string; usuarioId?: number | null;
+    items: { productoId: number; presentacionId: number | null; cantidad: number }[];
+  }) {
+    const juntos = new Map<string, { productoId: number; presentacionId: number | null; cantidad: number }>();
+    for (const it of o.items) {
+      const c = Number(it.cantidad) || 0;
+      if (!(c > 0)) continue;
+      const k = `${it.productoId}:${it.presentacionId ?? ''}`;
+      const x = juntos.get(k) ?? { productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: 0 };
+      x.cantidad += c;
+      juntos.set(k, x);
+    }
+    const filas = [...juntos.values()].sort((a, b) => a.productoId - b.productoId || (a.presentacionId ?? 0) - (b.presentacionId ?? 0));
+    const prodDe = await this.productosDe(tx, filas.map((f) => f.productoId));
+    if (o.sentido < 0) {
+      const faltan: string[] = [];
+      for (const f of filas) {
+        const hay = await this.cantConCandado(tx, f.productoId, o.sucursalId, f.presentacionId, 'disponible');
+        if (f.cantidad > hay + 1e-9) {
+          const prod = prodDe.get(f.productoId);
+          faltan.push(`${prod?.nombre ?? `#${f.productoId}`}: ingresaron ${this.fmtCant(prod?.tipo, f.presentacionId, f.cantidad)} y hoy hay ${this.fmtCant(prod?.tipo, f.presentacionId, hay)}`);
+        }
+      }
+      if (faltan.length) {
+        throw new BadRequestException(
+          `Parte de la mercadería ya se vendió o se movió, así que no se puede sacar entera: ${faltan.join('; ')}. `
+          + 'Registrá la devolución al proveedor con una nota de crédito, o ajustá el stock primero.',
+        );
+      }
+    }
+    for (const f of filas) {
+      const prod = prodDe.get(f.productoId);
+      await this.addDelta(tx, { productoId: f.productoId, sucursalId: o.sucursalId, presentacionId: f.presentacionId, estado: 'disponible' }, o.sentido * f.cantidad);
+      await this.mov(tx, {
+        tipo: 'ajuste', productoId: f.productoId, sucursalId: o.sucursalId, presentacionId: f.presentacionId,
+        signo: o.sentido, cantidad: f.cantidad, unidad: this.unidadDe(prod?.tipo, f.presentacionId),
+        estadoDesde: o.sentido < 0 ? 'disponible' : null, estadoHacia: o.sentido > 0 ? 'disponible' : null,
+        usuarioId: o.usuarioId ?? null, motivo: o.descripcion, descripcion: o.descripcion,
+      });
+    }
+  }
+
+  /** Cuánto hay hoy de cada renglón (sin candado): la vista previa de la anulación. */
+  async stockDeRenglones(sucursalId: number, items: { productoId: number; presentacionId: number | null; cantidad: number }[]) {
+    const out: { productoId: number; presentacionId: number | null; nombre: string; unidad: string; cantidad: number; hay: number }[] = [];
+    const juntos = new Map<string, any>();
+    for (const it of items) {
+      const k = `${it.productoId}:${it.presentacionId ?? ''}`;
+      const x = juntos.get(k) ?? { productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: 0 };
+      x.cantidad += Number(it.cantidad) || 0;
+      juntos.set(k, x);
+    }
+    const prodDe = await this.productosDe(this.db, [...juntos.values()].map((f) => f.productoId));
+    for (const f of juntos.values()) {
+      const prod = prodDe.get(f.productoId);
+      out.push({
+        ...f, nombre: prod?.nombre ?? `#${f.productoId}`, unidad: this.unidadDe(prod?.tipo, f.presentacionId),
+        hay: await this.cant(this.db, f.productoId, sucursalId, f.presentacionId, 'disponible'),
+      });
+    }
+    return out;
   }
 
   /**
@@ -971,7 +1208,8 @@ export class InventarioService {
       /* Quién la destapó: el cajero que cobró. No es "el culpable" — es por
        * dónde empezar a preguntar. */
       responsableId: o.usuarioId,
-      motivo: `${o.documento}: se vendieron ${f(o.vendido)} de ${o.prod.nombre} y el sistema tenía ${f(o.disponible)}. `
+      /* Sin el punto final de la cantidad ("0 u.") el texto quedaba "0 u..". */
+      motivo: `${o.documento}: se vendieron ${f(o.vendido)} de ${o.prod.nombre} y el sistema tenía ${f(o.disponible).replace(/\.$/, '')}. `
         + `Faltan ${f(o.faltante)}: hay que contar la góndola.`,
       productoId: o.prod.id,
       sucursalId: o.sucursalId,
@@ -1852,11 +2090,11 @@ export class InventarioService {
       // Viaja LO PREPARADO. Un renglón en 0 ("no había") no viaja ni se valúa.
       if (!(it.cantidadPreparada > 1e-9)) continue;
       const prod = await this.getProducto(tx, it.productoId);
-      const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === it.productoId)) as any, prod.iva);
+      const cnKg = costoNetoEntry(formatoDeCosto(prod, provs.filter((p: any) => p.productoId === it.productoId)) as any, prod.iva);
       let costo = cnKg;
       if (it.presentacionId) {
         const [pres] = await tx.select().from(presentaciones).where(eq(presentaciones.id, it.presentacionId)).limit(1);
-        costo = cnKg * (pres?.tamKg ?? 1);
+        costo = cnKg * escalaPaquete(pres?.tamKg ?? 1, prod.merma);
       }
       await tx.update(transferenciaItems).set({ costoUnitario: costo }).where(eq(transferenciaItems.id, it.id));
 
@@ -1886,7 +2124,11 @@ export class InventarioService {
    */
   async avanzarTransferencia(id: number, usuarioId?: number, desde?: string, soloSuc?: number | null, esJefe = false) {
     return this.db.transaction(async (tx) => {
-      const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
+      /* Con candado (27/9/2026): se leían las marcas "lista confirmada" de una
+       * foto, y desconfirmar una lista en el mismo instante liberaba la reserva
+       * mientras el despacho la usaba igual — tomando stock apartado para otro
+       * pedido. Así se pone en fila con `confirmarLista`, que toma la misma fila. */
+      const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1).for('update');
       if (!t) throw new NotFoundException('Transferencia inexistente.');
       // Avanzar es preparar y despachar: sale del depósito del ORIGEN.
       this.exigirLado(t, soloSuc, 'origenId');
@@ -2025,7 +2267,15 @@ export class InventarioService {
         const prod = await this.getProducto(tx, it.productoId);
         const unidad = this.unidadDe(prod.tipo, it.presentacionId);
         if (contado.has(it.id)) this.exigirEntero(prod, it.presentacionId, contado.get(it.id)!);
-        // Sin conteo explícito (solo la administración) se asume completo; jamás más de lo enviado.
+        /* Sin conteo explícito (solo la administración) se asume completo. MÁS
+         * de lo enviado no se recorta en silencio (27/9/2026): el sobrante se
+         * perdía sin que nadie se enterara. Se rechaza y lo corrige el origen. */
+        if (contado.has(it.id) && contado.get(it.id)! > enviado + 1e-9) {
+          throw new BadRequestException(
+            `${t.codigo}: de ${prod.nombre} se enviaron ${this.fmtCant(prod.tipo, it.presentacionId, enviado)} y se cargaron `
+            + `${this.fmtCant(prod.tipo, it.presentacionId, contado.get(it.id)!)}: no puede llegar más de lo enviado. Recibí lo enviado y anotá el sobrante en observaciones.`,
+          );
+        }
         const rec = Math.min(Math.max(contado.get(it.id) ?? enviado, 0), enviado);
         const faltante = enviado - rec;
         await tx.update(transferenciaItems).set({ cantidadRecibida: rec }).where(eq(transferenciaItems.id, it.id));
@@ -2070,7 +2320,7 @@ export class InventarioService {
           await this.move(tx, { productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId }, 'en_transito', 'comprometido', faltante);
           const [inc] = await tx.insert(incidencias).values({
             codigo: '', tipo: 'faltante', estado: 'pendiente', responsableId: o.usuarioId ?? null,
-            motivo: `${t.codigo} ${origen?.nombre} → ${destino?.nombre}: se enviaron ${this.fmtCant(prod.tipo, it.presentacionId, enviado)} de ${prod.nombre} y llegaron ${this.fmtCant(prod.tipo, it.presentacionId, rec)}.`,
+            motivo: `${t.codigo} ${origen?.nombre} → ${destino?.nombre}: se enviaron ${this.fmtCant(prod.tipo, it.presentacionId, enviado)} de ${prod.nombre} y llegaron ${this.fmtCant(prod.tipo, it.presentacionId, rec).replace(/\.$/, '')}.`,
             productoId: it.productoId, sucursalId: t.origenId, presentacionId: it.presentacionId,
             cantidad: faltante, unidad,
           }).returning();
@@ -2102,7 +2352,8 @@ export class InventarioService {
   async cancelarTransferencia(id: number, usuarioId?: number, soloSuc?: number | null, esJefe = false) {
     if (!esJefe) throw new ForbiddenException('Cancelar un pedido es de administración.');
     return this.db.transaction(async (tx) => {
-      const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1);
+      // Con candado, por lo mismo que al avanzar: libera según marcas que nadie cambia en el medio.
+      const [t] = await tx.select().from(transferencias).where(eq(transferencias.id, id)).limit(1).for('update');
       if (!t) throw new NotFoundException('Transferencia inexistente.');
       // Cancelar libera la reserva del ORIGEN: es de quien la preparó.
       this.exigirLado(t, soloSuc, 'origenId');
@@ -2151,8 +2402,20 @@ export class InventarioService {
       const sucId = o.sucursalId;
       const c = Number(o.cantidad);
       if (!(c > 0)) throw new BadRequestException('Ingresá la cantidad comprometida.');
+      /*
+       * EL TIPO, DE UNA LISTA CERRADA (27/9/2026). Era texto libre: se podía
+       * cargar a mano una incidencia "recepcion_cafe" o "venta_sin_stock" —
+       * tipos que el sistema cierra SIN tocar el comprometido— y la mercadería
+       * apartada al crearla quedaba trabada para siempre. Los tipos internos
+       * los escribe solo el sistema.
+       */
+      if (!TIPOS_INCIDENCIA_MANUAL.includes(o.tipo)) {
+        throw new BadRequestException(`Elegí el tipo de la lista: ${TIPOS_INCIDENCIA_MANUAL.join(', ')}.`);
+      }
+      await this.exigirPresDelProducto(tx, prod, presId);
+      this.exigirEntero(prod, presId, c);
       const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`No hay tanto stock disponible. Disponible: ${this.fmtCant(prod.tipo, presId, disp)}.`);
+      if (c > disp + 1e-9) throw new BadRequestException(`No hay tanto stock disponible. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
       await this.move(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId }, 'disponible', 'comprometido', c);
       const [inc] = await tx.insert(incidencias).values({
         codigo: '', tipo: o.tipo, estado: 'pendiente', responsableId: o.responsableId ?? null, motivo: o.motivo || '',
@@ -2240,8 +2503,12 @@ export class InventarioService {
       if (inc.tipo === InventarioService.TIPO_VENTA_SIN_STOCK) {
         return this.cerrarVentaSinStock(tx, inc, prod, resolucion, contado, autorId);
       }
+      if (inc.tipo === InventarioService.TIPO_RECEPCION_CAFE) {
+        return this.cerrarRecepcionCafe(tx, inc, resolucion);
+      }
       const c = inc.cantidad;
-      const comprom = await this.cant(tx, prod.id, inc.sucursalId, inc.presentacionId, 'comprometido');
+      // Con candado: dos resoluciones del mismo producto no descuentan el mismo comprometido.
+      const comprom = await this.cantConCandado(tx, prod.id, inc.sucursalId, inc.presentacionId, 'comprometido');
       if (c > comprom + 1e-9) throw new BadRequestException('El stock comprometido cambió; revisá manualmente.');
       await this.addDelta(tx, { productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId, estado: 'comprometido' }, -c);
       let tipoMov = 'ajuste';
@@ -2261,10 +2528,27 @@ export class InventarioService {
        * aparecía como una merma anónima aunque el vínculo estuviera guardado.
        */
       const esPerdida = resolucion !== 'liberar';
+      /*
+       * EL FALTANTE DE UN REMITO SE PIERDE AL COSTO DEL REMITO (27/9/2026). Se
+       * valuaba con el costo de HOY: el remito decía $1.000 y la pérdida del
+       * mismo paquete, resuelta un mes después, $1.300. Ahora se toma el costo
+       * congelado en el renglón de la transferencia que lo originó.
+       */
+      let costoPerdida = esPerdida ? await this.costoDePerdida(tx, prod, inc.presentacionId) : 0;
+      if (esPerdida && inc.tipo === 'faltante') {
+        const r: any = await tx.execute(sql`
+          SELECT ti.costo_unitario c FROM movimientos m
+            JOIN transferencia_items ti ON ti.transferencia_id = m.ref_transferencia_id
+             AND ti.producto_id = ${prod.id}
+             AND ti.presentacion_id IS NOT DISTINCT FROM ${inc.presentacionId}
+           WHERE m.ref_incidencia_id = ${inc.id} LIMIT 1`);
+        const f = (r.rows ?? r)[0];
+        if (f && Number(f.c) > 0) costoPerdida = Number(f.c);
+      }
       await this.mov(tx, {
         tipo: tipoMov, productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId,
         signo: resolucion === 'liberar' ? 0 : -1, cantidad: c, unidad: inc.unidad, estadoDesde: 'comprometido', estadoHacia,
-        costoUnitario: esPerdida ? await this.costoDePerdida(tx, prod, inc.presentacionId) : 0,
+        costoUnitario: costoPerdida,
         motivo: `Incidencia ${inc.codigo} · ${inc.tipo}`,
         /* QUIÉN LA RESOLVIÓ. Es el movimiento que convierte mercadería en
          * pérdida —figura en el reporte de Vencimientos con su costo— y era el
@@ -2288,6 +2572,24 @@ export class InventarioService {
    *     cargado dos veces, la compra no se había asentado). Cierra sin tocar
    *     un solo peso de stock, con el motivo escrito.
    */
+  /**
+   * EL FALTANTE DE UN ENVÍO DE LA CAFETERÍA SE CIERRA SIN TOCAR STOCK (0113):
+   * no hay nada retenido. Lo que queda es decir qué pasó —y si la mercadería
+   * en realidad no había salido, corregir el envío con Editar antes de cerrar.
+   */
+  private async cerrarRecepcionCafe(tx: any, inc: any, resolucion: string) {
+    const TEXTO: Record<string, string> = {
+      corregido: 'No había salido: se corrigió el envío.',
+      perdida: 'Se perdió o se rompió en el camino.',
+    };
+    if (!TEXTO[resolucion]) throw new BadRequestException('Resolución inválida para un faltante de envío de Cafetería.');
+    await tx.update(incidencias).set({
+      resolucion, fechaResolucion: new Date(), activa: false,
+      motivo: `${inc.motivo} · ${TEXTO[resolucion]}`,
+    }).where(eq(incidencias.id, inc.id));
+    return { ok: true, ajuste: 0 };
+  }
+
   private async cerrarVentaSinStock(
     tx: any, inc: any, prod: any, resolucion: string, contado?: number, autorId?: number,
   ) {
@@ -2308,8 +2610,12 @@ export class InventarioService {
     if (!Number.isFinite(n) || n < 0) {
       throw new BadRequestException('Poné cuántas unidades contaste en la góndola (0 o más).');
     }
+    this.exigirEntero(prod, inc.presentacionId, n);
+    await this.exigirSinControlAbierto(tx, prod.id, inc.sucursalId);
     const objetivo = this.cant3(n);
-    const actual = await this.cant(tx, prod.id, inc.sucursalId, inc.presentacionId, 'disponible');
+    /* Con candado: una venta en el medio no se pierde — si no, el ajuste se
+     * calculaba contra un "actual" viejo y pisaba lo que la caja acababa de restar. */
+    const actual = await this.cantConCandado(tx, prod.id, inc.sucursalId, inc.presentacionId, 'disponible');
     const delta = this.cant3(objetivo - actual);
     if (Math.abs(delta) > 1e-9) {
       await this.addDelta(tx, {
@@ -2321,6 +2627,8 @@ export class InventarioService {
         tipo: 'ajuste', productoId: prod.id, sucursalId: inc.sucursalId, presentacionId: inc.presentacionId,
         signo: delta > 0 ? 1 : -1, cantidad: Math.abs(delta), unidad: inc.unidad,
         estadoDesde: 'disponible', estadoHacia: 'disponible',
+        // Con su costo, como todo ajuste (27/9/2026): antes quedaba a $0.
+        costoUnitario: await this.costoDePerdida(tx, prod, inc.presentacionId),
         motivo: `Incidencia ${inc.codigo} · venta sin stock`,
         usuarioId: autorId ?? null, refIncidenciaId: inc.id,
         descripcion: `${inc.codigo} resuelta: contado ${this.fmtCant(prod.tipo, inc.presentacionId, objetivo)} `
@@ -2401,7 +2709,9 @@ export class InventarioService {
      * criterios en dos líneas consecutivas. */
     const desde = fechaLocal(q.desde) ?? new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const hasta = q.hasta ? new Date(`${q.hasta}T23:59:59`) : new Date();
-    const limit = Math.min(Math.max(Number(q.limit) || 300, 1), 1000);
+    /* 5.000 y no 300 (27/9/2026): el mes de un local cortado a 300 filas daba un
+     * total que no decía que le faltaban filas. */
+    const limit = Math.min(Math.max(Number(q.limit) || 5000, 1), 5000);
 
     /*
      * Los remitos de ESTA sucursal salen primero, y sus hijos se piden POR ESOS
@@ -2429,7 +2739,7 @@ export class InventarioService {
           gte(comprobantes.fechaCarga, desde), lte(comprobantes.fechaCarga, hasta))),
       this.db.select().from(movimientos)
         .where(and(eq(movimientos.sucursalId, sucId),
-          inArray(movimientos.tipo, ['ajuste', 'merma', 'vencido', 'defectuoso'] as any),
+          inArray(movimientos.tipo, ['ajuste', 'devolucion', 'merma', 'vencido', 'defectuoso'] as any),
           gte(movimientos.fecha, desde), lte(movimientos.fecha, hasta))),
       this.db.select().from(sucursales),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo, rolId: usuarios.rolId }).from(usuarios),
@@ -2466,7 +2776,7 @@ export class InventarioService {
              * mercadería que salió del depósito figuraba en $0; y un renglón
              * corto (pidieron 20, había 14) se valuaba por 20.
              */
-            monto: items.reduce((a, i) => a + i.cantidadPreparada * i.costoUnitario, 0),
+            monto: items.reduce((a, i) => a + i.cantidadPreparada * i.costoUnitario, 0), sentido: 'sale',
             observaciones: t.observaciones, usuario: nomUsr.get(usuarioEstado(t.id, 'transito') as number) ?? nomUsr.get(t.usuarioId as number) ?? '',
             refTransferenciaId: t.id,
           });
@@ -2480,7 +2790,7 @@ export class InventarioService {
             id: `t${t.id}-rec`, tipo: 'transferencia_recibida', codigo: t.codigo, fecha: f, fechaCarga: t.fecha,
             concepto: `Recepción desde ${nomSuc.get(t.origenId) ?? '—'}`,
             // Lo CONTADO al recibir; si no se contó, lo que viajó (nunca lo pedido).
-            monto: items.reduce((a, i) => a + (i.cantidadRecibida ?? i.cantidadPreparada) * i.costoUnitario, 0),
+            monto: items.reduce((a, i) => a + (i.cantidadRecibida ?? i.cantidadPreparada) * i.costoUnitario, 0), sentido: 'entra',
             observaciones: t.observaciones, usuario: nomUsr.get(usuarioEstado(t.id, 'recibida') as number) ?? '',
             refTransferenciaId: t.id,
           });
@@ -2496,7 +2806,7 @@ export class InventarioService {
          * se apoya en que se distinga en cualquier pantalla donde aparezca. */
         id: `c${c.id}`, tipo: 'compra_recibida', codigo: `${ABREV_LIBRO[c.tipo] ?? 'FC'} ${c.puntoVenta}-${String(c.numero ?? 0).padStart(8, '0')}`,
         fecha: c.fecha, fechaCarga: c.fechaCarga, concepto: 'Recepción de compra',
-        monto: c.subtotalNeto, observaciones: c.observaciones,
+        monto: c.subtotalNeto, sentido: 'entra', observaciones: c.observaciones,
         usuario: nomUsr.get(c.usuarioId as number) ?? '', refComprobanteId: c.id,
       });
     }
@@ -2505,7 +2815,12 @@ export class InventarioService {
       filas.push({
         id: `m${m.id}`, tipo: m.tipo, codigo: `MOV${m.id}`, fecha: m.fecha, fechaCarga: m.fecha,
         concepto: `${nomProd.get(m.productoId as number) ?? '—'}: ${m.descripcion || m.tipo}`,
-        monto: null, observaciones: m.motivo ?? '', usuario: nomUsr.get(m.usuarioId as number) ?? '',
+        /* Con su plata (el costo quedó congelado en el movimiento) y su sentido:
+         * `mueve` es un cambio de estado —apartar para una incidencia— que no
+         * entra ni sale del local. */
+        monto: Number(m.costoUnitario) > 0 ? Math.round(m.cantidad * Number(m.costoUnitario) * 100) / 100 : null,
+        sentido: m.signo > 0 ? 'entra' : m.signo < 0 ? 'sale' : 'mueve',
+        observaciones: m.motivo ?? '', usuario: nomUsr.get(m.usuarioId as number) ?? '',
         cantidad: m.cantidad, unidad: m.unidad,
       });
     }
@@ -2752,7 +3067,7 @@ export class InventarioService {
    * resuelto, que sí hace falta afuera de Compras: el envío a la cafetería es
    * "a costo". `costosOcultos` le avisa a la pantalla que no lo recalcule.
    */
-  async bootstrapCatalogo(verCostos = true) {
+  async bootstrapCatalogo(verCostos = true, ocultarUnitario = false) {
     const [prods, pres, provCostos, formatos, listasCat, ms, cs, ss, es, pes] = await Promise.all([
       this.db.select().from(productos),
       this.db.select().from(presentaciones),
@@ -2804,7 +3119,7 @@ export class InventarioService {
 
     const productosFull = prods.map((p) => {
       const pp = grupo(costosDe, p.id);
-      const active = formatoActivo(pp);
+      const active = formatoDeCosto(p, pp);
       /* Dos costos, dos preguntas (0072): `cn` es el REAL (valúa el stock que
        * muestra la pantalla), `cnPrecio` la base que multiplica el markup. Con
        * todo facturado son el mismo número. */
@@ -2867,8 +3182,8 @@ export class InventarioService {
          * ninguna lista cargada, que no es lo mismo que valer cero. */
         presentaciones: grupo(presDe, p.id).map((pr) => {
           // El paquete hereda los DOS costos de la madre, escalados a su tamaño.
-          const costoPaquete = costoNetoPresentacion(cn, pr.tamKg);
-          const suyas = armarFormato(pr.id, costoNetoPresentacion(cnPrecio, pr.tamKg));
+          const costoPaquete = costoNetoPresentacion(cn, pr.tamKg, p.merma);
+          const suyas = armarFormato(pr.id, costoNetoPresentacion(cnPrecio, pr.tamKg, p.merma));
           const pisoPres = piso(suyas);
           return {
             ...pr,
@@ -2887,6 +3202,20 @@ export class InventarioService {
         ...(verCostos ? {} : { costosOcultos: true, costoPrecioNeto: cnPrecio }),
         listas: listasProd,
       };
+    }).map((p: any) => {
+      /* Sin ni el costo unitario (`ocultaCostoUnitario`): viajan los precios de
+       * venta, que son públicos, y el costo solo de lo que el café elabora — es
+       * el suyo. El markup se va: precio ÷ (1 + markup) devolvería el costo. */
+      if (!ocultarUnitario || p.origenCafeteria) return p;
+      return {
+        ...p,
+        costoNeto: null,
+        costoPrecioNeto: null,
+        listas: p.listas.map((l: any) => ({ ...l, markup: null })),
+        presentaciones: p.presentaciones.map((pr: any) => ({
+          ...pr, costoNeto: null, listas: pr.listas.map((l: any) => ({ ...l, markup: null })),
+        })),
+      };
     });
     return { productos: productosFull };
   }
@@ -2896,9 +3225,9 @@ export class InventarioService {
    * usa el CRM que todavía no recargó después del deploy; el nuevo pide las
    * partes por separado (`/bootstrap/base`, `/catalogo`, `/stock`).
    */
-  async bootstrap(soloSuc: number | null = null, verCostos = true) {
+  async bootstrap(soloSuc: number | null = null, verCostos = true, ocultarUnitario = false) {
     const [base, catalogo, stk] = await Promise.all([
-      this.bootstrapBase(soloSuc), this.bootstrapCatalogo(verCostos), this.bootstrapStock(),
+      this.bootstrapBase(soloSuc), this.bootstrapCatalogo(verCostos, ocultarUnitario), this.bootstrapStock(),
     ]);
     return { ...base, ...catalogo, ...stk };
   }
@@ -3090,6 +3419,21 @@ export class InventarioService {
 
     const oculto = c.ciego && c.estado === 'en_curso' && !opciones.puedeVerVirtual;
     const conDiferencias = !oculto && (opciones.puedeVerVirtual || !c.ciego);
+    /*
+     * UN CONTROL APLICADO ES HISTORIA (27/9/2026). Su reporte recalculaba la
+     * plata con el costo de HOY y marcaba "se movió" en cada renglón ajustado
+     * (el propio ajuste movió el stock). Ahora la plata sale del costo
+     * CONGELADO en su movimiento de ajuste, y el aviso de "se movió" —que es
+     * para revisar ANTES de aplicar— ya no se enciende.
+     */
+    const aplicado = c.estado === 'aplicado';
+    const costoAplicado = new Map<string, number>();
+    if (aplicado) {
+      const ms = await this.db.select({
+        productoId: movimientos.productoId, presentacionId: movimientos.presentacionId, costo: movimientos.costoUnitario,
+      }).from(movimientos).where(eq(movimientos.refConteoId, id));
+      for (const m of ms) costoAplicado.set(`${m.productoId}:${m.presentacionId ?? ''}`, Number(m.costo) || 0);
+    }
 
     const filas = await Promise.all(items.map(async (i) => {
       const k = `${i.productoId}:${i.presentacionId ?? ''}`;
@@ -3105,9 +3449,11 @@ export class InventarioService {
       /* `seMovio` es LA ALARMA del local cerrado: si el disponible de ahora no
        * es el del momento del conteo, alguien vendió o movió mercadería con el
        * local supuestamente cerrado. No bloquea — señala. */
-      const seMovio = i.contado != null && Math.abs(virtual - (i.virtualAlContar ?? 0)) > 1e-9;
+      const seMovio = !aplicado && i.contado != null && Math.abs(virtual - (i.virtualAlContar ?? 0)) > 1e-9;
       let costoUnitario = 0;
-      if (diferencia != null && Math.abs(diferencia) > 1e-9) {
+      if (aplicado && costoAplicado.has(k)) {
+        costoUnitario = costoAplicado.get(k)!;
+      } else if (diferencia != null && Math.abs(diferencia) > 1e-9) {
         const [prod] = await this.db.select().from(productos).where(eq(productos.id, i.productoId)).limit(1);
         costoUnitario = prod ? await this.costoDePerdida(this.db, prod, i.presentacionId) : 0;
       }
@@ -3161,6 +3507,11 @@ export class InventarioService {
         return { id: itemId, contado: null, contadoEn: null, recontar: false };
       }
 
+      /* Lo que se cuenta por unidad o por paquete se cuenta ENTERO (27/9/2026):
+       * un 2,5 contado se aplicaba tal cual y dejaba media unidad en el stock. */
+      if (it.unidad !== 'kg' && !Number.isInteger(Number(o.contado))) {
+        throw new BadRequestException(`${it.nombre} se cuenta entero: ${String(o.contado).replace('.', ',')} no es una cantidad posible.`);
+      }
       const virtual = await this.cant(tx, it.productoId, c.sucursalId, it.presentacionId, 'disponible');
       const ahora = new Date();
       await tx.update(conteoItems).set({
@@ -3185,8 +3536,10 @@ export class InventarioService {
   async reabrirConteo(id: number, soloSuc?: number | null) {
     const c = await this.conteoVivo(this.db, id, soloSuc);
     if (c.estado !== 'cerrado') throw new BadRequestException('Solo se reabre un control cerrado sin aplicar.');
+    // Condicional: si en el medio se aplicó, no vuelve a "en curso".
     const [r] = await this.db.update(conteos).set({ estado: 'en_curso', cerradoEn: null })
-      .where(eq(conteos.id, id)).returning();
+      .where(and(eq(conteos.id, id), eq(conteos.estado, 'cerrado'))).returning();
+    if (!r) throw new BadRequestException('Solo se reabre un control cerrado sin aplicar.');
     return r;
   }
 
@@ -3224,6 +3577,30 @@ export class InventarioService {
       if (c.estado === 'descartado') throw new BadRequestException('Ese control está descartado.');
       if (c.estado !== 'cerrado') throw new BadRequestException('Cerrá el control antes de aplicarlo: el cierre es la foto final.');
 
+      /*
+       * EL RECLAMO ATÓMICO, ANTES DE TOCAR UN SOLO SALDO (27/9/2026).
+       *
+       * El estado se miraba con una lectura común y se marcaba "aplicado" recién
+       * al final: dos "Aplicar" al mismo tiempo (un doble clic, dos pestañas)
+       * leían los dos "cerrado", ajustaban los dos, y el conteo se aplicaba DOS
+       * VECES — contadas 18 contra 20 dejaban el stock en 16 (se probó). Ahora el
+       * primero se queda con la sesión en un UPDATE condicional; el segundo no
+       * encuentra ninguna fila en "cerrado" y rebota sin haber movido nada.
+       */
+      const [reclamo] = await tx.update(conteos).set({
+        estado: 'aplicado', aplicadoEn: new Date(), aplicadoPor: usuarioId ?? null,
+      }).where(and(eq(conteos.id, id), eq(conteos.estado, 'cerrado'))).returning();
+      if (!reclamo) throw new BadRequestException('Ese control ya se aplicó (o cambió de estado): actualizá la pantalla.');
+      /* Lo marcado "volvé a la góndola" frena el aplicar (27/9/2026): la marca
+       * dice que ese número no es confiable, y aplicarlo igual la vuelve decorado. */
+      const [rec] = await tx.select({ n: sql<number>`count(*)::int` }).from(conteoItems)
+        .where(and(eq(conteoItems.conteoId, id), eq(conteoItems.recontar, true)));
+      if (Number(rec?.n) > 0) {
+        throw new BadRequestException(
+          `Hay ${Number(rec.n)} renglón(es) marcados para recontar: reabrí el control, recontalos (o sacales la marca) y después aplicá.`,
+        );
+      }
+
       const items = await tx.select().from(conteoItems)
         .where(and(eq(conteoItems.conteoId, id), isNotNull(conteoItems.contado)));
       const avisos: string[] = [];
@@ -3256,10 +3633,7 @@ export class InventarioService {
         ajustes += 1;
       }
 
-      const [r] = await tx.update(conteos).set({
-        estado: 'aplicado', aplicadoEn: new Date(), aplicadoPor: usuarioId ?? null,
-      }).where(eq(conteos.id, id)).returning();
-      return { ...r, ajustes, sinDiferencia: items.length - ajustes, avisos };
+      return { ...reclamo, ajustes, sinDiferencia: items.length - ajustes, avisos };
     });
   }
 
@@ -3277,7 +3651,11 @@ export class InventarioService {
         throw new ForbiddenException('Este control ya tiene renglones contados: descartarlo es tirar ese trabajo, y lo decide quien puede aplicar.');
       }
     }
-    const [r] = await this.db.update(conteos).set({ estado: 'descartado' }).where(eq(conteos.id, id)).returning();
+    /* Condicional: si en el medio alguien lo aplicó, no se lo pisa a "descartado"
+     * — sus ajustes ya están en el stock. */
+    const [r] = await this.db.update(conteos).set({ estado: 'descartado' })
+      .where(and(eq(conteos.id, id), ne(conteos.estado, 'aplicado'))).returning();
+    if (!r) throw new BadRequestException('Un control aplicado no se descarta: ya movió stock.');
     return r;
   }
 }

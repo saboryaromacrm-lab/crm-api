@@ -25,7 +25,7 @@
  * su bandeja. Nada de plata se mueve por un camino nuevo.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -35,17 +35,29 @@ import {
 } from 'class-validator';
 import { and, desc, eq, gte, inArray, lt, ne, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { esJefe } from '../auth/auth.guard';
+import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
 import {
   comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
   proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
-import { FormaPagoDto, PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } from '../pagos/pagos.module';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
+import { exigirFueraDeConciliado } from '../common/conciliacion';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const EPS = 0.009;
+
+/**
+ * VER NO ES PAGAR (27/9/2026). Las secciones Cuentas corrientes, Echeqs y
+ * Estados de cuenta se abrían con su permiso de lectura, y ese mismo permiso
+ * alcanzaba para PAGAR un compromiso, cobrar un echeq (que registra el pago
+ * real) o cargar un ajuste que baja la deuda sin plata. El día que se arme un
+ * rol "solo consulta", ese rol podía mover plata. Lo que mueve plata o deuda
+ * pide además un permiso de pagos — el mismo par que usa Pagos a proveedores.
+ */
+const PERMISOS_MUEVEN_PLATA = ['compras.pagos', 'gastos.pagos_proveedor'];
 const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Medianoche de HOY en hora del servidor — la misma convención T00:00:00 de
@@ -98,6 +110,13 @@ class EcheqDto {
   @IsOptional() @IsString() @MaxLength(2000) obs?: string;
 }
 
+/** Borrar un ajuste pide el porqué: queda en Auditoría junto con lo que decía. */
+class BorrarAjusteDto {
+  @IsString({ message: 'Escribí por qué se borra el ajuste.' })
+  @Matches(/\S/, { message: 'Escribí por qué se borra el ajuste.' })
+  motivo!: string; // el largo se recorta al guardar: sin motivo, un solo mensaje claro
+}
+
 class EstadoEcheqDto {
   @IsIn(['emitido', 'entregado', 'cobrado', 'anulado']) estado!: string;
 }
@@ -118,6 +137,7 @@ export class FinanzasProveedorService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly pagos: PagosProveedorService,
+    private readonly audit: AuditoriaService,
   ) {}
 
   /* ==================================================================== *
@@ -228,10 +248,44 @@ export class FinanzasProveedorService {
     return this.mapCompromiso(f);
   }
 
+  /** El vencimiento no puede ser anterior a la emisión (27/9/2026). */
+  private exigirOrdenFechas(emision: Date, venc: Date) {
+    const e = new Date(emision); e.setHours(0, 0, 0, 0);
+    if (venc.getTime() < e.getTime()) {
+      throw new BadRequestException('El vencimiento no puede ser anterior a la fecha de emisión.');
+    }
+  }
+
+  /**
+   * LA CUOTA NO SUPERA LO QUE DEBE SU FACTURA (27/9/2026). Se podía subir la
+   * cuota de una factura de $1.000 a $99.999 y las alertas de vencimientos y el
+   * saldo proyectado pasaban a mentir. Lo pendiente de todas sus cuotas no
+   * puede pasar del saldo vivo de la factura (con sus notas descontadas).
+   */
+  private async exigirTopeCuotas(comprobanteId: number, proveedorId: number, compromisoId: number, nuevo: number) {
+    const docs = await this.pagos.documentosPendientes(proveedorId, 'mercaderia');
+    const doc = docs.find((d: any) => d.tipo === 'comprobante' && d.docId === comprobanteId);
+    const saldo = money(doc?.saldo ?? 0);
+    const [r] = await this.db.select({ t: sql<number>`coalesce(sum(${proveedorCompromisos.importe}), 0)` })
+      .from(proveedorCompromisos).where(and(
+        eq(proveedorCompromisos.comprobanteId, comprobanteId),
+        eq(proveedorCompromisos.pagado, false),
+        ne(proveedorCompromisos.id, compromisoId),
+      ));
+    const otras = money(Number(r?.t) || 0);
+    if (money(otras + nuevo) - saldo > EPS) {
+      throw new BadRequestException(
+        `La factura debe ${saldo.toFixed(2)} y sus otras cuotas pendientes suman ${otras.toFixed(2)}: `
+        + `esta cuota puede ser de hasta ${Math.max(0, money(saldo - otras)).toFixed(2)}.`,
+      );
+    }
+  }
+
   async crearCompromisoManual(dto: CompromisoManualDto) {
     const [prov] = await this.db.select({ id: proveedores.id }).from(proveedores)
       .where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
+    this.exigirOrdenFechas(dto.fechaEmision ? fecha0(dto.fechaEmision) : new Date(), fecha0(dto.fechaVenc));
     const [k] = await this.db.insert(proveedorCompromisos).values({
       proveedorId: dto.proveedorId,
       importe: money(dto.importe),
@@ -246,6 +300,15 @@ export class FinanzasProveedorService {
   async editarCompromiso(id: number, dto: EditarCompromisoDto) {
     const k = await this.getCompromiso(id);
     if (k.pagado) throw new BadRequestException('El compromiso ya se pagó: no se edita — la historia no se reescribe.');
+    if (dto.importe != null && k.comprobanteId) {
+      await this.exigirTopeCuotas(k.comprobanteId, k.proveedorId, id, money(dto.importe));
+    }
+    if (dto.fechaVenc || dto.fechaEmision) {
+      this.exigirOrdenFechas(
+        dto.fechaEmision ? fecha0(dto.fechaEmision) : (k.fechaEmision ?? new Date()),
+        dto.fechaVenc ? fecha0(dto.fechaVenc) : k.fechaVenc,
+      );
+    }
     await this.db.update(proveedorCompromisos).set({
       ...(dto.importe != null ? { importe: money(dto.importe) } : {}),
       ...(dto.fechaVenc ? { fechaVenc: fecha0(dto.fechaVenc) } : {}),
@@ -286,7 +349,33 @@ export class FinanzasProveedorService {
     if (!dto.medio && !dto.formas?.length) {
       throw new BadRequestException('Indicá con qué medio REAL se pagó (la promesa decía cuenta corriente; la plata salió por algún lado).');
     }
+    if (!desdeEcheq) exigirFechaPago(dto.fecha, dto.formas);
 
+    /*
+     * LA CUOTA SE TOMA ANTES DE PAGAR (26/9/2026). Antes se miraba `pagado`,
+     * se creaba el pago y recién después se marcaba: dos clics a la vez pasaban
+     * los dos por el control y la cuota se pagaba DOS veces (probado: dos
+     * pagos de $605 para una cuota de $605). Ahora el primero la marca con un
+     * UPDATE condicional y el segundo ya no la encuentra libre. Si el pago
+     * falla, se devuelve: una cuota no puede quedar "paga" sin su pago.
+     */
+    const tomada = await this.db.update(proveedorCompromisos).set({ pagado: true })
+      .where(and(eq(proveedorCompromisos.id, id), eq(proveedorCompromisos.pagado, false)))
+      .returning({ id: proveedorCompromisos.id });
+    if (!tomada.length) {
+      throw new BadRequestException('Esa cuota ya se pagó (o se está pagando en este momento). Actualizá la pantalla.');
+    }
+    try {
+      return await this.pagarCompromisoTomado(k, id, dto, auth);
+    } catch (e) {
+      await this.db.update(proveedorCompromisos).set({ pagado: false, pagoId: null })
+        .where(eq(proveedorCompromisos.id, id));
+      throw e;
+    }
+  }
+
+  /** El pago de una cuota YA TOMADA por `pagarCompromiso`. */
+  private async pagarCompromisoTomado(k: any, id: number, dto: PagarCompromisoDto, auth: Sesion) {
     const concepto = `Compromiso #${k.id}`
       + (k.comprobanteEtiqueta ? ` · ${k.comprobanteEtiqueta}` : '')
       + (k.cuota ? ` · cuota ${k.cuota}/${k.cuotas}` : '')
@@ -303,9 +392,8 @@ export class FinanzasProveedorService {
       const doc = pendientes.find((d: any) => d.tipo === 'comprobante' && d.docId === k.comprobanteId);
       const saldoDoc = doc ? money(doc.saldo) : 0;
       if (saldoDoc <= EPS) {
-        // La factura ya estaba saldada por otro camino: cerrar sin mover plata.
-        await this.db.update(proveedorCompromisos).set({ pagado: true })
-          .where(and(eq(proveedorCompromisos.id, id), eq(proveedorCompromisos.pagado, false)));
+        // La factura ya estaba saldada por otro camino: cerrar sin mover plata
+        // (la cuota ya quedó marcada al tomarla).
         return { ...(await this.getCompromiso(id)), aviso: 'La factura ya estaba saldada: el compromiso se cerró sin generar un pago nuevo.' };
       }
       importePago = Math.min(importePago, saldoDoc);
@@ -324,7 +412,7 @@ export class FinanzasProveedorService {
       cajaSesionId: dto.cajaSesionId,
       usuarioId: auth.usuarioId,
       imputaciones,
-    } as any, auth.sucursalId, esJefe(auth));
+    } as any, auth.sucursalId, esJefe(auth), false, { cuotaTomadaId: id });
 
     /* La CUOTA: si la factura sigue con saldo, el puente no lo cerró — lo
      * cierra este método, que es el único que sabe qué compromiso se pagó. */
@@ -432,6 +520,7 @@ export class FinanzasProveedorService {
     const [prov] = await this.db.select({ id: proveedores.id }).from(proveedores)
       .where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
+    await this.exigirEcheqUnico(dto.numero, dto.banco);
     const [e] = await this.db.insert(proveedorEcheqs).values({
       numero: (dto.numero ?? '').trim(),
       banco: (dto.banco ?? '').trim(),
@@ -451,6 +540,10 @@ export class FinanzasProveedorService {
      * se corrige editando el compromiso (o la factura), no el papel. */
     if (dto.importe != null && e.compromisoId) {
       throw new BadRequestException('Este echeq nació de una factura: su importe es el del compromiso.');
+    }
+    if (e.estado === 'anulado') throw new BadRequestException('Ese echeq está anulado: no se edita.');
+    if (dto.numero !== undefined || dto.banco !== undefined) {
+      await this.exigirEcheqUnico(dto.numero ?? e.numero, dto.banco ?? e.banco, id);
     }
     await this.db.update(proveedorEcheqs).set({
       ...(dto.numero !== undefined ? { numero: dto.numero.trim() } : {}),
@@ -475,7 +568,24 @@ export class FinanzasProveedorService {
     if (e.estado === 'cobrado') {
       throw new BadRequestException('El echeq ya se cobró: si el pago está mal, se anula desde Pagos (eso lo devuelve a emitido).');
     }
+    /*
+     * ANULADO ES FINAL (27/9/2026). Antes un echeq anulado se podía pasar a
+     * "cobrado" y generaba un pago real de $5.000 por un papel que ya no
+     * existía. Si se anuló por error, se carga de nuevo.
+     */
+    if (e.estado === 'anulado') {
+      throw new BadRequestException('Ese echeq está anulado: no vuelve a la cartera. Si se anuló por error, cargalo de nuevo.');
+    }
     if (estado === 'cobrado') {
+      /* EL BANCO NO LO DEBITA ANTES DE SU FECHA: marcarlo cobrado antes
+       * registraba un pago fechado en el futuro (probado: uno de 2031). */
+      const diaVenc = new Date(e.fechaVenc); diaVenc.setHours(0, 0, 0, 0);
+      if (diaVenc.getTime() > hoy0().getTime()) {
+        throw new BadRequestException(
+          `Ese echeq vence el ${aIso(new Date(e.fechaVenc)).split('-').reverse().join('/')}: el banco no lo debita antes. `
+          + 'Se marca cobrado ese día o después.',
+        );
+      }
       if (e.pagoId) {
         await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' }).where(eq(proveedorEcheqs.id, id));
         return this.getEcheq(id);
@@ -508,6 +618,26 @@ export class FinanzasProveedorService {
     return this.getEcheq(id);
   }
 
+  /**
+   * UN PAPEL, UNA FILA (27/9/2026): el mismo número del mismo banco cargado
+   * dos veces es el mismo echeq, y al cobrarse los dos se pagaba dos veces.
+   * Los "a completar" (PEND-…) y los anulados no cuentan.
+   */
+  private async exigirEcheqUnico(numero?: string, banco?: string, exceptoId?: number) {
+    const n = (numero ?? '').trim();
+    if (!n || n.startsWith('PEND-')) return;
+    const conds: any[] = [
+      sql`lower(trim(${proveedorEcheqs.numero})) = lower(${n})`,
+      sql`lower(trim(${proveedorEcheqs.banco})) = lower(${(banco ?? '').trim()})`,
+      ne(proveedorEcheqs.estado, 'anulado'),
+    ];
+    if (exceptoId) conds.push(ne(proveedorEcheqs.id, exceptoId));
+    const [ya] = await this.db.select({ id: proveedorEcheqs.id }).from(proveedorEcheqs).where(and(...conds)).limit(1);
+    if (ya) {
+      throw new BadRequestException(`Ese echeq ya está cargado (echeq #${ya.id}, número ${n}${banco ? ` de ${banco}` : ''}).`);
+    }
+  }
+
   async borrarEcheq(id: number) {
     const e = await this.getEcheq(id);
     if (e.estado === 'cobrado' || e.pagoId) {
@@ -533,9 +663,6 @@ export class FinanzasProveedorService {
       this.db.select({
         proveedorId: comprobantes.proveedorId,
         deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
-        // La factura impaga MÁS VIEJA: de acá sale el estado "vencido"
-        // (fecha + días de pago del proveedor ya pasó).
-        impagaDesde: sql<string | null>`min(${comprobantes.fecha}) filter (where ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') and ${comprobantes.total} - ${comprobantes.pagado} > ${EPS})`,
       }).from(comprobantes)
         .where(eq(comprobantes.estado, 'confirmado'))
         .groupBy(comprobantes.proveedorId),
@@ -571,6 +698,37 @@ export class FinanzasProveedorService {
       }).from(proveedores).orderBy(proveedores.nombre),
     ]);
 
+    /*
+     * LA FACTURA IMPAGA MÁS VIEJA, CON SUS NOTAS (28/9/2026). De acá sale el
+     * estado "vencido" (fecha + días de pago del proveedor). Se miraba
+     * `total − pagado`, así que una factura que una NC dejó en cero seguía
+     * "impaga" y marcaba vencido a un proveedor al día. Se calcula en JS, igual
+     * que la bandeja de pagos (ver el porqué en `documentosPendientes`).
+     */
+    const abiertas = await this.db.select({
+      id: comprobantes.id, proveedorId: comprobantes.proveedorId, fecha: comprobantes.fecha,
+      total: comprobantes.total, pagado: comprobantes.pagado,
+    }).from(comprobantes).where(and(
+      eq(comprobantes.estado, 'confirmado'),
+      inArray(comprobantes.tipo, ['factura', 'liquidacion', 'nota_debito']),
+      sql`${comprobantes.total} - ${comprobantes.pagado} > ${EPS}`,
+    ));
+    const notas = abiertas.length ? await this.db.select({
+      ref: comprobantes.refComprobanteId, tipo: comprobantes.tipo, total: comprobantes.total,
+    }).from(comprobantes).where(and(
+      inArray(comprobantes.refComprobanteId, abiertas.map((c) => c.id)),
+      inArray(comprobantes.tipo, ['nota_credito', 'nota_debito']),
+      eq(comprobantes.estado, 'confirmado'),
+    )) : [];
+    const ajusteNotas = new Map<number, number>();
+    for (const n of notas) ajusteNotas.set(n.ref!, (ajusteNotas.get(n.ref!) ?? 0) + (n.tipo === 'nota_debito' ? n.total : -n.total));
+    const impagaComp = new Map<number, Date>();
+    for (const c of abiertas) {
+      if (money(c.total + (ajusteNotas.get(c.id) ?? 0) - c.pagado) <= EPS) continue;
+      const prev = impagaComp.get(c.proveedorId);
+      if (!prev || c.fecha < prev) impagaComp.set(c.proveedorId, c.fecha);
+    }
+
     const porId = <T extends { proveedorId: number | null }>(xs: T[]) =>
       new Map(xs.filter((x) => x.proveedorId != null).map((x) => [x.proveedorId as number, x]));
     const mComp = porId(compAgg); const mGasto = porId(gastoAgg);
@@ -601,7 +759,7 @@ export class FinanzasProveedorService {
       if (saldo < -EPS) estado = 'a_favor';
       else if (saldo > EPS) {
         estado = 'pendiente';
-        const desdeRaw = mComp.get(p.id)?.impagaDesde ?? mGasto.get(p.id)?.impagaDesde ?? null;
+        const desdeRaw = impagaComp.get(p.id) ?? mGasto.get(p.id)?.impagaDesde ?? null;
         if (desdeRaw && p.diasPago != null && p.diasPago > 0) {
           const desde = new Date(desdeRaw);
           if (!Number.isNaN(desde.getTime())
@@ -693,6 +851,11 @@ export class FinanzasProveedorService {
       formasPorPago.set(f.pagoId, arr);
     }
 
+    /* El "queda debiendo" de cada factura, con sus notas descontadas (28/9/2026):
+     * el mismo saldo que ofrece la bandeja de pago. */
+    const saldoVivo = new Map<number, number>(
+      docsPendientes.filter((d: any) => d.tipo === 'comprobante').map((d: any) => [d.docId, money(d.saldo)]),
+    );
     const movs: any[] = [];
     for (const c of comps) {
       const esNc = c.tipo === 'nota_credito';
@@ -704,19 +867,21 @@ export class FinanzasProveedorService {
         detalle: c.observaciones || '',
         debe: esNc ? 0 : money(c.total),
         haber: esNc ? money(c.total) : 0,
-        saldoDoc: esNc ? null : money(c.total - c.pagado),
+        saldoDoc: esNc ? null : (saldoVivo.get(c.id) ?? 0),
       });
     }
     for (const g of gs) {
+      // La NC de un gasto se guarda en negativo (27/9/2026): va al HABER.
+      const esNc = g.total < 0;
       movs.push({
-        kind: 'gasto',
+        kind: esNc ? 'nc_gasto' : 'gasto',
         id: g.id,
         fecha: g.fecha,
-        etiqueta: `Gasto #${g.id}${g.numero ? ` · ${g.numero}` : ''}`,
+        etiqueta: `${esNc ? 'NC de gasto' : 'Gasto'} #${g.id}${g.numero ? ` · ${g.numero}` : ''}`,
         detalle: g.descripcion || '',
-        debe: money(g.total),
-        haber: 0,
-        saldoDoc: money(g.total - g.pagado),
+        debe: esNc ? 0 : money(g.total),
+        haber: esNc ? money(-g.total) : 0,
+        saldoDoc: esNc ? null : money(g.total - g.pagado),
       });
     }
     for (const p of pgs) {
@@ -799,7 +964,7 @@ export class FinanzasProveedorService {
     const totales = {
       mercaderia: sumar((m) => m.kind === 'comprobante', 'debe'),
       notasCredito: sumar((m) => m.kind === 'nc', 'haber'),
-      gastos: sumar((m) => m.kind === 'gasto', 'debe'),
+      gastos: money(sumar((m) => m.kind === 'gasto', 'debe') - sumar((m) => m.kind === 'nc_gasto', 'haber')),
       ajustesDebe: sumar((m) => m.kind === 'ajuste_debe', 'debe'),
       ajustesHaber: sumar((m) => m.kind === 'ajuste_haber', 'haber'),
       pagos: sumar((m) => m.kind === 'pago', 'haber'),
@@ -834,26 +999,65 @@ export class FinanzasProveedorService {
     };
   }
 
+  /**
+   * LOS AJUSTES MUEVEN DEUDA SIN MOVER PLATA (27/9/2026). Un HABER de $250.000
+   * borraba deuda real con una línea de texto, se podía fechar en cualquier año
+   * —incluso antes de la conciliación— y se borraba sin dejar rastro. Ahora:
+   *  · la fecha no puede ser futura ni caer en lo ya conciliado (conciliar es
+   *    "hasta acá cuadra con el resumen del proveedor": cambiar eso es primero
+   *    quitar la conciliación, a la vista);
+   *  · el alta y la baja quedan en Auditoría con importe, fecha y motivo;
+   *  · borrar pide el porqué.
+   */
+  private async exigirFechaAjuste(proveedorId: number, fecha: Date) {
+    const manana = hoy0(); manana.setDate(manana.getDate() + 1);
+    if (fecha.getTime() >= manana.getTime()) {
+      throw new BadRequestException('El ajuste no puede tener fecha futura.');
+    }
+    await exigirFueraDeConciliado(this.db, proveedorId, fecha, 'tocar un ajuste');
+  }
+
+  private legibleAjuste(a: { importe: number; fecha: Date; motivo: string }) {
+    const tipo = a.importe >= 0 ? 'DEBE (suma deuda)' : 'HABER (resta deuda)';
+    return `${tipo} $${Math.abs(a.importe).toFixed(2)} · ${aIso(new Date(a.fecha))} · ${a.motivo}`;
+  }
+
   async crearAjuste(dto: AjusteDto, usuarioId: number | null) {
     const [prov] = await this.db.select({ id: proveedores.id }).from(proveedores)
       .where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
     if (!dto.motivo.trim()) throw new BadRequestException('El motivo del ajuste es obligatorio: sin explicación no se audita.');
     const importe = dto.tipo === 'haber' ? -money(dto.monto) : money(dto.monto);
-    const [a] = await this.db.insert(proveedorAjustes).values({
-      proveedorId: dto.proveedorId,
-      importe,
-      motivo: dto.motivo.trim(),
-      fecha: dto.fecha ? fecha0(dto.fecha) : new Date(),
-      usuarioId,
-    }).returning();
-    return a;
+    const fecha = dto.fecha ? fecha0(dto.fecha) : new Date();
+    await this.exigirFechaAjuste(dto.proveedorId, fecha);
+    return this.db.transaction(async (tx) => {
+      const [a] = await tx.insert(proveedorAjustes).values({
+        proveedorId: dto.proveedorId,
+        importe,
+        motivo: dto.motivo.trim(),
+        fecha,
+        usuarioId,
+      }).returning();
+      await this.audit.registrar([{
+        entidad: 'proveedor', entidadId: dto.proveedorId, ambito: 'Estado de cuenta',
+        campo: `Ajuste #${a.id} cargado`, antes: '', despues: this.legibleAjuste(a), usuarioId,
+      }], tx);
+      return a;
+    });
   }
 
-  async borrarAjuste(id: number) {
+  async borrarAjuste(id: number, motivo: string, usuarioId: number | null) {
     const [a] = await this.db.select().from(proveedorAjustes).where(eq(proveedorAjustes.id, id)).limit(1);
     if (!a) throw new NotFoundException('Ajuste inexistente.');
-    await this.db.delete(proveedorAjustes).where(eq(proveedorAjustes.id, id));
+    await this.exigirFechaAjuste(a.proveedorId, new Date(Math.min(new Date(a.fecha).getTime(), Date.now())));
+    await this.db.transaction(async (tx) => {
+      await tx.delete(proveedorAjustes).where(eq(proveedorAjustes.id, id));
+      await this.audit.registrar([{
+        entidad: 'proveedor', entidadId: a.proveedorId, ambito: 'Estado de cuenta',
+        campo: `Ajuste #${a.id} borrado`, antes: this.legibleAjuste(a),
+        despues: `Borrado: ${motivo.trim().slice(0, 280)}`, usuarioId,
+      }], tx);
+    });
     return { ok: true };
   }
 
@@ -892,7 +1096,7 @@ export class CompromisosController {
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarCompromisoDto) {
     return this.svc.editarCompromiso(id, dto);
   }
-  @Post(':id/pagar') pagar(
+  @Post(':id/pagar') @Permiso(...PERMISOS_MUEVEN_PLATA) pagar(
     @Param('id', ParseIntPipe) id: number, @Body() dto: PagarCompromisoDto, @Auth() auth: Sesion,
   ) {
     return this.svc.pagarCompromiso(id, dto, auth);
@@ -921,6 +1125,10 @@ export class EcheqsController {
   @Post(':id/estado') estado(
     @Param('id', ParseIntPipe) id: number, @Body() dto: EstadoEcheqDto, @Auth() auth: Sesion,
   ) {
+    // Cobrar registra el pago real: pide permiso de pagos (ver PERMISOS_MUEVEN_PLATA).
+    if (dto.estado === 'cobrado' && !tienePermiso(auth.permisos ?? [], PERMISOS_MUEVEN_PLATA)) {
+      throw new ForbiddenException('Marcar un echeq como cobrado registra el pago: necesita permiso de pagos a proveedores.');
+    }
     return this.svc.estadoEcheq(id, dto.estado, auth);
   }
   @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarEcheq(id); }
@@ -935,22 +1143,24 @@ export class EdocController {
   @Get(':proveedorId') detalle(@Param('proveedorId', ParseIntPipe) id: number) {
     return this.svc.edocProveedor(id);
   }
-  @Post('ajustes') ajuste(@Body() dto: AjusteDto, @Auth() auth: Sesion) {
+  @Post('ajustes') @Permiso(...PERMISOS_MUEVEN_PLATA) ajuste(@Body() dto: AjusteDto, @Auth() auth: Sesion) {
     return this.svc.crearAjuste(dto, auth.usuarioId ?? null);
   }
-  @Delete('ajustes/:id') borrarAjuste(@Param('id', ParseIntPipe) id: number) {
-    return this.svc.borrarAjuste(id);
+  @Delete('ajustes/:id') @Permiso(...PERMISOS_MUEVEN_PLATA) borrarAjuste(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: BorrarAjusteDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.borrarAjuste(id, dto.motivo, auth.usuarioId ?? null);
   }
-  @Post(':proveedorId/conciliar') conciliar(@Param('proveedorId', ParseIntPipe) id: number, @Auth() auth: Sesion) {
+  @Post(':proveedorId/conciliar') @Permiso(...PERMISOS_MUEVEN_PLATA) conciliar(@Param('proveedorId', ParseIntPipe) id: number, @Auth() auth: Sesion) {
     return this.svc.conciliar(id, auth.usuarioId);
   }
-  @Delete(':proveedorId/conciliar') desconciliar(@Param('proveedorId', ParseIntPipe) id: number) {
+  @Delete(':proveedorId/conciliar') @Permiso(...PERMISOS_MUEVEN_PLATA) desconciliar(@Param('proveedorId', ParseIntPipe) id: number) {
     return this.svc.desconciliar(id);
   }
 }
 
 @Module({
-  imports: [PagosModule],
+  imports: [PagosModule, AuditoriaModule],
   controllers: [CompromisosController, EcheqsController, EdocController],
   providers: [FinanzasProveedorService],
 })

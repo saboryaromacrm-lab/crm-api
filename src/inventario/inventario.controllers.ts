@@ -42,7 +42,7 @@ import {
   Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
+import { esJefe, ocultaCostoUnitario, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
 
 /** Quién ve el detalle de compra en la carga inicial (ver `bootstrapCatalogo`). */
 const verCostos = (sesion: Sesion) => tienePermiso(sesion?.permisos ?? [], ['precios', 'compras.productos']);
@@ -88,12 +88,6 @@ const LLAVE_DE_TIPO: Record<string, string> = {
  * porque lo usan la factura y los seeds, pero ya no hay puerta HTTP propia.
  */
 
-class VentaDto {
-  @IsInt() productoId!: number;
-  @IsOptional() @IsInt() sucursalId?: number;
-  @IsOptional() @IsInt() presId?: number | null;
-  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
-}
 
 class RenglonFraccionadoDto {
   @IsInt() productoId!: number;
@@ -156,6 +150,15 @@ class MovimientoDto {
  * de cada operación sale de la SESIÓN (como en Ventas y Cobranzas), no de lo
  * que mande el cliente — una traza que elige el cliente no prueba nada. Los
  * frontends viejos que todavía lo manden no rompen: `whitelist` lo descarta. */
+class DescartarEstadoDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() sucursalId?: number;
+  @IsOptional() @IsInt() presId?: number | null;
+  @IsIn(['vencido', 'defectuoso'], { message: 'Solo se descarta lo vencido o lo defectuoso: lo disponible que se tiró es una merma.' }) estado!: 'vencido' | 'defectuoso';
+  @IsNumber() @Min(0.001) @Max(MAX_CANT) cantidad!: number;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+
 class AbrirBorradorDto {
   @IsInt() origenId!: number;
   @IsOptional() @IsInt() destinoId?: number;
@@ -259,7 +262,7 @@ export class BootstrapController {
    */
   @Get()
   bootstrap(@Auth() sesion: Sesion) {
-    return this.inv.bootstrap(soloSuSucursal(sesion), verCostos(sesion));
+    return this.inv.bootstrap(soloSuSucursal(sesion), verCostos(sesion), ocultaCostoUnitario(sesion?.permisos ?? []));
   }
 
   /*
@@ -293,7 +296,9 @@ export class BootstrapController {
   @Get('catalogo')
   catalogo(@Req() req: any, @Res() res: any, @Auth() sesion: Sesion) {
     const ve = verCostos(sesion);
-    return this.parte(req, res, 'catalogo', ve ? 'costos' : 'sin-costos', () => this.inv.bootstrapCatalogo(ve));
+    const nada = ocultaCostoUnitario(sesion?.permisos ?? []);
+    return this.parte(req, res, 'catalogo', ve ? 'costos' : (nada ? 'sin-costo-unitario' : 'sin-costos'),
+      () => this.inv.bootstrapCatalogo(ve, nada));
   }
 
   @Get('stock')
@@ -372,11 +377,13 @@ export class OperacionesController {
    * que aparece contando la góndola se resuelve en Control de stock.
    */
 
-  @Post('venta')
-  @Permiso('inventario')
-  venta(@Body() dto: VentaDto, @Auth() sesion: Sesion) {
-    return this.inv.opVenta({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
-  }
+  /*
+   * `POST /operaciones/venta` SE CERRÓ el 27/9/2026. Descontaba stock como
+   * "venta" SIN crear la venta: sin ticket, sin caja y sin cliente — la forma
+   * prolija de tapar un faltante (se probó: −3 u. y cero ventas registradas).
+   * Ninguna pantalla la usaba. Las ventas entran por el POS; `opVenta` queda en
+   * el servicio solo para las semillas.
+   */
 
   /*
    * `POST /operaciones/fraccionar` (la de un solo producto) SE RETIRÓ el
@@ -398,6 +405,21 @@ export class OperacionesController {
   @Permiso('fraccionar')
   corregirFraccionado(@Body() dto: CorregirFraccionadoDto, @Auth() sesion: Sesion) {
     return this.inv.opCorregirFraccionado({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) });
+  }
+
+  /**
+   * TIRAR LO VENCIDO O DEFECTUOSO (27/9/2026): la salida que esos estados no
+   * tenían. Pide la misma llave que marcarlo así (vencido → `merma`,
+   * defectuoso → `defectuoso`).
+   */
+  @Post('descartar')
+  @Permiso('merma', 'defectuoso')
+  descartar(@Body() dto: DescartarEstadoDto, @Auth() sesion: Sesion) {
+    const llave = dto.estado === 'defectuoso' ? 'defectuoso' : 'merma';
+    if (!sesion.permisos.includes('*') && !sesion.permisos.includes(llave)) {
+      throw new ForbiddenException(`Tu rol no puede descartar lo ${dto.estado}.`);
+    }
+    return this.inv.opDescartarEstado({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId)! });
   }
 
   /**
@@ -594,6 +616,13 @@ export class IncidenciasController {
   @Post(':id/resolver')
   @Permiso('inventario')
   resolver(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverIncidenciaDto, @Auth() sesion: Sesion) {
+    /* Cerrar como PÉRDIDA pide la llave de esa pérdida (27/9/2026), igual que
+     * el movimiento a mano: con solo `inventario` se daba de baja como merma
+     * sin tener `merma`. */
+    const llave = ({ merma: 'merma', vencido: 'merma', defectuoso: 'defectuoso' } as Record<string, string>)[dto.resolucion];
+    if (llave && !sesion.permisos.includes('*') && !sesion.permisos.includes(llave)) {
+      throw new ForbiddenException(`Tu rol no puede cerrar una incidencia como "${dto.resolucion}".`);
+    }
     return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion), dto.contado);
   }
 }
@@ -694,7 +723,11 @@ export class ConteosController {
     return this.inv.cerrarConteo(id, soloSuSucursal(sesion));
   }
 
+  /* Reabrir es del que revisa (27/9/2026): con la sola sección, el que contaba
+   * podía reabrir DESPUÉS de que el admin miró las diferencias, cambiar números
+   * y volver a cerrar — y se aplicaba un reporte que nadie revisó. */
   @Post(':id/reabrir')
+  @Permiso('conteos_aplicar')
   reabrir(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     return this.inv.reabrirConteo(id, soloSuSucursal(sesion));
   }

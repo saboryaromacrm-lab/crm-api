@@ -29,13 +29,37 @@ import {
 import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm';
 import { mimeReal, nombreSeguro } from '../common/archivos';
 import { fechaLocal } from '../common/documentos';
+import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
-import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { PagosModule, PagosProveedorService, esAdminPagos, exigirFechaPago } from '../pagos/pagos.module';
+
+/**
+ * LAS FECHAS DEL GASTO (27/9/2026). Se aceptaba un gasto fechado en 2035 y un
+ * vencimiento ocho meses ANTES de la factura. Ahora: la fecha no es futura ni
+ * de más de un año atrás, y el vencimiento no es anterior a la fecha.
+ */
+const DIAS_ATRAS_GASTO = 365;
+function exigirFechasGasto(fecha?: Date | null, vencimiento?: Date | null) {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const manana = new Date(hoy); manana.setDate(manana.getDate() + 1);
+  const tope = new Date(hoy); tope.setDate(tope.getDate() - DIAS_ATRAS_GASTO);
+  const fmt = (d: Date) => d.toLocaleDateString('es-AR');
+  if (fecha) {
+    if (fecha.getTime() >= manana.getTime()) throw new BadRequestException(`El gasto no puede tener fecha futura (${fmt(fecha)}).`);
+    if (fecha.getTime() < tope.getTime()) {
+      throw new BadRequestException(`La fecha ${fmt(fecha)} tiene más de un año: revisala.`);
+    }
+  }
+  const base = fecha ?? hoy;
+  if (vencimiento && vencimiento.getTime() < new Date(base).setHours(0, 0, 0, 0)) {
+    throw new BadRequestException(`El vencimiento (${fmt(vencimiento)}) no puede ser anterior a la fecha del gasto (${fmt(base)}).`);
+  }
+}
 
 /**
  * Redondeo a dos decimales, y última red contra los números que no son números.
@@ -102,12 +126,39 @@ const PERMISOS_IMPUTAR = ['gastos_imputar', 'gastos.pagos_proveedor', 'compras.p
  * En dos copias, arreglar una no arreglaba la otra.
  */
 
+/** "0001-00000123" → "1-123"; lo demás, sin espacios ni signos y en minúsculas. */
+function normalizarNumero(n?: string | null) {
+  const t = String(n ?? '').trim();
+  const m = /^0*(\d+)\s*-\s*0*(\d+)$/.exec(t);
+  if (m) return `${Number(m[1])}-${Number(m[2])}`;
+  return t.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/^0+(?=\d)/, '');
+}
+function normalizarTexto(t?: string | null) {
+  return String(t ?? '').toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
 /** Meses que cubre cada frecuencia: define cuándo un gasto fijo vuelve a tocar. */
 const MESES_FRECUENCIA: Record<string, number> = {
   mensual: 1, bimestral: 2, trimestral: 3, semestral: 6, anual: 12,
 };
 
 const TIPOS_DOC = ['factura', 'ticket', 'recibo', 'nota_credito', 'otro'] as const;
+
+/**
+ * LA NOTA DE CRÉDITO DE UN GASTO VA EN NEGATIVO (27/9/2026). Se guardaba con
+ * importe positivo y todo la leía como gasto: el resumen del mes SUBÍA $500 y
+ * aparecía en Cuentas a pagar como deuda. En negativo resta sola en todas las
+ * sumas que ya existen (resumen, saldo del proveedor, estado de cuenta,
+ * Gerencia, Coffit) y no se ofrece para pagar. Nace "pagada": no hay nada que
+ * pagarle. La cargan en positivo, como dice el papel; el signo lo pone acá.
+ */
+const esNotaCredito = (tipo?: string | null) => tipo === 'nota_credito';
+const CAMPOS_IMPORTE = ['neto', 'iva', 'otros', 'impInternos', 'percDgi', 'percDgr', 'total'] as const;
+function conSigno<T extends Record<string, any>>(x: T, signo: 1 | -1): T {
+  const out: any = { ...x };
+  for (const k of CAMPOS_IMPORTE) if (typeof out[k] === 'number') out[k] = money(out[k] * signo);
+  return out;
+}
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro'] as const;
 
 /* ------------------------------- DTOs ------------------------------- */
@@ -132,6 +183,8 @@ class PagoDto {
   /** Turno de caja del que sale el efectivo (genera el egreso). */
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** "Sí, es otro pago": la segunda confirmación ante un pago gemelo del día (409). */
+  @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
 }
 
 /** Un renglón del gasto: concepto + importe FINAL, como se lee del papel. */
@@ -154,8 +207,10 @@ class GastoDto {
   /** A qué negocio se imputa: la distribuidora (defecto) o la cafetería. */
   @IsOptional() @IsIn(['distribuidora', 'cafeteria']) negocio?: string;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vencimiento?: string;
-  @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) neto?: number;
-  @IsOptional() @IsNumber() @Min(-TOPE_IMPORTE) @Max(TOPE_IMPORTE) iva?: number;
+  /* Sin negativos (27/9/2026): se cargaba neto −$500 con IVA $600. La nota de
+   * crédito va por su tipo, no con importes negativos. */
+  @IsOptional() @IsNumber() @Min(0, { message: 'El neto no puede ser negativo (la nota de crédito va con su tipo).' }) @Max(TOPE_IMPORTE) neto?: number;
+  @IsOptional() @IsNumber() @Min(0, { message: 'El IVA no puede ser negativo.' }) @Max(TOPE_IMPORTE) iva?: number;
   /**
    * Lo que suma abajo del IVA y NO se detalló en los tres de abajo. Sin
    * detalle, `otros` es todo (es como venía antes de 0071 y como lo mandan los
@@ -182,6 +237,8 @@ class GastoDto {
    * renglones el flag no significa nada y se ignora.
    */
   @IsOptional() @IsBoolean() ivaAparte?: boolean;
+  /** La NC (0115): el gasto del que descuenta. `null` al editar = que no descuente de ninguno. */
+  @IsOptional() @IsInt() refGastoId?: number | null;
   @IsOptional() @IsString() observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
   /**
@@ -209,8 +266,11 @@ class AplicarPagoDto {
   @IsOptional() @IsInt() usuarioId?: number;
 }
 
+/* El motivo es obligatorio (27/9/2026), igual que al anular un pago. */
 class AnularGastoDto {
-  @IsOptional() @IsString() motivo?: string;
+  @IsString({ message: 'Escribí por qué se anula el gasto.' })
+  @Matches(/\S/, { message: 'Escribí por qué se anula el gasto.' })
+  motivo!: string; // el largo se recorta al guardar: sin motivo, un solo mensaje claro
 }
 
 class GenerarPeriodoDto {
@@ -420,7 +480,22 @@ export class GastosService {
       // Los renglones (0067). Un gasto viejo no tiene: el array vacío es válido.
       this.db.select().from(gastoItems).where(eq(gastoItems.gastoId, id)).orderBy(asc(gastoItems.id)),
     ]);
-    return { ...g, saldo: money(g.total - g.pagado), pagos, adjuntos, items };
+    /* Las NC (0115): las que le descuentan a ESTE gasto, y si es una NC, de cuál
+     * descuenta. `pagado` incluye lo acreditado; `pagadoEnPlata` es lo que salió. */
+    const notasCredito = await this.db.select({
+      id: gastos.id, numero: gastos.numero, fecha: gastos.fecha, total: gastos.total,
+    }).from(gastos).where(and(
+      eq(gastos.refGastoId, id), eq(gastos.tipoDoc, 'nota_credito'), ne(gastos.estado, 'anulado'),
+    )).orderBy(asc(gastos.id));
+    const acreditado = money(notasCredito.reduce((a, n) => a - n.total, 0));
+    const [refGasto] = g.refGastoId
+      ? await this.db.select({ id: gastos.id, numero: gastos.numero, descripcion: gastos.descripcion })
+        .from(gastos).where(eq(gastos.id, g.refGastoId)).limit(1)
+      : [null];
+    return {
+      ...g, saldo: money(g.total - g.pagado), pagos, adjuntos, items,
+      notasCredito, acreditado, pagadoEnPlata: money(g.pagado - acreditado), refGasto: refGasto ?? null,
+    };
   }
 
   /**
@@ -493,7 +568,11 @@ export class GastosService {
         total: sql<number>`coalesce(sum(${gastos.total}), 0)`,
         neto: sql<number>`coalesce(sum(${gastos.neto}), 0)`,
         iva: sql<number>`coalesce(sum(${gastos.iva}), 0)`,
-        pagado: sql<number>`coalesce(sum(${gastos.pagado}), 0)`,
+        // Lo PAGADO en plata: `pagado` incluye lo que acreditan las NC con gasto (0115),
+        // y esas NC (en negativo) lo restan acá.
+        pagado: sql<number>`coalesce(sum(${gastos.pagado}), 0) + coalesce(sum(${gastos.total}) filter (where ${gastos.tipoDoc} = 'nota_credito' and ${gastos.refGastoId} is not null), 0)`,
+        // Falta pagar = lo que deben los gastos con saldo; la NC (negativa) no se paga.
+        faltaPagar: sql<number>`coalesce(sum(greatest(${gastos.total} - ${gastos.pagado}, 0)), 0)`,
       }).from(gastos).where(where),
 
       this.db.select({
@@ -539,7 +618,7 @@ export class GastosService {
       // IVA de los gastos = crédito fiscal (lo que se descuenta del IVA ventas).
       iva: money(Number(totales?.iva) || 0),
       pagado: money(Number(totales?.pagado) || 0),
-      saldo: money((Number(totales?.total) || 0) - (Number(totales?.pagado) || 0)),
+      saldo: money(Number(totales?.faltaPagar) || 0),
       porCategoria: cat,
       porMes: porMes.map((m) => ({ ...m, total: money(Number(m.total)) })),
       porProveedor: porProveedor.map((p) => ({ ...p, total: money(Number(p.total)) })),
@@ -644,16 +723,30 @@ export class GastosService {
    * más de lo que da el banco). Con proveedor y número, la combinación tiene
    * que ser única.
    */
-  private async chequearDuplicado(proveedorId: number | null, letra: string, numero: string, exceptoId?: number) {
-    if (!proveedorId || !numero) return;
+  /*
+   * EL NÚMERO SE COMPARA NORMALIZADO (27/9/2026): "0001-00000123" y "1-123"
+   * son el mismo papel y pasaban los dos. Punto de venta y número se comparan
+   * como números; cualquier otro formato, sin espacios ni signos ni mayúsculas.
+   * Y el gasto SIN proveedor del padrón (el plomero escrito a mano) también se
+   * controla, por el nombre escrito.
+   */
+  private async chequearDuplicado(
+    proveedorId: number | null, letra: string, numero: string, exceptoId?: number, proveedorTexto?: string,
+  ) {
+    const clave = normalizarNumero(numero);
+    const texto = normalizarTexto(proveedorTexto);
+    if (!clave || (!proveedorId && !texto)) return;
     const conds: any[] = [
-      eq(gastos.proveedorId, proveedorId),
-      eq(gastos.numero, numero),
       eq(gastos.letra, letra as any),
       ne(gastos.estado, 'anulado'),
+      sql`${gastos.numero} <> ''`,
+      proveedorId ? eq(gastos.proveedorId, proveedorId) : sql`${gastos.proveedorId} is null`,
     ];
     if (exceptoId) conds.push(ne(gastos.id, exceptoId));
-    const [ya] = await this.db.select({ id: gastos.id }).from(gastos).where(and(...conds)).limit(1);
+    const candidatos = await this.db.select({ id: gastos.id, numero: gastos.numero, proveedorTexto: gastos.proveedorTexto })
+      .from(gastos).where(and(...conds));
+    const ya = candidatos.find((c) => normalizarNumero(c.numero) === clave
+      && (proveedorId || normalizarTexto(c.proveedorTexto) === texto));
     if (ya) {
       throw new BadRequestException(
         `Ese comprobante ya está cargado (gasto #${ya.id}). Si es otro, revisá el número o el proveedor.`,
@@ -679,6 +772,33 @@ export class GastosService {
     return sesion.sucursalId ?? null;
   }
 
+  /**
+   * CONTRA QUÉ GASTO DESCUENTA UNA NC (0115, 28/9/2026). Del mismo proveedor,
+   * vivo, que no sea otra NC, y que le quede saldo para absorberla: una NC de
+   * $300 contra un gasto que debe $200 dejaría el gasto "pagado de más".
+   * `creditoPropio` es lo que ESTA misma NC ya le acredita (al editarla).
+   */
+  private async validarRefNc(
+    refId: number, importeNc: number, proveedorId: number | null, proveedorTexto: string, creditoPropio = 0,
+  ) {
+    const [t] = await this.db.select().from(gastos).where(eq(gastos.id, refId)).limit(1);
+    if (!t) throw new BadRequestException('El gasto del que descuenta la nota de crédito no existe.');
+    if (t.estado === 'anulado') throw new BadRequestException(`El gasto #${t.id} está anulado: la nota de crédito no descuenta de él.`);
+    if (esNotaCredito(t.tipoDoc) || t.total < 0) throw new BadRequestException('Una nota de crédito descuenta de un gasto, no de otra nota de crédito.');
+    const mismo = proveedorId
+      ? t.proveedorId === proveedorId
+      : !t.proveedorId && normalizarTexto(t.proveedorTexto) === normalizarTexto(proveedorTexto);
+    if (!mismo) throw new BadRequestException(`El gasto #${t.id} es de otro proveedor: la nota de crédito descuenta de un gasto del mismo.`);
+    const disponible = money(t.total - t.pagado + creditoPropio);
+    if (importeNc - disponible > 0.009) {
+      throw new BadRequestException(
+        `Al gasto #${t.id} le quedan ${disponible.toFixed(2)} por pagar y la nota de crédito es de ${importeNc.toFixed(2)}: `
+        + 'no puede descontar más de lo que el gasto debe. Cargala sin gasto (queda como crédito del proveedor) o elegí otro.',
+      );
+    }
+    return t.id;
+  }
+
   async crear(dto: GastoDto, sesion: Sesion) {
     /*
      * El alta con "lo pagué y lo cargo" tildado hace salir plata del cajón, así
@@ -691,9 +811,13 @@ export class GastosService {
         'Podés cargar el gasto, pero no registrar su pago: eso saca plata de la caja y necesita permiso propio.',
       );
     }
+    if (dto.pagoInmediato) {
+      this.exigirPagoPropio(sesion, this.sucursalDelGasto(sesion, dto.sucursalId), dto.pagoInmediato);
+    }
     const [cat] = await this.db.select().from(gastoCategorias)
       .where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
     if (!cat) throw new BadRequestException('Elegí el rubro al que se imputa el gasto.');
+    if (!cat.activa) throw new BadRequestException(`El rubro "${cat.nombre}" está dado de baja: elegí otro.`);
 
     let proveedorId: number | null = null;
     if (dto.proveedorId) {
@@ -702,14 +826,26 @@ export class GastosService {
       proveedorId = p.id;
     }
 
+    const calc = this.importesDe(dto);
+    if (calc.total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
+    exigirFechasGasto(fechaLocal(dto.fecha), fechaLocal(dto.vencimiento));
+    if (dto.pagoInmediato) exigirFechaPago(dto.pagoInmediato.fecha);
+    const esNc = esNotaCredito(dto.tipoDoc);
+    if (esNc && dto.pagoInmediato) {
+      throw new BadRequestException('Una nota de crédito no se paga: descuenta lo que se le debe al proveedor.');
+    }
     const {
       neto, iva, otros, impInternos, percDgi, percDgr, total, items, descripcion,
-    } = this.importesDe(dto);
-    if (total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
+    } = conSigno(calc, esNc ? -1 : 1);
+    if (dto.refGastoId && !esNc) throw new BadRequestException('Solo una nota de crédito descuenta de otro gasto.');
+    const refGastoId = esNc && dto.refGastoId
+      ? await this.validarRefNc(dto.refGastoId, calc.total, proveedorId, proveedorId ? '' : (dto.proveedorTexto ?? ''))
+      : null;
 
+    await exigirFueraDeConciliado(this.db, proveedorId, fechaLocal(dto.fecha), 'cargar un gasto');
     const numero = (dto.numero ?? '').trim();
     const letra = dto.letra ?? 'B';
-    await this.chequearDuplicado(proveedorId, letra, numero);
+    await this.chequearDuplicado(proveedorId, letra, numero, undefined, proveedorId ? '' : dto.proveedorTexto);
 
     const sucursalId = this.sucursalDelGasto(sesion, dto.sucursalId);
 
@@ -728,20 +864,28 @@ export class GastosService {
         vencimiento: fechaLocal(dto.vencimiento),
         neto, iva, otros, impInternos, percDgi, percDgr, total,
         pagado: 0,
-        estado: 'pendiente',
+        estado: esNc ? 'pagado' : 'pendiente',
+        refGastoId,
         observaciones: (dto.observaciones ?? '').trim(),
         usuarioId: dto.usuarioId ?? null,
     }).returning();
     if (items?.length) {
       await this.db.insert(gastoItems).values(items.map((i) => ({ ...i, gastoId: creado.id })));
     }
+    // La NC con gasto (0115): el saldo de ese gasto baja ya.
+    await this.pagos.recalcularGastoAhora(refGastoId);
 
     /*
      * "Lo pagué y lo cargo": el pago se registra como pago al proveedor y se
-     * imputa a este gasto en un solo acto. Va DESPUÉS del alta y no dentro de
-     * la misma transacción a propósito — si el pago falla (turno cerrado, por
-     * ejemplo), el gasto queda cargado y pendiente, que es un estado válido y
-     * recuperable. Perder también la carga sería peor.
+     * imputa a este gasto en un solo acto. Va DESPUÉS del alta porque el pago
+     * maneja su propia transacción (egreso de caja incluido).
+     *
+     * TODO O NADA (27/9/2026). Antes, si el pago rebotaba (turno cerrado, de
+     * otra sucursal…) el gasto quedaba cargado igual, pero la pantalla mostraba
+     * el error con el formulario abierto: la persona corregía, volvía a
+     * apretar y el gasto se cargaba DOS veces (probado). Ahora, si el pago no
+     * entra, el alta se deshace — no salió plata ni quedó nada imputado — y el
+     * formulario se reintenta limpio.
      */
     if (dto.pagoInmediato) {
       // El importe viene siempre: `PagoDto.importe` es obligatorio y tiene
@@ -763,7 +907,11 @@ export class GastosService {
         // del gasto lo firma el mismo que carga el gasto.
         usuarioId: dto.usuarioId,
         imputaciones: [{ gastoId: creado.id, importe: importePago }],
-      }, sesion.sucursalId, esJefe(sesion));
+      }, sesion.sucursalId, esJefe(sesion)).catch(async (e) => {
+        await this.db.delete(gastoItems).where(eq(gastoItems.gastoId, creado.id));
+        await this.db.delete(gastos).where(and(eq(gastos.id, creado.id), sql`${gastos.pagado} = 0`));
+        throw e;
+      });
     }
     return this.get(creado.id);
   }
@@ -782,6 +930,7 @@ export class GastosService {
     if (dto.categoriaId != null) {
       const [c] = await this.db.select().from(gastoCategorias).where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
       if (!c) throw new BadRequestException('Rubro inválido.');
+      if (!c.activa && c.id !== g.categoriaId) throw new BadRequestException(`El rubro "${c.nombre}" está dado de baja: elegí otro.`);
       patch.categoriaId = c.id;
     }
     if (dto.descripcion != null) patch.descripcion = String(dto.descripcion).trim();
@@ -838,34 +987,89 @@ export class GastosService {
          * sumar dos veces lo que ya estaba adentro. Lo no detallado se
          * despeja de la fila vieja.
          */
-        const sinDetallarGuardado = money(g.otros - g.impInternos - g.percDgi - g.percDgr);
+        // Lo guardado de una NC está en negativo: se lee en positivo, como el papel.
+        const gp = conSigno(g, g.total < 0 ? -1 : 1);
+        const sinDetallarGuardado = money(gp.otros - gp.impInternos - gp.percDgi - gp.percDgr);
         const t = this.totalesDe({
-          neto: dto.neto ?? g.neto,
-          iva: dto.iva ?? g.iva,
+          neto: dto.neto ?? gp.neto,
+          iva: dto.iva ?? gp.iva,
           otros: dto.otros ?? Math.max(0, sinDetallarGuardado),
-          impInternos: dto.impInternos ?? g.impInternos,
-          percDgi: dto.percDgi ?? g.percDgi,
-          percDgr: dto.percDgr ?? g.percDgr,
+          impInternos: dto.impInternos ?? gp.impInternos,
+          percDgi: dto.percDgi ?? gp.percDgi,
+          percDgr: dto.percDgr ?? gp.percDgr,
         } as GastoDto);
         if (t.total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
         Object.assign(patch, t);
       }
+      /* El signo de la NC (ver `esNotaCredito`): lo recalculado nace positivo;
+       * si solo cambió el tipo, se da vuelta lo que ya estaba guardado. */
+      const tipoFinal = patch.tipoDoc ?? g.tipoDoc;
+      const signoFinal: 1 | -1 = esNotaCredito(tipoFinal) ? -1 : 1;
+      if (patch.total != null) Object.assign(patch, conSigno(patch, signoFinal));
+      else if (Math.sign(g.total) !== signoFinal) {
+        for (const k of CAMPOS_IMPORTE) patch[k] = money(-(g as any)[k]);
+      }
+      if (esNotaCredito(tipoFinal) !== esNotaCredito(g.tipoDoc)) patch.estado = esNotaCredito(tipoFinal) ? 'pagado' : 'pendiente';
       await this.chequearDuplicado(
         patch.proveedorId !== undefined ? patch.proveedorId : g.proveedorId,
         patch.letra ?? g.letra,
         patch.numero ?? g.numero,
         id,
+        patch.proveedorTexto ?? g.proveedorTexto,
       );
     } else if (
       tocaImportes(dto)
       || dto.numero != null || dto.proveedorId !== undefined || dto.items != null
     ) {
       throw new BadRequestException(
-        'El gasto ya tiene pagos registrados: revertí el pago antes de cambiar importes, número o proveedor.',
+        'El gasto ya tiene pagos (o una nota de crédito aplicada): revertilos antes de cambiar importes, número o proveedor.',
       );
     }
 
+    /* La conciliación (28/9/2026): lo que cambia el saldo del proveedor —importe,
+     * tipo, proveedor o fecha— no se toca si el gasto (o su fecha nueva) cae
+     * antes del día conciliado. Descripción, rubro u observaciones, sí. */
+    const cambia = (k: string) => patch[k] !== undefined && (k === 'fecha'
+      ? new Date(patch.fecha).getTime() !== new Date(g.fecha).getTime()
+      : Math.abs(Number(patch[k] ?? 0) - Number((g as any)[k] ?? 0)) > 0.009 || (typeof patch[k] === 'string' && patch[k] !== (g as any)[k]));
+    const cambiaFecha = cambia('fecha');
+    const cambiaProv = patch.proveedorId !== undefined && (patch.proveedorId ?? null) !== (g.proveedorId ?? null);
+    if (cambiaFecha || cambiaProv || cambia('total') || (patch.tipoDoc !== undefined && patch.tipoDoc !== g.tipoDoc)) {
+      await exigirFueraDeConciliado(this.db, g.proveedorId, g.fecha, 'modificar un gasto');
+      if (cambiaFecha || cambiaProv) {
+        await exigirFueraDeConciliado(
+          this.db, cambiaProv ? patch.proveedorId : g.proveedorId, cambiaFecha ? patch.fecha : g.fecha, 'modificar un gasto',
+        );
+      }
+    }
+    if (patch.fecha !== undefined || patch.vencimiento !== undefined) {
+      if (patch.fecha) exigirFechasGasto(patch.fecha, null);
+      const f = patch.fecha ?? g.fecha;
+      const v = patch.vencimiento !== undefined ? patch.vencimiento : g.vencimiento;
+      if (v && f && new Date(v).getTime() < new Date(new Date(f).setHours(0, 0, 0, 0)).getTime()) {
+        throw new BadRequestException('El vencimiento no puede ser anterior a la fecha del gasto.');
+      }
+    }
+    /* La NC y su gasto (0115): contra cuál descuenta se puede cambiar o quitar;
+     * si deja de ser NC, pierde la referencia. Se valida con lo que queda. */
+    const tipoFin = patch.tipoDoc ?? g.tipoDoc;
+    let refFin: number | null = dto.refGastoId !== undefined ? (dto.refGastoId ?? null) : (g.refGastoId ?? null);
+    if (!esNotaCredito(tipoFin)) {
+      if (dto.refGastoId) throw new BadRequestException('Solo una nota de crédito descuenta de otro gasto.');
+      refFin = null;
+    }
+    const totalFin = patch.total ?? g.total;
+    const provFin = patch.proveedorId !== undefined ? patch.proveedorId : g.proveedorId;
+    if (refFin && (refFin !== g.refGastoId || totalFin !== g.total || provFin !== g.proveedorId)) {
+      await this.validarRefNc(
+        refFin, money(-totalFin), provFin ?? null, patch.proveedorTexto ?? g.proveedorTexto,
+        refFin === g.refGastoId ? money(-g.total) : 0,
+      );
+    }
+    if (refFin !== (g.refGastoId ?? null)) patch.refGastoId = refFin;
     if (Object.keys(patch).length) await this.db.update(gastos).set(patch).where(eq(gastos.id, id));
+    await this.pagos.recalcularGastoAhora(g.refGastoId);
+    if (refFin !== g.refGastoId) await this.pagos.recalcularGastoAhora(refFin);
     return this.get(id);
   }
 
@@ -873,14 +1077,22 @@ export class GastosService {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('Ya está anulado.');
+    await exigirFueraDeConciliado(this.db, g.proveedorId, g.fecha, 'anular un gasto');
     if (g.pagado > 0.009) {
-      throw new BadRequestException('Tiene pagos registrados: revertilos primero — la plata que salió tiene que quedar rastreable.');
+      const [nc] = await this.db.select({ id: gastos.id }).from(gastos).where(and(
+        eq(gastos.refGastoId, id), eq(gastos.tipoDoc, 'nota_credito'), ne(gastos.estado, 'anulado'),
+      )).limit(1);
+      throw new BadRequestException(nc
+        ? `Tiene aplicada la nota de crédito #${nc.id}: anulala o sacale la referencia primero.`
+        : 'Tiene pagos registrados: revertilos primero — la plata que salió tiene que quedar rastreable.');
     }
-    const nota = (motivo ?? '').trim();
+    const nota = (motivo ?? '').trim().slice(0, 300);
     await this.db.update(gastos).set({
       estado: 'anulado',
       observaciones: nota ? `${g.observaciones ? `${g.observaciones}\n` : ''}Anulado: ${nota}` : g.observaciones,
     }).where(eq(gastos.id, id));
+    // Una NC anulada deja de descontar: su gasto recupera el saldo (0115).
+    await this.pagos.recalcularGastoAhora(g.refGastoId);
     return this.get(id);
   }
 
@@ -896,6 +1108,11 @@ export class GastosService {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('El gasto está anulado.');
+    if (esNotaCredito(g.tipoDoc) || g.total < 0) {
+      throw new BadRequestException('Una nota de crédito no se paga: descuenta lo que se le debe al proveedor.');
+    }
+    exigirFechaPago(dto.fecha);
+    this.exigirPagoPropio(sesion, g.sucursalId, dto);
     const importe = money(dto.importe);
     await this.pagos.crear({
       destino: 'gastos',
@@ -909,8 +1126,28 @@ export class GastosService {
       cajaSesionId: dto.cajaSesionId,
       usuarioId: dto.usuarioId,
       imputaciones: [{ gastoId: g.id, importe }],
-    }, sesion.sucursalId, esJefe(sesion));
+      confirmarDuplicado: dto.confirmarDuplicado === true,
+    }, sesion.sucursalId, esJefe(sesion), false, { controlarDuplicado: true });
     return this.get(id);
+  }
+
+  /**
+   * QUIÉN PUEDE PAGAR ESTE GASTO (27/9/2026). Administración, cualquiera. El
+   * resto (el mostrador, que entra con `ventas.caja`) solo un gasto de SU
+   * sucursal y en EFECTIVO de su turno: antes la cajera daba por pagado "por
+   * transferencia" el alquiler de otra sucursal, que ni siquiera puede ver, y
+   * el gasto desaparecía de Cuentas a pagar sin que saliera un peso.
+   */
+  private exigirPagoPropio(sesion: Sesion, sucursalGasto: number | null, dto: PagoDto) {
+    if (esAdminPagos(sesion)) return;
+    if (sucursalGasto == null || sucursalGasto !== sesion.sucursalId) {
+      throw new ForbiddenException('Ese gasto no es de tu sucursal: lo paga administración.');
+    }
+    if ((dto.medio ?? 'efectivo') !== 'efectivo' || !dto.cajaSesionId) {
+      throw new ForbiddenException(
+        'Desde la sucursal solo se paga en EFECTIVO de tu turno abierto. Las transferencias las registra administración.',
+      );
+    }
   }
 
   /**
@@ -1014,9 +1251,35 @@ export class GastosService {
     return this.db.select().from(gastosRecurrentes).orderBy(asc(gastosRecurrentes.nombre));
   }
 
+  /**
+   * LO QUE APUNTA UN GASTO FIJO TIENE QUE EXISTIR (27/9/2026). Editar a un
+   * rubro inexistente daba "Internal server error"; y un fijo sin importe
+   * generaba gastos de $0 que no aparecían en ningún lado pero dejaban el mes
+   * como "ya generado".
+   */
+  private async validarRecurrente(dto: RecurrenteDto, alta: boolean) {
+    if (dto.categoriaId != null || alta) {
+      const [c] = await this.db.select().from(gastoCategorias).where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
+      if (!c) throw new BadRequestException('Elegí el rubro del gasto fijo.');
+      if (!c.activa) throw new BadRequestException(`El rubro "${c.nombre}" está dado de baja: elegí otro.`);
+    }
+    if (dto.proveedorId) {
+      const [p] = await this.db.select({ id: proveedores.id }).from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
+      if (!p) throw new BadRequestException('Proveedor inválido.');
+    }
+    if (dto.sucursalId) {
+      const [x] = await this.db.select({ id: sucursales.id }).from(sucursales).where(eq(sucursales.id, dto.sucursalId)).limit(1);
+      if (!x) throw new BadRequestException('Sucursal inválida.');
+    }
+    if ((alta || dto.importeEstimado != null) && !(Number(dto.importeEstimado) > 0)) {
+      throw new BadRequestException('Poné el importe estimado: sin él se generan gastos de $0 que no aparecen en ningún lado.');
+    }
+  }
+
   async crearRecurrente(dto: RecurrenteDto) {
     const nombre = (dto.nombre ?? '').trim();
     if (!nombre) throw new BadRequestException('Poné un nombre (ej.: "Alquiler del local").');
+    await this.validarRecurrente(dto, true);
     const [c] = await this.db.select().from(gastoCategorias).where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
     if (!c) throw new BadRequestException('Elegí el rubro del gasto fijo.');
     const [r] = await this.db.insert(gastosRecurrentes).values({
@@ -1036,6 +1299,7 @@ export class GastosService {
   async editarRecurrente(id: number, dto: RecurrenteDto) {
     const [r] = await this.db.select().from(gastosRecurrentes).where(eq(gastosRecurrentes.id, id)).limit(1);
     if (!r) throw new NotFoundException('Gasto fijo inexistente.');
+    await this.validarRecurrente(dto, false);
     const patch: any = {};
     if (dto.nombre != null) {
       const n = String(dto.nombre).trim();
@@ -1137,11 +1401,19 @@ export class GastosService {
   }
 
   async generarPeriodo(periodo: string, usuarioId?: number, soloIds?: number[]) {
+    /* Hasta el mes que viene (27/9/2026): generar 2031 dejaba previsiones de
+     * gastos fijos en un futuro que nadie mira, y el período ya "emitido". */
+    const ini = this.inicioPeriodo(periodo);
+    const hoy = new Date();
+    const proximo = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 1);
+    if (ini.getTime() > proximo.getTime()) {
+      throw new BadRequestException('Los gastos fijos se generan hasta el mes que viene, no más adelante.');
+    }
     const creados = await this.db.transaction(async (tx) => {
       // La previa va ADENTRO y con candado: ver `calcularPeriodo`.
       const previa = await this.calcularPeriodo(tx, periodo, true);
       const aGenerar = previa.pendientes.filter(
-        (x: any) => !soloIds?.length || soloIds.includes(x.plantilla.id),
+        (x: any) => (!soloIds?.length || soloIds.includes(x.plantilla.id)) && x.plantilla.importeEstimado > 0,
       );
       if (!aGenerar.length) return [];
 

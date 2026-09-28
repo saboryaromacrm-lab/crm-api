@@ -25,7 +25,7 @@
  *   · El pago solo se imputa a documentos DEL MISMO proveedor.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, ForbiddenException, Inject, Injectable, Module,
+  BadRequestException, Body, ConflictException, Controller, Delete, Get, ForbiddenException, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -40,8 +40,9 @@ import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
+import { exigirFueraDeConciliado } from '../common/conciliacion';
 import {
-  cajaMovimientos, cajaSesiones, comprobantes, gastos, pagoFormas, proveedorCompromisos,
+  cajaMovimientos, cajaSesiones, comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
   proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 
@@ -146,6 +147,8 @@ export class CrearPagoDto {
    */
   @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => DescuentoFleteDto)
   fletes?: DescuentoFleteDto[];
+  /** "Sí, es otro pago": la segunda confirmación ante un pago gemelo del día (409). */
+  @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
 }
 
 export class ImputarDto {
@@ -235,12 +238,23 @@ export class PagosProveedorService {
       .where(eq(proveedorPagos.id, pagoId));
   }
 
+  /**
+   * `pagado` del gasto = lo imputado por pagos vivos + lo que le ACREDITAN las
+   * notas de crédito que lo referencian (0115, 28/9/2026). Así todo lo que ya
+   * mira `total − pagado` —Cuentas a pagar, la bandeja, el candado de pagar de
+   * más, el estado "pagado"— ve el saldo real sin cambiar ninguna consulta. La
+   * plata efectivamente pagada se separa en `GastosService.get` (`acreditado`).
+   */
   private async recalcularGasto(tx: any, gastoId: number) {
     const [r] = await tx.select({ total: sql<number>`coalesce(sum(${proveedorImputaciones.importe}), 0)` })
       .from(proveedorImputaciones)
       .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
       .where(and(eq(proveedorImputaciones.gastoId, gastoId), eq(proveedorPagos.estado, 'activo')));
-    const pagado = money(Number(r?.total) || 0);
+    const [nc] = await tx.select({ total: sql<number>`coalesce(sum(-${gastos.total}), 0)` })
+      .from(gastos).where(and(
+        eq(gastos.refGastoId, gastoId), eq(gastos.tipoDoc, 'nota_credito'), ne(gastos.estado, 'anulado'),
+      ));
+    const pagado = money((Number(r?.total) || 0) + (Number(nc?.total) || 0));
     const [g] = await tx.select().from(gastos).where(eq(gastos.id, gastoId)).limit(1);
     if (!g) return;
     await tx.update(gastos).set({
@@ -347,6 +361,13 @@ export class PagosProveedorService {
         .set({ estado: 'emitido', pagoId: null })
         .where(and(eq(proveedorEcheqs.compromisoId, k.id), eq(proveedorEcheqs.estado, 'cobrado')));
     }
+  }
+
+  /** Recalcular un gasto desde afuera (Gastos, al cargar/editar/anular una NC que lo referencia). */
+  async recalcularGastoAhora(gastoId: number | null | undefined, tx?: any) {
+    if (!gastoId) return;
+    if (tx) return this.recalcularGasto(tx, gastoId);
+    await this.db.transaction(async (t) => this.recalcularGasto(t, gastoId));
   }
 
   /** El puente con transacción propia: lo llama Comprobantes cuando una NC/ND
@@ -645,7 +666,7 @@ export class PagosProveedorService {
    * porque no había dónde registrar los pagos.
    */
   async cuenta(proveedorId: number) {
-    const [comp, gast, pag] = await Promise.all([
+    const [comp, gast, pag, ajs] = await Promise.all([
       this.db.select({
         // LISTA DE TIPOS · la cuenta corriente del proveedor, incluida la
         // liquidación: se le debe igual, y se le paga en el mismo acto.
@@ -663,8 +684,14 @@ export class PagosProveedorService {
         eq(proveedorPagos.proveedorId, proveedorId),
         eq(proveedorPagos.estado, 'activo'),
       )),
+      /* LOS AJUSTES DEL ESTADO DE CUENTA (27/9/2026). Estaban solo allá: el
+       * mismo proveedor daba −$9.584 acá y −$259.584 en su estado de cuenta.
+       * Un saldo, una fórmula: mercadería + gastos + ajustes − pagos. */
+      this.db.select({ total: sql<number>`coalesce(sum(${proveedorAjustes.importe}), 0)` })
+        .from(proveedorAjustes).where(eq(proveedorAjustes.proveedorId, proveedorId)),
     ]);
 
+    const ajustes = money(Number(ajs[0]?.total) || 0);
     const mercaderia = money(Number(comp[0]?.deuda) || 0);
     const gastosTotal = money(Number(gast[0]?.deuda) || 0);
     const pagado = money(Number(pag[0]?.pagado) || 0);
@@ -673,9 +700,10 @@ export class PagosProveedorService {
       mercaderia,
       gastos: gastosTotal,
       comprado: money(mercaderia + gastosTotal),
+      ajustes,
       pagado,
       // Positivo = se le debe. Negativo = se le pagó de más (queda a favor).
-      saldo: money(mercaderia + gastosTotal - pagado),
+      saldo: money(mercaderia + gastosTotal + ajustes - pagado),
       sinAplicar: money(Number(pag[0]?.sinAplicar) || 0),
     };
   }
@@ -716,6 +744,7 @@ export class PagosProveedorService {
    */
   async crear(
     dto: CrearPagoDto, sucursalSesion: number, cruzaSucursales = false, enAltaComprobante = false,
+    opciones: { cuotaTomadaId?: number; controlarDuplicado?: boolean } = {},
   ) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
@@ -743,6 +772,8 @@ export class PagosProveedorService {
       if (!u) throw new BadRequestException('El usuario que registra el pago no existe.');
       if (!u.activo) throw new BadRequestException('Ese usuario está dado de baja: no puede registrar pagos.');
     }
+
+    await exigirFueraDeConciliado(this.db, proveedorId, dto.fecha, 'registrar un pago');
 
     // Un pago que va a quedar a cuenta necesita saber DE QUIÉN es esa cuenta.
     if (!proveedorId && !dto.imputaciones?.length) {
@@ -819,6 +850,55 @@ export class PagosProveedorService {
       let cajaMovimientoId: number | null = null;
       let cajaSesionId: number | null = null;
       let sucursalId: number | null = dto.sucursalId ?? null;
+
+      /*
+       * EL PAGO GEMELO (27/9/2026). Un doble clic en "Pagar" registraba dos
+       * pagos idénticos (probado: dos de $777 a la vez, y un gasto de $1.000
+       * con $800 pagados por dos clics de $400). La pantalla tiene su candado,
+       * pero lo que se acepta no puede depender de la pantalla.
+       *
+       * Solo lo piden las pantallas donde una persona teclea el pago (ver
+       * `controlarDuplicado`): las cuotas y los echeqs ya tienen su propio
+       * reclamo, y dos cuotas iguales pagadas el mismo día son legítimas.
+       *
+       * El candado consultivo serializa a los que pagan AL MISMO destinatario:
+       * el segundo espera al primero y, cuando pasa, ya lo ve. Si la persona de
+       * verdad paga dos veces lo mismo el mismo día, lo confirma.
+       */
+      if (opciones.controlarDuplicado && !dto.confirmarDuplicado) {
+        const destinoGemelo = proveedorId
+          ? `prov:${proveedorId}`
+          : `doc:${dto.imputaciones?.[0]?.gastoId ?? ''}:${dto.imputaciones?.[0]?.comprobanteId ?? ''}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`pago-gemelo:${destinoGemelo}`}))`);
+        /* El día con la MISMA convención con que se guarda la fecha del pago
+         * (medianoche local del servidor): comparar en otro huso corría el día. */
+        const desdeDia = dto.fecha ? new Date(`${dto.fecha.slice(0, 10)}T00:00:00`) : (() => {
+          const d = new Date(); d.setHours(0, 0, 0, 0); return d;
+        })();
+        const hastaDia = new Date(desdeDia); hastaDia.setDate(hastaDia.getDate() + 1);
+        const conds: any[] = [
+          eq(proveedorPagos.estado, 'activo'),
+          sql`abs(${proveedorPagos.importe} - ${importe}) < ${EPS}`,
+          eq(proveedorPagos.medio, medio),
+          sql`${proveedorPagos.fecha} >= ${desdeDia.toISOString()}`,
+          sql`${proveedorPagos.fecha} < ${hastaDia.toISOString()}`,
+        ];
+        if (proveedorId) conds.push(eq(proveedorPagos.proveedorId, proveedorId));
+        else {
+          const imp = dto.imputaciones?.[0];
+          conds.push(sql`exists (select 1 from proveedor_imputaciones i where i.pago_id = ${proveedorPagos.id}
+            and ${imp?.gastoId ? sql`i.gasto_id = ${imp.gastoId}` : sql`i.comprobante_id = ${imp?.comprobanteId ?? 0}`})`);
+        }
+        const [gemelo] = await tx.select({ id: proveedorPagos.id }).from(proveedorPagos)
+          .where(and(...conds)).orderBy(desc(proveedorPagos.id)).limit(1);
+        if (gemelo) {
+          throw new ConflictException({
+            duplicado: gemelo.id,
+            message: `Ese mismo día ya hay un pago igual (pago #${gemelo.id}: $${importe.toFixed(2)} por ${medio}`
+              + `${prov ? ` a ${prov.nombre}` : ''}). Si de verdad es otro pago, confirmalo.`,
+          });
+        }
+      }
 
       /*
        * Efectivo desde un turno abierto: la plata sale del cajón, así que el
@@ -935,7 +1015,9 @@ export class PagosProveedorService {
       await this.aplicarFletes(tx, dto.fletes ?? [], proveedorId, dto.usuarioId, cruzaSucursales);
 
       if (dto.imputaciones?.length) {
-        await this.aplicar(tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante);
+        await this.aplicar(
+          tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante, opciones.cuotaTomadaId,
+        );
       }
       return pago.id;
     });
@@ -1017,7 +1099,7 @@ export class PagosProveedorService {
    */
   private async aplicar(
     tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number, cruzaSucursales = false,
-    enAltaComprobante = false,
+    enAltaComprobante = false, cuotaTomadaId?: number, desdePagoExistente = false,
   ) {
     for (const item of items) {
       const importe = money(item.importe);
@@ -1067,6 +1149,9 @@ export class PagosProveedorService {
           .where(eq(gastos.id, item.gastoId)).limit(1).for('update');
         if (!g) throw new BadRequestException('Gasto inexistente.');
         if (g.estado === 'anulado') throw new BadRequestException('Ese gasto está anulado.');
+        if (g.tipoDoc === 'nota_credito' || g.total < 0) {
+          throw new BadRequestException('Una nota de crédito no se paga: descuenta deuda.');
+        }
         docProveedorId = g.proveedorId;
         docSucursalId = g.sucursalId;
         saldoDoc = money(g.total - g.pagado);
@@ -1146,22 +1231,45 @@ export class PagosProveedorService {
          * Fuera de estos dos casos el modo 'facturas' sigue mandando: pagar
          * sueltos contra una factura abierta se sigue rechazando.
          */
-        const exentoDelModo = pago.esFlete || enAltaComprobante;
+        /*
+         * 3) EL PAGO A CUENTA QUE YA EXISTE (27/9/2026). La cajera le dio $400
+         *    al proveedor, o un cliente le transfirió a su cuenta disponible, y
+         *    después llega la factura de $1.000. En modo "por facturas" ese
+         *    pago no se podía aplicar NUNCA (no es el saldo ni una cuota) y
+         *    quedaba "sin aplicar" para siempre con la factura figurando
+         *    impaga. Se acepta cuando se aplica ENTERO lo que le queda al pago:
+         *    no deja centavos sueltos en el pago, y la factura sigue debiendo
+         *    lo que falta. Solo desde "Aplicar" (`imputar`): un pago NUEVO por
+         *    un monto suelto sigue rebotando como siempre.
+         */
+        const consumePagoEntero = desdePagoExistente && Math.abs(importe - saldoPago) <= EPS;
+        const exentoDelModo = pago.esFlete || enAltaComprobante || consumePagoEntero;
         if (!exentoDelModo && pago.proveedorId && Math.abs(importe - saldoDoc) > EPS) {
           const [provModo] = await tx.select({ modoCuenta: proveedores.modoCuenta })
             .from(proveedores).where(eq(proveedores.id, pago.proveedorId)).limit(1);
           if (provModo?.modoCuenta === 'facturas') {
+            /*
+             * LA CUOTA QUE SE ESTÁ PAGANDO CUENTA (27/9/2026). El botón Pagar
+             * del compromiso la TOMA antes de pagar (`pagado = true`, para que
+             * dos clics no la paguen dos veces), así que buscando solo las
+             * `pagado = false` la propia cuota no aparecía: en una factura de
+             * $1.000 en 3 cuotas la 2 y la 3 rebotaban. `cuotaTomadaId` la
+             * nombra el servidor (Compromisos), nunca el cliente.
+             */
             const cuotas = await tx.select({ importe: proveedorCompromisos.importe })
               .from(proveedorCompromisos)
               .where(and(
                 eq(proveedorCompromisos.comprobanteId, c.id),
-                eq(proveedorCompromisos.pagado, false),
+                cuotaTomadaId
+                  ? or(eq(proveedorCompromisos.pagado, false), eq(proveedorCompromisos.id, cuotaTomadaId))
+                  : eq(proveedorCompromisos.pagado, false),
               ));
             const esCuota = cuotas.some((q: any) => Math.abs(money(q.importe) - importe) <= EPS);
             if (!esCuota) {
               throw new BadRequestException(
-                `${etiqueta} se paga por su saldo completo (${saldoDoc.toFixed(2)}) o por una cuota pactada: `
-                + 'el proveedor está en modo "por facturas". Para pagos parciales a cuenta, pasalo a modo "libre" en su ficha.',
+                `${etiqueta} se paga por su saldo completo (${saldoDoc.toFixed(2)}), por una cuota pactada `
+                + 'o aplicándole ENTERO un pago a cuenta que ya exista: el proveedor está en modo "por facturas". '
+                + 'Para entregarle un monto suelto, registralo a cuenta (sin tildar la factura) y aplicalo después.',
               );
             }
           }
@@ -1240,7 +1348,7 @@ export class PagosProveedorService {
     }
     await this.db.transaction(
       async (tx) => this.aplicar(
-        tx, pagoId, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante,
+        tx, pagoId, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante, undefined, true,
       ),
     );
     return this.get(pagoId);
@@ -1383,6 +1491,7 @@ export class PagosProveedorService {
         .where(eq(proveedorPagos.id, id)).limit(1).for('update');
       if (!p) throw new NotFoundException('Pago inexistente.');
       if (p.estado === 'anulado') throw new BadRequestException('Ese pago ya está anulado.');
+      await exigirFueraDeConciliado(tx, p.proveedorId, p.fecha, 'anular un pago');
       /* El espejo de una transferencia de cliente (0095) no se anula desde
        * acá: quedaría la venta cobrada y el proveedor sin su pago. Se anula
        * el cobro, y ese camino anula los dos juntos. */
@@ -1503,7 +1612,62 @@ export class PagosProveedorService {
  *     cuentas de proveedor — solo administración (la caja no los usa).
  */
 const ADMIN_PAGOS = ['compras.pagos', 'gastos.pagos_proveedor'] as const;
-const esAdminPagos = (s: Sesion) => tienePermiso(s?.permisos ?? [], [...ADMIN_PAGOS]);
+export const esAdminPagos = (s: Sesion) => tienePermiso(s?.permisos ?? [], [...ADMIN_PAGOS]);
+
+/**
+ * LO QUE EL MOSTRADOR PUEDE PAGAR (27/9/2026). La caja paga una sola cosa:
+ * EFECTIVO de SU turno abierto (el candado de `crear` ya ata el turno a la
+ * sucursal de la sesión). Sin esto, la cajera registraba un pago "por
+ * transferencia" —que no sale de ningún cajón y nadie controla— y, con una
+ * imputación, daba por pagado un gasto de cualquier sucursal que ni siquiera
+ * puede ver (probado: un alquiler de $50.000 de la Distribuidora). Aplicar
+ * pagos a documentos y descontar fletes es trabajo de administración.
+ */
+/**
+ * LA FECHA DE UN PAGO (27/9/2026). Se aceptaba cualquiera: probado un pago
+ * fechado en 1999 y otro en 2031. Un pago en el futuro todavía no salió; uno de
+ * hace años corre saldos, conciliaciones y reportes ya cerrados. Se admite
+ * hasta `DIAS_ATRAS_PAGO` para atrás — la transferencia que se registra tarde —
+ * y nunca después de hoy. Lo usan las pantallas donde alguien teclea la fecha;
+ * el pago contado de una factura lleva la fecha del papel y no pasa por acá.
+ */
+export const DIAS_ATRAS_PAGO = 90;
+export function exigirFechaPago(fecha?: string, formas?: { fecha?: string }[]) {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const tope = new Date(hoy); tope.setDate(tope.getDate() - DIAS_ATRAS_PAGO);
+  const fmt = (d: Date) => d.toLocaleDateString('es-AR');
+  for (const f of [fecha, ...(formas ?? []).map((x) => x.fecha)]) {
+    if (!f) continue;
+    const d = new Date(`${f.slice(0, 10)}T00:00:00`);
+    if (d.getTime() > hoy.getTime()) {
+      throw new BadRequestException(`El pago no puede tener fecha futura (${fmt(d)}): se registra cuando la plata sale.`);
+    }
+    if (d.getTime() < tope.getTime()) {
+      throw new BadRequestException(
+        `La fecha ${fmt(d)} tiene más de ${DIAS_ATRAS_PAGO} días: revisala. Un pago tan viejo corre saldos y conciliaciones ya cerrados.`,
+      );
+    }
+  }
+}
+
+export function exigirPagoDeMostrador(dto: {
+  medio?: string; formas?: { medio: string }[]; cajaSesionId?: number;
+  imputaciones?: unknown[]; fletes?: unknown[];
+}) {
+  const soloEfectivo = (dto.formas?.length ? dto.formas.every((f) => f.medio === 'efectivo') : true)
+    && (dto.formas?.length ? true : (dto.medio ?? 'efectivo') === 'efectivo');
+  if (!soloEfectivo || !dto.cajaSesionId) {
+    throw new ForbiddenException(
+      'Desde la caja solo se registran pagos en EFECTIVO que salen de tu turno abierto. '
+      + 'Las transferencias y los demás medios los registra administración.',
+    );
+  }
+  if (dto.imputaciones?.length || dto.fletes?.length) {
+    throw new ForbiddenException(
+      'Desde la caja el pago queda a cuenta del proveedor: aplicarlo a una factura o a un gasto lo hace administración.',
+    );
+  }
+}
 
 @Controller('pagos-proveedor')
 @Permiso('compras.pagos', 'gastos.pagos_proveedor', 'ventas.caja')
@@ -1550,7 +1714,9 @@ export class PagosProveedorController {
   // La sucursal sale de la SESIÓN, no del body: es con lo que se compara el
   // turno de caja para que el egreso no pueda salir del cajón de otra sucursal.
   @Post() crear(@Body() dto: CrearPagoDto, @Auth() auth: Sesion) {
-    return this.svc.crear(dto, auth.sucursalId, esJefe(auth));
+    if (!esAdminPagos(auth)) exigirPagoDeMostrador(dto);
+    exigirFechaPago(dto.fecha, dto.formas);
+    return this.svc.crear(dto, auth.sucursalId, esJefe(auth), false, { controlarDuplicado: true });
   }
 
   @Get(':id') async get(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {

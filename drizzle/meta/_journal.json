@@ -743,6 +743,76 @@
       "when": 1790090000000,
       "tag": "0105_usuarios_sucursales",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1790100000000,
+      "tag": "0106_anular_comprobantes",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1790110000000,
+      "tag": "0107_comprobantes_numero_con_letra",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1790120000000,
+      "tag": "0108_costos_con_bulto",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1790130000000,
+      "tag": "0109_ventas_facturar_por_caida",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1790140000000,
+      "tag": "0110_productos_merma",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1790150000000,
+      "tag": "0111_caja_fondo_fijo_y_envio",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1790160000000,
+      "tag": "0112_costo_cafeteria_desde_envios",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1790170000000,
+      "tag": "0113_envios_cafeteria_recepcion",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1790180000000,
+      "tag": "0114_nc_gastos_en_negativo",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1790190000000,
+      "tag": "0115_nc_gasto_referencia",
+      "breakpoints": true
     }
   ]
 }

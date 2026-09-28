@@ -9,7 +9,7 @@ import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { tienePermiso } from '../auth/auth.guard';
+import { ocultaCostoUnitario, tienePermiso } from '../auth/auth.guard';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasModule, ListasService } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
@@ -22,7 +22,7 @@ import {
   transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import {
-  costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo,
+  costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, formatoDeCosto,
   precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
@@ -78,7 +78,12 @@ class UpsertProductoDto {
   @IsOptional() @IsArray() etiquetas?: number[];
 
   @IsOptional() @IsNumber() iva?: number;
-  @IsOptional() @IsInt() redondeo?: number | null;
+  /* Los mismos valores que la configuración general (26/9/2026): aceptaba
+   * cualquier entero, y un redondeo de $5.000 dejaba la góndola en cualquier
+   * lado. null = hereda el general. */
+  @IsOptional() @IsIn([0, 1, 10, 50, 100], { message: 'El redondeo va de a 0, 1, 10, 50 o 100.' }) redondeo?: number | null;
+  /** % de merma al fraccionar (0110): sube el costo de los paquetes. 0 a 50. */
+  @IsOptional() @IsNumber() @Min(0, { message: 'La merma no puede ser negativa.' }) @Max(50, { message: 'La merma va de 0 a 50%.' }) merma?: number;
   @IsOptional() @IsNumber() stockMin?: number;
 
   @IsOptional() @IsBoolean() publicado?: boolean;
@@ -239,7 +244,7 @@ export class ProductosService {
    * `verCostos`: si es false, la respuesta sale SIN los costos de compra ni los
    * márgenes. Ver el recorte al final de este método.
    */
-  private async assembleMany(prods: any[], verCostos = true) {
+  private async assembleMany(prods: any[], verCostos = true, ocultarUnitario = false) {
     if (!prods.length) return [];
     const ids = prods.map((p) => p.id);
     const solo = ids.length === 1 ? ids[0] : null;
@@ -317,7 +322,7 @@ export class ProductosService {
 
     return prods.map((prod) => {
       const mios = provsDe.get(prod.id) ?? [];
-      const active = formatoActivo(mios);
+      const active = formatoDeCosto(prod, mios) as any;
       /* Dos costos (0072): `costoNeto` es el REAL (pantallas y valuación);
        * `costoPrecio` la base del markup, con la parte sin factura ya sin el
        * IVA que el negocio absorbe. Todo facturado = el mismo número. */
@@ -351,8 +356,8 @@ export class ProductosService {
          */
         presentaciones: (presDe.get(prod.id) ?? []).map((pr: any) => {
           // Los DOS costos de la madre, escalados: el real muestra, el otro cotiza.
-          const costoPaquete = costoNetoPresentacion(costoNeto, pr.tamKg);
-          const suyas = armarFormato(formatoPresDe.get(pr.id) ?? [], costoNetoPresentacion(costoPrecio, pr.tamKg), opts);
+          const costoPaquete = costoNetoPresentacion(costoNeto, pr.tamKg, prod.merma);
+          const suyas = armarFormato(formatoPresDe.get(pr.id) ?? [], costoNetoPresentacion(costoPrecio, pr.tamKg, prod.merma), opts);
           const piso = filaPiso(suyas);
           return {
             ...pr,
@@ -400,6 +405,17 @@ export class ProductosService {
           })),
         listas: verCostos ? listas : listas.map((l: any) => ({ ...l, markup: null })),
       };
+    }).map((p: any) => {
+      /* Sin ni el costo unitario (ver `ocultaCostoUnitario`): solo el del café
+       * viaja, que es el suyo. Los paquetes pierden también el markup. */
+      if (!ocultarUnitario || p.origenCafeteria) return p;
+      return {
+        ...p,
+        costoNeto: null,
+        presentaciones: (p.presentaciones ?? []).map((pr: any) => ({
+          ...pr, costoNeto: null, listas: (pr.listas ?? []).map((l: any) => ({ ...l, markup: null })),
+        })),
+      };
     });
   }
 
@@ -415,15 +431,15 @@ export class ProductosService {
     return { marca: mapa(ms), categoria: mapa(cs), subcategoria: mapa(ss), etiqueta: mapa(es) };
   }
 
-  async list(verCostos = true) {
+  async list(verCostos = true, ocultarUnitario = false) {
     const rows = await this.db.select().from(productos).orderBy(productos.id);
-    return this.assembleMany(rows, verCostos);
+    return this.assembleMany(rows, verCostos, ocultarUnitario);
   }
 
-  async get(id: number, verCostos = true) {
+  async get(id: number, verCostos = true, ocultarUnitario = false) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
-    const [armado] = await this.assembleMany([p], verCostos);
+    const [armado] = await this.assembleMany([p], verCostos, ocultarUnitario);
     return armado;
   }
 
@@ -636,6 +652,7 @@ export class ProductosService {
       stockMin: Number(dto.stockMin ?? previo?.stockMin ?? 0) || 0,
       // `undefined` = no lo mandaron (queda como estaba); `null` = heredar.
       redondeo: dto.redondeo === undefined ? (previo?.redondeo ?? null) : dto.redondeo,
+      merma: dto.merma === undefined ? (Number(previo?.merma) || 0) : Math.round(Number(dto.merma) * 100) / 100,
       publicado: dto.publicado ?? previo?.publicado ?? false,
       soloFraccionar: dto.soloFraccionar ?? previo?.soloFraccionar ?? false,
       soloCafeteria,
@@ -1862,7 +1879,7 @@ export class ProductosController {
    * token que le da su propio login.
    */
   @Get() list(@Auth() auth: Sesion) {
-    return this.svc.list(tienePermiso(auth.permisos, ['precios', 'compras.productos']));
+    return this.svc.list(tienePermiso(auth.permisos, ['precios', 'compras.productos']), ocultaCostoUnitario(auth.permisos));
   }
   /** Antes de `:id`, si no "siguiente-codigo" entra como id y revienta. */
   @Get('siguiente-codigo') siguienteCodigo() { return this.svc.siguienteCodigo(); }
@@ -1874,7 +1891,7 @@ export class ProductosController {
     return this.svc.siguienteEan13(String(excluir || '').split(',').filter(Boolean));
   }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
-    return this.svc.get(id, tienePermiso(auth.permisos, ['precios', 'compras.productos']));
+    return this.svc.get(id, tienePermiso(auth.permisos, ['precios', 'compras.productos']), ocultaCostoUnitario(auth.permisos));
   }
 
   @Permiso('compras.productos')

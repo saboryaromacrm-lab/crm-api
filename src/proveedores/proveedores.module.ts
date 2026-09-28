@@ -52,6 +52,25 @@ class UpsertProveedorDto {
   @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) minimoTransferencia?: number;
 }
 
+/**
+ * EL CUIT SE VALIDA (27/9/2026): se aceptaba "abc", y dos proveedores con el
+ * mismo CUIT. El CUIT es lo que usa la bandeja de facturas para reconocer de
+ * quién es un papel: uno mal cargado manda la factura al proveedor equivocado.
+ * Once dígitos (con o sin guiones) y el dígito verificador de AFIP.
+ */
+export function cuitValido(cuit: string) {
+  const d = cuit.replace(/\D/g, '');
+  if (d.length !== 11) return false;
+  const pesos = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+  const suma = pesos.reduce((a, p, i) => a + p * Number(d[i]), 0);
+  let dv = 11 - (suma % 11);
+  if (dv === 11) dv = 0;
+  if (dv === 10) return false;
+  return dv === Number(d[10]);
+}
+const normNombre = (v: any) => String(v ?? '').toLowerCase().normalize('NFD')
+  .replace(/\p{Diacritic}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim().replace(/\b([a-z0-9]) (?=[a-z0-9]\b)/g, '$1'); // "S.A." = "SA"
+
 /** Tope de filas por importación de proveedores (el padrón real son ~170). */
 export const MAX_FILAS_IMPORT_PROV = 500;
 
@@ -127,9 +146,29 @@ export class ProveedoresService {
     return p;
   }
 
+  /**
+   * LA IDENTIDAD DEL PROVEEDOR (27/9/2026): nombre obligatorio, CUIT válido, y
+   * ni el CUIT ni el nombre (sin mayúsculas, tildes ni signos) repetidos —
+   * "ZZ Prov" y "zz prov" eran dos proveedores con dos cuentas corrientes.
+   */
+  private async exigirIdentidad(nombre: string, cuit: string, exceptoId?: number) {
+    if (!nombre.trim()) throw new BadRequestException('Poné el nombre del proveedor.');
+    const digitos = cuit.replace(/\D/g, '');
+    if (cuit.trim() && !cuitValido(cuit)) {
+      throw new BadRequestException(`El CUIT "${cuit.trim()}" no es válido: son 11 números y el último es el dígito verificador.`);
+    }
+    const todos = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre, cuit: proveedores.cuit }).from(proveedores);
+    const otros = todos.filter((p) => p.id !== exceptoId);
+    const mismoCuit = digitos.length === 11 && otros.find((p) => String(p.cuit ?? '').replace(/\D/g, '') === digitos);
+    if (mismoCuit) throw new BadRequestException(`Ese CUIT ya es de "${mismoCuit.nombre}" (proveedor #${mismoCuit.id}).`);
+    const mismoNombre = otros.find((p) => normNombre(p.nombre) === normNombre(nombre));
+    if (mismoNombre) throw new BadRequestException(`Ya existe "${mismoNombre.nombre}" (proveedor #${mismoNombre.id}).`);
+  }
+
   async create(dto: UpsertProveedorDto) {
+    await this.exigirIdentidad(dto.nombre ?? '', dto.cuit ?? '');
     const [p] = await this.db.insert(proveedores).values({
-      nombre: dto.nombre.trim(), cuit: dto.cuit ?? '', condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
+      nombre: dto.nombre.trim(), cuit: (dto.cuit ?? '').trim(), condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
       telefono: dto.telefono ?? '', email: dto.email ?? '',
       // Sin indicar nada se asume el proveedor clásico: el que trae mercadería.
       proveeMercaderia: dto.proveeMercaderia ?? true,
@@ -148,6 +187,15 @@ export class ProveedoresService {
 
   async update(id: number, dto: UpsertProveedorDto, usuarioId?: number | null) {
     const actual = await this.get(id);
+    /* Solo si cambia: un proveedor viejo con el CUIT mal cargado se sigue
+     * pudiendo editar en lo demás (ficha comercial) sin que lo frene esto. */
+    const cambiaNombre = normNombre(dto.nombre) !== normNombre(actual.nombre);
+    const cambiaCuit = dto.cuit !== undefined && dto.cuit.replace(/\D/g, '') !== String(actual.cuit ?? '').replace(/\D/g, '');
+    if (cambiaNombre || cambiaCuit) {
+      await this.exigirIdentidad(
+        dto.nombre ?? '', cambiaCuit ? (dto.cuit ?? '') : '', id,
+      );
+    }
     const [p] = await this.db.update(proveedores).set({
       nombre: dto.nombre.trim(),
       // TODO el update es "ausente conserva, '' borra" — también la identidad:
@@ -190,9 +238,39 @@ export class ProveedoresService {
     return p;
   }
 
+  /**
+   * BORRAR SOLO AL QUE NO TIENE HISTORIA (27/9/2026). Antes: con facturas o
+   * pagos la base lo frenaba con un "Internal server error"; con un saldo
+   * inicial cargado como ajuste lo BORRABA en cascada junto con esa deuda
+   * (probado: $90.000 desaparecidos sin aviso), y lo mismo con sus formatos de
+   * compra y el historial de costos. Ahora se cuenta todo antes y se dice qué
+   * tiene. El que tiene historia no se borra: se deja de usar.
+   */
   async remove(id: number) {
-    await this.get(id);
-    // Los costos por proveedor se borran en cascada; el proveedor_activo_id queda en null.
+    const p = await this.get(id);
+    const contar = async (tabla: string) => {
+      const r: any = await this.db.execute(
+        sql`select count(*)::int n from ${sql.identifier(tabla)} where proveedor_id = ${id}`,
+      );
+      return Number((r?.rows ?? r)?.[0]?.n) || 0;
+    };
+    const partes: Array<[string, string]> = [
+      ['comprobantes', 'comprobante(s) de compra'], ['gastos', 'gasto(s)'], ['proveedor_pagos', 'pago(s)'],
+      ['proveedor_compromisos', 'compromiso(s)'], ['proveedor_echeqs', 'echeq(s)'],
+      ['proveedor_ajustes', 'ajuste(s) de cuenta'], ['cuentas_disponibles', 'cuenta(s) disponible(s)'],
+      ['producto_proveedores', 'formato(s) de compra con su historial de costos'],
+    ];
+    const tiene: string[] = [];
+    for (const [tabla, nombre] of partes) {
+      const n = await contar(tabla);
+      if (n) tiene.push(`${n} ${nombre}`);
+    }
+    if (tiene.length) {
+      throw new BadRequestException(
+        `${p.nombre} no se puede eliminar: tiene ${tiene.join(', ')}. Borrarlo se llevaría esa historia. `
+        + 'Si ya no se usa, dejalo como está.',
+      );
+    }
     await this.db.delete(proveedores).where(eq(proveedores.id, id));
     return { ok: true };
   }

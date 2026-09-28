@@ -104,6 +104,12 @@ export const sucursales = pgTable('sucursales', {
    * decir Belgrano 728, no el domicilio fiscal de la empresa.
    */
   direccion: text('direccion').notNull().default(''),
+  /*
+   * EL FONDO FIJO DE CAJA (0111): con cuánto abre la caja y cuánto queda
+   * apartado al cerrar para el turno siguiente. Lo carga el superadmin; null =
+   * todavía no se fijó (la primera apertura lo fija).
+   */
+  fondoCaja: doublePrecision('fondo_caja'),
 }, (t) => ({
   /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
    * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
@@ -525,6 +531,12 @@ export const productos = pgTable('productos', {
    * que necesita otra cosa.
    */
   redondeo: integer('redondeo'),
+  /*
+   * % DE MERMA AL FRACCIONAR (0110): lo que se pierde al llenar paquetes. Solo
+   * afecta el COSTO de los paquetes (y con él, su precio si va por margen):
+   * costo del paquete = costo del kilo × kilos ÷ (1 − merma). 0 = sin merma.
+   */
+  merma: doublePrecision('merma').notNull().default(0),
 
   /* Tienda ------------------------------------------------------------- */
   /**
@@ -725,6 +737,15 @@ export const productoProveedorCostos = pgTable('producto_proveedor_costos', {
   costo: doublePrecision('costo').notNull().default(0),
   descuento: doublePrecision('descuento').notNull().default(0),
   flete: doublePrecision('flete').notNull().default(0),
+  // EL BULTO (0108): kg o unidades del formato antes y después. Nulo = esta
+  // fila no tocó el bulto. Sin esto, anular una factura con el bulto mal
+  // tipeado dejaba el $/kg —y la góndola— multiplicados.
+  cantidadAnterior: doublePrecision('cantidad_anterior'),
+  cantidad: doublePrecision('cantidad'),
+  // El "precio final" del bulto en los formatos en modo final (0108): nulo =
+  // esta fila no lo tocó.
+  costoFinalAnterior: doublePrecision('costo_final_anterior'),
+  costoFinal: doublePrecision('costo_final'),
   origen: origenCostoEnum('origen').notNull().default('manual'),
   // Cambio de PROVEEDOR ACTIVO. Mueve el precio tanto como un cambio de costo,
   // así que se audita en la misma tabla: sin esto, el historial no puede
@@ -1498,6 +1519,10 @@ export const comprobantes = pgTable('comprobantes', {
   // NC/ND referencian la factura que ajustan (sin FK dura para evitar autorreferencia).
   refComprobanteId: integer('ref_comprobante_id'),
   observaciones: text('observaciones').notNull().default(''),
+  /** La anulación (0106): cuándo, quién y por qué. El comprobante no se borra. */
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  motivoAnulacion: text('motivo_anulacion').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   /**
@@ -1513,8 +1538,9 @@ export const comprobantes = pgTable('comprobantes', {
    * orden de compra interna puede no tenerlo).
    */
   uqNumero: uniqueIndex('uq_comprobantes_numero')
-    .on(t.proveedorId, t.tipo, t.puntoVenta, t.numero)
-    .where(sql`${t.numero} is not null`),
+    // Con la letra y sin los anulados (0107): ver la migración.
+    .on(t.proveedorId, t.tipo, t.letra, t.puntoVenta, t.numero)
+    .where(sql`${t.numero} is not null and ${t.estado} <> 'anulado'`),
   /**
    * "¿Qué notas ajustan a esta factura?" se pregunta MUCHO: una vez por cada
    * imputación (para saber el saldo real antes de aceptar un pago) y otra por
@@ -1761,6 +1787,14 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   totales: jsonb('totales').notNull().default({}),
   estado: estadoCajaEnum('estado').notNull().default('abierta'),
   observaciones: text('observaciones').notNull().default(''),
+  /*
+   * EL CIERRE POR ENVÍO (0111): el conteo billete por billete ({ "20000": 3,
+   * … }), lo que se envió y lo que quedó de fondo para el turno siguiente.
+   * Null en los turnos cerrados por un jefe con el cierre de siempre.
+   */
+  billetes: jsonb('billetes'),
+  envioEfectivo: doublePrecision('envio_efectivo'),
+  fondoQueda: doublePrecision('fondo_queda'),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
   /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el
@@ -1933,6 +1967,13 @@ export const ventas = pgTable('ventas', {
    */
   facturarPendiente: boolean('facturar_pendiente').notNull().default(false),
   facturarMotivo: text('facturar_motivo').notNull().default(''),
+  /*
+   * POR QUÉ QUEDÓ SIN FACTURAR (0109): `true` = ARCA no respondió (caído, sin
+   * red) y el reintento sale solo cuando vuelva; `false` = ARCA RECHAZÓ por un
+   * dato (o la facturación no está configurada) y hay que corregir antes. El
+   * ticket del cliente dice "servicio caído" SOLO en el primer caso.
+   */
+  facturarPorCaida: boolean('facturar_por_caida').notNull().default(true),
   /*
    * EL NÚMERO RESERVADO ANTES DE LLAMAR A ARCA (0075) — la pieza que evita
    * facturas duplicadas.
@@ -2412,6 +2453,8 @@ export const gastos = pgTable('gastos', {
   negocio: negocioGastoEnum('negocio').notNull().default('distribuidora'),
   /** Si lo generó un gasto fijo, de cuál salió (para no duplicar el período). */
   recurrenteId: integer('recurrente_id'),
+  /** La NC de un gasto (0115): contra qué gasto descuenta. Su saldo baja por la NC. */
+  refGastoId: integer('ref_gasto_id'),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
@@ -2576,6 +2619,17 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
    * Viaja en el sync: coffit puede cruzar su pedido con lo que llegó.
    */
   pedidoId: integer('pedido_id'),
+  /**
+   * EL CONTROL DEL QUE RECIBE (0113, 27/9/2026). Todo envío nace `pendiente` y
+   * lo cierra el otro lado contando contra el remito: `recibido` si llegó todo,
+   * `con_diferencias` si faltó algo (y cada faltante abre una incidencia). En
+   * una ENTRADA el stock de la sucursal recién se mueve acá, con lo contado.
+   * Los envíos de antes del control quedaron `recibido` (su stock ya se movió).
+   */
+  recepcion: text('recepcion').notNull().default('pendiente'),
+  recibidoEn: timestamp('recibido_en', { withTimezone: true }),
+  recibidoPor: integer('recibido_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  recepcionObs: text('recepcion_obs').notNull().default(''),
 }, (t) => ({
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
   // La consulta de sincronización de coffit entra por acá.
@@ -2618,6 +2672,8 @@ export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
   exclusivo: boolean('exclusivo').notNull().default(false),
   codigoBarras: text('codigo_barras').notNull().default(''),
   codigoPropio: text('codigo_propio').notNull().default(''),
+  /** Lo que contó el que recibió (0113). Nulo = todavía no se recibió. */
+  cantidadRecibida: doublePrecision('cantidad_recibida'),
 });
 
 /* ============================================================================

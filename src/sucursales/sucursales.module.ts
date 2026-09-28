@@ -2,7 +2,7 @@ import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
   Param, ParseIntPipe, Patch, Post,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 import { and, eq, gt, ne, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -16,6 +16,8 @@ class UpsertSucursalDto {
   @IsOptional() @IsString() @MaxLength(5) puntoVenta?: string;
   /** El domicilio comercial declarado para ese punto de venta. */
   @IsOptional() @IsString() @MaxLength(200) direccion?: string;
+  /** El fondo fijo de caja (0111). Solo lo cambia quien edita sucursales: el superadmin. */
+  @IsOptional() @IsNumber() @Min(0, { message: 'El fondo de caja no puede ser negativo.' }) @Max(100_000_000) fondoCaja?: number;
 }
 
 /**
@@ -69,6 +71,8 @@ export class SucursalesService {
       tipo: dto.tipo ?? ('express' as const),
       puntoVenta,
       direccion: (dto.direccion ?? '').trim(),
+      // Sin el campo, el fondo queda como estaba: editar el nombre no lo borra.
+      ...(dto.fondoCaja !== undefined ? { fondoCaja: Math.round(Number(dto.fondoCaja) * 100) / 100 } : {}),
     };
   }
 

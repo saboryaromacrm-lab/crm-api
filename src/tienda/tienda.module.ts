@@ -31,7 +31,7 @@ import {
   categorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
-import { costoPrecioEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -268,8 +268,8 @@ export class TiendaService {
       if (!filaTienda) continue;
 
       // La BASE del precio (0072): el sitio publica el mismo precio que el POS.
-      const costoNeto = costoPrecioEntry(formatoActivo(provsPorProducto.get(p.id) ?? []), p.iva);
-      const pv = precioVentaFila(costoNeto, filaTienda, { iva: p.iva, redondeo: cfg.redondeoPrecio });
+      const costoNeto = costoPrecioEntry(formatoDeCosto(p, provsPorProducto.get(p.id) ?? []) as any, p.iva);
+      const pv = precioVentaFila(costoNeto, filaTienda, { iva: p.iva, redondeo: p.redondeo ?? cfg.redondeoPrecio });
       /*
        * Sin precio real no hay publicación: una fila mayorista con el costo a
        * medio cargar daría $0 — y el pedido se recotizaría a $0. Mejor que el

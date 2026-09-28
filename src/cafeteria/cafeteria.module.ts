@@ -44,16 +44,16 @@ import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, sql }
 import { fechaLocal } from '../common/documentos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, ClaveServicio, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { soloSuSucursal, tienePermiso } from '../auth/auth.guard';
+import { PERMISO_METRICAS_CAFE, soloSuSucursal, tienePermiso, veMetricasDelCafe } from '../auth/auth.guard';
 import {
-  comprobantes, enviosCafeteria, envioCafeteriaItems, gastos, listasVenta, pedidoCafeteriaItems,
+  comprobantes, enviosCafeteria, envioCafeteriaItems, gastos, incidencias, listasVenta, pedidoCafeteriaItems,
   pedidosCafeteria, precioHistorial, presentaciones, productoListas, productoProveedores, productos,
   stock, sucursales, usuarios,
 } from '../db/schema';
 import { ProductosModule, ProductosService } from '../productos/productos.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, formatoActivo } from '../inventario/pricing';
+import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -65,6 +65,34 @@ const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const SIGNO_COMPRA = sql`(case when ${comprobantes.tipo} in ('factura', 'liquidacion', 'nota_debito') then 1
   when ${comprobantes.tipo} = 'nota_credito' then -1 else 0 end)`;
 const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
+/**
+ * CUÁNTO PARA ATRÁS PUEDE IR LA FECHA DE UN ENVÍO (26/9/2026).
+ *
+ * El stock se mueve en el momento de cargarlo, sea cual sea la fecha: la fecha
+ * solo dice en qué período cuenta. Sin límite se aceptaba 2020 o 2031, y eso
+ * mete o saca plata de un mes ya mirado (o de uno que todavía no existe) sin
+ * que nadie lo note. Una semana alcanza para "me olvidé de cargar el lunes".
+ */
+const DIAS_ATRAS_ENVIO = 7;
+/**
+ * La incidencia de un faltante al recibir un envío de la cafetería (0113). No
+ * retiene stock —no hay nada que liberar—: se cierra revisando (ver
+ * `InventarioService.cerrarRecepcionCafe`).
+ */
+const TIPO_RECEPCION_CAFE = InventarioService.TIPO_RECEPCION_CAFE;
+
+/**
+ * Las alícuotas que se ofrecen para lo que elabora el café (ver
+ * `ProductoCafeDto.iva`). El 0 es "sin IVA" (27/9/2026, pedido del dueño):
+ * lo que se vende tipo remito, sin IVA que cobrar — el precio del mostrador es
+ * todo neto. ARCA lo conoce (alícuota 0 %, código 3).
+ */
+const ALICUOTAS_CAFE = [21, 10.5, 0];
+const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
+/** Una cantidad como se lee: 2,5 y no 2.5000000001. */
+/** Un importe como se lee acá: $5.000,00. */
+const plata = (n: number) => `$${Number(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const cantTxt = (n: number) => Number(n).toLocaleString('es-AR', { maximumFractionDigits: 3 });
 
 class EnvioItemDto {
   @IsInt() productoId!: number;
@@ -119,6 +147,23 @@ class EditarEnvioDto {
   items!: EnvioItemDto[];
 }
 
+class RenglonRecibidoDto {
+  @IsInt() itemId!: number;
+  @IsNumber() @Min(0) @Max(100000) cantidadRecibida!: number;
+}
+
+/**
+ * EL CONTROL DEL QUE RECIBE (0113): un número por renglón, contado contra el
+ * remito. La pantalla propone "llegó completo" (lo enviado) y se cambia solo
+ * donde falta. Todos los renglones tienen que venir: uno sin contar no se da
+ * por llegado.
+ */
+class RecibirEnvioDto {
+  @IsArray() @ArrayNotEmpty({ message: 'Contá los renglones del envío antes de recibirlo.' }) @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => RenglonRecibidoDto)
+  items!: RenglonRecibidoDto[];
+  @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
+}
+
 class AnularEnvioDto {
   @IsString() @MaxLength(300) motivo!: string;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -140,6 +185,8 @@ class CrearPedidoDto {
   @IsInt() sucursalId!: number;
   @IsOptional() @IsString() @MaxLength(500) observaciones?: string;
   @IsOptional() @IsInt() usuarioId?: number;
+  /** «Sí, ya pedí esto mismo hoy, va otra vez»: lo manda la pantalla después de preguntar. */
+  @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => PedidoItemDto)
   items!: PedidoItemDto[];
 }
@@ -163,6 +210,30 @@ class ProductoCafeDto {
    * producto hoy y poner el costo cuando lo sepa. 0 = todavía no lo sé.
    */
   @IsOptional() @IsNumber() @Min(0) @Max(100_000_000) costo?: number;
+  /**
+   * EL IVA DEL MOSTRADOR (26/9/2026): 21 % por defecto, 10,5 % para lo que la
+   * ley grava a la mitad (el pan, por ejemplo). Quién va en cuál lo decide el
+   * contador; acá solo se ofrecen las dos que aplican a lo que hace un café.
+   */
+  @IsOptional() @IsIn(ALICUOTAS_CAFE, { message: 'El IVA del mostrador va al 21 %, al 10,5 % o sin IVA.' }) iva?: number;
+  /** «Sí, lo vendo por debajo del costo a propósito»: lo manda la pantalla después de preguntar. */
+  @IsOptional() @IsBoolean() confirmarPerdida?: boolean;
+}
+
+/**
+ * LA EDICIÓN: lo mismo que el alta, pero el PRECIO ES OPCIONAL (26/9/2026).
+ *
+ * Si la distribuidora le puso el precio por MARGEN, la cafetería no lo toca
+ * desde acá: la pantalla no lo manda y la API rechaza si llega. Obligarla a
+ * tipear un precio para poder corregir solo el costo convertía la regla de
+ * margen en un precio fijo, en silencio.
+ */
+class EditarProductoCafeDto {
+  @IsString() @MaxLength(120) nombre!: string;
+  @IsOptional() @IsNumber() @Min(0.01) @Max(100_000_000) precio?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(100_000_000) costo?: number;
+  @IsOptional() @IsIn(ALICUOTAS_CAFE, { message: 'El IVA del mostrador va al 21 %, al 10,5 % o sin IVA.' }) iva?: number;
+  @IsOptional() @IsBoolean() confirmarPerdida?: boolean;
 }
 
 class AnularPedidoDto {
@@ -223,9 +294,9 @@ export class CafeteriaService {
         if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
       }
       const cnKg = conCosto
-        ? costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva)
+        ? costoNetoEntry(formatoDeCosto(prod, provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva)
         : 0;
-      out.set(clave, { prod, pres, costoU: pres ? cnKg * (pres.tamKg ?? 1) : cnKg });
+      out.set(clave, { prod, pres, costoU: pres ? cnKg * escalaPaquete(pres.tamKg ?? 1, prod.merma) : cnKg });
     }
     return out;
   }
@@ -351,6 +422,32 @@ export class CafeteriaService {
     }
   }
 
+  /**
+   * LA PRIMERA DECLARACIÓN LLENA LA FICHA VACÍA (26/9/2026).
+   *
+   * Desde que la venta toma el costo de la ficha (`formatoDeCosto`), una ficha
+   * que nunca se declaró deja a ese producto vendiéndose a costo cero aunque
+   * la cafetería lo esté declarando en cada envío. Si la ficha está VACÍA, el
+   * costo de este envío pasa a ser el suyo, con la fecha de hoy.
+   *
+   * Una ficha YA declarada no se toca: ahí sigue valiendo la regla de 0099 —
+   * pisar el costo en un envío puntual (una tanda más cara) es del documento,
+   * no del producto. Solo el renglón suelto: el costo de un paquete es otro.
+   */
+  private async llenarFichasVacias(tx: any, filas: any[]) {
+    const ultimo = new Map<number, number>();
+    for (const f of filas) if (!f.presentacionId) ultimo.set(f.productoId, Number(f.costoUnitario));
+    for (const [productoId, costo] of ultimo) {
+      await tx.update(productos)
+        .set({ costoCafeteria: r2(costo), costoCafeteriaActualizado: new Date() })
+        .where(and(
+          eq(productos.id, productoId),
+          eq(productos.origenCafeteria, true),
+          isNull(productos.costoCafeteriaActualizado),
+        ));
+    }
+  }
+
   /* ==================================================================== *
    * LOS PRODUCTOS QUE HACE LA CAFETERÍA
    * ==================================================================== *
@@ -419,6 +516,7 @@ export class CafeteriaService {
       codigoPropio: productos.codigoPropio,
       tipo: productos.tipo,
       estado: productos.estado,
+      iva: productos.iva,
       costo: productos.costoCafeteria,
       costoActualizado: productos.costoCafeteriaActualizado,
       modoPrecio: productoListas.modoPrecio,
@@ -453,11 +551,18 @@ export class CafeteriaService {
           costo,
           costoDias: this.diasDesde(f.costoActualizado),
           precioDias: this.diasDesde(f.precioActualizado as any),
+          iva: Number(f.iva) || 0,
           /* El margen sale de los dos números de esta misma fila, y es la razón
            * por la que importa que ninguno de los dos esté viejo. Sin costo no
-           * hay margen — y esa ausencia también dice algo. */
+           * hay margen — y esa ausencia también dice algo.
+           *
+           * SOBRE EL PRECIO SIN IVA (26/9/2026). El precio del mostrador trae el
+           * IVA adentro y ese IVA es de ARCA, no del café; el costo es neto. Se
+           * comparaban $1.500 contra $700 y salía 53 %, cuando la venta guarda
+           * $1.239,67 contra $700: 43,5 %. Ahora es el mismo número que va a
+           * dar la rentabilidad de Gerencia. */
           margen: precio != null && costo != null && precio > 0
-            ? r2(((precio - costo) / precio) * 100)
+            ? r2(((precio / (1 + (Number(f.iva) || 0) / 100) - costo) / (precio / (1 + (Number(f.iva) || 0) / 100))) * 100)
             : null,
         };
       }),
@@ -493,11 +598,57 @@ export class CafeteriaService {
     return n;
   }
 
+  /**
+   * UN NOMBRE, UN PRODUCTO (26/9/2026). Se podían cargar dos "Medialuna" con
+   * precios distintos y la cajera veía las dos en la caja sin saber cuál era
+   * cuál. Se compara contra TODO el catálogo vivo (no solo lo del café): una
+   * medialuna del café llamada igual que una de la distribuidora confunde igual.
+   * Sin mayúsculas, tildes ni espacios de más. Lo archivado no cuenta: ya no
+   * aparece en ningún buscador.
+   */
+  private async exigirNombreLibre(nombre: string, exceptoId?: number) {
+    const clave = (t: string) => t.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '').replace(/\s+/g, ' ').trim();
+    const buscado = clave(nombre);
+    /* El catálogo vivo entero (unos miles de nombres): comparar en SQL sin
+     * tildes pediría la extensión `unaccent`, y esto corre solo al guardar. */
+    const parecidos = await this.db.select({ id: productos.id, nombre: productos.nombre, codigo: productos.codigoPropio })
+      .from(productos)
+      .where(ne(productos.estado, 'archivado' as any));
+    const otro = parecidos.find((x) => x.id !== exceptoId && clave(x.nombre) === buscado);
+    if (otro) {
+      throw new BadRequestException(
+        `Ya hay un producto que se llama "${otro.nombre}"${otro.codigo ? ` (código ${otro.codigo})` : ''}. `
+        + 'Poné un nombre que los distinga en la caja, o editá ese.',
+      );
+    }
+  }
+
+  /**
+   * PRECIO POR DEBAJO DEL COSTO (26/9/2026). Se guardaba $0,01 con un costo de
+   * $5.000 y la pantalla mostraba "−49.999.900 %" como si nada. Puede ser a
+   * propósito (una liquidación, una muestra), así que no se prohíbe: se pide
+   * confirmarlo. Se compara SIN IVA, igual que el margen.
+   */
+  private exigirPrecioSobreCosto(nombre: string, precio: number | null, costo: number | null, iva: number, confirmado?: boolean) {
+    if (confirmado || precio == null || costo == null) return;
+    const neto = precio / (1 + iva / 100);
+    if (neto + 0.005 >= costo) return;
+    throw new ConflictException({
+      perdida: true,
+      message: `Con ese precio ${nombre} se vende por debajo del costo: sin IVA quedan ${plata(neto)} `
+        + `y hacerlo cuesta ${plata(costo)}. Si es a propósito, confirmalo.`,
+    });
+  }
+
   async crearProductoDelCafe(dto: ProductoCafeDto) {
     const nombre = this.nombreDelProducto(dto);
+    await this.exigirNombreLibre(nombre);
+    const iva = dto.iva ?? 21;
+    this.exigirPrecioSobreCosto(nombre, Number(dto.precio), dto.costo ?? null, iva, dto.confirmarPerdida);
     const lista = await this.listaMostrador();
     const p: any = await this.prods.create({
       nombre,
+      iva,
       esGranel: !!dto.esGranel,
       /* Las dos marcas, explícitas y en el alta: `origenCafeteria` es lo que
        * lo habilita en el envío, y `soloCafeteria` en false porque es
@@ -512,24 +663,88 @@ export class CafeteriaService {
     return this.productosDelCafe();
   }
 
-  async editarProductoDelCafe(id: number, dto: ProductoCafeDto) {
-    const nombre = this.nombreDelProducto(dto);
+  async editarProductoDelCafe(id: number, dto: EditarProductoCafeDto, usuarioId?: number | null) {
+    const nombre = this.nombreDelProducto(dto as any);
     const p = await this.productoDelCafe(id);
+    await this.exigirNombreLibre(nombre, id);
     const lista = await this.listaMostrador();
-    /* Solo el nombre: el tipo NO se cambia después del alta. Pasar de contar a
-     * pesar (o al revés) le cambia el significado a todo el stock y a todos
-     * los envíos que ya existen — eso es un producto nuevo, no una edición. */
-    await this.prods.update(id, { nombre, esGranel: p.tipo === 'granel' } as any);
-    await this.prods.setListas(id, [
-      { listaId: lista.id, modoPrecio: 'precio', precioFijo: Number(dto.precio), unidades: 1 },
-    ]);
+
+    /*
+     * EL CAFÉ TOCA SOLO SU FILA: la del mostrador (26/9/2026).
+     *
+     * Antes se reemplazaba el formato de venta ENTERO por esa sola fila, así que
+     * si la distribuidora le había cargado un precio mayorista, cambiarle el
+     * nombre a la medialuna lo borraba. Ahora se leen las filas que hay, se
+     * cambia únicamente la del mostrador, y las demás vuelven tal cual (con su
+     * código de caja, sus unidades y su mínimo).
+     *
+     * Y si esa fila va POR MARGEN, el precio es de la distribuidora: no se toca,
+     * y si la pantalla lo manda igual se rechaza con un mensaje.
+     */
+    const filas = await this.db.select().from(productoListas)
+      .where(and(eq(productoListas.productoId, id), isNull(productoListas.presentacionId)));
+    const mostrador = filas.find((f) => f.listaId === lista.id);
+    if (dto.precio != null && mostrador?.modoPrecio === 'markup') {
+      throw new BadRequestException(
+        `El precio de ${p.nombre} lo fija Sabor y Aroma por margen: desde acá no se cambia. Si tiene que ser otro, pedíselo a ellos.`,
+      );
+    }
+    /* El precio y el costo con los que va a quedar: lo que se manda, o lo que
+     * ya tenía. Por margen no hay precio fijo que comparar. */
+    const iva = dto.iva ?? Number(p.iva);
+    const precioFinal = dto.precio != null ? Number(dto.precio)
+      : (mostrador?.modoPrecio === 'precio' ? Number(mostrador.precioFijo) : null);
+    const costoFinal = dto.costo != null ? Number(dto.costo)
+      : (p.costoCafeteriaActualizado ? Number(p.costoCafeteria) : null);
+    this.exigirPrecioSobreCosto(nombre, precioFinal, costoFinal, iva, dto.confirmarPerdida);
+
+    /* Solo el nombre (y el IVA): el tipo NO se cambia después del alta. Pasar
+     * de contar a pesar (o al revés) le cambia el significado a todo el stock
+     * y a todos los envíos que ya existen — eso es un producto nuevo. */
+    await this.prods.update(id, { nombre, iva, esGranel: p.tipo === 'granel' } as any);
+
+    const nuevo = dto.precio != null ? Number(dto.precio) : null;
+    const cambiaPrecio = nuevo != null
+      && !(mostrador?.modoPrecio === 'precio' && Math.abs(Number(mostrador.precioFijo) - nuevo) < 0.005);
+    if (cambiaPrecio) {
+      const comoItem = (f: any) => ({
+        listaId: f.listaId, modoPrecio: f.modoPrecio, markup: f.markup, precioFijo: f.precioFijo,
+        unidades: f.unidades, codigoBarras: f.codigoBarras, unidadesMinimas: f.unidadesMinimas,
+      });
+      const items: any[] = filas.filter((f) => f.listaId !== lista.id).map(comoItem);
+      items.push(mostrador
+        ? { ...comoItem(mostrador), modoPrecio: 'precio', precioFijo: nuevo }
+        : { listaId: lista.id, modoPrecio: 'precio', precioFijo: nuevo, unidades: 1 });
+      await this.prods.setListas(id, items, usuarioId ?? null);
+    }
     await this.guardarCostoDelCafe(p, dto.costo);
     return this.productosDelCafe();
   }
 
   /** Dejó de hacerlo: sale del catálogo pero su historia queda. */
   async bajaProductoDelCafe(id: number, activar: boolean) {
-    await this.productoDelCafe(id);
+    const p = await this.productoDelCafe(id);
+    if (activar) {
+      await this.exigirNombreLibre(p.nombre, id);
+    } else {
+      /*
+       * CON STOCK NO SE DA DE BAJA, y el mensaje de Compras (liquidalo con una
+       * oferta, dalo de baja por merma, dejalo discontinuado) le habla a quien
+       * tiene esas herramientas. El café no las tiene: lo que le sirve saber es
+       * dónde quedó y qué hacer.
+       */
+      const quedan = await this.db.select({ sucursal: sucursales.nombre, cantidad: sql<number>`sum(${stock.cantidad})` })
+        .from(stock).innerJoin(sucursales, eq(sucursales.id, stock.sucursalId))
+        .where(and(eq(stock.productoId, id), gt(stock.cantidad, 1e-9), inArray(stock.estado, ['disponible', 'comprometido', 'retenido', 'en_transito'] as any)))
+        .groupBy(sucursales.nombre);
+      if (quedan.length) {
+        const donde = quedan.map((q) => `${cantTxt(Number(q.cantidad))} en ${q.sucursal}`).join(', ');
+        throw new BadRequestException(
+          `Todavía quedan ${donde}. Dejá de mandarlo y, cuando se venda lo que queda, lo das de baja. `
+          + 'Si se tiró o se venció, avisale a Sabor y Aroma para que lo den de baja del stock.',
+        );
+      }
+    }
     await this.prods.cambiarEstado(id, { estado: activar ? 'activo' : 'archivado' } as any);
     return this.productosDelCafe();
   }
@@ -680,7 +895,7 @@ export class CafeteriaService {
         entrada ? (_c, _hoy, it) => r2(Number(it.costoUnitario)) : (_c, hoy) => hoy,
       );
 
-      const fecha = fechaLocal(o.fecha) ?? new Date();
+      const fecha = this.fechaDelEnvio(o.fecha);
       if (!o.confirmarDuplicado) {
         /*
          * EL CANDADO QUE HACE ATÓMICA LA BÚSQUEDA DEL GEMELO.
@@ -720,11 +935,21 @@ export class CafeteriaService {
       const codigo = `${entrada ? 'RCA' : 'CAF'}${String(envio.id).padStart(4, '0')}`;
       await tx.update(enviosCafeteria).set({ codigo }).where(eq(enviosCafeteria.id, envio.id));
       await tx.insert(envioCafeteriaItems).values(filas.map((f) => ({ ...f, envioId: envio.id })));
+      if (entrada) await this.llenarFichasVacias(tx, filas);
 
-      await this.moverStock(tx, {
-        sentido, accion: 'aplicar', sucursalId: sucId, usuarioId: o.usuarioId, filas,
-        descripcion: `${codigo}: ${entrada ? 'recibido de' : 'enviado a'} Cafetería`,
-      });
+      /*
+       * CADA LADO MUEVE SU STOCK EN SU MOMENTO (0113). La SALIDA egresa acá: la
+       * mercadería dejó la distribuidora. La ENTRADA no toca nada todavía: entra
+       * al stock de la sucursal recién cuando la sucursal la controla y la
+       * recibe, y entra LO QUE CONTÓ (ver `recibir`). Las dos nacen con la
+       * recepción `pendiente`.
+       */
+      if (!entrada) {
+        await this.moverStock(tx, {
+          sentido, accion: 'aplicar', sucursalId: sucId, usuarioId: o.usuarioId, filas,
+          descripcion: `${codigo}: enviado a Cafetería`,
+        });
+      }
       return envio.id;
     });
     return this.get(id);
@@ -732,18 +957,20 @@ export class CafeteriaService {
 
   /**
    * EDITAR UN ENVÍO YA ENVIADO — la única forma de corregirlo (no hay
-   * devoluciones). El patrón es el de la casa: REVERTIR Y RE-APLICAR, nunca
-   * deltas. En una sola transacción:
+   * devoluciones). En una sola transacción:
    *
    *   1. La fila del envío se toma con FOR UPDATE (dos edits simultáneos se
    *      serializan; edit y anular no se pisan).
    *   2. Se valida la versión que la pantalla estaba mirando.
-   *   3. Se REINGRESA todo el detalle viejo (la reversión).
-   *   4. Se arma el detalle nuevo: el renglón que ya estaba CONSERVA su costo
-   *      congelado; el renglón nuevo se valúa al costo de hoy.
-   *   5. Se EGRESA el detalle nuevo — la validación de stock corre acá, ya con
-   *      lo viejo devuelto: subir de 10 a 15 kg exige 5 de más, no 15.
-   *   6. version + 1, actualizadoEn = ahora: coffit se entera en el próximo sync.
+   *   3. Se arma el detalle nuevo: en una salida el renglón que ya estaba
+   *      CONSERVA su costo congelado y el nuevo se valúa al de hoy; en una
+   *      entrada el costo es siempre el que declara la cafetería.
+   *   4. El stock: en una SALIDA se mueve solo por la diferencia de cada
+   *      artículo; en una ENTRADA nunca (entra al recibir, con lo contado).
+   *      YA RECIBIDO, la cantidad enviada solo puede BAJAR hasta lo que se
+   *      contó —para corregir lo que en realidad no salió—; no se agregan
+   *      renglones ni se sube: eso es otro envío (0113).
+   *   5. version + 1, actualizadoEn = ahora: coffit se entera en el próximo sync.
    *
    * Si algo falla (stock que no alcanza, producto inválido), la transacción
    * entera vuelve atrás y el envío queda EXACTAMENTE como estaba.
@@ -768,15 +995,7 @@ export class CafeteriaService {
       const viejos = await tx.select().from(envioCafeteriaItems)
         .where(eq(envioCafeteriaItems.envioId, id));
 
-      /* 3 — la reversión: el detalle viejo se deshace en el sentido que
-       * corresponda (una salida vuelve a disponible; una entrada se saca). */
-      await this.moverStock(tx, {
-        sentido: envio.sentido, accion: 'revertir',
-        sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas: viejos,
-        descripcion: `${envio.codigo} v${envio.version + 1}: edición — reversión del detalle anterior`,
-      });
-
-      /* 4 — el detalle nuevo, conservando el costo congelado de lo que ya estaba. */
+      /* 3 — el detalle nuevo, conservando el costo congelado de lo que ya estaba. */
       const entrada = envio.sentido === 'entrada';
       const costoViejo = new Map(viejos.map((f) => [`${f.productoId}-${f.presentacionId ?? 0}`, f.costoUnitario]));
       const val = await this.valuarItems(tx, items, !entrada);
@@ -792,20 +1011,96 @@ export class CafeteriaService {
         return hoy;
       });
 
-      await tx.delete(envioCafeteriaItems).where(eq(envioCafeteriaItems.envioId, id));
-      await tx.insert(envioCafeteriaItems).values(filas.map((f) => ({ ...f, envioId: id })));
+      const antes = this.sumarPorArticulo(viejos);
+      const despues = this.sumarPorArticulo(filas);
 
-      /* 5 — el detalle nuevo. La validación de stock corre acá, después de la
-       * reversión: si no alcanza, TODO vuelve atrás. */
-      await this.moverStock(tx, {
-        sentido: envio.sentido, accion: 'aplicar',
-        sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas,
-        descripcion: `${envio.codigo} v${envio.version + 1}: edición — detalle nuevo`,
+      /*
+       * 4a — YA RECIBIDO (0113): lo contado manda. La cantidad enviada puede
+       * bajar hasta lo recibido (lo que en realidad no salió) y nada más: subir
+       * o agregar sería declarar mercadería que el que recibió nunca contó.
+       */
+      const recibido = envio.recepcion !== 'pendiente';
+      const recPor = new Map<string, number>();
+      for (const f of viejos) {
+        const k = `${f.productoId}-${f.presentacionId ?? 0}`;
+        recPor.set(k, r6((recPor.get(k) ?? 0) + Number(f.cantidadRecibida ?? 0)));
+      }
+      if (recibido) {
+        for (const k of new Set([...antes.keys(), ...despues.keys()])) {
+          const a = antes.get(k);
+          const d = despues.get(k);
+          const nombre = (d ?? a)!.nombre;
+          const nuevo = d?.cantidad ?? 0;
+          const rec = recPor.get(k) ?? 0;
+          if (!a) {
+            throw new BadRequestException(`${envio.codigo} ya se recibió: no se le agregan renglones (${nombre}). Si falta mandar algo, hacé otro envío.`);
+          }
+          if (nuevo > a.cantidad + 1e-9) {
+            throw new BadRequestException(`${envio.codigo} ya se recibió: la cantidad de ${nombre} no se sube. Si falta mandar, hacé otro envío.`);
+          }
+          if (nuevo + 1e-9 < rec) {
+            throw new BadRequestException(
+              `${nombre}: al recibir se contaron ${cantTxt(rec)} ${a.unidad.replace(/\.$/, '')}. Lo enviado no puede quedar por debajo de lo que llegó.`,
+            );
+          }
+        }
+      }
+
+      /*
+       * 4b — EL STOCK, SOLO EN LA SALIDA Y SOLO POR LA DIFERENCIA (26/9/2026).
+       * Lo que no cambió no se toca; lo que sube egresa la diferencia y lo que
+       * baja vuelve por la diferencia. La ENTRADA no mueve nada al editar: su
+       * stock es el que contó la sucursal al recibir.
+       */
+      const suben: any[] = [];
+      const bajan: any[] = [];
+      if (!entrada) {
+        for (const k of new Set([...antes.keys(), ...despues.keys()])) {
+          const d = r6((despues.get(k)?.cantidad ?? 0) - (antes.get(k)?.cantidad ?? 0));
+          if (Math.abs(d) < 1e-9) continue;
+          const art = despues.get(k) ?? antes.get(k)!;
+          (d > 0 ? suben : bajan).push({ ...art, cantidad: Math.abs(d) });
+        }
+      }
+
+      /* Lo contado viaja con cada renglón: se reparte por artículo en el orden
+       * de los renglones (casi siempre hay uno solo por artículo). */
+      const quedaPor = new Map(recPor);
+      const filasConRecibido = filas.map((f) => {
+        if (!recibido) return { ...f, cantidadRecibida: null };
+        const k = `${f.productoId}-${f.presentacionId ?? 0}`;
+        const tomo = Math.min(Number(f.cantidad), quedaPor.get(k) ?? 0);
+        quedaPor.set(k, r6((quedaPor.get(k) ?? 0) - tomo));
+        return { ...f, cantidadRecibida: r6(tomo) };
       });
+      await tx.delete(envioCafeteriaItems).where(eq(envioCafeteriaItems.envioId, id));
+      await tx.insert(envioCafeteriaItems).values(filasConRecibido.map((f) => ({ ...f, envioId: id })));
+      if (entrada) await this.llenarFichasVacias(tx, filas);
+
+      /* Primero lo que vuelve (baja) y después lo que sale (sube): la validación
+       * de stock corre con lo devuelto ya adentro. */
+      for (const m of [
+        { accion: 'revertir' as const, filas: bajan, texto: 'vuelve la diferencia' },
+        { accion: 'aplicar' as const, filas: suben, texto: 'sale la diferencia' },
+      ]) {
+        if (!m.filas.length) continue;
+        await this.moverStock(tx, {
+          sentido: envio.sentido, accion: m.accion,
+          sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas: m.filas,
+          descripcion: `${envio.codigo} v${envio.version + 1}: corrección — ${m.texto}`,
+        });
+      }
+
+      /* Si ya se había recibido, se recalcula: si lo enviado quedó igual a lo
+       * contado, las diferencias se resolvieron corrigiendo el envío. */
+      const recepcion = !recibido ? envio.recepcion
+        : ([...despues.entries()].every(([k, d]) => Math.abs(d.cantidad - (recPor.get(k) ?? 0)) < 1e-9)
+          ? 'recibido' : 'con_diferencias');
 
       await tx.update(enviosCafeteria).set({
         totalCosto: total,
-        fecha: fechaLocal(o.fecha) ?? envio.fecha,
+        recepcion,
+        fecha: this.fechaDelEnvio(o.fecha, envio.fecha),
         observaciones: o.observaciones != null ? o.observaciones.trim() : envio.observaciones,
         version: envio.version + 1,
         actualizadoEn: new Date(),
@@ -814,7 +1109,49 @@ export class CafeteriaService {
     return { ...(await this.get(id)), avisos };
   }
 
-  /** Anular = reversión completa. También sube la versión: coffit tiene que deshacer su ingreso. */
+  /** Cantidad por artículo (producto + presentación), sumando renglones repetidos. */
+  private sumarPorArticulo(filas: any[]) {
+    const m = new Map<string, { productoId: number; presentacionId: number | null; cantidad: number; nombre: string; unidad: string }>();
+    for (const f of filas) {
+      const k = `${f.productoId}-${f.presentacionId ?? 0}`;
+      const x = m.get(k);
+      if (x) x.cantidad = r6(x.cantidad + Number(f.cantidad));
+      else m.set(k, { productoId: f.productoId, presentacionId: f.presentacionId ?? null, cantidad: Number(f.cantidad), nombre: f.nombre, unidad: f.unidad });
+    }
+    return m;
+  }
+
+  /**
+   * LA FECHA DEL ENVÍO, validada. Sin fecha es ahora; nunca futura; hasta
+   * `DIAS_ATRAS_ENVIO` días atrás. Al editar, dejar el mismo día no se revalida:
+   * corregir hoy un envío de hace un mes no tiene que obligar a moverle la fecha.
+   */
+  private fechaDelEnvio(txt?: string, previa?: Date | null) {
+    const f = fechaLocal(txt);
+    if (!f) return previa ?? new Date();
+    if (Number.isNaN(f.getTime())) throw new BadRequestException('La fecha del envío no es válida.');
+    const dia = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    if (previa && dia(f) === dia(new Date(previa))) return previa;
+    const hoy = new Date();
+    if (dia(f) > dia(hoy)) throw new BadRequestException('La fecha del envío no puede ser futura.');
+    const limite = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate() - DIAS_ATRAS_ENVIO);
+    if (dia(f) < limite.getTime()) {
+      throw new BadRequestException(
+        `La fecha del envío puede ir hasta ${DIAS_ATRAS_ENVIO} días para atrás (desde el ${limite.toLocaleDateString('es-AR')}). `
+        + 'Uno más viejo cambiaría la cuenta de un período que ya se miró: cargalo con la fecha de hoy y aclaralo en observaciones.',
+      );
+    }
+    return f;
+  }
+
+  /**
+   * Anular = reversión completa, y SOLO MIENTRAS NO SE RECIBIÓ (0113). Una vez
+   * controlado, la mercadería ya está del otro lado: anular la haría volver en
+   * los papeles sin que vuelva de verdad. Después de recibido se corrige con
+   * Editar (bajando hasta lo que llegó) y los faltantes van por su incidencia.
+   * La salida devuelve su egreso; la entrada pendiente no había movido nada.
+   * También sube la versión: coffit tiene que deshacer su ingreso.
+   */
   async anular(id: number, o: AnularEnvioDto, soloSentido?: 'entrada' | null) {
     if (!o.motivo?.trim()) throw new BadRequestException('Escribí por qué se anula.');
     await this.db.transaction(async (tx) => {
@@ -823,22 +1160,136 @@ export class CafeteriaService {
       if (!envio) throw new NotFoundException('Envío inexistente.');
       if (envio.estado === 'anulado') throw new BadRequestException('El envío ya está anulado.');
       this.verSentido(envio.sentido, soloSentido);
+      if (envio.recepcion !== 'pendiente') {
+        throw new BadRequestException(
+          `${envio.codigo} ya se recibió y se controló: no se anula. Si algo no salió, corregilo con Editar `
+          + '(se puede bajar hasta lo que llegó); si faltó mercadería, se resuelve desde su incidencia.',
+        );
+      }
 
-      const items = await tx.select().from(envioCafeteriaItems)
-        .where(eq(envioCafeteriaItems.envioId, id));
-      await this.moverStock(tx, {
-        sentido: envio.sentido, accion: 'revertir',
-        sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas: items,
-        descripcion: envio.sentido === 'entrada'
-          ? `${envio.codigo}: entrada de Cafetería ANULADA — sale lo que había ingresado`
-          : `${envio.codigo}: envío a Cafetería ANULADO — reingreso completo`,
-      });
+      if (envio.sentido === 'salida') {
+        const items = await tx.select().from(envioCafeteriaItems)
+          .where(eq(envioCafeteriaItems.envioId, id));
+        await this.moverStock(tx, {
+          sentido: envio.sentido, accion: 'revertir',
+          sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas: items,
+          descripcion: `${envio.codigo}: envío a Cafetería ANULADO — reingreso completo`,
+        });
+      }
       await tx.update(enviosCafeteria).set({
         estado: 'anulado', motivoAnulacion: o.motivo.trim(),
         version: envio.version + 1, actualizadoEn: new Date(),
       }).where(eq(enviosCafeteria.id, id));
     });
     return this.get(id);
+  }
+
+  /**
+   * QUIÉN RECIBE (0113): el OTRO lado. La salida la recibe la cafetería; la
+   * entrada, la sucursal a la que llega (su gente, o la administración). El
+   * que mandó no puede darlo por recibido: el control existe justamente para
+   * que lo mire otra persona. El superadmin pasa siempre.
+   */
+  private exigirReceptor(envio: any, sesion: Sesion) {
+    const permisos = sesion?.permisos ?? [];
+    if (permisos.includes('*')) return;
+    if (sesion?.usuarioId && envio.usuarioId === sesion.usuarioId) {
+      throw new ForbiddenException('Este envío lo cargaste vos: lo tiene que controlar y recibir otra persona.');
+    }
+    const esCafe = tienePermiso(permisos, ['almacen.cafeteria-entradas']) && !tienePermiso(permisos, ['almacen.cafeteria']);
+    if (envio.sentido === 'salida') {
+      if (!esCafe) throw new ForbiddenException('Este envío lo recibe la cafetería: lo controla y lo marca ella.');
+      return;
+    }
+    if (esCafe) throw new ForbiddenException('Lo que mandaste lo controla y lo recibe la sucursal a la que llega.');
+    const suya = soloSuSucursal(sesion);
+    if (suya != null && suya !== envio.sucursalId) {
+      throw new ForbiddenException('Este envío llega a otra sucursal: lo recibe esa sucursal.');
+    }
+  }
+
+  /**
+   * RECIBIR Y CONTROLAR (0113). El que recibe cuenta contra el remito y deja
+   * un número por renglón. En una ENTRADA recién acá entra el stock a la
+   * sucursal, y entra LO CONTADO. Lo que falta no desaparece: cada faltante
+   * abre una incidencia para la administración (ya no hay mercadería retenida
+   * que liberar: se resuelve revisando y corrigiendo el envío si no salió).
+   *
+   * No sube la versión: coffit sincroniza lo que la distribuidora le manda, y
+   * el control de recepción no le cambia nada de eso.
+   */
+  async recibir(id: number, o: RecibirEnvioDto, sesion: Sesion) {
+    const creadas: string[] = [];
+    await this.db.transaction(async (tx) => {
+      const [envio] = await tx.select().from(enviosCafeteria)
+        .where(eq(enviosCafeteria.id, id)).limit(1).for('update');
+      if (!envio) throw new NotFoundException('Envío inexistente.');
+      if (envio.estado === 'anulado') throw new BadRequestException('Un envío anulado no se recibe.');
+      if (envio.recepcion !== 'pendiente') throw new BadRequestException(`${envio.codigo} ya se recibió.`);
+      this.exigirReceptor(envio, sesion);
+
+      const items = await tx.select().from(envioCafeteriaItems)
+        .where(eq(envioCafeteriaItems.envioId, id)).orderBy(envioCafeteriaItems.id);
+      const contado = new Map((o.items ?? []).map((x) => [Number(x.itemId), Number(x.cantidadRecibida)]));
+      const sinContar = items.filter((it) => !contado.has(it.id));
+      if (sinContar.length) {
+        throw new BadRequestException(
+          `Falta contar ${sinContar.length === 1 ? 'un renglón' : `${sinContar.length} renglones`}: `
+          + `${sinContar.slice(0, 3).map((it) => it.nombre).join(', ')}${sinContar.length > 3 ? '…' : ''}.`,
+        );
+      }
+
+      const [suc] = await tx.select({ nombre: sucursales.nombre }).from(sucursales)
+        .where(eq(sucursales.id, envio.sucursalId)).limit(1);
+      const entrada = envio.sentido === 'entrada';
+      const ruta = entrada ? `Cafetería → ${suc?.nombre ?? 'sucursal'}` : `${suc?.nombre ?? 'Distribuidora'} → Cafetería`;
+      const entran: any[] = [];
+      let hayDiferencias = false;
+
+      for (const it of items) {
+        const rec = r6(contado.get(it.id)!);
+        if (rec > Number(it.cantidad) + 1e-9) {
+          throw new BadRequestException(
+            `${it.nombre}: se mandaron ${cantTxt(Number(it.cantidad))} ${it.unidad} y no pueden llegar más. `
+            + 'Si vino de más, que el que lo mandó corrija el envío.',
+          );
+        }
+        if (it.modo !== 'granel' && !Number.isInteger(rec)) {
+          throw new BadRequestException(`${it.nombre} se cuenta entero: ${cantTxt(rec)} no es una cantidad posible.`);
+        }
+        await tx.update(envioCafeteriaItems).set({ cantidadRecibida: rec }).where(eq(envioCafeteriaItems.id, it.id));
+        if (rec > 1e-9) entran.push({ productoId: it.productoId, presentacionId: it.presentacionId, cantidad: rec });
+
+        const falta = r6(Number(it.cantidad) - rec);
+        if (falta > 1e-9) {
+          hayDiferencias = true;
+          const [inc] = await tx.insert(incidencias).values({
+            codigo: '', tipo: TIPO_RECEPCION_CAFE, estado: 'pendiente', responsableId: sesion?.usuarioId ?? null,
+            motivo: `${envio.codigo} ${ruta}: se mandaron ${cantTxt(Number(it.cantidad))} ${it.unidad} de ${it.nombre} `
+              + `y llegaron ${cantTxt(rec)}. Faltan ${cantTxt(falta)}.`,
+            productoId: it.productoId, sucursalId: envio.sucursalId, presentacionId: it.presentacionId,
+            cantidad: falta, unidad: it.modo === 'granel' ? 'kg' : 'u',
+          } as any).returning();
+          const codigo = 'INC' + String(inc.id).padStart(4, '0');
+          await tx.update(incidencias).set({ codigo }).where(eq(incidencias.id, inc.id));
+          creadas.push(codigo);
+        }
+      }
+
+      if (entrada && entran.length) {
+        await this.moverStock(tx, {
+          sentido: 'entrada', accion: 'aplicar', sucursalId: envio.sucursalId, usuarioId: sesion?.usuarioId ?? null,
+          filas: entran, descripcion: `${envio.codigo}: recibido de Cafetería (controlado)`,
+        });
+      }
+      await tx.update(enviosCafeteria).set({
+        recepcion: hayDiferencias ? 'con_diferencias' : 'recibido',
+        recibidoEn: new Date(),
+        recibidoPor: sesion?.usuarioId ?? null,
+        recepcionObs: (o.observaciones ?? '').trim(),
+      }).where(eq(enviosCafeteria.id, id));
+    });
+    return { ...(await this.get(id)), incidencias: creadas };
   }
 
   /** Kg totales de un renglón, para que coffit contraste y la trampa del 20× no exista. */
@@ -872,6 +1323,7 @@ export class CafeteriaService {
       totalCosto: enviosCafeteria.totalCosto,
       observaciones: enviosCafeteria.observaciones, version: enviosCafeteria.version,
       actualizadoEn: enviosCafeteria.actualizadoEn,
+      recepcion: enviosCafeteria.recepcion,
       sucursalNombre: sucursales.nombre, usuarioNombre: usuarios.nombre,
     }).from(enviosCafeteria)
       .leftJoin(sucursales, eq(sucursales.id, enviosCafeteria.sucursalId))
@@ -900,6 +1352,9 @@ export class CafeteriaService {
       version: enviosCafeteria.version, actualizadoEn: enviosCafeteria.actualizadoEn,
       pedidoId: enviosCafeteria.pedidoId, pedidoCodigo: pedidosCafeteria.codigo,
       sucursalNombre: sucursales.nombre, usuarioNombre: usuarios.nombre,
+      usuarioId: enviosCafeteria.usuarioId,
+      recepcion: enviosCafeteria.recepcion, recibidoEn: enviosCafeteria.recibidoEn,
+      recibidoPor: enviosCafeteria.recibidoPor, recepcionObs: enviosCafeteria.recepcionObs,
     }).from(enviosCafeteria)
       .leftJoin(sucursales, eq(sucursales.id, enviosCafeteria.sucursalId))
       .leftJoin(usuarios, eq(usuarios.id, enviosCafeteria.usuarioId))
@@ -909,7 +1364,10 @@ export class CafeteriaService {
     const items = await this.db.select().from(envioCafeteriaItems)
       .where(eq(envioCafeteriaItems.envioId, id))
       .orderBy(envioCafeteriaItems.id);
-    return { ...envio, items: items.map((it) => this.conKg(it)) };
+    const [rec] = envio.recibidoPor
+      ? await this.db.select({ nombre: usuarios.nombre }).from(usuarios).where(eq(usuarios.id, envio.recibidoPor)).limit(1)
+      : [];
+    return { ...envio, recibidoPorNombre: rec?.nombre ?? null, items: items.map((it) => this.conKg(it)) };
   }
 
   /* ==================================================================== *
@@ -934,6 +1392,13 @@ export class CafeteriaService {
       const filas = items.map((it) => {
         const { prod, pres } = val.get(`${it.productoId}-${it.presentacionId ?? 0}`)!;
         const esGranel = prod.tipo === 'granel' && !pres;
+        /* La misma regla que el envío: solo el granel se fracciona. Se pedían
+         * 2,5 paquetes y el que armaba tenía que adivinar si eran 2 o 3. */
+        if (!esGranel && !Number.isInteger(Number(it.cantidad))) {
+          throw new BadRequestException(
+            `${prod.nombre} se pide por ${pres ? 'paquete' : 'unidad'} entera: ${cantTxt(Number(it.cantidad))} no es una cantidad posible.`,
+          );
+        }
         const tam = pres ? (pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`) : '';
         return {
           productoId: prod.id,
@@ -943,6 +1408,39 @@ export class CafeteriaService {
           unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
         };
       });
+
+      /*
+       * EL PEDIDO GEMELO (26/9/2026), mismo criterio que el del envío: otro
+       * pedido ABIERTO de hoy a la misma sucursal con exactamente el mismo
+       * detalle. Dos clics, dos pestañas o "¿se mandó?" y volver a mandar
+       * terminaban en dos pedidos iguales, y la sucursal armaba dos veces. No
+       * bloquea: se pregunta, y si de verdad va otra vez se confirma.
+       */
+      if (!o.confirmarDuplicado) {
+        const huella = filas.map((f) => `${f.productoId}-${f.presentacionId ?? 0}:${f.cantidad}`).sort().join('|');
+        const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`pcaf:${suc.id}:${hoy.toISOString().slice(0, 10)}:${huella}`}))`);
+        const abiertos = await tx.select({ id: pedidosCafeteria.id, codigo: pedidosCafeteria.codigo })
+          .from(pedidosCafeteria)
+          .where(and(
+            eq(pedidosCafeteria.sucursalId, suc.id),
+            inArray(pedidosCafeteria.estado, ['pendiente', 'armando']),
+            gte(pedidosCafeteria.fecha, hoy),
+          ))
+          .orderBy(desc(pedidosCafeteria.id)).limit(10);
+        if (abiertos.length) {
+          const suyos = await tx.select().from(pedidoCafeteriaItems)
+            .where(inArray(pedidoCafeteriaItems.pedidoId, abiertos.map((a: any) => a.id)));
+          const gemelo = abiertos.find((a: any) => suyos.filter((x: any) => x.pedidoId === a.id)
+            .map((x: any) => `${x.productoId}-${x.presentacionId ?? 0}:${Number(x.cantidad)}`).sort().join('|') === huella);
+          if (gemelo) {
+            throw new ConflictException({
+              duplicado: gemelo.codigo,
+              message: `Hoy ya le pediste exactamente esto a esa sucursal: ${gemelo.codigo}, y sigue abierto. Si de verdad va otra vez, confirmalo.`,
+            });
+          }
+        }
+      }
 
       const [pedido] = await tx.insert(pedidosCafeteria).values({
         codigo: '', usuarioId: o.usuarioId ?? null, sucursalId: suc.id,
@@ -1022,7 +1520,8 @@ export class CafeteriaService {
   /** El contador del badge y del aviso del admin: qué demanda espera. */
   /** El contador del menú y el aviso: cuenta lo MISMO que la lista va a
    *  mostrar, si no a Norte le sonaba la campana en el Depósito. */
-  async pedidosPendientes(soloSuc?: number | null) {
+  async pedidosPendientes(soloSuc?: number | null, sesion?: Sesion) {
+    const porRecibir = sesion ? await this.porRecibir(sesion) : 0;
     const conds: any[] = [inArray(pedidosCafeteria.estado, ['pendiente', 'armando'])];
     if (soloSuc) conds.push(eq(pedidosCafeteria.sucursalId, soloSuc));
     const rows = await this.db.select({
@@ -1032,7 +1531,26 @@ export class CafeteriaService {
       .where(and(...conds))
       .groupBy(pedidosCafeteria.estado);
     const de = (e: string) => Number(rows.find((r) => r.estado === e)?.n) || 0;
-    return { pendientes: de('pendiente'), armando: de('armando') };
+    return { pendientes: de('pendiente'), armando: de('armando'), porRecibir };
+  }
+
+  /**
+   * LO QUE ESPERA QUE YO LO CONTROLE (0113). La cafetería: las salidas que le
+   * mandaron. La distribuidora: las entradas que llegan a su sucursal (el jefe,
+   * todas). Sin esto el envío quedaba "pendiente" sin que nadie se enterara.
+   */
+  private async porRecibir(sesion: Sesion) {
+    const permisos = sesion.permisos ?? [];
+    const esCafe = tienePermiso(permisos, ['almacen.cafeteria-entradas']) && !tienePermiso(permisos, ['almacen.cafeteria']);
+    const conds: any[] = [eq(enviosCafeteria.estado, 'enviado'), eq(enviosCafeteria.recepcion, 'pendiente')];
+    if (esCafe) conds.push(eq(enviosCafeteria.sentido, 'salida'));
+    else {
+      conds.push(eq(enviosCafeteria.sentido, 'entrada'));
+      const suya = soloSuSucursal(sesion);
+      if (suya != null) conds.push(eq(enviosCafeteria.sucursalId, suya));
+    }
+    const [r] = await this.db.select({ n: sql<number>`count(*)::int` }).from(enviosCafeteria).where(and(...conds));
+    return Number(r?.n) || 0;
   }
 
   /** pendiente → armando: "lo estoy preparando". Reclamo atómico. */
@@ -1045,16 +1563,30 @@ export class CafeteriaService {
     return this.getPedido(id);
   }
 
-  async anularPedido(id: number, o: AnularPedidoDto) {
+  /**
+   * `soloPendiente` (26/9/2026): la cafetería anula lo que TODAVÍA NADIE TOMÓ.
+   * Uno en "armando" ya tiene a alguien preparándolo en la sucursal: si el café
+   * lo anulaba por su cuenta, el que armaba se enteraba al terminar. La pantalla
+   * ya lo decía; ahora la API también.
+   */
+  async anularPedido(id: number, o: AnularPedidoDto, soloPendiente = false) {
     if (!o.motivo?.trim()) throw new BadRequestException('Escribí por qué se anula.');
     const gano = await this.db.update(pedidosCafeteria)
       .set({ estado: 'anulado', motivoAnulacion: o.motivo.trim(), actualizadoEn: new Date() })
       .where(and(
         eq(pedidosCafeteria.id, id),
-        inArray(pedidosCafeteria.estado, ['pendiente', 'armando']),
+        inArray(pedidosCafeteria.estado, soloPendiente ? ['pendiente'] : ['pendiente', 'armando']),
       ))
       .returning({ id: pedidosCafeteria.id });
-    if (!gano.length) throw new BadRequestException('Ese pedido ya se envió (o ya estaba anulado): no se anula.');
+    if (!gano.length) {
+      const [ped] = await this.db.select({ estado: pedidosCafeteria.estado }).from(pedidosCafeteria)
+        .where(eq(pedidosCafeteria.id, id)).limit(1);
+      if (!ped) throw new NotFoundException('Pedido inexistente.');
+      if (ped.estado === 'armando') {
+        throw new BadRequestException('Ese pedido ya lo están armando: avisale a la sucursal que no lo necesitás y que lo anulen ellos.');
+      }
+      throw new BadRequestException('Ese pedido ya se envió (o ya estaba anulado): no se anula.');
+    }
     return this.getPedido(id);
   }
 
@@ -1309,6 +1841,14 @@ export class CafeteriaService {
       total: sql<number>`coalesce(sum(${enviosCafeteria.totalCosto}), 0)`,
       cantidad: sql<number>`count(*)::int`,
     }).from(enviosCafeteria).where(and(...condsEnvio)).groupBy(enviosCafeteria.sentido);
+    /* De lo mandado, la parte EXCLUSIVA del café: ya se le imputó al comprarla
+     * (`compradoDirecto`), así que en la cuenta entre los dos negocios no vuelve
+     * a entrar. Mismo corte que Gerencia (`enviadoDesdeStock`). */
+    const [exclusivo] = await this.db.select({
+      total: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad} * ${envioCafeteriaItems.costoUnitario}), 0)`,
+    }).from(envioCafeteriaItems)
+      .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
+      .where(and(...condsEnvio, eq(enviosCafeteria.sentido, 'salida'), eq(envioCafeteriaItems.exclusivo, true)));
     /*
      * LO COMPRADO DIRECTO PARA EL CAFÉ (0101): la parte de las facturas de
      * compra que era de artículos exclusivos, con el signo del documento.
@@ -1332,6 +1872,15 @@ export class CafeteriaService {
     const enviado = Number(de('salida')?.total ?? 0);
     const recibido = Number(de('entrada')?.total ?? 0);
     const gastosCafe = Number(g?.total ?? 0);
+    /*
+     * LA CUENTA ENTRE LOS DOS NEGOCIOS, CON EL MISMO CORTE QUE GERENCIA
+     * (26/9/2026). Lo exclusivo se le imputa al café UNA vez, al comprarlo; lo
+     * compartido, al mandárselo. Antes el saldo sumaba todo lo mandado —
+     * exclusivo incluido— y no contaba lo comprado directo: con un envío de
+     * yerba exclusiva, esta pantalla y Gerencia daban números distintos.
+     */
+    const comprado = Number(compra?.total ?? 0);
+    const desdeStock = enviado - Number(exclusivo?.total ?? 0);
     return {
       /** Comprado a proveedores directo para el café en el período (neto). */
       compradoDirecto: r2(Number(compra?.total ?? 0)),
@@ -1343,11 +1892,14 @@ export class CafeteriaService {
       /** Lo que la cafetería mandó a las sucursales, al costo que ella declaró. */
       recibido: r2(recibido),
       recibidosCantidad: Number(de('entrada')?.cantidad ?? 0),
-      /** A favor de la distribuidora cuando es positivo: le mandó más de lo que recibió. */
-      saldo: r2(enviado - recibido),
+      /** De lo mandado, lo que salió del stock propio (lo exclusivo ya contó al comprarse). */
+      enviadoDesdeStock: r2(desdeStock),
+      /** A favor de la distribuidora cuando es positivo: puso más (comprado + mandado de su stock) de lo que recibió. */
+      saldo: r2(comprado + desdeStock - recibido),
       gastos: r2(gastosCafe),
       gastosCantidad: Number(g?.cantidad ?? 0),
-      costoTotal: r2(enviado + gastosCafe),
+      /** Lo que el café le costó al negocio en el período: comprado para él + mandado de stock + gastos. */
+      costoTotal: r2(comprado + desdeStock + gastosCafe),
     };
   }
 
@@ -1366,7 +1918,7 @@ export class CafeteriaService {
   private async existenciasDelCafe() {
     const prods = await this.db.select({
       id: productos.id, nombre: productos.nombre, tipo: productos.tipo, iva: productos.iva,
-      codigoPropio: productos.codigoPropio,
+      codigoPropio: productos.codigoPropio, merma: productos.merma,
     }).from(productos)
       .where(and(eq(productos.soloCafeteria, true), ne(productos.estado, 'archivado')));
     if (!prods.length) return [];
@@ -1407,7 +1959,7 @@ export class CafeteriaService {
           nombre: pres ? `${prod.nombre} · ${tam}` : prod.nombre,
           codigoPropio: prod.codigoPropio || '',
           unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
-          costoU: r2(pres ? cnKg * (pres.tamKg ?? 1) : cnKg),
+          costoU: r2(pres ? cnKg * escalaPaquete(pres.tamKg ?? 1, prod.merma) : cnKg),
           porSucursal: {} as Record<number, number>,
           total: 0, valor: 0,
         };
@@ -1437,6 +1989,9 @@ export class CafeteriaService {
   }
 }
 
+/** Ver `PERMISO_METRICAS_CAFE` en auth.guard: solo el superadmin. */
+const PERMISO_METRICAS = PERMISO_METRICAS_CAFE;
+
 /**
  * DOS PANTALLAS Y DOS LLAVES, y son de lados opuestos del mostrador:
  * `almacen.cafeteria` es la de la distribuidora (arma y edita los envíos, que
@@ -1465,11 +2020,11 @@ export class CafeteriaController {
     return this.svc.list({ desde, hasta, estado, sentido, limit: limit ? Number(limit) : undefined });
   }
 
-  /* El resumen viaja en la MISMA carga que abre la pantalla: si pide un
-   * permiso que el rol Cafetería no tiene, su 403 tumba las otras cuatro
-   * consultas y la pantalla entera queda en "no se pudieron cargar". */
+  /* Resumen y Métrica: solo el superadmin (`PERMISO_METRICAS`). La pantalla
+   * NO los pide si no tiene la llave — van en la misma carga que la lista de
+   * envíos, y un 403 ahí tumbaba la pantalla entera. */
   @Get('resumen')
-  @Permiso('almacen.cafeteria', 'almacen.cafeteria-entradas')
+  @Permiso(PERMISO_METRICAS)
   resumen(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
     return this.svc.resumen({ desde, hasta });
   }
@@ -1499,9 +2054,10 @@ export class CafeteriaController {
   @Permiso('almacen.cafeteria-entradas')
   @Patch('productos/:id') editarProductoCafe(
     @Param('id', ParseIntPipe) id: number,
-    @Body() dto: ProductoCafeDto,
+    @Body() dto: EditarProductoCafeDto,
+    @Auth() sesion: Sesion,
   ) {
-    return this.svc.editarProductoDelCafe(id, dto);
+    return this.svc.editarProductoDelCafe(id, dto, sesion?.usuarioId ?? null);
   }
 
   @Permiso('almacen.cafeteria-entradas')
@@ -1517,8 +2073,11 @@ export class CafeteriaController {
    * llaves de las dos puntas. */
   @Get('deposito')
   @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos', 'almacen.cafeteria-entradas')
-  deposito() {
-    return this.svc.deposito();
+  async deposito(@Auth() sesion: Sesion) {
+    const d = await this.svc.deposito();
+    /* El detalle (qué hay, dónde y a cuánto) es operativo: con eso se pide. El
+     * total en plata es una métrica y viaja solo al superadmin. */
+    return veMetricasDelCafe(sesion?.permisos) ? d : { ...d, valor: null };
   }
 
   @Get('costos-entrada')
@@ -1528,7 +2087,7 @@ export class CafeteriaController {
   }
 
   @Get('metrica')
-  @Permiso('almacen.cafeteria', 'almacen.cafeteria-entradas')
+  @Permiso(PERMISO_METRICAS)
   metrica(
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
@@ -1583,7 +2142,7 @@ export class CafeteriaController {
   /** El poller del aviso del admin: un count, nada más. */
   @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
   @Get('pedidos-pendientes') pedidosPendientes(@Auth() sesion: Sesion) {
-    return this.svc.pedidosPendientes(soloSuSucursal(sesion));
+    return this.svc.pedidosPendientes(soloSuSucursal(sesion), sesion);
   }
 
   @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
@@ -1601,8 +2160,10 @@ export class CafeteriaController {
   }
 
   @Permiso('almacen.cafeteria', 'almacen.cafeteria-pedidos')
-  @Post('pedidos/:id/anular') anularPedido(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularPedidoDto) {
-    return this.svc.anularPedido(id, dto);
+  @Post('pedidos/:id/anular') anularPedido(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: AnularPedidoDto, @Auth() sesion: Sesion,
+  ) {
+    return this.svc.anularPedido(id, dto, !tienePermiso(sesion.permisos ?? [], ['almacen.cafeteria']));
   }
 
   @Get('envios/:id')
@@ -1631,6 +2192,13 @@ export class CafeteriaController {
   @Permiso('almacen.cafeteria', 'almacen.cafeteria-entradas')
   editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarEnvioDto, @Auth() sesion: Sesion) {
     return this.svc.editar(id, dto, this.soloEntradas(sesion));
+  }
+
+  /** Controlar y recibir (0113). Quién puede, lo decide `exigirReceptor`. */
+  @Post('envios/:id/recibir')
+  @Permiso('almacen.cafeteria', 'almacen.cafeteria-entradas')
+  recibir(@Param('id', ParseIntPipe) id: number, @Body() dto: RecibirEnvioDto, @Auth() sesion: Sesion) {
+    return this.svc.recibir(id, dto, sesion);
   }
 
   @Post('envios/:id/anular')

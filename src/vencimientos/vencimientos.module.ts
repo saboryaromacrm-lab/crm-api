@@ -42,7 +42,7 @@ import {
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, formatoActivo } from '../inventario/pricing';
+import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -191,8 +191,8 @@ export class VencimientosService {
         pres = presDe.get(it.presentacionId) ?? null;
         if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
       }
-      const cnKg = costoNetoEntry(formatoActivo(provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
-      out.set(clave, { prod, pres, costoU: pres ? cnKg * (pres.tamKg ?? 1) : cnKg });
+      const cnKg = costoNetoEntry(formatoDeCosto(prod, provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva);
+      out.set(clave, { prod, pres, costoU: pres ? cnKg * escalaPaquete(pres.tamKg ?? 1, prod.merma) : cnKg });
     }
     return out;
   }
@@ -209,6 +209,11 @@ export class VencimientosService {
         }
       }
       const val = await this.valuar(tx, o.items);
+      /* Lo que se cuenta por unidad o paquete va entero (27/9/2026). */
+      for (const it of o.items) {
+        const v = val.get(`${it.productoId}-${it.presentacionId ?? 0}`);
+        if (v) this.inv.exigirEntero(v.prod, it.presentacionId ?? null, Number(it.cantidad));
+      }
 
       let unidades = 0;
       for (const it of o.items) unidades += Number(it.cantidad);
@@ -244,11 +249,17 @@ export class VencimientosService {
   }
 
   /* ============================ EL LISTADO ============================ */
-  async list() {
+  /**
+   * `soloSuc` (27/9/2026): cada sucursal ve SUS registros; el jefe (`null`),
+   * todos. Antes cualquier cajera leía los vencimientos, las pérdidas y los
+   * reportes en plata de todas las sucursales.
+   */
+  async list(soloSuc: number | null = null) {
     const rows = await this.db.select({
       v: vencimientos,
       diasParaVencer: DIAS,
     }).from(vencimientos)
+      .where(soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined)
       .orderBy(asc(vencimientos.fechaVencimiento), asc(vencimientos.id));
     return rows.map((r) => ({ ...r.v, diasParaVencer: Number(r.diasParaVencer) }));
   }
@@ -266,6 +277,8 @@ export class VencimientosService {
     const patch: any = {};
     if (o.cantidad !== undefined) {
       if (!(Number(o.cantidad) > 0)) throw new BadRequestException('La cantidad debe ser mayor a 0.');
+      const [prod] = await this.db.select().from(productos).where(eq(productos.id, reg.productoId)).limit(1);
+      if (prod) this.inv.exigirEntero(prod, reg.presentacionId ?? null, Number(o.cantidad));
       patch.cantidad = Number(o.cantidad);
     }
     if (o.fechaVencimiento !== undefined) patch.fechaVencimiento = o.fechaVencimiento;
@@ -300,13 +313,23 @@ export class VencimientosService {
       if (reg.procesado) throw new BadRequestException('Ya estaba procesado.');
       const uv = Number(o.unidadesVendidas);
       if (!(uv >= 0)) throw new BadRequestException('Las unidades vendidas no pueden ser negativas.');
+      const [prodV] = await tx.select().from(productos).where(eq(productos.id, reg.productoId)).limit(1);
+      if (prodV) this.inv.exigirEntero(prodV, reg.presentacionId ?? null, uv);
       if (uv > reg.cantidad + 1e-9) {
         throw new BadRequestException(`Las vendidas no pueden superar lo registrado (${reg.cantidad}).`);
       }
       const perdidas = r2(reg.cantidad - uv);
 
+      /*
+       * PROCESAR ES DAR DE BAJA LO VENCIDO, SIEMPRE (27/9/2026). Se podía
+       * destildar la baja: la pérdida quedaba asentada en el registro pero el
+       * stock seguía ahí, y si después alguien la daba de baja a mano el
+       * reporte la contaba DOS veces (la del registro y la merma suelta). Ahora
+       * lo perdido sale del stock en el mismo acto; si no alcanza, rebota y se
+       * corrige el stock primero.
+       */
       let mermaMovimientoId: number | null = null;
-      if (o.generarMerma && perdidas > 0) {
+      if (perdidas > 0) {
         const res = await this.inv.opSimpleTx(tx, {
           tipo: 'vencido',
           productoId: reg.productoId,
@@ -338,10 +361,11 @@ export class VencimientosService {
    * El registro viaja con su contexto (cuánto hay, dónde, cuánta plata está en
    * juego) para que la decisión del descuento no sea a ciegas.
    */
-  async borradorOferta(id: number) {
+  async borradorOferta(id: number, soloSuc: number | null = null) {
     const [reg] = await this.db.select({ v: vencimientos, dias: DIAS })
       .from(vencimientos).where(eq(vencimientos.id, id)).limit(1);
     if (!reg) throw new NotFoundException('Registro inexistente.');
+    this.exigirMio(reg.v, soloSuc);
     const v = reg.v;
     if (v.procesado) throw new BadRequestException('Ya se procesó: la oferta llega tarde.');
     if (Number(reg.dias) < 0) throw new BadRequestException('Ya venció: no se ofrece mercadería vencida.');
@@ -421,9 +445,10 @@ export class VencimientosService {
    * Se exige que la oferta ALCANCE al producto: si no, el vínculo sería una
    * mentira («en oferta» en pantalla, cero descuento en la caja).
    */
-  async vincularOferta(id: number, o: VincularOfertaDto) {
+  async vincularOferta(id: number, o: VincularOfertaDto, soloSuc: number | null = null) {
     const [reg] = await this.db.select().from(vencimientos).where(eq(vencimientos.id, id)).limit(1);
     if (!reg) throw new NotFoundException('Registro inexistente.');
+    this.exigirMio(reg, soloSuc);
     if (reg.procesado) throw new BadRequestException('Ya se procesó: el cierre no cambia.');
     if (reg.ofertaId && reg.ofertaId !== o.ofertaId) {
       throw new BadRequestException('Este registro ya está atado a otra oferta.');
@@ -475,13 +500,13 @@ export class VencimientosService {
    * De ahí salen las alarmas. La grave es una sola: mercadería VENCIDA con la
    * oferta corriendo, o sea la caja vendiendo con descuento algo que ya venció.
    */
-  async ofertasEnJuego() {
+  async ofertasEnJuego(soloSuc: number | null = null) {
     const ahora = new Date();
     const [todas, prods, abiertos] = await Promise.all([
       this.ofertas.listar(),
       this.productosParaAlcance(),
       this.db.select({ v: vencimientos, dias: DIAS }).from(vencimientos)
-        .where(eq(vencimientos.procesado, false))
+        .where(and(eq(vencimientos.procesado, false), soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined))
         .orderBy(asc(vencimientos.fechaVencimiento), asc(vencimientos.id)),
     ]);
     const porId = new Map(prods.map((p) => [p.id, p]));
@@ -627,7 +652,8 @@ export class VencimientosService {
 
   /* ============================ EL RESUMEN ============================ */
   /** Las tarjetas del panel: rangos EXCLUYENTES sobre lo abierto + el histórico procesado. */
-  async resumen() {
+  async resumen(soloSuc: number | null = null) {
+    const deSuc = soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined;
     const abiertos = await this.db.select({
       rango: sql<string>`case
         when ${DIAS} < 0 then 'vencido'
@@ -639,7 +665,7 @@ export class VencimientosService {
       unidades: sql<number>`coalesce(sum(${vencimientos.cantidad}), 0)`,
       plata: sql<number>`coalesce(sum(${vencimientos.cantidad} * ${vencimientos.costoUnitario}), 0)`,
     }).from(vencimientos)
-      .where(eq(vencimientos.procesado, false))
+      .where(and(eq(vencimientos.procesado, false), deSuc))
       .groupBy(sql`1`);
 
     const [proc] = await this.db.select({
@@ -647,10 +673,10 @@ export class VencimientosService {
       vendidas: sql<number>`coalesce(sum(${vencimientos.unidadesVendidas}), 0)`,
       perdidas: sql<number>`coalesce(sum(${vencimientos.cantidad} - ${vencimientos.unidadesVendidas}), 0)`,
       perdidaReal: sql<number>`coalesce(sum((${vencimientos.cantidad} - ${vencimientos.unidadesVendidas}) * ${vencimientos.costoUnitario}), 0)`,
-    }).from(vencimientos).where(eq(vencimientos.procesado, true));
+    }).from(vencimientos).where(and(eq(vencimientos.procesado, true), deSuc));
 
     const ultimos = await this.db.select({ v: vencimientos, diasParaVencer: DIAS })
-      .from(vencimientos).orderBy(desc(vencimientos.id)).limit(5);
+      .from(vencimientos).where(deSuc).orderBy(desc(vencimientos.id)).limit(5);
 
     const base = { n: 0, unidades: 0, plata: 0 };
     const por = Object.fromEntries(abiertos.map((a) => [a.rango, {
@@ -672,13 +698,40 @@ export class VencimientosService {
     };
   }
 
+  /**
+   * LA PÉRDIDA DEL MES, CONTADA EN EL SERVIDOR (27/9/2026). La pestaña Mermas la
+   * sumaba en la pantalla sobre los últimos 300 movimientos de TODO tipo que
+   * trae la carga inicial: en un mes movido, la mayoría de las bajas quedaban
+   * afuera y el número daba de menos sin avisar. Mismos filtros que la
+   * pestaña (sucursal, tipo) y la sucursal de quien mira.
+   */
+  async perdidasMes(q: { sucursalId?: number | null; tipo?: string }, soloSuc: number | null = null) {
+    const hoy = new Date();
+    const desde = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+    const tipos = ['merma', 'vencido', 'defectuoso'].includes(q.tipo ?? '') ? [q.tipo!] : ['merma', 'vencido', 'defectuoso'];
+    const suc = soloSuc ?? (q.sucursalId || null);
+    const [r] = await this.db.select({
+      movimientos: sql<number>`count(*)::int`,
+      plata: sql<number>`coalesce(sum(${movimientos.cantidad} * ${movimientos.costoUnitario}), 0)`,
+    }).from(movimientos).where(and(
+      inArray(movimientos.tipo, tipos as any),
+      sql`${movimientos.fecha} >= ${desde}`,
+      suc ? eq(movimientos.sucursalId, suc) : undefined,
+    ));
+    return { desde: desde.toISOString(), movimientos: Number(r?.movimientos) || 0, plata: r2(Number(r?.plata) || 0) };
+  }
+
   /* ============================ LOS REPORTES ============================ */
   /**
    * Todo el análisis del período en un viaje. Las mermas EXCLUYEN los
    * movimientos generados al procesar vencimientos (ya cuentan como pérdida
    * real del registro — sumarlos de nuevo duplicaría la plata).
    */
-  async reportes(periodo: string) {
+  async reportes(periodo: string, soloSuc: number | null = null) {
+    /* La sucursal de quien mira (el jefe, todas): en cada consulta. */
+    const deSuc = soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined;
+    const movSuc = soloSuc ? eq(movimientos.sucursalId, soloSuc) : undefined;
+    const sesSuc = soloSuc ? eq(vencimientoSesiones.sucursalId, soloSuc) : undefined;
     const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
     const desde = new Date(hoy);
     if (periodo === 'semana') desde.setDate(desde.getDate() - 7);
@@ -696,7 +749,7 @@ export class VencimientosService {
       procesados: sql<number>`count(*) filter (where ${vencimientos.procesado})::int`,
       vendidas: sql<number>`coalesce(sum(${vencimientos.unidadesVendidas}) filter (where ${vencimientos.procesado}), 0)`,
       real: sql<number>`coalesce(sum(${perdidaRealExpr}) filter (where ${vencimientos.procesado}), 0)`,
-    }).from(vencimientos).where(enPeriodo);
+    }).from(vencimientos).where(and(enPeriodo, deSuc));
 
     // Mermas del período: merma + defectuoso + vencido SUELTO (no nacido de procesar).
     const noDeProcesar = sql`${movimientos.id} not in (select merma_movimiento_id from vencimientos where merma_movimiento_id is not null)`;
@@ -704,6 +757,7 @@ export class VencimientosService {
       inArray(movimientos.tipo, ['merma', 'defectuoso', 'vencido'] as any),
       sql`${movimientos.fecha} >= ${desde}`,
       noDeProcesar,
+      movSuc,
     );
     const [mermasG] = await this.db.select({
       registros: sql<number>`count(*)::int`,
@@ -717,7 +771,7 @@ export class VencimientosService {
       unidades: sql<number>`coalesce(sum(${vencimientos.cantidad}), 0)`,
       estimada: sql<number>`coalesce(sum(${vencimientos.cantidad} * ${vencimientos.costoUnitario}), 0)`,
       real: sql<number>`coalesce(sum(${perdidaRealExpr}) filter (where ${vencimientos.procesado}), 0)`,
-    }).from(vencimientos).where(enPeriodo).groupBy(vencimientos.sucursalId);
+    }).from(vencimientos).where(and(enPeriodo, deSuc)).groupBy(vencimientos.sucursalId);
 
     const porSucursalMerma = await this.db.select({
       sucursalId: movimientos.sucursalId,
@@ -733,7 +787,7 @@ export class VencimientosService {
     }).from(vencimientos)
       .innerJoin(productos, eq(productos.id, vencimientos.productoId))
       .leftJoin(categorias, eq(categorias.id, productos.categoriaId))
-      .where(enPeriodo)
+      .where(and(enPeriodo, deSuc))
       .groupBy(sql`1`)
       // Ordinal 4 = la pérdida estimada: lo que más plata pierde va arriba.
       .orderBy(sql`4 desc`);
@@ -747,6 +801,7 @@ export class VencimientosService {
       unidades: sql<number>`coalesce(sum(${vencimientos.cantidad}), 0)`,
       plata: sql<number>`coalesce(sum(${vencimientos.cantidad} * ${vencimientos.costoUnitario}), 0)`,
     }).from(vencimientos)
+      .where(deSuc)
       .groupBy(vencimientos.productoId, vencimientos.presentacionId, vencimientos.nombre)
       .orderBy(sql`4 desc, 6 desc`)
       .limit(10);
@@ -760,7 +815,7 @@ export class VencimientosService {
       estimada: sql<number>`coalesce(sum(${vencimientos.cantidad} * ${vencimientos.costoUnitario}), 0)`,
       real: sql<number>`coalesce(sum(${perdidaRealExpr}) filter (where ${vencimientos.procesado}), 0)`,
     }).from(vencimientos)
-      .where(sql`${vencimientos.creadoEn} >= ${seisMeses}`)
+      .where(and(sql`${vencimientos.creadoEn} >= ${seisMeses}`, deSuc))
       .groupBy(sql`1`)
       .orderBy(sql`1 desc`);
 
@@ -768,7 +823,7 @@ export class VencimientosService {
       sesiones: sql<number>`count(*)::int`,
       items: sql<number>`coalesce(sum(${vencimientoSesiones.totalItems}), 0)::int`,
       unidades: sql<number>`coalesce(sum(${vencimientoSesiones.totalUnidades}), 0)`,
-    }).from(vencimientoSesiones).where(sql`${vencimientoSesiones.fecha} >= ${desde}`);
+    }).from(vencimientoSesiones).where(and(sql`${vencimientoSesiones.fecha} >= ${desde}`, sesSuc));
 
     const sesiones = await this.db.select({
       s: vencimientoSesiones,
@@ -777,6 +832,7 @@ export class VencimientosService {
     }).from(vencimientoSesiones)
       .leftJoin(usuarios, eq(usuarios.id, vencimientoSesiones.usuarioId))
       .innerJoin(sucursales, eq(sucursales.id, vencimientoSesiones.sucursalId))
+      .where(sesSuc)
       .orderBy(desc(vencimientoSesiones.id)).limit(20);
 
     return {
@@ -845,16 +901,25 @@ export class VencimientosController {
   constructor(private readonly svc: VencimientosService) {}
 
   /* Las rutas fijas van ANTES de las de `:id`: 'ofertas' no es un id. */
-  @Get() list() { return this.svc.list(); }
-  @Get('resumen') resumen() { return this.svc.resumen(); }
-  @Get('reportes') reportes(@Query('periodo') periodo?: string) { return this.svc.reportes(periodo || 'mes'); }
-  @Get('ofertas') ofertas() { return this.svc.ofertasEnJuego(); }
+  /* Cada sucursal ve lo suyo; el jefe, todo (27/9/2026). El filtro sale de la
+   * SESIÓN, nunca de la query. */
+  @Get() list(@Auth() sesion: Sesion) { return this.svc.list(soloSuSucursal(sesion)); }
+  @Get('resumen') resumen(@Auth() sesion: Sesion) { return this.svc.resumen(soloSuSucursal(sesion)); }
+  @Get('reportes') reportes(@Auth() sesion: Sesion, @Query('periodo') periodo?: string) {
+    return this.svc.reportes(periodo || 'mes', soloSuSucursal(sesion));
+  }
+  @Get('ofertas') ofertas(@Auth() sesion: Sesion) { return this.svc.ofertasEnJuego(soloSuSucursal(sesion)); }
+  @Get('perdidas-mes') perdidasMes(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string, @Query('tipo') tipo?: string) {
+    return this.svc.perdidasMes({ sucursalId: sucursalId ? Number(sucursalId) : null, tipo }, soloSuSucursal(sesion));
+  }
   @Post('sesiones')
   crearSesion(@Body() dto: CrearSesionDto, @Auth() sesion: Sesion) {
     // El control se carga en la sucursal donde se está mirando la góndola.
-    return this.svc.crearSesion({ ...dto, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) as number });
+    return this.svc.crearSesion({ ...dto, usuarioId: sesion.usuarioId, sucursalId: sucursalDeOperacion(sesion, dto.sucursalId) as number });
   }
-  @Get(':id/borrador-oferta') borradorOferta(@Param('id', ParseIntPipe) id: number) { return this.svc.borradorOferta(id); }
+  @Get(':id/borrador-oferta') borradorOferta(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.borradorOferta(id, soloSuSucursal(sesion));
+  }
   @Put(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarVencimientoDto, @Auth() sesion: Sesion) {
     return this.svc.editar(id, dto, soloSuSucursal(sesion));
   }
@@ -862,15 +927,17 @@ export class VencimientosController {
     return this.svc.eliminar(id, soloSuSucursal(sesion));
   }
   /* Procesar = dar de baja lo vencido, que es una MERMA (el movimiento sale
-   * como `vencido`, que pide `merma` en el movimiento manual). Con `merma`
-   * alcanza: el fraccionador perdió `inventario` y no pierde esto. */
+   * como `vencido`, que pide `merma` en el movimiento manual). `merma` viene de
+   * fábrica para todos; `inventario` ya no (27/9/2026). */
   @Post(':id/procesar')
-  @Permiso('inventario', 'merma')
+  @Permiso('merma')
   procesar(@Param('id', ParseIntPipe) id: number, @Body() dto: ProcesarDto, @Auth() sesion: Sesion) {
-    return this.svc.procesar(id, dto, soloSuSucursal(sesion));
+    /* El autor sale de la SESIÓN (27/9/2026): venía del body, y el movimiento
+     * «vencido» se podía firmar a nombre de cualquiera. */
+    return this.svc.procesar(id, { ...dto, usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
-  @Post(':id/vincular-oferta') vincularOferta(@Param('id', ParseIntPipe) id: number, @Body() dto: VincularOfertaDto) {
-    return this.svc.vincularOferta(id, dto);
+  @Post(':id/vincular-oferta') vincularOferta(@Param('id', ParseIntPipe) id: number, @Body() dto: VincularOfertaDto, @Auth() sesion: Sesion) {
+    return this.svc.vincularOferta(id, dto, soloSuSucursal(sesion));
   }
 }
 

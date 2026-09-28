@@ -286,9 +286,52 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
  * alcanzaba con que uno quedara desalineado para que el precio del POS no
  * coincidiera con el de la ficha.
  */
-export function formatoActivo<T extends { usarParaPrecio?: boolean }>(entries: T[]): T | null {
+export function formatoActivo<T extends { usarParaPrecio?: boolean; id?: number | string }>(entries: T[]): T | null {
   if (!entries || !entries.length) return null;
-  return entries.find((e) => e.usarParaPrecio) ?? entries[0];
+  /* Sin ninguno marcado, el de id más bajo (26/9/2026) — y no "el primero que
+   * devolvió la base", que en Postgres no tiene orden garantizado: dos
+   * pantallas (o la caja y el cobro) podían tomar costos distintos. */
+  return entries.find((e) => e.usarParaPrecio)
+    ?? [...entries].sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0))[0];
+}
+
+/** Lo que `formatoDeCosto` mira del producto: las marcas de la cafetería. */
+export interface ProductoConCosto {
+  origenCafeteria?: boolean | null;
+  costoCafeteria?: number | string | null;
+  costoCafeteriaActualizado?: Date | string | null;
+}
+
+/**
+ * EL FORMATO QUE DEFINE EL COSTO DE UN PRODUCTO — el de compra, salvo lo que
+ * elabora la cafetería (26/9/2026).
+ *
+ * La medialuna no se compra: no tiene proveedor, así que `formatoActivo` daba
+ * null y el costo salía CERO en todos lados —la venta lo congelaba en $0 (100 %
+ * de margen), el stock valía $0 y una merma no costaba nada—, mientras la
+ * cafetería declaraba $700 en su ficha y en cada envío. Ese número existía y
+ * nadie lo leía.
+ *
+ * Acá se lo convierte en un formato de compra más: un "bulto" de 1 a lo que
+ * ella declaró, sin descuentos, flete ni parte sin factura. Así pasa por la
+ * MISMA cadena (`costosFormato`) que cualquier costo y cada lugar que ya
+ * calculaba con `formatoActivo` solo tiene que pedir este en su lugar: no hay
+ * una segunda fórmula que algún día no coincida.
+ *
+ * El costo declarado es NETO, como todos los costos del sistema: los insumos
+ * del café se compran con el mismo CUIT y su IVA vuelve como crédito.
+ *
+ * Una ficha que nunca se declaró (`costoCafeteriaActualizado` nulo) no es un
+ * costo cero: cae al formato de compra como siempre, que para un producto del
+ * café es "sin costo". El 0 declarado a propósito sí es un costo.
+ */
+export function formatoDeCosto<T extends { usarParaPrecio?: boolean; id?: number | string }>(
+  prod: ProductoConCosto | null | undefined, entries: T[],
+): T | CostoEntry | null {
+  if (prod?.origenCafeteria && prod.costoCafeteriaActualizado != null) {
+    return { cantidad: 1, costo: Number(prod.costoCafeteria) || 0, descuento: 0, flete: 0, modoCosto: 'lista', porcSinFactura: 0 };
+  }
+  return formatoActivo(entries);
 }
 
 /* ------------------------------------------------------------------ *
@@ -401,12 +444,19 @@ export function costoPrecioEntry(e?: CostoEntry | null, iva = 0): number {
   return costosFormato(e, iva).costoPrecioUnitario;
 }
 
-/** Redondea a la unidad pedida. `redondeo <= 0` deja el valor a 2 decimales. */
+/**
+ * Redondea a la unidad pedida. `redondeo <= 0` deja el valor a 2 decimales.
+ *
+ * NUNCA A CERO (26/9/2026): con redondeo de $100, un sobre de $45 quedaba en
+ * $0 y la caja lo regalaba. Si redondear se come el precio entero, no se
+ * redondea: queda el precio real. Subirlo a $100 sería cobrar 2,2 veces.
+ */
 export function redondearPrecio(valor: number, redondeo = 0): number {
   const v = Number(valor) || 0;
   const r = Number(redondeo) || 0;
   if (r <= 0) return money(v);
-  return Math.round(v / r) * r;
+  const red = Math.round(v / r) * r;
+  return red > 0 || v <= 0 ? red : money(v);
 }
 
 /**
@@ -446,6 +496,18 @@ export function precioLista(costoNetoKg: number, markup: number, opts?: Opciones
  * precio de la lista de la madre por un `recargo`: se borró junto con la columna
  * (0053) porque era una forma paralela de decir cuánto vale un paquete.
  */
-export function costoNetoPresentacion(costoNetoKg: number, tamKg: number): number {
-  return (Number(costoNetoKg) || 0) * (Number(tamKg) || 0);
+export function costoNetoPresentacion(costoNetoKg: number, tamKg: number, mermaPct = 0): number {
+  return (Number(costoNetoKg) || 0) * escalaPaquete(tamKg, mermaPct);
+}
+
+/**
+ * CUÁNTOS KILOS DE GRANEL CONSUME UN PAQUETE (0110): sus kilos, más la merma
+ * del fraccionado. Con 5% de merma, llenar una bolsa de 1 kg gasta 1,053 kg —
+ * lo que se pierde también se pagó. Es LA regla: todo lo que cuesta, valúa o
+ * cotiza un paquete multiplica el costo del kilo por esto. Acotada a 0–50%:
+ * más que eso no es merma, es un error de carga.
+ */
+export function escalaPaquete(tamKg: number, mermaPct = 0): number {
+  const m = Math.min(Math.max(Number(mermaPct) || 0, 0), 50) / 100;
+  return (Number(tamKg) || 0) / (1 - m);
 }

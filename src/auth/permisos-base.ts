@@ -28,18 +28,13 @@
 const AJENOS = new Set(['cafeteria']);
 
 /**
- * LO QUE LA BASE NO LE DA A UN ROL (25/9/2026, pedido del dueño).
+ * LO QUE LA BASE NO LE DA A UN ROL, por rol (25/9/2026, pedido del dueño).
  *
- * `inventario` abre la devolución (+stock), el ajuste (±) y la "venta" sin
- * ticket ni caja. Al fraccionador no le toca ninguna: su trabajo es convertir
- * granel en paquetes, y con esa llave podía inflar el stock con una
- * "devolución" y sacarlo como venta sin que pasara por ninguna caja. Lo único
- * que esa llave le daba de verdad —procesar un vencimiento, que es dar de baja
- * lo vencido— ahora pide también `merma`, que sí conserva.
+ * Nació para sacarle `inventario` al fraccionador. Desde el 27/9 esa llave ya
+ * no viene de fábrica para NADIE (ver abajo), así que hoy está vacío: queda el
+ * mecanismo para el próximo caso.
  */
-const QUITADOS_POR_ROL: Record<string, readonly string[]> = Object.freeze({
-  fraccionador: ['inventario'],
-});
+const QUITADOS_POR_ROL: Record<string, readonly string[]> = Object.freeze({});
 
 export const PERMISOS_BASE = Object.freeze([
   /* Vencimientos, la sección: control de góndola, alertas y reportes. */
@@ -62,18 +57,21 @@ export const PERMISOS_BASE = Object.freeze([
    */
   'ventas.carteles',
   /*
-   * Las tres acciones que hacen falta para CERRAR el circuito de vencimientos.
-   * Sin ellas la pantalla se ve pero no se puede procesar lo que ya venció, que
-   * es exactamente para lo que existe:
-   *   inventario  → dar de baja el stock vencido (lo exige POST /vencimientos/:id/procesar)
-   *   merma       → registrar lo que se tiró
+   * Las dos acciones que hacen falta para CERRAR el circuito de vencimientos
+   * en cualquier sucursal (decisión del dueño):
+   *   merma       → registrar lo que se tiró, y procesar lo vencido
    *   defectuoso  → apartar lo que salió fallado
+   * Las dos son BAJAS (el stock solo baja) y quedan con su costo y su autor.
    *
-   * Son ACCIONES, no secciones: solo se pueden ejercer dentro de una pantalla
-   * que el rol ya tenga. A un cajero sin `almacen.operaciones` no le abren
-   * ninguna puerta nueva fuera de Vencimientos.
+   * SIN `inventario` DESDE EL 27/9/2026. Estaba acá con la excusa de procesar
+   * vencimientos (que ya pide `merma`), pero la API no la ata a ninguna
+   * pantalla: con ella cualquier cajera podía, por la API, SUMAR stock con un
+   * ajuste o una devolución, restarlo con un ajuste a costo $0 y resolver ella
+   * misma sus incidencias. El comentario decía que "no abre puertas fuera de
+   * Vencimientos" y no era cierto — se probó: ajuste +100, devolución +50,
+   * merma −120, todo con la sesión de una cajera. `inventario` ahora es del
+   * rol que la tenga tildada (admin), como cualquier llave de verdad.
    */
-  'inventario',
   'merma',
   'defectuoso',
 ]);

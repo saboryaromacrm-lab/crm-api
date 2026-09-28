@@ -23,9 +23,9 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, ValidateNested,
+  ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
 import {
@@ -33,9 +33,31 @@ import {
   productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { costoPrecioEntry, formatoActivo, precioVentaFila } from '../inventario/pricing';
+import { costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * CÓMO QUEDA UN FORMATO DE COMPRA DESPUÉS DE UN CAMBIO DE COSTO (26/9/2026).
+ *
+ * Es LA regla, en un solo lugar: la usa `actualizarCostos` para grabar y la
+ * proyección de góndola de la factura para mostrar lo que va a pasar. Si
+ * fueran dos cuentas, el precio que la pantalla promete y el que la caja cobra
+ * podrían no coincidir — y eso es plata. Lo que el cambio no trae, queda como
+ * estaba.
+ */
+export function aplicarCambioCosto(
+  a: { costo: number; descuento: number; flete: number; cantidad: number; costoFinal: number },
+  c: { costo?: number; descuento?: number; flete?: number; cantidad?: number; costoFinal?: number },
+) {
+  return {
+    costo: money(Math.max(0, c.costo ?? a.costo)),
+    descuento: money(Math.max(0, c.descuento ?? a.descuento)),
+    flete: money(Math.max(0, c.flete ?? a.flete)),
+    cantidad: Number(c.cantidad) > 0 ? Number(c.cantidad) : a.cantidad,
+    costoFinal: c.costoFinal != null ? money(Math.max(0, Number(c.costoFinal) || 0)) : a.costoFinal,
+  };
+}
 
 /**
  * EVOLUCIÓN DE PRECIOS — snapshot-diff.
@@ -55,6 +77,12 @@ export class HistorialPreciosService {
 
   /** Precio final vigente de cada lista de un conjunto de productos. */
   private async preciosActuales(productoIds: number[]) {
+    const d = await this.datosDePrecio(productoIds);
+    return this.calcularPrecios(d, d.formatos);
+  }
+
+  /** Lo que hace falta para derivar un precio de góndola, leído una vez. */
+  private async datosDePrecio(productoIds: number[]) {
     const cfg = await this.cfg.get('ventas');
     const [prods, formatos, plistas, listas] = await Promise.all([
       this.db.select().from(productos).where(inArray(productos.id, productoIds)),
@@ -67,12 +95,22 @@ export class HistorialPreciosService {
         .where(and(inArray(productoListas.productoId, productoIds), isNull(productoListas.presentacionId))),
       this.db.select().from(listasVenta).where(eq(listasVenta.activa, true)),
     ]);
+    return { cfg, prods, formatos, plistas, listas };
+  }
+
+  /**
+   * El precio final de cada producto×lista con ESTOS formatos de compra. Con los
+   * de la base es el precio de hoy; con formatos simulados, el de mañana (la
+   * proyección de la factura) — la misma cuenta para las dos cosas.
+   */
+  private calcularPrecios(d: Awaited<ReturnType<HistorialPreciosService['datosDePrecio']>>, formatos: any[]) {
+    const { cfg, prods, plistas, listas } = d;
     const listasVivas = new Set(listas.map((l) => l.id));
     const out: { productoId: number; listaId: number; precio: number }[] = [];
     for (const p of prods) {
       // La BASE del precio (0072), no el costo real: el historial registra el
       // precio que la etiqueta mostró, y la etiqueta se arma con esta base.
-      const cn = costoPrecioEntry(formatoActivo(formatos.filter((f) => f.productoId === p.id)), p.iva);
+      const cn = costoPrecioEntry(formatoDeCosto(p, formatos.filter((f) => f.productoId === p.id)) as any, p.iva);
       // Mismo criterio que las pantallas: el redondeo del producto pisa al de
       // configuración. Si acá difiriera, el historial registraría un precio
       // que ninguna etiqueta mostró jamás.
@@ -86,6 +124,48 @@ export class HistorialPreciosService {
       }
     }
     return out;
+  }
+
+  /**
+   * LA GÓNDOLA QUE DEJARÍA UN CAMBIO DE FORMATOS, SIN GRABAR NADA (26/9/2026).
+   *
+   * `simular` recibe una COPIA de los formatos de compra de estos productos y
+   * devuelve cómo quedarían. Se calcula el precio de hoy y el de después con la
+   * MISMA función que usan el historial, la ficha y el POS, y se informa el del
+   * PISO (el de mostrador: la lista base, o la última del producto), que es el
+   * que la caja cobra sin que el ticket habilite nada.
+   */
+  async proyectarPiso(productoIds: number[], simular: (formatos: any[]) => any[]) {
+    const ids = [...new Set(productoIds)].filter(Boolean);
+    if (!ids.length) return [];
+    const d = await this.datosDePrecio(ids);
+    const antes = this.calcularPrecios(d, d.formatos);
+    const simulados = simular(d.formatos.map((f) => ({ ...f })));
+    const despues = this.calcularPrecios(d, simulados);
+    const precio = (arr: typeof antes, p: number, l: number) => arr.find((x) => x.productoId === p && x.listaId === l)?.precio ?? null;
+    const activas = [...d.listas].sort((a, b) => a.orden - b.orden);
+    const base = activas.find((l) => l.id === d.cfg.listaBaseId) ?? activas[0] ?? null;
+    return d.prods.map((p) => {
+      const suyas = d.plistas
+        .filter((pl) => pl.productoId === p.id && activas.some((l) => l.id === pl.listaId))
+        .sort((a, b) => (activas.find((l) => l.id === a.listaId)!.orden) - (activas.find((l) => l.id === b.listaId)!.orden));
+      const piso = suyas.find((pl) => pl.listaId === base?.id) ?? suyas[suyas.length - 1] ?? null;
+      const formatoAntes = formatoActivo(d.formatos.filter((f) => f.productoId === p.id));
+      const formatoDespues = formatoActivo(simulados.filter((f) => f.productoId === p.id));
+      return {
+        productoId: p.id,
+        sinFormatoDeVenta: !piso,
+        listaId: piso?.listaId ?? null,
+        lista: activas.find((l) => l.id === piso?.listaId)?.nombre ?? '',
+        precioFijo: (piso as any)?.modoPrecio === 'precio',
+        actual: piso ? precio(antes, p.id, piso.listaId) : null,
+        proyectado: piso ? precio(despues, p.id, piso.listaId) : null,
+        /* Qué formato fija el precio después: para decir "sin efecto" cuando el
+         * de este proveedor no es el que manda. */
+        formatoActivoDespues: formatoDespues ? { id: formatoDespues.id, proveedorId: formatoDespues.proveedorId } : null,
+        formatoActivoAntes: formatoAntes ? { id: formatoAntes.id, proveedorId: formatoAntes.proveedorId } : null,
+      };
+    });
   }
 
   /**
@@ -239,9 +319,15 @@ export class HistorialPreciosService {
 class CambioCostoDto {
   /** id de `producto_proveedores`. */
   @IsInt() id!: number;
-  @IsOptional() @IsNumber() costo?: number;
-  @IsOptional() @IsNumber() descuento?: number;
-  @IsOptional() @IsNumber() flete?: number;
+  /* Con límites (26/9/2026): un descuento de 150% daba costo NEGATIVO y
+   * góndola negativa. Mismos topes que la factura y la ficha del formato. */
+  @IsOptional() @IsNumber() @Min(0, { message: 'El costo no puede ser negativo.' }) @Max(1_000_000_000) costo?: number;
+  @IsOptional() @IsNumber() @Min(0, { message: 'El descuento no puede ser negativo.' }) @Max(99.99, { message: 'El descuento va de 0 a 99,99%.' }) descuento?: number;
+  @IsOptional() @IsNumber() @Min(0, { message: 'El flete no puede ser negativo.' }) @Max(100, { message: 'El flete va de 0 a 100%.' }) flete?: number;
+  /** El bulto (kg o unidades) — lo manda la recepción de una factura (0108). */
+  @IsOptional() @IsNumber() @Min(0.001, { message: 'El bulto tiene que ser mayor a 0.' }) @Max(1_000_000) cantidad?: number;
+  /** Lo que se paga por bulto, en los formatos en modo "precio final" (0108). */
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) costoFinal?: number;
 }
 
 class ActualizarCostosDto {
@@ -292,6 +378,11 @@ export class PreciosService {
    * con el historial. Devuelve el `lote`, que es lo que después permite
    * deshacer la tanda entera.
    */
+  /** La góndola que dejaría un cambio de formatos, sin grabar (ver `HistorialPreciosService.proyectarPiso`). */
+  proyectarPiso(productoIds: number[], simular: (formatos: any[]) => any[]) {
+    return this.evolucion.proyectarPiso(productoIds, simular);
+  }
+
   async actualizarCostos(dto: ActualizarCostosDto, tx?: any) {
     const ejecutar = async (db: any) => {
       const ids = [...new Set(dto.cambios.map((c) => c.id))];
@@ -306,15 +397,14 @@ export class PreciosService {
         .map((c) => {
           const a: any = porId.get(c.id);
           if (!a) return null;
-          const nuevo = {
-            id: c.id,
-            costo: money(Math.max(0, c.costo ?? a.costo)),
-            descuento: money(Math.max(0, c.descuento ?? a.descuento)),
-            flete: money(Math.max(0, c.flete ?? a.flete)),
-          };
+          /* El bulto viaja con el costo (0108) y en modo "precio final" manda
+           * `costoFinal` (26/9/2026): ver `aplicarCambioCosto`. */
+          const nuevo = { id: c.id, ...aplicarCambioCosto(a, c) };
           const sinCambio = Math.abs(nuevo.costo - a.costo) < 0.005
             && Math.abs(nuevo.descuento - a.descuento) < 0.005
-            && Math.abs(nuevo.flete - a.flete) < 0.005;
+            && Math.abs(nuevo.flete - a.flete) < 0.005
+            && Math.abs(nuevo.cantidad - a.cantidad) < 0.0005
+            && Math.abs(nuevo.costoFinal - a.costoFinal) < 0.005;
           return sinCambio ? null : { nuevo, anterior: a };
         })
         .filter(Boolean) as { nuevo: any; anterior: any }[];
@@ -322,13 +412,13 @@ export class PreciosService {
       if (!finales.length) return { ok: true, actualizados: 0, lote: '' };
 
       const valores = sql.join(
-        finales.map(({ nuevo }) => sql`(${nuevo.id}::int, ${nuevo.costo}::double precision, ${nuevo.descuento}::double precision, ${nuevo.flete}::double precision)`),
+        finales.map(({ nuevo }) => sql`(${nuevo.id}::int, ${nuevo.costo}::double precision, ${nuevo.descuento}::double precision, ${nuevo.flete}::double precision, ${nuevo.cantidad}::double precision, ${nuevo.costoFinal}::double precision)`),
         sql`, `,
       );
       await db.execute(sql`
         UPDATE producto_proveedores AS t
-        SET costo = v.costo, descuento = v.descuento, flete = v.flete
-        FROM (VALUES ${valores}) AS v(id, costo, descuento, flete)
+        SET costo = v.costo, descuento = v.descuento, flete = v.flete, cantidad = v.cantidad, costo_final = v.costo_final
+        FROM (VALUES ${valores}) AS v(id, costo, descuento, flete, cantidad, costo_final)
         WHERE t.id = v.id
       `);
 
@@ -337,6 +427,10 @@ export class PreciosService {
         productoProveedorId: nuevo.id,
         costoAnterior: anterior.costo, descuentoAnterior: anterior.descuento, fleteAnterior: anterior.flete,
         costo: nuevo.costo, descuento: nuevo.descuento, flete: nuevo.flete,
+        ...(Math.abs(nuevo.cantidad - anterior.cantidad) >= 0.0005
+          ? { cantidadAnterior: anterior.cantidad, cantidad: nuevo.cantidad } : {}),
+        ...(Math.abs(nuevo.costoFinal - anterior.costoFinal) >= 0.005
+          ? { costoFinalAnterior: anterior.costoFinal, costoFinal: nuevo.costoFinal } : {}),
         origen: (dto.origen ?? 'manual') as any,
         motivo: dto.motivo ?? '',
         lote,
@@ -435,8 +529,15 @@ export class PreciosService {
 
       // Todos los formatos de compra de esos productos, para saber cuál manda
       // hoy y cuál pasaría a mandar.
+      /* EN ORDEN DE ID (26/9/2026): con dos formatos del mismo proveedor, el
+       * que se activa tiene que ser el MISMO que la factura acaba de actualizar
+       * (el de id más bajo, ver `formatoPorProducto`). Sin orden, la base
+       * devolvía cualquiera: la factura escribía el costo nuevo en uno y
+       * activaba otro con el costo viejo — y la góndola quedaba con un precio
+       * que nadie eligió. */
       const formatos = await db.select().from(productoProveedores)
-        .where(inArray(productoProveedores.productoId, ids));
+        .where(inArray(productoProveedores.productoId, ids))
+        .orderBy(asc(productoProveedores.id));
       const porProducto = new Map<number, any[]>();
       for (const f of formatos as any[]) {
         const arr = porProducto.get(f.productoId);
@@ -545,86 +646,113 @@ export class PreciosService {
    */
   async revertirLote(lote: string, usuarioId?: number) {
     if (!lote) throw new BadRequestException('Indicá el lote a revertir.');
-
     const res: any = await this.db.transaction(async (tx) => {
-      const filas = await tx.select().from(productoProveedorCostos)
-        .where(eq(productoProveedorCostos.lote, lote));
-      if (!filas.length) throw new BadRequestException('No existe ese lote de actualización.');
-
-      const ids = filas.map((f: any) => f.productoProveedorId);
-      const actuales = await tx.select().from(productoProveedores).where(inArray(productoProveedores.id, ids));
-      const porId = new Map(actuales.map((e: any) => [e.id, e]));
-
-      // Productos involucrados, solo si el lote además cambió el proveedor activo.
-      const prodIds = [...new Set(actuales.map((e: any) => e.productoId))];
-
-      const revertibles: any[] = [];
-      const salteadas: any[] = [];
-      for (const f of filas as any[]) {
-        const a: any = porId.get(f.productoProveedorId);
-        if (!a) { salteadas.push({ id: f.productoProveedorId, motivo: 'La entrada ya no existe.' }); continue; }
-        const intacta = Math.abs(a.costo - f.costo) < 0.005
-          && Math.abs(a.descuento - f.descuento) < 0.005
-          && Math.abs(a.flete - f.flete) < 0.005;
-        if (!intacta) { salteadas.push({ id: f.productoProveedorId, motivo: 'Cambió después de este lote.' }); continue; }
-
-        // Si la fila cambió el formato activo, ese cambio también tiene que
-        // seguir vigente; si no, revertirlo pisaría una decisión más nueva.
-        if (f.activoNuevo != null) {
-          const vigente: any = porId.get(f.activoNuevo);
-          if (!vigente?.usarParaPrecio) {
-            salteadas.push({ id: f.productoProveedorId, motivo: 'El formato activo cambió después de este lote.' });
-            continue;
-          }
-        }
-        revertibles.push({ f, a });
-      }
-
-      if (revertibles.length) {
-        const valores = sql.join(
-          revertibles.map(({ f }) => sql`(${f.productoProveedorId}::int, ${f.costoAnterior}::double precision, ${f.descuentoAnterior}::double precision, ${f.fleteAnterior}::double precision)`),
-          sql`, `,
-        );
-        await tx.execute(sql`
-          UPDATE producto_proveedores AS t
-          SET costo = v.costo, descuento = v.descuento, flete = v.flete
-          FROM (VALUES ${valores}) AS v(id, costo, descuento, flete)
-          WHERE t.id = v.id
-        `);
-
-        // Los cambios de formato activo del lote también vuelven atrás.
-        for (const { f, a } of revertibles) {
-          if (f.activoNuevo == null) continue;
-          await tx.update(productoProveedores).set({ usarParaPrecio: false })
-            .where(eq(productoProveedores.productoId, a.productoId));
-          if (f.activoAnterior != null) {
-            await tx.update(productoProveedores).set({ usarParaPrecio: true })
-              .where(eq(productoProveedores.id, f.activoAnterior));
-          }
-        }
-
-        const nuevoLote = `R${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
-        await tx.insert(productoProveedorCostos).values(revertibles.map(({ f, a }) => ({
-          productoProveedorId: f.productoProveedorId,
-          costoAnterior: a.costo, descuentoAnterior: a.descuento, fleteAnterior: a.flete,
-          costo: f.costoAnterior, descuento: f.descuentoAnterior, flete: f.fleteAnterior,
-          // Invertidos: esta fila deshace lo que hizo la original.
-          activoAnterior: f.activoNuevo ?? null,
-          activoNuevo: f.activoNuevo != null ? (f.activoAnterior ?? null) : null,
-          origen: 'reversion' as any,
-          motivo: `Reversión del lote ${lote}`,
-          lote: nuevoLote,
-          usuarioId: usuarioId ?? null,
-        })));
-      }
-
-      return { ok: true, revertidos: revertibles.length, salteados: salteadas, productoIds: prodIds };
+      const r = await this.revertirLoteTx(tx, lote, usuarioId);
+      if (!r.existe) throw new BadRequestException('No existe ese lote de actualización.');
+      return r;
     });
     // Después del commit: la reversión también mueve precios y queda en la evolución.
     if (res.productoIds?.length) {
       await this.evolucion.snapshot(res.productoIds ?? [], 'reversion', { detalle: `Reversión del lote ${lote}`, usuarioId: usuarioId ?? null });
     }
-    return res;
+    return { ok: true, revertidos: res.revertidos, salteados: res.salteados, productoIds: res.productoIds };
+  }
+
+  /**
+   * QUÉ SE PUEDE DESHACER DE UN LOTE, sin tocar nada. Es la misma regla que la
+   * reversión: una fila que alguien volvió a cambiar después, o cuyo formato
+   * activo ya es otro, no se pisa. Lo usa la reversión y la VISTA PREVIA de la
+   * anulación de un comprobante (0106), para decir antes qué costos vuelven.
+   */
+  async evaluarLote(tx: any, lote: string) {
+    const filas = await tx.select().from(productoProveedorCostos)
+      .where(eq(productoProveedorCostos.lote, lote));
+    if (!filas.length) return { filas, revertibles: [] as any[], salteadas: [] as any[], prodIds: [] as number[] };
+    const ids = filas.map((f: any) => f.productoProveedorId);
+    const actuales = await tx.select().from(productoProveedores).where(inArray(productoProveedores.id, ids));
+    const porId = new Map(actuales.map((e: any) => [e.id, e]));
+    // Productos involucrados, solo si el lote además cambió el proveedor activo.
+    const prodIds = [...new Set(actuales.map((e: any) => e.productoId))] as number[];
+
+    const revertibles: any[] = [];
+    const salteadas: any[] = [];
+    for (const f of filas as any[]) {
+      const a: any = porId.get(f.productoProveedorId);
+      if (!a) { salteadas.push({ id: f.productoProveedorId, f, motivo: 'La entrada ya no existe.' }); continue; }
+      const intacta = Math.abs(a.costo - f.costo) < 0.005
+        && Math.abs(a.descuento - f.descuento) < 0.005
+        && Math.abs(a.flete - f.flete) < 0.005
+        && (f.cantidad == null || Math.abs(a.cantidad - f.cantidad) < 0.0005)
+        && (f.costoFinal == null || Math.abs(a.costoFinal - f.costoFinal) < 0.005);
+      if (!intacta) { salteadas.push({ id: f.productoProveedorId, f, a, motivo: 'Cambió después de este lote.' }); continue; }
+
+      // Si la fila cambió el formato activo, ese cambio también tiene que
+      // seguir vigente; si no, revertirlo pisaría una decisión más nueva.
+      if (f.activoNuevo != null) {
+        const vigente: any = porId.get(f.activoNuevo);
+        if (!vigente?.usarParaPrecio) {
+          salteadas.push({ id: f.productoProveedorId, f, a, motivo: 'El formato activo cambió después de este lote.' });
+          continue;
+        }
+      }
+      revertibles.push({ f, a });
+    }
+    return { filas, revertibles, salteadas, prodIds };
+  }
+
+  /** La reversión de un lote DENTRO de la transacción de quien llama (la anulación). */
+  async revertirLoteTx(tx: any, lote: string, usuarioId?: number) {
+    const { filas, revertibles, salteadas, prodIds } = await this.evaluarLote(tx, lote);
+    if (!filas.length) return { existe: false, revertidos: 0, salteados: [], productoIds: [] as number[] };
+
+    if (revertibles.length) {
+      const valores = sql.join(
+        revertibles.map(({ f, a }) => sql`(${f.productoProveedorId}::int, ${f.costoAnterior}::double precision, ${f.descuentoAnterior}::double precision, ${f.fleteAnterior}::double precision, ${f.cantidadAnterior ?? a.cantidad}::double precision, ${f.costoFinalAnterior ?? a.costoFinal}::double precision)`),
+        sql`, `,
+      );
+      /* El bulto y el precio final vuelven también (0108): el lote que no los
+       * tocó los deja como están. */
+      await tx.execute(sql`
+        UPDATE producto_proveedores AS t
+        SET costo = v.costo, descuento = v.descuento, flete = v.flete, cantidad = v.cantidad, costo_final = v.costo_final
+        FROM (VALUES ${valores}) AS v(id, costo, descuento, flete, cantidad, costo_final)
+        WHERE t.id = v.id
+      `);
+
+      // Los cambios de formato activo del lote también vuelven atrás.
+      for (const { f, a } of revertibles) {
+        if (f.activoNuevo == null) continue;
+        await tx.update(productoProveedores).set({ usarParaPrecio: false })
+          .where(eq(productoProveedores.productoId, a.productoId));
+        if (f.activoAnterior != null) {
+          await tx.update(productoProveedores).set({ usarParaPrecio: true })
+            .where(eq(productoProveedores.id, f.activoAnterior));
+        }
+      }
+
+      const nuevoLote = `R${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+      await tx.insert(productoProveedorCostos).values(revertibles.map(({ f, a }) => ({
+        productoProveedorId: f.productoProveedorId,
+        costoAnterior: a.costo, descuentoAnterior: a.descuento, fleteAnterior: a.flete,
+        costo: f.costoAnterior, descuento: f.descuentoAnterior, flete: f.fleteAnterior,
+        ...(f.cantidad != null ? { cantidadAnterior: a.cantidad, cantidad: f.cantidadAnterior } : {}),
+        ...(f.costoFinal != null ? { costoFinalAnterior: a.costoFinal, costoFinal: f.costoFinalAnterior } : {}),
+        // Invertidos: esta fila deshace lo que hizo la original.
+        activoAnterior: f.activoNuevo ?? null,
+        activoNuevo: f.activoNuevo != null ? (f.activoAnterior ?? null) : null,
+        origen: 'reversion' as any,
+        motivo: `Reversión del lote ${lote}`,
+        lote: nuevoLote,
+        usuarioId: usuarioId ?? null,
+        comprobanteId: f.comprobanteId ?? null,
+      })));
+    }
+    return {
+      existe: true,
+      revertidos: revertibles.length,
+      salteados: salteadas.map(({ id, motivo }) => ({ id, motivo })),
+      productoIds: prodIds,
+    };
   }
 }
 

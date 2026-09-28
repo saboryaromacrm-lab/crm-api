@@ -20,13 +20,14 @@
  */
 import { Controller, Get, Inject, Injectable, Module, Query } from '@nestjs/common';
 import { and, asc, eq, gt, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-orm';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { veMetricasDelCafe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, gastos, marcas, productoProveedores,
   productos, proveedores, stock, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
-import { costosFormato, formatoActivo } from '../inventario/pricing';
+import { costosFormato, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -78,7 +79,7 @@ export class RentabilidadService {
     /** productoId → { proveedorId, porcAhora, costoU, ivaAbsU } del formato activo. */
     const hoyDe = new Map<number, { proveedorId: number | null; porcAhora: number; costoU: number; ivaAbsU: number }>();
     for (const p of prods) {
-      const activo = formatoActivo(porProducto.get(p.id) ?? []);
+      const activo = formatoDeCosto(p, porProducto.get(p.id) ?? []);
       const cf = costosFormato(activo as any, p.iva);
       hoyDe.set(p.id, {
         proveedorId: (activo as any)?.proveedorId ?? null,
@@ -418,11 +419,12 @@ export class RentabilidadService {
       (((press as any).rows ?? []) as any[]).map((r: any) => [Number(r.id), Number(r.tam_kg)]),
     );
 
+    const mermaDe = new Map<number, number>(prods.map((p: any) => [p.id, Number(p.merma) || 0]));
     let valorReal = 0; let ivaAbsorber = 0;
     const conStock = new Set<number>();
     for (const f of filas) {
       const h = hoyDe.get(f.productoId); if (!h) continue;
-      const escala = f.presentacionId ? (tamDe.get(f.presentacionId) ?? 0) : 1;
+      const escala = f.presentacionId ? escalaPaquete(tamDe.get(f.presentacionId) ?? 0, mermaDe.get(f.productoId)) : 1;
       valorReal += f.cantidad * h.costoU * escala;
       ivaAbsorber += f.cantidad * h.ivaAbsU * escala;
       conStock.add(f.productoId);
@@ -437,12 +439,16 @@ export class GerenciaController {
   constructor(private readonly svc: RentabilidadService) {}
 
   @Get('rentabilidad')
-  rentabilidad(
+  async rentabilidad(
+    @Auth() sesion: Sesion,
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
     @Query('sucursalId') sucursalId?: string,
   ) {
-    return this.svc.rentabilidad({ desde, hasta, sucursalId: sucursalId ? Number(sucursalId) : null });
+    const r = await this.svc.rentabilidad({ desde, hasta, sucursalId: sucursalId ? Number(sucursalId) : null });
+    /* El bloque de Coffit es una métrica de la cafetería: solo el superadmin
+     * (ver `PERMISO_METRICAS_CAFE`). El resto de la rentabilidad no cambia. */
+    return veMetricasDelCafe(sesion?.permisos) ? r : { ...r, coffit: null };
   }
 }
 
