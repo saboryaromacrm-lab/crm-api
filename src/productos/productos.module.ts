@@ -3,8 +3,9 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import {
-  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -16,8 +17,8 @@ import { PreciosModule, HistorialPreciosService } from '../precios/precios.modul
 import { CatalogosModule } from '../catalogos/catalogos.module';
 import { AuditoriaModule, AuditoriaService, type CambioAuditado } from '../auditoria/auditoria.module';
 import {
-  categorias, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, marcas, movimientos,
-  pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
+  categorias, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
+  modalidadesVenta, movimientos, pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
   productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
   transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
@@ -197,6 +198,43 @@ class ImportarCostosDto {
   @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
     message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
   }) items!: CostoItemDto[];
+}
+
+/** Una lista que la importación de formatos de venta tiene que CREAR. */
+class ListaNuevaImportDto {
+  @IsString() @MaxLength(60) clave!: string;
+  @IsInt() modalidadId!: number;
+  @IsInt() @Min(1) @Max(9999) numero!: number;
+  @IsString() @MaxLength(80) nombre!: string;
+}
+
+/**
+ * UN RENGLÓN DEL FORMATO DE VENTA A IMPORTAR (28/9/2026). El artículo llega
+ * resuelto (la pantalla ya lo buscó, paquetes incluidos) y el servidor vuelve
+ * a validar todo: existe, no está archivado, es del proveedor, el paquete es
+ * de ese producto. La lista es `listaId` (existe) o `listaNueva` (la clave de
+ * una de `listasNuevas`).
+ */
+class FormatoVentaImportDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() presentacionId?: number | null;
+  @IsOptional() @IsInt() listaId?: number;
+  @IsOptional() @IsString() @MaxLength(60) listaNueva?: string;
+  @IsIn(['markup', 'precio']) modoPrecio!: 'markup' | 'precio';
+  @IsOptional() @IsNumber() @Min(-99) @Max(100000) markup?: number;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) precioFijo?: number;
+  @IsOptional() @IsNumber() @Min(1) @Max(1_000_000) unidades?: number;
+  @IsOptional() @IsString() @MaxLength(40) codigo?: string;
+}
+
+class ImportarFormatosVentaDto {
+  @IsInt() proveedorId!: number;
+  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ListaNuevaImportDto)
+  listasNuevas!: ListaNuevaImportDto[];
+  @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
+    message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
+  }) @ValidateNested({ each: true }) @Type(() => FormatoVentaImportDto)
+  items!: FormatoVentaImportDto[];
 }
 
 /**
@@ -1151,6 +1189,162 @@ export class ProductosService {
   }
 
   /**
+   * ACTUALIZAR FORMATOS DE VENTA DE UN PROVEEDOR (28/9/2026), el hermano de
+   * `importarCostos`. Toca SOLO `producto_listas`: markup o precio fijo, y de a
+   * cuántas unidades se vende. Reglas fijadas con el dueño:
+   *
+   *  · Se importan todas las listas; la que no existe se CREA. Nace AL FINAL
+   *    del orden de preferencia: entre las listas que un renglón habilita gana
+   *    la de orden menor, y una lista recién importada no puede empezar a
+   *    ganarle el precio a Minorista o Mayorista sin que nadie lo decida.
+   *  · Solo productos que tienen a ESTE proveedor en su formato de compra.
+   *  · FUSIÓN, no reemplazo: la lista que el producto tiene y el archivo no
+   *    trae queda como está. De la fila existente se conservan el código de la
+   *    caja y el mínimo de unidades — el archivo no los trae.
+   *
+   * Todo en UNA transacción (listas nuevas incluidas): o entra entero o no
+   * entra nada.
+   */
+  async importarFormatosVenta(dto: ImportarFormatosVentaDto, usuarioId: number | null) {
+    const items = dto.items || [];
+    if (!items.length) throw new BadRequestException('No hay nada para importar.');
+
+    const [prov] = await this.db.select().from(proveedores)
+      .where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
+    if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
+
+    /* ---- Las listas: las que existen y las que hay que crear ---- */
+    const activas = new Set((await this.listas.listasActivas()).map((l) => l.id));
+    const mods = new Set((await this.db.select({ id: modalidadesVenta.id }).from(modalidadesVenta)).map((m) => m.id));
+    const nuevas = new Map<string, ListaNuevaImportDto>();
+    for (const n of dto.listasNuevas || []) {
+      const clave = n.clave.trim();
+      if (!clave || nuevas.has(clave)) throw new BadRequestException('Lista nueva sin clave o repetida.');
+      if (!mods.has(n.modalidadId)) throw new BadRequestException(`La modalidad de la lista «${n.nombre}» no existe.`);
+      if (!n.nombre.trim()) throw new BadRequestException('Cada lista nueva necesita un nombre.');
+      nuevas.set(clave, n);
+    }
+    /* Una lista "nueva" que ya existe (otra importación la creó, o dos
+       pestañas a la vez) se REUSA: importar dos veces no duplica listas. Si
+       existe pero está dada de baja, se frena — reactivarla es una decisión. */
+    const existentesNuevas = new Map<string, number>();
+    for (const [clave, n] of nuevas) {
+      const [ya] = await this.db.select().from(listasVenta)
+        .where(and(eq(listasVenta.modalidadId, n.modalidadId), eq(listasVenta.numero, n.numero))).limit(1);
+      if (ya && !ya.activa) {
+        throw new BadRequestException(`La lista ${n.numero} de esa modalidad existe pero está dada de baja: reactivala en Ventas › Configuración › Formato de venta, o elegí otro destino.`);
+      }
+      if (ya) existentesNuevas.set(clave, ya.id);
+    }
+
+    /* ---- Los artículos ---- */
+    const ids = [...new Set(items.map((it) => Number(it.productoId)))];
+    const prods = await this.db.select({ id: productos.id, nombre: productos.nombre, estado: productos.estado })
+      .from(productos).where(inArray(productos.id, ids));
+    const porId = new Map(prods.map((p) => [p.id, p]));
+    const delProv = new Set((await this.db.select({ productoId: productoProveedores.productoId })
+      .from(productoProveedores)
+      .where(and(inArray(productoProveedores.productoId, ids), eq(productoProveedores.proveedorId, prov.id))))
+      .map((f) => f.productoId));
+    const presIds = [...new Set(items.map((it) => Number(it.presentacionId)).filter((x) => x > 0))];
+    const presDe = new Map((presIds.length
+      ? await this.db.select({ id: presentaciones.id, productoId: presentaciones.productoId })
+        .from(presentaciones).where(inArray(presentaciones.id, presIds))
+      : []).map((x) => [x.id, x.productoId]));
+
+    const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
+    type Aplicar = { productoId: number; presentacionId: number | null; lista: { id?: number; clave?: string }; it: FormatoVentaImportDto };
+    const aAplicar: Aplicar[] = [];
+    const vistos = new Set<string>();
+    for (const it of items) {
+      const p = porId.get(Number(it.productoId));
+      const codigo = (it.codigo ?? '').trim();
+      const saltar = (motivo: string) => saltados.push({ codigo, nombre: p?.nombre ?? '', motivo });
+      if (!p) { saltar('el producto no existe'); continue; }
+      if (p.estado === 'archivado') { saltar('está archivado'); continue; }
+      if (!delProv.has(p.id)) { saltar(`no tiene a ${prov.nombre} en su formato de compra`); continue; }
+      const presentacionId = Number(it.presentacionId) > 0 ? Number(it.presentacionId) : null;
+      if (presentacionId != null && presDe.get(presentacionId) !== p.id) { saltar('el paquete no es de este producto'); continue; }
+      let lista: { id?: number; clave?: string };
+      if (it.listaId != null) {
+        if (!activas.has(Number(it.listaId))) { saltar('la lista no existe o está dada de baja'); continue; }
+        lista = { id: Number(it.listaId) };
+      } else if (it.listaNueva && nuevas.has(it.listaNueva.trim())) {
+        const clave = it.listaNueva.trim();
+        lista = existentesNuevas.has(clave) ? { id: existentesNuevas.get(clave)! } : { clave };
+      } else { saltar('renglón sin lista'); continue; }
+      if (it.modoPrecio === 'precio' && !(Number(it.precioFijo) > 0)) { saltar('precio definido en $0'); continue; }
+      const k = `${p.id}:${presentacionId ?? ''}:${lista.id ?? `n${lista.clave}`}`;
+      if (vistos.has(k)) { saltar('renglón repetido'); continue; }
+      vistos.add(k);
+      aAplicar.push({ productoId: p.id, presentacionId, lista, it });
+    }
+    if (!aAplicar.length) return { ok: true, proveedor: prov.nombre, listasCreadas: [], actualizados: 0, agregados: 0, saltados };
+
+    const listasCreadas: { id: number; nombre: string; numero: number }[] = [];
+    let actualizados = 0;
+    let agregados = 0;
+    await this.db.transaction(async (tx) => {
+      /* Las nuevas, al final del orden, de a 10 como las carga la pantalla. */
+      const idDeClave = new Map<string, number>();
+      const usadas = [...new Set(aAplicar.map((a) => a.lista.clave).filter(Boolean))] as string[];
+      if (usadas.length) {
+        const [{ max }] = await tx.select({ max: sql<number>`coalesce(max(${listasVenta.orden}), 0)` }).from(listasVenta);
+        let orden = Number(max) || 0;
+        for (const clave of usadas) {
+          const n = nuevas.get(clave)!;
+          orden += 10;
+          const [l] = await tx.insert(listasVenta).values({
+            modalidadId: n.modalidadId, numero: n.numero, nombre: n.nombre.trim(), orden, activa: true,
+          }).returning();
+          idDeClave.set(clave, l.id);
+          listasCreadas.push({ id: l.id, nombre: n.nombre.trim(), numero: n.numero });
+        }
+      }
+
+      for (const a of aAplicar) {
+        const listaId = a.lista.id ?? idDeClave.get(a.lista.clave!)!;
+        const ambito = a.presentacionId == null
+          ? and(eq(productoListas.productoId, a.productoId), sql`${productoListas.presentacionId} IS NULL`)
+          : eq(productoListas.presentacionId, a.presentacionId);
+        const [previa] = await tx.select().from(productoListas)
+          .where(and(ambito, eq(productoListas.listaId, listaId))).limit(1);
+        const unidades = Math.max(1, Number(a.it.unidades) || 1);
+        const valores = {
+          modoPrecio: (a.it.modoPrecio === 'precio' ? 'precio' : 'markup') as any,
+          markup: a.it.modoPrecio === 'precio' ? (previa?.markup ?? 0) : Number(a.it.markup) || 0,
+          precioFijo: a.it.modoPrecio === 'precio' ? Number(a.it.precioFijo) || 0 : (previa?.precioFijo ?? 0),
+          unidades,
+        };
+        if (previa) {
+          /* El código propio es el de la CAJA: si el formato pasa a vender de
+             a 1, ese código sería un segundo código del mismo artículo (la
+             regla de `guardarFormato`). Se suelta. */
+          const codigoBarras = unidades > 1 ? previa.codigoBarras : '';
+          await tx.update(productoListas).set({ ...valores, codigoBarras }).where(eq(productoListas.id, previa.id));
+          actualizados += 1;
+        } else {
+          await tx.insert(productoListas).values({
+            productoId: a.productoId, presentacionId: a.presentacionId, listaId, ...valores,
+            codigoBarras: '', unidadesMinimas: 0,
+          });
+          agregados += 1;
+        }
+      }
+    });
+
+    // Markup nuevo = precio nuevo: queda en la evolución, firmada. (Los
+    // paquetes todavía no tienen historial propio — ver `setListasPresentacion`.)
+    const idsTocados = [...new Set(aAplicar.filter((a) => a.presentacionId == null).map((a) => a.productoId))];
+    if (idsTocados.length) {
+      await this.evolucion.snapshot(idsTocados, 'formato_venta', {
+        usuarioId, detalle: `Importación de formatos de venta · ${prov.nombre}`,
+      });
+    }
+    return { ok: true, proveedor: prov.nombre, listasCreadas, actualizados, agregados, saltados };
+  }
+
+  /**
    * ACTUALIZAR CATEGORÍA Y ETIQUETAS DE MUCHOS PRODUCTOS, SIN EL MAESTRO
    * (23/9/2026). El pedido del dueño después de "Actualizar costos": no
    * quería reexportar el catálogo entero del sistema viejo para retocar
@@ -1914,6 +2108,12 @@ export class ProductosController {
   @Post('importar-costos')
   importarCostos(@Body() dto: ImportarCostosDto, @Auth() sesion: Sesion) {
     return this.svc.importarCostos(dto, sesion?.usuarioId ?? null);
+  }
+  /** Formatos de venta de un proveedor: misma llave que editar el de un producto. */
+  @Permiso('precios', 'ventas.listas')
+  @Post('importar-formatos-venta')
+  importarFormatosVenta(@Body() dto: ImportarFormatosVentaDto, @Auth() sesion: Sesion) {
+    return this.svc.importarFormatosVenta(dto, sesion?.usuarioId ?? null);
   }
 
   /** Solo categoría y etiquetas, sin el maestro: ver el comentario del servicio. */
