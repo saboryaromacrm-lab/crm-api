@@ -200,6 +200,13 @@ class ImportarCostosDto {
   }) items!: CostoItemDto[];
 }
 
+/** Pasar artículos de una lista a otra (28/9/2026). */
+class MoverListaDto {
+  @IsInt() origenId!: number;
+  @IsInt() destinoId!: number;
+  @IsArray() @ArrayMaxSize(10000) @IsInt({ each: true }) filaIds!: number[];
+}
+
 /** Una lista que la importación de formatos de venta tiene que CREAR. */
 class ListaNuevaImportDto {
   @IsString() @MaxLength(60) clave!: string;
@@ -1356,6 +1363,82 @@ export class ProductosService {
   }
 
   /**
+   * PASAR ARTÍCULOS DE UNA LISTA A OTRA (28/9/2026, pedido del dueño). Reglas
+   * fijadas con él:
+   *
+   *  · MOVER, no copiar: la fila del formato de venta cambia de lista y se
+   *    lleva todo lo suyo (markup o precio fijo, unidades, código de la caja,
+   *    mínimo). El artículo sale de la lista de origen.
+   *  · SI YA ESTABA EN EL DESTINO, MANDA EL DESTINO: esa fila no se toca, y la
+   *    del origen se borra (igual sale de la lista de origen).
+   *
+   * Candados: la lista BASE no se vacía desde acá — es el precio de góndola, y
+   * sacarle artículos cambiaría la vidriera de golpe —; el destino tiene que
+   * estar activo; y solo se mueven filas que DE VERDAD son de la lista de
+   * origen (un id ajeno se ignora y se informa). Todo en una transacción.
+   */
+  async moverLista(dto: MoverListaDto, usuarioId: number | null) {
+    const origenId = Number(dto.origenId);
+    const destinoId = Number(dto.destinoId);
+    if (origenId === destinoId) throw new BadRequestException('La lista de origen y la de destino son la misma.');
+    const ids = [...new Set((dto.filaIds || []).map(Number).filter((x) => Number.isInteger(x) && x > 0))];
+    if (!ids.length) throw new BadRequestException('No elegiste ningún artículo para mover.');
+
+    const listas = await this.db.select().from(listasVenta).orderBy(asc(listasVenta.orden), asc(listasVenta.id));
+    const origen = listas.find((l) => l.id === origenId);
+    const destino = listas.find((l) => l.id === destinoId);
+    if (!origen) throw new BadRequestException('La lista de origen no existe.');
+    if (!destino || !destino.activa) throw new BadRequestException('La lista de destino no existe o está dada de baja.');
+    const cfg: any = await this.cfg.get('ventas');
+    const baseId = Number(cfg?.listaBaseId) || listas.filter((l) => l.activa)[0]?.id;
+    if (origenId === baseId) {
+      throw new BadRequestException('La lista base es el precio de góndola: no se vacía desde acá. Si querés cambiar cuál es la base, hacelo en Ventas › Configuración.');
+    }
+    const nombre = (l: any) => l.nombre || `lista ${l.numero}`;
+
+    let movidos = 0;
+    let yaEstaban = 0;
+    let ignorados = 0;
+    const productosTocados = new Set<number>();
+    await this.db.transaction(async (tx) => {
+      const filas = await tx.select().from(productoListas).where(inArray(productoListas.id, ids));
+      const delOrigen = filas.filter((f) => f.listaId === origenId);
+      ignorados = ids.length - delOrigen.length;
+      if (!delOrigen.length) return;
+      const prodIds = [...new Set(delOrigen.map((f) => f.productoId))];
+      const enDestino = await tx.select({ productoId: productoListas.productoId, presentacionId: productoListas.presentacionId })
+        .from(productoListas)
+        .where(and(eq(productoListas.listaId, destinoId), inArray(productoListas.productoId, prodIds)));
+      const yaEsta = new Set(enDestino.map((f) => `${f.productoId}:${f.presentacionId ?? ''}`));
+      const aBorrar: number[] = [];
+      const aMover: number[] = [];
+      for (const f of delOrigen) {
+        if (yaEsta.has(`${f.productoId}:${f.presentacionId ?? ''}`)) aBorrar.push(f.id); else aMover.push(f.id);
+        productosTocados.add(f.productoId);
+      }
+      if (aBorrar.length) await tx.delete(productoListas).where(inArray(productoListas.id, aBorrar));
+      if (aMover.length) {
+        await tx.update(productoListas).set({ listaId: destinoId }).where(inArray(productoListas.id, aMover));
+      }
+      movidos = aMover.length;
+      yaEstaban = aBorrar.length;
+      await this.audit.registrar([{
+        entidad: 'lista', entidadId: origenId, ambito: 'Formato de venta',
+        detalle: `${nombre(origen)} → ${nombre(destino)}`, campo: 'Artículos movidos de lista',
+        antes: `${delOrigen.length} fila(s) en ${nombre(origen)}`,
+        despues: `${movidos} movida(s) a ${nombre(destino)} · ${yaEstaban} ya estaban ahí (se respetó el destino)`,
+        usuarioId,
+      }], tx);
+    });
+    if (productosTocados.size) {
+      await this.evolucion.snapshot([...productosTocados], 'formato_venta', {
+        usuarioId, detalle: `Movidos de ${nombre(origen)} a ${nombre(destino)}`,
+      });
+    }
+    return { ok: true, movidos, yaEstaban, ignorados, origen: nombre(origen), destino: nombre(destino) };
+  }
+
+  /**
    * LA GUÍA DE IMPORTACIONES POR PROVEEDOR (28/9/2026, pedido del dueño: "son
    * muchos proveedores y me voy a perder"). Cada importación de costos o de
    * formatos de venta deja una fila en la AUDITORÍA del proveedor — la misma
@@ -2175,6 +2258,12 @@ export class ProductosController {
   @Post('importar-costos')
   importarCostos(@Body() dto: ImportarCostosDto, @Auth() sesion: Sesion) {
     return this.svc.importarCostos(dto, sesion?.usuarioId ?? null);
+  }
+  /** Pasar artículos de una lista a otra: misma llave que editar un formato de venta. */
+  @Permiso('precios', 'ventas.listas')
+  @Post('mover-lista')
+  moverLista(@Body() dto: MoverListaDto, @Auth() sesion: Sesion) {
+    return this.svc.moverLista(dto, sesion?.usuarioId ?? null);
   }
   /** Formatos de venta de un proveedor: misma llave que editar el de un producto. */
   @Permiso('precios', 'ventas.listas')

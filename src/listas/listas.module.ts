@@ -230,6 +230,24 @@ export class ListasService {
     return { ok: true, desactivada: false };
   }
 
+  /**
+   * QUIÉN MÁS USA UNA LISTA (28/9/2026): lo que la pantalla de mover artículos
+   * tiene que avisar antes de vaciarla. Un cliente con la lista asignada deja
+   * de tener ese precio para lo que se mueve; un descuento o una oferta atados
+   * a ella dejan de alcanzar a esos artículos.
+   */
+  async usoLista(id: number) {
+    const r = await this.db.execute(sql`
+      SELECT
+        (SELECT count(*)::int FROM cliente_listas WHERE lista_id = ${id}) AS clientes,
+        (SELECT count(*)::int FROM descuentos WHERE lista_id = ${id} AND activo) AS descuentos,
+        (SELECT count(*)::int FROM ofertas WHERE activa AND (hasta IS NULL OR hasta > now())
+           AND ${String(id)} = ANY (string_to_array(listas, ','))) AS ofertas
+    `);
+    const f: any = r.rows[0] ?? {};
+    return { clientes: Number(f.clientes) || 0, descuentos: Number(f.descuentos) || 0, ofertas: Number(f.ofertas) || 0 };
+  }
+
   /* --------------------------- Reglas de marca --------------------------- */
 
   async reglas() {
@@ -512,6 +530,8 @@ export class ListasController {
   constructor(private readonly svc: ListasService) {}
 
   @Get() catalogo() { return this.svc.catalogo(); }
+  @Permiso('ventas.listas', 'precios')
+  @Get(':id/uso') uso(@Param('id', ParseIntPipe) id: number) { return this.svc.usoLista(id); }
 
   @Permiso('ventas.listas', 'precios')
   @Post('modalidades') crearMod(@Body() dto: UpsertModalidadDto) { return this.svc.crearModalidad(dto); }
