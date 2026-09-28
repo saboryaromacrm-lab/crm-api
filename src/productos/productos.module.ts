@@ -1177,6 +1177,7 @@ export class ProductosService {
         usuarioId, detalle: `Importación de costos · ${prov.nombre}`,
       });
     }
+    await this.anotarImportacion(prov.id, 'Costos', `${aActualizar.length} actualizado(s) · ${aAgregar.length} agregado(s)`, usuarioId);
 
     return {
       ok: true,
@@ -1207,11 +1208,18 @@ export class ProductosService {
    */
   async importarFormatosVenta(dto: ImportarFormatosVentaDto, usuarioId: number | null) {
     const items = dto.items || [];
-    if (!items.length) throw new BadRequestException('No hay nada para importar.');
 
     const [prov] = await this.db.select().from(proveedores)
       .where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
     if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
+
+    /* EL ARCHIVO YA COINCIDÍA: no hay nada que escribir, pero el proveedor
+       quedó revisado. Se anota igual — si no, la guía lo mostraría como
+       pendiente para siempre. */
+    if (!items.length) {
+      await this.anotarImportacion(prov.id, 'Formatos de venta', 'sin cambios: el archivo ya coincidía', usuarioId);
+      return { ok: true, proveedor: prov.nombre, listasCreadas: [], actualizados: 0, agregados: 0, saltados: [] };
+    }
 
     /* ---- Las listas: las que existen y las que hay que crear ---- */
     const activas = new Set((await this.listas.listasActivas()).map((l) => l.id));
@@ -1341,7 +1349,63 @@ export class ProductosService {
         usuarioId, detalle: `Importación de formatos de venta · ${prov.nombre}`,
       });
     }
+    await this.anotarImportacion(prov.id, 'Formatos de venta',
+      `${actualizados} actualizado(s) · ${agregados} agregado(s)${listasCreadas.length ? ` · ${listasCreadas.length} lista(s) nueva(s)` : ''}`,
+      usuarioId);
     return { ok: true, proveedor: prov.nombre, listasCreadas, actualizados, agregados, saltados };
+  }
+
+  /**
+   * LA GUÍA DE IMPORTACIONES POR PROVEEDOR (28/9/2026, pedido del dueño: "son
+   * muchos proveedores y me voy a perder"). Cada importación de costos o de
+   * formatos de venta deja una fila en la AUDITORÍA del proveedor — la misma
+   * tabla que ya lista su pestaña Auditoría, así que no hizo falta una tabla
+   * nueva — y acá se lee la última de cada tipo.
+   *
+   * Lo importado ANTES de que existiera la anotación se reconstruye de la
+   * evolución de precios, que ya firmaba "Importación de … · <proveedor>".
+   * Es la mejor evidencia que hay: una importación que no movió ningún
+   * precio no dejó rastro ahí, y por eso esa fuente se marca aparte.
+   */
+  private async anotarImportacion(proveedorId: number, campo: 'Costos' | 'Formatos de venta', resumen: string, usuarioId: number | null) {
+    await this.audit.registrar([{
+      entidad: 'proveedor', entidadId: proveedorId, ambito: 'Importación', campo, antes: '', despues: resumen, usuarioId,
+    }]);
+  }
+
+  async importacionesPorProveedor() {
+    const anotadas = await this.db.execute(sql`
+      SELECT DISTINCT ON (a.entidad_id, a.campo) a.entidad_id AS proveedor_id, a.campo, to_json(a.fecha) #>> '{}' AS fecha, a.despues AS resumen, u.nombre AS usuario
+      FROM auditoria a LEFT JOIN usuarios u ON u.id = a.usuario_id
+      WHERE a.entidad = 'proveedor' AND a.ambito = 'Importación'
+      ORDER BY a.entidad_id, a.campo, a.fecha DESC
+    `);
+    const deHistorial = await this.db.execute(sql`
+      SELECT p.id AS proveedor_id,
+             CASE WHEN h.detalle LIKE 'Importación de costos · %' THEN 'Costos' ELSE 'Formatos de venta' END AS campo,
+             to_json(max(h.fecha)) #>> '{}' AS fecha
+      FROM precio_historial h
+      JOIN proveedores p ON h.detalle IN ('Importación de costos · ' || p.nombre, 'Importación de formatos de venta · ' || p.nombre)
+      GROUP BY 1, 2
+    `);
+    const porProv = new Map<number, any>();
+    const lugar = (id: number) => {
+      if (!porProv.has(id)) porProv.set(id, { proveedorId: id, costos: null, formatos: null });
+      return porProv.get(id);
+    };
+    const clave = (campo: string) => (campo === 'Costos' ? 'costos' : 'formatos');
+    for (const r of deHistorial.rows as any[]) {
+      lugar(Number(r.proveedor_id))[clave(r.campo)] = { fecha: r.fecha, usuario: null, resumen: '', fuente: 'historial' };
+    }
+    // La anotación manda sobre el historial: es la importación en sí.
+    for (const r of anotadas.rows as any[]) {
+      const l = lugar(Number(r.proveedor_id));
+      const previa = l[clave(r.campo)];
+      if (!previa || previa.fuente === 'historial' || new Date(r.fecha) >= new Date(previa.fecha)) {
+        l[clave(r.campo)] = { fecha: r.fecha, usuario: r.usuario ?? null, resumen: r.resumen ?? '', fuente: 'importacion' };
+      }
+    }
+    return [...porProv.values()];
   }
 
   /**
@@ -2093,6 +2157,9 @@ export class ProductosController {
   @Get('siguiente-ean') siguienteEan(@Query('excluir') excluir?: string) {
     return this.svc.siguienteEan13(String(excluir || '').split(',').filter(Boolean));
   }
+  /** La guía de importaciones por proveedor. Antes de `:id`, igual que las de arriba. */
+  @Permiso('compras.productos')
+  @Get('importaciones-por-proveedor') importaciones() { return this.svc.importacionesPorProveedor(); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
     return this.svc.get(id, tienePermiso(auth.permisos, ['precios', 'compras.productos']), ocultaCostoUnitario(auth.permisos));
   }
