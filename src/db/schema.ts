@@ -172,6 +172,11 @@ export const proveedores = pgTable('proveedores', {
    * proveedores comparten formato cuando facturan con el mismo sistema.
    */
   formatoFactura: text('formato_factura').notNull().default(''),
+  /**
+   * La ESTRUCTURA PROPIA que armó el asistente (0118): las posiciones de las
+   * columnas de sus facturas PDF. Se usa cuando `formatoFactura` = 'plantilla'.
+   */
+  plantillaFactura: jsonb('plantilla_factura').$type<Record<string, any> | null>(),
   /** Factura gastos de la empresa (servicios, fletes, honorarios, alquiler…). */
   proveeGastos: boolean('provee_gastos').notNull().default(false),
   /**

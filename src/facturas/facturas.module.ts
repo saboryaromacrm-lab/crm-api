@@ -40,7 +40,7 @@ import {
 import type { Response } from 'express';
 import { createHash } from 'crypto';
 import {
-  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -102,6 +102,34 @@ class EmparejarDto {
   @ValidateNested() @Type(() => PieLeidoDto) pie!: PieLeidoDto;
   @IsOptional() @IsArray() @ArrayMaxSize(30) @IsString({ each: true }) @MaxLength(400, { each: true }) avisos?: string[];
 }
+/**
+ * La estructura del asistente: por cada dato, el rango X de su columna en la
+ * hoja. Se valida entera acá — viene del navegador — y es chica a propósito.
+ */
+const ROLES_PLANTILLA = ['codigo', 'descripcion', 'cantidad', 'unidad', 'precio', 'dto', 'importe'];
+function validarPlantilla(p: any) {
+  if (!p || typeof p !== 'object' || Array.isArray(p) || p.v !== 1) throw new BadRequestException('Estructura inválida.');
+  const cols = p.columnas;
+  if (!cols || typeof cols !== 'object' || Array.isArray(cols)) throw new BadRequestException('Estructura sin columnas.');
+  const columnas: Record<string, [number, number]> = {};
+  for (const [rol, rango] of Object.entries(cols)) {
+    if (!ROLES_PLANTILLA.includes(rol)) throw new BadRequestException(`Columna desconocida: ${rol}.`);
+    const [a, b] = Array.isArray(rango) ? rango : [];
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a >= b || a < -50 || b > 3000) {
+      throw new BadRequestException(`La columna ${rol} tiene una posición inválida.`);
+    }
+    columnas[rol] = [Math.round(a * 10) / 10, Math.round(b * 10) / 10];
+  }
+  for (const r of ['descripcion', 'cantidad', 'importe']) {
+    if (!columnas[r]) throw new BadRequestException('La estructura necesita al menos descripción, cantidad e importe.');
+  }
+  return { v: 1, columnas, codigoAbajo: p.codigoAbajo === true };
+}
+class PlantillaProveedorDto {
+  // Declarada (el ValidationPipe descarta lo que no lo está); su forma la valida `validarPlantilla`.
+  @IsObject() plantilla!: any;
+}
+
 class FormatoProveedorDto {
   /** Id de un formato del navegador ('tango-bavosi'); vacío = sin estructura. */
   @IsString() @MaxLength(40) formato!: string;
@@ -582,9 +610,10 @@ export class FacturasService {
       }).from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id)),
 
       l.proveedorId
-        ? this.db.select({ nombre: proveedores.nombre, formatoFactura: proveedores.formatoFactura })
-          .from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
-        : Promise.resolve([] as Array<{ nombre: string; formatoFactura: string }>),
+        ? this.db.select({
+          nombre: proveedores.nombre, formatoFactura: proveedores.formatoFactura, plantillaFactura: proveedores.plantillaFactura,
+        }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
+        : Promise.resolve([] as Array<{ nombre: string; formatoFactura: string; plantillaFactura: any }>),
 
       l.proveedorId && l.numero && l.tipo
         ? this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
@@ -604,6 +633,7 @@ export class FacturasService {
       proveedorNombre: prov?.nombre ?? '',
       /* Con qué receta la lee el navegador (0117): viaja acá para no pedirla aparte. */
       formatoFactura: prov?.formatoFactura ?? '',
+      plantillaFactura: prov?.plantillaFactura ?? null,
       archivos,
       duplicadoDe: dup?.id ?? null,
       ...this.semaforo(l, { comprobanteId: dup?.id ?? null, otraLectura: null }, archivos.length),
@@ -912,6 +942,8 @@ export class FacturasService {
   async resumenProveedores() {
     const r = await this.db.execute(sql`
       SELECT p.id, p.nombre, p.cuit, p.formato_factura AS formato,
+        (p.plantilla_factura IS NOT NULL) AS "tienePlantilla",
+        p.plantilla_factura AS plantilla,
         coalesce(l.pendientes, 0)::int AS pendientes,
         coalesce(l.cargadas, 0)::int AS cargadas,
         to_json(l.ultima) #>> '{}' AS ultima,
@@ -939,6 +971,20 @@ export class FacturasService {
     const [p] = await this.db.update(proveedores).set({ formatoFactura: formato })
       .where(eq(proveedores.id, proveedorId))
       .returning({ id: proveedores.id, formatoFactura: proveedores.formatoFactura });
+    if (!p) throw new NotFoundException('Ese proveedor no existe.');
+    return p;
+  }
+
+  /**
+   * Guarda la ESTRUCTURA PROPIA que armó el asistente y la deja en uso: desde
+   * ahora las facturas de este proveedor se leen con sus columnas.
+   */
+  async setPlantilla(proveedorId: number, dto: PlantillaProveedorDto) {
+    if (JSON.stringify(dto?.plantilla ?? null).length > 4000) throw new BadRequestException('Estructura demasiado grande.');
+    const plantilla = validarPlantilla(dto?.plantilla);
+    const [p] = await this.db.update(proveedores).set({ plantillaFactura: plantilla, formatoFactura: 'plantilla' })
+      .where(eq(proveedores.id, proveedorId))
+      .returning({ id: proveedores.id, formatoFactura: proveedores.formatoFactura, plantillaFactura: proveedores.plantillaFactura });
     if (!p) throw new NotFoundException('Ese proveedor no existe.');
     return p;
   }
@@ -1036,6 +1082,11 @@ export class FacturasController {
 
   @Put('proveedores/:id/formato') formato(@Param('id', ParseIntPipe) id: number, @Body() dto: FormatoProveedorDto) {
     return this.svc.setFormato(id, dto);
+  }
+
+  /** La estructura propia que armó el asistente. */
+  @Put('proveedores/:id/plantilla') plantilla(@Param('id', ParseIntPipe) id: number, @Body() dto: PlantillaProveedorDto) {
+    return this.svc.setPlantilla(id, dto);
   }
 
   /** Cuánto ocupan todavía los papeles de facturas ya cargadas, y liberarlo. */

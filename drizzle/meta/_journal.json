@@ -827,6 +827,13 @@
       "when": 1790210000000,
       "tag": "0117_formato_factura_proveedor",
       "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1790220000000,
+      "tag": "0118_plantilla_factura_proveedor",
+      "breakpoints": true
     }
   ]
 }
