@@ -820,6 +820,13 @@
       "when": 1790200000000,
       "tag": "0116_cafeteria_se_llama_coffit",
       "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1790210000000,
+      "tag": "0117_formato_factura_proveedor",
+      "breakpoints": true
     }
   ]
 }

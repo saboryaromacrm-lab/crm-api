@@ -166,6 +166,12 @@ export const proveedores = pgTable('proveedores', {
   email: text('email').notNull().default(''),
   /** Vende mercadería que entra al stock (los que ya existían: default true). */
   proveeMercaderia: boolean('provee_mercaderia').notNull().default(true),
+  /**
+   * Con qué FORMATO se leen sus facturas PDF (0117): el id de una receta del
+   * navegador ('tango-bavosi'…). Vacío = todavía no tiene estructura. Varios
+   * proveedores comparten formato cuando facturan con el mismo sistema.
+   */
+  formatoFactura: text('formato_factura').notNull().default(''),
   /** Factura gastos de la empresa (servicios, fletes, honorarios, alquiler…). */
   proveeGastos: boolean('provee_gastos').notNull().default(false),
   /**

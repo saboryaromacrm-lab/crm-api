@@ -51,8 +51,61 @@ import {
   comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
   proveedorArticulos, proveedores, sucursales, usuarios,
 } from '../db/schema';
-import { clave, extraerLineasPdf, pegarNumeros, PdfDemasiadoGrande } from './extraccion';
-import { RECETAS } from './recetas';
+import { clave } from './extraccion';
+
+/* ============================================================================
+ * LO QUE LEYÓ EL NAVEGADOR (28/9/2026)
+ * ============================================================================
+ * El PDF ya no se lee acá: lo lee la computadora de quien procesa la factura
+ * (pdf.js + la receta del formato del proveedor) y manda solo el resultado.
+ * Este servidor atiende las cajas; leer un PDF grande las frenaba. Acá queda
+ * lo liviano: reconocer los productos contra la base. Todo se valida con
+ * topes, porque viene del navegador.
+ * ==========================================================================*/
+
+class RenglonLeidoDto {
+  @IsString() @MaxLength(40) codigo!: string;
+  @IsString() @MaxLength(300) descripcion!: string;
+  @IsNumber() @Min(0) cantidad!: number;
+  @IsOptional() @IsNumber() precioUnit?: number | null;
+  @IsOptional() @IsString() @MaxLength(12) unidad?: string;
+  @IsNumber() @Min(0) dto!: number;
+  @IsNumber() importe!: number;
+}
+class PercepcionLeidaDto {
+  @IsString() @MaxLength(120) nombre!: string;
+  @IsOptional() @IsNumber() alicuota?: number | null;
+  @IsNumber() importe!: number;
+}
+class PieLeidoDto {
+  @IsOptional() @IsNumber() bruto?: number | null;
+  @IsOptional() @IsNumber() bonifPct?: number | null;
+  @IsOptional() @IsNumber() bonifImporte?: number | null;
+  @IsOptional() @IsNumber() neto?: number | null;
+  @IsOptional() @IsNumber() ivaAlicuota?: number | null;
+  @IsOptional() @IsNumber() ivaImporte?: number | null;
+  @IsArray() @ArrayMaxSize(20) @ValidateNested({ each: true }) @Type(() => PercepcionLeidaDto) percepciones!: PercepcionLeidaDto[];
+  @IsOptional() @IsNumber() total?: number | null;
+}
+class EncabezadoLeidoDto {
+  @IsOptional() @IsInt() tipoArca?: number | null;
+  @IsOptional() @IsString() @MaxLength(8) puntoVenta?: string | null;
+  @IsOptional() @IsInt() numero?: number | null;
+  @IsOptional() @IsString() @MaxLength(10) fecha?: string | null;
+  @IsOptional() @IsString() @MaxLength(20) cae?: string | null;
+  @IsOptional() @IsString() @MaxLength(10) vencimiento?: string | null;
+}
+class EmparejarDto {
+  @IsString() @MaxLength(80) receta!: string;
+  @ValidateNested() @Type(() => EncabezadoLeidoDto) encabezado!: EncabezadoLeidoDto;
+  @IsArray() @ArrayMaxSize(1000) @ValidateNested({ each: true }) @Type(() => RenglonLeidoDto) renglones!: RenglonLeidoDto[];
+  @ValidateNested() @Type(() => PieLeidoDto) pie!: PieLeidoDto;
+  @IsOptional() @IsArray() @ArrayMaxSize(30) @IsString({ each: true }) @MaxLength(400, { each: true }) avisos?: string[];
+}
+class FormatoProveedorDto {
+  /** Id de un formato del navegador ('tango-bavosi'); vacío = sin estructura. */
+  @IsString() @MaxLength(40) formato!: string;
+}
 
 /* ============================================================================
  * EL QR DE LA FACTURA (RG 4892)
@@ -427,7 +480,7 @@ export class FacturasService {
    * verdaderos: si la bandeja pregunta quince cosas por factura, el admin tipea
    * más rápido a mano.
    */
-  private semaforo(l: any, dup: { comprobanteId: number | null; otraLectura: number | null }) {
+  private semaforo(l: any, dup: { comprobanteId: number | null; otraLectura: number | null }, paginas: number | null = null) {
     const rojos: string[] = [];
     const amarillos: string[] = [];
 
@@ -440,6 +493,11 @@ export class FacturasService {
     if (!l.leido) amarillos.push('No se pudo leer el QR: el encabezado se carga a mano.');
     if (l.moneda && l.moneda !== 'PES') amarillos.push('La factura no está en pesos.');
     if (!(Number(l.total) > 0)) amarillos.push('Sin el total del papel no se puede validar que los renglones cierren.');
+    /* Volvió a la bandeja porque se anuló su comprobante, y el papel se había
+       borrado al cargarla: para leerla de nuevo hay que volver a subirlo. */
+    if (paginas === 0 && l.estado === 'pendiente') {
+      amarillos.push('El archivo se borró cuando se cargó: si hay que procesarla de nuevo, agregá la factura otra vez.');
+    }
 
     return {
       rojos,
@@ -498,7 +556,7 @@ export class FacturasService {
       duplicadoDe: f.dupComprobante ?? null,
       /* `dupLectura` NO viaja como campo propio: nadie lo leía. Lo que sí se usa
        * es el amarillo que sale de él, acá abajo. */
-      ...this.semaforo(f.l, { comprobanteId: f.dupComprobante, otraLectura: f.dupLectura }),
+      ...this.semaforo(f.l, { comprobanteId: f.dupComprobante, otraLectura: f.dupLectura }, Number(f.paginas) || 0),
     }));
   }
 
@@ -524,8 +582,9 @@ export class FacturasService {
       }).from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id)),
 
       l.proveedorId
-        ? this.db.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
-        : Promise.resolve([] as Array<{ nombre: string }>),
+        ? this.db.select({ nombre: proveedores.nombre, formatoFactura: proveedores.formatoFactura })
+          .from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
+        : Promise.resolve([] as Array<{ nombre: string; formatoFactura: string }>),
 
       l.proveedorId && l.numero && l.tipo
         ? this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
@@ -543,9 +602,11 @@ export class FacturasService {
     return {
       ...l,
       proveedorNombre: prov?.nombre ?? '',
+      /* Con qué receta la lee el navegador (0117): viaja acá para no pedirla aparte. */
+      formatoFactura: prov?.formatoFactura ?? '',
       archivos,
       duplicadoDe: dup?.id ?? null,
-      ...this.semaforo(l, { comprobanteId: dup?.id ?? null, otraLectura: null }),
+      ...this.semaforo(l, { comprobanteId: dup?.id ?? null, otraLectura: null }, archivos.length),
     };
   }
 
@@ -663,9 +724,13 @@ export class FacturasService {
       }).where(eq(facturaLecturas.id, id));
     }
 
-    await this.db.update(facturaLecturas)
-      .set({ estado: 'cargada', comprobanteId: c.id })
-      .where(eq(facturaLecturas.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.update(facturaLecturas)
+        .set({ estado: 'cargada', comprobanteId: c.id })
+        .where(eq(facturaLecturas.id, id));
+      // Cargada = el papel ya no hace falta (pedido del dueño, 28/9/2026).
+      await tx.delete(facturaArchivos).where(eq(facturaArchivos.lecturaId, id));
+    });
     return this.get(id);
   }
 
@@ -715,72 +780,15 @@ export class FacturasService {
   }
 
   /**
-   * La propuesta de carga: renglones + pie + encabezado, leídos del PDF de la
-   * lectura y matcheados contra el catálogo del proveedor. NO escribe nada —
-   * es una lectura que el alta usa para precargar, y la persona confirma.
+   * LA PROPUESTA DE CARGA a partir de lo que leyó el navegador: encabezado
+   * mapeado, renglones con su producto reconocido, y si el total cierra con el
+   * del QR. NO escribe nada — el alta la usa para precargar y la persona
+   * confirma.
    */
-  async renglonesPdf(id: number) {
+  async emparejar(id: number, leida: EmparejarDto) {
     const [l] = await this.db.select().from(facturaLecturas).where(eq(facturaLecturas.id, id)).limit(1);
     if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
-
-    const archivos = await this.db.select().from(facturaArchivos)
-      .where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id));
-    const pdf = archivos.find((a) => a.mime === 'application/pdf');
-    if (!pdf) {
-      throw new BadRequestException(
-        'Este papel no es un PDF: la lectura de renglones por ahora funciona solo con PDFs digitales. Las fotos se cargan a mano (leerlas automáticamente es la etapa de visión, en espera).',
-      );
-    }
-
-    let lineas;
-    try {
-      lineas = await extraerLineasPdf(Buffer.from(pdf.data, 'base64'));
-    } catch (e) {
-      /*
-       * Los techos del extractor (páginas y fragmentos) llegan como este error.
-       * Se traduce a 400 con el motivo: es un archivo que no sirve, no una falla
-       * del sistema, y quien lo subió tiene que poder entender qué hacer.
-       */
-      if (e instanceof PdfDemasiadoGrande) throw new BadRequestException(e.message);
-      throw e;
-    }
-    const totalFrags = lineas.reduce((a, x) => a + x.frags.length, 0);
-    /*
-     * El texto crudo viaja en la respuesta para poder armar la receta de un
-     * proveedor nuevo mirándolo. Va RECORTADO: los techos del extractor ya
-     * evitan lo grave (que el servidor se cuelgue), pero mandar megabytes de
-     * texto al navegador no le sirve a nadie — la receta se arma con la primera
-     * pantalla.
-     */
-    const MAX_TEXTO = 200_000;
-    const crudo = lineas.map((x) => `[p${x.pagina}] ${pegarNumeros(x.texto)}`).join('\n');
-    const texto = crudo.length > MAX_TEXTO
-      ? `${crudo.slice(0, MAX_TEXTO)}\n… (recortado: el PDF tiene ${crudo.length} caracteres de texto)`
-      : crudo;
-    if (totalFrags < 15) {
-      return {
-        receta: null, cierra: false, encabezado: null, renglones: [], pie: null, texto,
-        avisos: ['El PDF no tiene capa de texto: es un escaneo o una foto convertida. Para estos el camino es la carga a mano (o el modelo de visión, cuando se decida).'],
-      };
-    }
-
-    // La receta se elige por CUIT del emisor: del QR si se leyó, del padrón si no.
-    let cuit = soloDigitos(l.cuit);
-    if (!cuit && l.proveedorId) {
-      const [p] = await this.db.select({ cuit: proveedores.cuit }).from(proveedores)
-        .where(eq(proveedores.id, l.proveedorId)).limit(1);
-      cuit = soloDigitos(p?.cuit);
-    }
-    const receta = cuit ? RECETAS[cuit] : undefined;
-    if (!receta) {
-      return {
-        receta: null, cierra: false, encabezado: null, renglones: [], pie: null, texto,
-        avisos: [`Todavía no hay receta de lectura para este proveedor${cuit ? ` (CUIT ${cuit})` : ''}. El texto del PDF se extrajo igual — con una factura real se arma la receta.`],
-      };
-    }
-
-    const leida = receta.leer(lineas);
-    const avisos = [...leida.avisos];
+    const avisos = [...(leida.avisos ?? [])];
 
     /* El encabezado del papel, mapeado al vocabulario del sistema. */
     const mapeo = leida.encabezado.tipoArca != null ? TIPOS_ARCA[leida.encabezado.tipoArca] : undefined;
@@ -788,43 +796,43 @@ export class FacturasService {
       tipo: mapeo?.tipo ?? null,
       letra: mapeo?.letra ?? null,
       puntoVenta: leida.encabezado.puntoVenta ? normalizarPuntoVenta(leida.encabezado.puntoVenta) : null,
-      numero: leida.encabezado.numero,
-      fecha: leida.encabezado.fecha,
-      cae: leida.encabezado.cae,
-      vencimiento: leida.encabezado.vencimiento,
+      numero: leida.encabezado.numero ?? null,
+      fecha: leida.encabezado.fecha ?? null,
+      cae: leida.encabezado.cae ?? null,
+      vencimiento: leida.encabezado.vencimiento ?? null,
     };
 
-    /* Matcheo contra el catálogo DEL PROVEEDOR: ahí están los nombres limpios. */
-    const catalogo = l.proveedorId
-      ? await this.db.select({
-        id: productos.id, nombre: productos.nombre, iva: productos.iva,
-        porBulto: productoProveedores.cantidad,
-        codigoProveedor: productoProveedores.codigoProveedor,
-      }).from(productoProveedores)
-        .innerJoin(productos, eq(productos.id, productoProveedores.productoId))
-        .where(eq(productoProveedores.proveedorId, l.proveedorId))
-      : [];
-    if (!catalogo.length) avisos.push('La lectura no tiene proveedor asignado (o el proveedor no tiene catálogo): los renglones van sin producto.');
-
     /*
-     * TRES NIVELES para reconocer el producto, del más confiable al menos:
+     * Matcheo contra el catálogo DEL PROVEEDOR (ahí están los nombres limpios) y
+     * contra lo APRENDIDO de facturas anteriores. Las dos consultas son
+     * independientes: van juntas.
      *
+     * TRES NIVELES para reconocer el producto, del más confiable al menos:
      *   1. `aprendido` — el mapeo (proveedor, código del papel) → producto que
      *      quedó guardado la última vez que una persona CONFIRMÓ una factura.
      *   2. `catalogo` — el código de proveedor cargado en el formato de compra.
-     *      Vino del sistema viejo y tiene corrimientos (la factura real dice
-     *      10206 donde el catálogo dice 10200), por eso no alcanza solo.
+     *      Vino del sistema viejo y tiene corrimientos, por eso no alcanza solo.
      *   3. `parecido` — similitud de nombres. Solo para el arranque en frío:
      *      en cuanto la factura se guarda, el renglón pasa al nivel 1.
      */
-    const aprendidos = l.proveedorId
-      ? await this.db.select({
-        codigo: proveedorArticulos.codigo, productoId: proveedorArticulos.productoId,
-        nombre: productos.nombre, iva: productos.iva,
-      }).from(proveedorArticulos)
-        .innerJoin(productos, eq(productos.id, proveedorArticulos.productoId))
-        .where(eq(proveedorArticulos.proveedorId, l.proveedorId))
-      : [];
+    const [catalogo, aprendidos] = l.proveedorId
+      ? await Promise.all([
+        this.db.select({
+          id: productos.id, nombre: productos.nombre, iva: productos.iva,
+          porBulto: productoProveedores.cantidad,
+          codigoProveedor: productoProveedores.codigoProveedor,
+        }).from(productoProveedores)
+          .innerJoin(productos, eq(productos.id, productoProveedores.productoId))
+          .where(eq(productoProveedores.proveedorId, l.proveedorId)),
+        this.db.select({
+          codigo: proveedorArticulos.codigo, productoId: proveedorArticulos.productoId,
+          nombre: productos.nombre, iva: productos.iva,
+        }).from(proveedorArticulos)
+          .innerJoin(productos, eq(productos.id, proveedorArticulos.productoId))
+          .where(eq(proveedorArticulos.proveedorId, l.proveedorId)),
+      ])
+      : [[], []];
+    if (!catalogo.length) avisos.push('La lectura no tiene proveedor asignado (o el proveedor no tiene catálogo): los renglones van sin producto.');
     const porAprendido = new Map(aprendidos.map((a) => [a.codigo, a]));
     const porCatalogo = new Map<string, (typeof catalogo)[number]>();
     for (const p of catalogo) {
@@ -832,7 +840,7 @@ export class FacturasService {
       if (cod && !porCatalogo.has(cod)) porCatalogo.set(cod, p);
     }
 
-    const ivaFactura = leida.pie.ivaAlicuota ?? 21;
+    const ivaFactura = leida.pie?.ivaAlicuota ?? 21;
     const renglones = leida.renglones.map((ren) => {
       let productoId: number | null = null;
       let productoNombre: string | null = null;
@@ -882,13 +890,85 @@ export class FacturasService {
     }
 
     /* El checksum de siempre: el total reconstruido contra el de la lectura. */
-    const cierra = Number(l.total) > 0 && leida.pie.total != null
-      && Math.abs(leida.pie.total - Number(l.total)) <= 0.05;
-    if (Number(l.total) > 0 && leida.pie.total != null && !cierra) {
-      avisos.push(`El total leído del PDF (${leida.pie.total.toFixed(2)}) no coincide con el total de la lectura (${Number(l.total).toFixed(2)}).`);
+    const totalPapel = leida.pie?.total ?? null;
+    const cierra = Number(l.total) > 0 && totalPapel != null
+      && Math.abs(totalPapel - Number(l.total)) <= 0.05;
+    if (Number(l.total) > 0 && totalPapel != null && !cierra) {
+      avisos.push(`El total leído del PDF (${totalPapel.toFixed(2)}) no coincide con el total de la lectura (${Number(l.total).toFixed(2)}).`);
     }
 
-    return { receta: receta.nombre, cierra, encabezado, renglones, pie: leida.pie, avisos, texto };
+    return { receta: leida.receta, cierra, encabezado, renglones, pie: leida.pie, avisos };
+  }
+
+  /* ====================================================================
+   * PROVEEDORES: la guía de cuáles ya tienen estructura (28/9/2026)
+   * ==================================================================== */
+
+  /**
+   * Una fila por proveedor de mercadería: su formato de lectura, cuántas
+   * facturas esperan, cuántas se cargaron, cuándo fue la última y cuántos
+   * artículos suyos ya se reconocen solos. Todo en UNA consulta.
+   */
+  async resumenProveedores() {
+    const r = await this.db.execute(sql`
+      SELECT p.id, p.nombre, p.cuit, p.formato_factura AS formato,
+        coalesce(l.pendientes, 0)::int AS pendientes,
+        coalesce(l.cargadas, 0)::int AS cargadas,
+        to_json(l.ultima) #>> '{}' AS ultima,
+        coalesce(a.aprendidos, 0)::int AS aprendidos
+      FROM proveedores p
+      LEFT JOIN (
+        SELECT proveedor_id,
+          count(*) FILTER (WHERE estado = 'pendiente') AS pendientes,
+          count(*) FILTER (WHERE estado = 'cargada') AS cargadas,
+          max(subido_en) AS ultima
+        FROM factura_lecturas WHERE proveedor_id IS NOT NULL GROUP BY proveedor_id
+      ) l ON l.proveedor_id = p.id
+      LEFT JOIN (
+        SELECT proveedor_id, count(*) AS aprendidos FROM proveedor_articulos GROUP BY proveedor_id
+      ) a ON a.proveedor_id = p.id
+      WHERE p.provee_mercaderia
+      ORDER BY p.nombre
+    `);
+    return r.rows;
+  }
+
+  async setFormato(proveedorId: number, dto: FormatoProveedorDto) {
+    const formato = dto.formato.trim();
+    if (formato && !/^[a-z0-9-]{1,40}$/.test(formato)) throw new BadRequestException('Formato inválido.');
+    const [p] = await this.db.update(proveedores).set({ formatoFactura: formato })
+      .where(eq(proveedores.id, proveedorId))
+      .returning({ id: proveedores.id, formatoFactura: proveedores.formatoFactura });
+    if (!p) throw new NotFoundException('Ese proveedor no existe.');
+    return p;
+  }
+
+  /* ====================================================================
+   * EL PAPEL NO SE GUARDA UNA VEZ CARGADO (28/9/2026, pedido del dueño)
+   * ====================================================================
+   * La factura ya queda en el sistema como comprobante: guardar además el
+   * archivo solo engorda la base y los respaldos. Al cargarla se borra (ver
+   * `comprobantes.module` y `vincular`); lo que ya estaba guardado de antes
+   * se libera desde acá, a pedido y con confirmación en pantalla.
+   */
+  async espacioCargadas() {
+    const r = await this.db.execute(sql`
+      SELECT count(*)::int AS archivos, coalesce(sum(length(a.data)), 0)::bigint AS base64
+      FROM factura_archivos a JOIN factura_lecturas l ON l.id = a.lectura_id
+      WHERE l.estado = 'cargada'
+    `);
+    const f: any = r.rows[0] ?? {};
+    // El base64 ocupa 4/3 del archivo real.
+    return { archivos: Number(f.archivos) || 0, bytes: Math.round((Number(f.base64) || 0) * 0.75) };
+  }
+
+  async liberarCargadas() {
+    const antes = await this.espacioCargadas();
+    await this.db.execute(sql`
+      DELETE FROM factura_archivos a USING factura_lecturas l
+      WHERE l.id = a.lectura_id AND l.estado = 'cargada'
+    `);
+    return { ok: true, borrados: antes.archivos, bytes: antes.bytes };
   }
 
   /** Los papeles de un comprobante ya cargado, para el botón "Ver la factura". */
@@ -944,9 +1024,27 @@ export class FacturasController {
     return this.svc.get(id);
   }
 
-  /** La propuesta de carga leída del PDF: renglones + pie + encabezado. Solo lee. */
-  @Get('lecturas/:id/renglones') renglonesPdf(@Param('id', ParseIntPipe) id: number) {
-    return this.svc.renglonesPdf(id);
+  /** Lo que leyó el navegador del PDF, con los productos reconocidos. Solo lee. */
+  @Post('lecturas/:id/emparejar') emparejar(@Param('id', ParseIntPipe) id: number, @Body() dto: EmparejarDto) {
+    return this.svc.emparejar(id, dto);
+  }
+
+  /** La guía: cada proveedor con su formato de lectura y cuánto se procesó. */
+  @Get('proveedores') proveedores() {
+    return this.svc.resumenProveedores();
+  }
+
+  @Put('proveedores/:id/formato') formato(@Param('id', ParseIntPipe) id: number, @Body() dto: FormatoProveedorDto) {
+    return this.svc.setFormato(id, dto);
+  }
+
+  /** Cuánto ocupan todavía los papeles de facturas ya cargadas, y liberarlo. */
+  @Get('espacio') espacio() {
+    return this.svc.espacioCargadas();
+  }
+
+  @Post('liberar') liberar() {
+    return this.svc.liberarCargadas();
   }
 
   @Post('lecturas') subir(@Body() dto: SubirLecturaDto) {

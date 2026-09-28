@@ -1376,9 +1376,13 @@ export class ComprobantesService {
        * un módulo entero para esto ataba dos servicios sin necesidad.
        */
       if (dto.lecturaId) {
-        await tx.update(facturaLecturas)
+        const cerrada = await tx.update(facturaLecturas)
           .set({ estado: 'cargada', comprobanteId: c.id })
-          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')));
+          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')))
+          .returning({ id: facturaLecturas.id });
+        // Cargada = el papel ya no hace falta (pedido del dueño, 28/9/2026): se
+        // borra en la misma transacción, así si el alta se cae el papel queda.
+        if (cerrada.length) await tx.delete(facturaArchivos).where(eq(facturaArchivos.lecturaId, dto.lecturaId));
       }
       return c.id;
     });
@@ -1682,7 +1686,7 @@ export class ComprobantesService {
     if (distinto.length) {
       throw new BadRequestException(
         `Lo cargado no coincide con el papel de la bandeja: ${distinto.join('; ')}. `
-        + 'Revisá los renglones, la bonificación y las percepciones, o corregí el papel en "Por procesar".',
+        + 'Revisá los renglones, la bonificación y las percepciones, o corregí el papel en Procesamiento de facturas.',
       );
     }
   }
@@ -2167,9 +2171,11 @@ export class ComprobantesService {
 
       // Y el papel de la bandeja que esta factura cierra, si vino de ahí.
       if (dto.lecturaId) {
-        await tx.update(facturaLecturas)
+        const cerrada = await tx.update(facturaLecturas)
           .set({ estado: 'cargada', comprobanteId: id })
-          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')));
+          .where(and(eq(facturaLecturas.id, dto.lecturaId), eq(facturaLecturas.estado, 'pendiente')))
+          .returning({ id: facturaLecturas.id });
+        if (cerrada.length) await tx.delete(facturaArchivos).where(eq(facturaArchivos.lecturaId, dto.lecturaId));
       }
     });
 
