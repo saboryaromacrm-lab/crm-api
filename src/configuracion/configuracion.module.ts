@@ -34,6 +34,16 @@ export const VENTAS_DEFAULTS = {
   arcaHabilitado: false as boolean,
   // Condición fiscal PROPIA: junto con la del cliente define la letra (A/B/C).
   condicionIvaEmpresa: 'responsable_inscripto' as string,
+  /**
+   * TOPE PARA FACTURAR SIN IDENTIFICAR AL COMPRADOR (28/9/2026). Por encima de
+   * este total, ARCA exige el DNI o el CUIT del consumidor final en la Factura
+   * B y RECHAZA la que no lo trae. Con la facturación electrónica prendida, la
+   * venta se frena ANTES de cobrar pidiendo que se identifique al cliente, en
+   * vez de salir como un provisorio que después no se puede facturar.
+   * ARCA lo actualiza seguido: el valor vigente lo confirma el contador.
+   * 0 = sin control.
+   */
+  topeSinIdentificar: 10_000_000 as number,
 
   /* Precios y descuentos ----------------------------------------------- */
   /**
@@ -163,6 +173,9 @@ export const EMPRESA_DEFAULTS = {
   telefono: '' as string,
   logo: '' as string,
   colorMarca: '#166534' as string,   // acentos en documentos A4 (los rollos son B/N)
+  /* Datos que la factura electrónica tiene que llevar impresos (28/9/2026). */
+  ingresosBrutos: '' as string,      // N° de inscripción (o "Convenio Multilateral …")
+  inicioActividades: '' as string,   // AAAA-MM-DD
 };
 
 /**
@@ -425,6 +438,7 @@ const REGLAS: Record<string, {
   'ventas.montoMinimoMayorista': { min: 0, max: 100_000_000 },
   'ventas.montoMinimoCamioneta': { min: 0, max: 100_000_000 },
   'ventas.listaBaseId': { min: 0, max: 1_000_000, entero: true },
+  'ventas.topeSinIdentificar': { min: 0, max: 10_000_000_000 },
   'ventas.modalidadMontoId': { min: 0, max: 1_000_000, entero: true },
   /* El punto de venta se normaliza con la MISMA función que usan comprobantes
    * y facturas — era el único de los cuatro lugares que no la usaba. No es
@@ -433,6 +447,8 @@ const REGLAS: Record<string, {
   'ventas.puntoVenta': { texto: normalizarPuntoVenta },
   'empresa.cuit': { texto: cuitNormalizado },
   'empresa.colorMarca': { texto: colorNormalizado },
+  'empresa.inicioActividades': { texto: fechaIsoONada },
+  'empresa.ingresosBrutos': { texto: (v: string) => String(v ?? '').trim().slice(0, 60) },
 };
 
 /**
@@ -448,6 +464,14 @@ function cuitNormalizado(v: string): string {
 }
 
 /** Un color de verdad o el de la marca: entra en un `<style>` del impreso. */
+/** 'AAAA-MM-DD' válida, o vacío: una fecha mal tipeada no llega impresa a la factura. */
+function fechaIsoONada(v: string): string {
+  const t = String(v ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return '';
+  const d = new Date(`${t}T12:00:00Z`);
+  return Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== t ? '' : t;
+}
+
 function colorNormalizado(v: string): string {
   return /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(String(v ?? '').trim()) ? String(v).trim() : '#166534';
 }

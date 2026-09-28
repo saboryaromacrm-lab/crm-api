@@ -83,6 +83,8 @@ export interface PedidoEmision {
    */
   ptoVta?: number | null;
   fecha?: Date;
+  /** Tope de total para la B/C sin identificar al comprador (config de ventas). 0 = sin control. */
+  topeSinIdentificar?: number;
   /** Notas de crédito/débito: el comprobante que ajustan. */
   asociado?: { tipo: string; ptoVta: string; numero: number };
   /**
@@ -208,7 +210,7 @@ export class ArcaService implements OnApplicationBootstrap {
      * no tiene sentido hacer esperar a nadie, y el mensaje es de datos. */
     let receptor;
     try {
-      receptor = armarReceptor(letra, p.receptor, p.total, 0);
+      receptor = armarReceptor(letra, p.receptor, p.total, Number(p.topeSinIdentificar) || 0);
     } catch (e) {
       return { ok: false, motivo: (e as Error).message, reintentable: false };
     }

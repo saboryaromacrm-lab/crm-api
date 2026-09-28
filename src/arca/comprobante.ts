@@ -160,6 +160,23 @@ export interface ReceptorArca {
  *    documento. El tope lo mueven por resolución, así que vive en la
  *    configuración y no clavado acá.
  */
+/**
+ * ¿Esta venta necesita identificar al comprador y no lo tiene? Solo en B/C
+ * (la A ya exige CUIT siempre), con un tope > 0 y un total que lo supera.
+ * La usan la VENTA —para frenar antes de cobrar— y `armarReceptor`, que es la
+ * última red antes de ARCA: una sola regla en los dos lugares.
+ */
+export function faltaIdentificar(
+  letra: 'A' | 'B' | 'C',
+  receptor: Pick<Receptor, 'tipoDoc' | 'numeroDoc'>,
+  total: number,
+  tope: number,
+): boolean {
+  if (letra === 'A' || !(tope > 0) || !(total > tope)) return false;
+  const digitos = String(receptor.numeroDoc ?? '').replace(/\D/g, '');
+  return !(digitos.length > 0 && receptor.tipoDoc !== 'sin_identificar');
+}
+
 export function armarReceptor(
   letra: 'A' | 'B' | 'C',
   receptor: Receptor,
@@ -181,7 +198,7 @@ export function armarReceptor(
 
   const identificado = digitos.length > 0 && receptor.tipoDoc !== 'sin_identificar';
   if (!identificado) {
-    if (topeSinIdentificar > 0 && total > topeSinIdentificar) {
+    if (faltaIdentificar(letra, receptor, total, topeSinIdentificar)) {
       throw new Error(
         `Una venta de $${total.toFixed(2)} supera el tope para facturar sin identificar `
         + `($${topeSinIdentificar.toFixed(2)}): pedile el DNI o el CUIT al cliente y cargalo en su ficha.`,

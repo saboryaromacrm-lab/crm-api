@@ -49,6 +49,7 @@ import { costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, 
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
+import { faltaIdentificar } from '../arca/comprobante';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
 
@@ -2581,6 +2582,24 @@ export class VentasService {
     if (!config.arcaHabilitado) return { ...vacio, tipo: letra };
 
     /*
+     * EL COMPRADOR SIN IDENTIFICAR, POR ENCIMA DEL TOPE (28/9/2026). ARCA
+     * rechaza esa Factura B, y rechazada no es "caída": el provisorio que
+     * quedaba no se podía facturar después sin cambiar el cliente. Acá se frena
+     * ANTES de cobrar y de tocar stock (este paso corre antes de la
+     * transacción en los tres caminos: caja, venta directa y reintento), con
+     * el ticket intacto para elegir el cliente y volver a cobrar.
+     */
+    const tope = Number(config.topeSinIdentificar) || 0;
+    const letraFiscal = letra === 'factura_a' ? 'A' : letra === 'factura_c' ? 'C' : 'B';
+    if (faltaIdentificar(letraFiscal, cliente, venta.total, tope)) {
+      throw new BadRequestException(
+        `Esta venta de $${Number(venta.total).toLocaleString('es-AR', { minimumFractionDigits: 2 })} supera el tope de `
+        + `$${tope.toLocaleString('es-AR')} para facturar sin identificar al comprador: ARCA la rechazaría. `
+        + 'Elegí el cliente (o cargalo) con su DNI o CUIT y volvé a cobrar.',
+      );
+    }
+
+    /*
      * Prendido pero sin poder: NO se emite una factura sin CAE haciéndose la
      * distraída. Sale el ticket provisorio y el motivo dice exactamente qué
      * falta (`motivoNoDisponible` recorre las cinco causas). Es además el modo
@@ -2608,6 +2627,7 @@ export class VentasService {
       total: venta.total,
       ptoVta: opciones.ptoVta ?? null,
       fecha: venta.fecha,
+      topeSinIdentificar: tope,
       reservado: opciones.reservado ?? null,
       reservar: opciones.reservar,
     });
