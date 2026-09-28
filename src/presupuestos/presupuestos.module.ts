@@ -184,7 +184,7 @@ export class PresupuestosService {
       .where(and(inArray(productos.id, ids), eq(productos.soloCafeteria, true))).limit(1);
     if (p) {
       throw new BadRequestException(
-        `${p.nombre} es de uso exclusivo de la Cafetería: no se vende en el mostrador y no se puede presupuestar. `
+        `${p.nombre} es de uso exclusivo de Coffit: no se vende en el mostrador y no se puede presupuestar. `
         + 'Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
       );
     }

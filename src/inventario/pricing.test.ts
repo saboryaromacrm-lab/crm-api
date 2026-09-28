@@ -151,7 +151,7 @@ test('formatoActivo: el marcado para precio, si no el primero', () => {
   assert.equal(formatoActivo([f7, f3]), f3);
 });
 
-test('formatoDeCosto: lo que elabora la cafetería cuesta lo que ella declaró', () => {
+test('formatoDeCosto: lo que elabora Coffit cuesta lo que ella declaró', () => {
   const prov = { id: 1, usarParaPrecio: true, costo: 1000, descuento: 0, flete: 0 };
   // Producto comprado: el formato de compra, como siempre.
   assert.equal(formatoDeCosto({ origenCafeteria: false }, [prov]), prov);

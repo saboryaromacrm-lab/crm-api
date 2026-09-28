@@ -813,6 +813,13 @@
       "when": 1790190000000,
       "tag": "0115_nc_gasto_referencia",
       "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1790200000000,
+      "tag": "0116_cafeteria_se_llama_coffit",
+      "breakpoints": true
     }
   ]
 }

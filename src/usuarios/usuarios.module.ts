@@ -159,7 +159,7 @@ export const CATALOGO_PERMISOS = [
        * vencidos (pérdida real + baja de stock), ofertas por vencer y mermas.
        */
       { clave: 'almacen.vencimientos', nombre: 'Vencimientos (control de fechas)' },
-      { clave: 'almacen.cafeteria', nombre: 'Cafetería (envíos a coffit)' },
+      { clave: 'almacen.cafeteria', nombre: 'Coffit (envíos)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
        * única sección del rol Cafetería — sin ninguna otra clave, ese usuario
@@ -169,8 +169,8 @@ export const CATALOGO_PERMISOS = [
        * es el café pidiendo, no la distribuidora mandando. Para mandar sin
        * pedido detrás está "+ Nuevo envío" en `almacen.cafeteria`.
        */
-      { clave: 'almacen.cafeteria-pedidos', nombre: 'Pedido a la distribuidora (SOLO para el rol Cafetería)' },
-      { clave: 'almacen.cafeteria-entradas', nombre: 'Envíos DE la cafetería a las sucursales (rol Cafetería)' },
+      { clave: 'almacen.cafeteria-pedidos', nombre: 'Pedido a la distribuidora (SOLO para el rol Coffit)' },
+      { clave: 'almacen.cafeteria-entradas', nombre: 'Envíos DE Coffit a las sucursales (rol Coffit)' },
     ],
     acciones: [
       { clave: 'pedidos', nombre: 'Pedir y recibir mercadería' },

@@ -407,8 +407,8 @@ export class CafeteriaService {
     for (const { prod } of val.values()) {
       if (!prod.origenCafeteria) {
         throw new BadRequestException(
-          `${prod.nombre} no es un producto de la cafetería. `
-          + 'Marcalo como "Lo elabora la cafetería" en su ficha, o sacalo del envío.',
+          `${prod.nombre} no es un producto de Coffit. `
+          + 'Marcalo como "Lo elabora Coffit" en su ficha, o sacalo del envío.',
         );
       }
     }
@@ -416,7 +416,7 @@ export class CafeteriaService {
       if (it.costoUnitario == null) {
         const { prod } = val.get(`${it.productoId}-${it.presentacionId ?? 0}`)!;
         throw new BadRequestException(
-          `Falta el costo de ${prod.nombre}. En una entrada lo declara la cafetería: sin él, ese producto quedaría con rentabilidad inventada.`,
+          `Falta el costo de ${prod.nombre}. En una entrada lo declara Coffit: sin él, ese producto quedaría con rentabilidad inventada.`,
         );
       }
     }
@@ -481,7 +481,7 @@ export class CafeteriaService {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
     if (!p.origenCafeteria) {
-      throw new ForbiddenException('Ese producto no es de la cafetería: se edita desde Compras › Productos.');
+      throw new ForbiddenException('Ese producto no es de Coffit: se edita desde Compras › Productos.');
     }
     return p;
   }
@@ -816,7 +816,7 @@ export class CafeteriaService {
    */
   private verSentido(sentido: string, soloSentido?: 'entrada' | null) {
     if (soloSentido && sentido !== soloSentido) {
-      throw new ForbiddenException('Desde Cafetería solo se cargan los envíos que salen de la cafetería.');
+      throw new ForbiddenException('Desde Coffit solo se cargan los envíos que salen de Coffit.');
     }
   }
 
@@ -831,7 +831,7 @@ export class CafeteriaService {
     /* Un pedido es la demanda de la cafetería HACIA la distribuidora: el camino
      * de vuelta no tiene nada que cerrar. */
     if (entrada && o.pedidoId) {
-      throw new BadRequestException('Un envío de la cafetería no cumple pedidos: los pedidos son lo que ella pide.');
+      throw new BadRequestException('Un envío de Coffit no cumple pedidos: los pedidos son lo que ella pide.');
     }
 
     const id = await this.db.transaction(async (tx) => {
@@ -947,7 +947,7 @@ export class CafeteriaService {
       if (!entrada) {
         await this.moverStock(tx, {
           sentido, accion: 'aplicar', sucursalId: sucId, usuarioId: o.usuarioId, filas,
-          descripcion: `${codigo}: enviado a Cafetería`,
+          descripcion: `${codigo}: enviado a Coffit`,
         });
       }
       return envio.id;
@@ -1173,7 +1173,7 @@ export class CafeteriaService {
         await this.moverStock(tx, {
           sentido: envio.sentido, accion: 'revertir',
           sucursalId: envio.sucursalId, usuarioId: o.usuarioId, filas: items,
-          descripcion: `${envio.codigo}: envío a Cafetería ANULADO — reingreso completo`,
+          descripcion: `${envio.codigo}: envío a Coffit ANULADO — reingreso completo`,
         });
       }
       await tx.update(enviosCafeteria).set({
@@ -1198,7 +1198,7 @@ export class CafeteriaService {
     }
     const esCafe = tienePermiso(permisos, ['almacen.cafeteria-entradas']) && !tienePermiso(permisos, ['almacen.cafeteria']);
     if (envio.sentido === 'salida') {
-      if (!esCafe) throw new ForbiddenException('Este envío lo recibe la cafetería: lo controla y lo marca ella.');
+      if (!esCafe) throw new ForbiddenException('Este envío lo recibe Coffit: lo controla y lo marca ella.');
       return;
     }
     if (esCafe) throw new ForbiddenException('Lo que mandaste lo controla y lo recibe la sucursal a la que llega.');
@@ -1242,7 +1242,7 @@ export class CafeteriaService {
       const [suc] = await tx.select({ nombre: sucursales.nombre }).from(sucursales)
         .where(eq(sucursales.id, envio.sucursalId)).limit(1);
       const entrada = envio.sentido === 'entrada';
-      const ruta = entrada ? `Cafetería → ${suc?.nombre ?? 'sucursal'}` : `${suc?.nombre ?? 'Distribuidora'} → Cafetería`;
+      const ruta = entrada ? `Coffit → ${suc?.nombre ?? 'sucursal'}` : `${suc?.nombre ?? 'Distribuidora'} → Coffit`;
       const entran: any[] = [];
       let hayDiferencias = false;
 
@@ -1279,7 +1279,7 @@ export class CafeteriaService {
       if (entrada && entran.length) {
         await this.moverStock(tx, {
           sentido: 'entrada', accion: 'aplicar', sucursalId: envio.sucursalId, usuarioId: sesion?.usuarioId ?? null,
-          filas: entran, descripcion: `${envio.codigo}: recibido de Cafetería (controlado)`,
+          filas: entran, descripcion: `${envio.codigo}: recibido de Coffit (controlado)`,
         });
       }
       await tx.update(enviosCafeteria).set({

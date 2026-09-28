@@ -2966,8 +2966,8 @@ export class VentasService {
     const deCafeteria = filas.find((f) => f.soloCafeteria);
     if (deCafeteria) {
       throw new BadRequestException(
-        `${deCafeteria.nombre} es de uso exclusivo de la Cafetería: no se vende en el mostrador. `
-        + 'Sale por el envío de Almacén › Cafetería. Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
+        `${deCafeteria.nombre} es de uso exclusivo de Coffit: no se vende en el mostrador. `
+        + 'Sale por el envío de Almacén › Coffit. Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
       );
     }
   }

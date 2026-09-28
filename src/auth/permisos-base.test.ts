@@ -19,7 +19,7 @@ test('la base trae lo que el dueño pidió: vencimientos completo y envíos al c
   }
 });
 
-test('un rol pelado igual entra a Vencimientos y a Cafetería', () => {
+test('un rol pelado igual entra a Vencimientos y a Coffit', () => {
   const p = conPermisosBase([], 'cajero');
   for (const clave of IMPRESCINDIBLES) assert.ok(p.includes(clave), `al cajero le falta ${clave}`);
 });
@@ -34,7 +34,7 @@ test('el superadmin vuelve intacto: el comodín ya puede todo', () => {
   assert.deepEqual(conPermisosBase(['*'], 'superadmin'), ['*']);
 });
 
-test('el rol Cafetería NO puede despacharse mercadería a sí mismo', () => {
+test('el rol Coffit NO puede despacharse mercadería a sí mismo', () => {
   const p = conPermisosBase(['almacen.cafeteria-pedidos'], 'cafeteria');
   assert.deepEqual(p, ['almacen.cafeteria-pedidos'], 'coffit no debe recibir la base');
   assert.ok(!p.includes('almacen.cafeteria'), 'coffit no puede despachar del depósito');

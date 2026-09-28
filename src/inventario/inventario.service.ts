@@ -39,7 +39,7 @@ const TIPOS_MOV: Record<string, { label: string; dir: number }> = {
   vencido: { label: 'Producto vencido', dir: -1 },
   defectuoso: { label: 'Producto defectuoso', dir: -1 },
   transferencia: { label: 'Transferencia', dir: 0 },
-  envio_cafeteria: { label: 'Envío a Cafetería', dir: -1 },
+  envio_cafeteria: { label: 'Envío a Coffit', dir: -1 },
 };
 
 /** Fraccionado (0102): la mañana va hasta las 14; de ahí en adelante, la tarde. */
@@ -2582,7 +2582,7 @@ export class InventarioService {
       corregido: 'No había salido: se corrigió el envío.',
       perdida: 'Se perdió o se rompió en el camino.',
     };
-    if (!TEXTO[resolucion]) throw new BadRequestException('Resolución inválida para un faltante de envío de Cafetería.');
+    if (!TEXTO[resolucion]) throw new BadRequestException('Resolución inválida para un faltante de envío de Coffit.');
     await tx.update(incidencias).set({
       resolucion, fechaResolucion: new Date(), activa: false,
       motivo: `${inc.motivo} · ${TEXTO[resolucion]}`,

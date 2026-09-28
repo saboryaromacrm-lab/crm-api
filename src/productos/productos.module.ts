@@ -623,8 +623,8 @@ export class ProductosService {
     const origenCafeteria = dto.origenCafeteria ?? previo?.origenCafeteria ?? false;
     if (soloCafeteria && origenCafeteria) {
       throw new BadRequestException(
-        'Un producto no puede ser las dos cosas: "uso exclusivo de Cafetería" es lo que ella consume '
-        + 'y "lo elabora la cafetería" es lo que ella produce. Dejá una sola marca.',
+        'Un producto no puede ser las dos cosas: "uso exclusivo de Coffit" es lo que ella consume '
+        + 'y "lo elabora Coffit" es lo que ella produce. Dejá una sola marca.',
       );
     }
     return {
@@ -1339,8 +1339,8 @@ export class ProductosService {
     if (transf) lista.push(`${transf} transferencia(s)`);
     if (incid) lista.push(`${incid} incidencia(s)`);
     if (vencs) lista.push(`${vencs} registro(s) de vencimiento`);
-    if (enviosCafe) lista.push(`${enviosCafe} envío(s) a la cafetería`);
-    if (pedidosCafe) lista.push(`${pedidosCafe} pedido(s) de la cafetería`);
+    if (enviosCafe) lista.push(`${enviosCafe} envío(s) a Coffit`);
+    if (pedidosCafe) lista.push(`${pedidosCafe} pedido(s) de Coffit`);
     if (movs) lista.push(`${movs} movimiento(s) de stock`);
     return lista;
   }
