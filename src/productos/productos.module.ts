@@ -1080,6 +1080,15 @@ export class ProductosService {
         saltados.push({ codigo, nombre: prod.nombre, motivo: 'está archivado — reactivalo antes de cargarle un costo' });
         continue;
       }
+      /* COSTO EN CERO NO PISA (28/9/2026): un renglón del archivo con costo $0
+       * reemplazaba el costo real del formato por cero, y con él el precio de
+       * góndola si va por margen. La pantalla ya no lo manda; esto es lo que
+       * se acepta. */
+      const costoIt = it.modoCosto === 'final' ? Number(it.costoFinal) : Number(it.costo);
+      if (!(costoIt > 0)) {
+        saltados.push({ codigo, nombre: prod.nombre, motivo: 'el archivo trae costo $0 — no se pisa el costo que tiene' });
+        continue;
+      }
       vistos.add(codigo);
       const formatoId = formatoDe.get(prod.id);
       if (formatoId) {
