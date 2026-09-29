@@ -93,7 +93,7 @@ const TABLAS_PRACTICA = [
   'coffit_movimientos', 'coffit_cierres',
   // métricas (0122): son resúmenes de las ventas; vaciadas, se rearman solas
   'metricas_venta_prod_dia', 'metricas_venta_dia', 'metricas_venta_hora', 'metricas_venta_cliente_dia',
-  'metricas_venta_pago_dia', 'metricas_compra_prov_dia', 'metricas_estado',
+  'metricas_venta_pago_dia', 'metricas_compra_prov_dia', 'metricas_venta_mezcla_dia', 'metricas_estado',
   // tienda: eventos (las fotos quedan)
   'web_eventos',
   // el rastro de la práctica; el primer registro de la era nueva es la limpieza

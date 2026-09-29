@@ -37,8 +37,11 @@ import { hoyAr } from '../cafeteria/cuenta';
 import type { Database } from '../db/drizzle';
 import { schema } from '../db/schema';
 import { resolverDatabaseUrl } from '../db/url';
-import { LENTES, PASOS, reporteMargenes, reporteVentas, type Filtro, type Lente, type Paso } from './consultas';
-import { CUENTAS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
+import {
+  LENTES, PASOS, TIPOS, periodoAnterior, reporteComparar, reporteGranel, reporteMargenes, reporteVentas,
+  type Filtro, type Lente, type Paso, type TipoVenta,
+} from './consultas';
+import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
 import { reporteStock } from './stock';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
@@ -126,7 +129,23 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   margenes(q: any) {
     const f = this.filtro(q);
     const lente = (LENTES as readonly string[]).includes(q.lente) ? (q.lente as Lente) : 'producto';
-    return this.leer((c) => reporteMargenes(c, f, this.paso(q.paso), lente));
+    // Solo granel o solo enteros (0123); cualquier otro valor = todo.
+    const tipo = (TIPOS as readonly string[]).includes(q.tipo) ? (q.tipo as TipoVenta) : null;
+    return this.leer((c) => reporteMargenes(c, { ...f, tipo }, this.paso(q.paso), lente));
+  }
+
+  granel(q: any) { const f = this.filtro(q); return this.leer((c) => reporteGranel(c, f, this.paso(q.paso))); }
+
+  /**
+   * A = desde/hasta (el período de arriba); B = bDesde/bHasta. Sin B, el período
+   * anterior del mismo largo. La sucursal vale para los dos.
+   */
+  comparar(q: any) {
+    const a = this.filtro(q);
+    const b = diaValido(q.bDesde) && diaValido(q.bHasta)
+      ? this.filtro({ desde: q.bDesde, hasta: q.bHasta, sucursalId: q.sucursalId })
+      : periodoAnterior(a);
+    return this.leer((c) => reporteComparar(c, a, b, this.paso(q.paso)));
   }
 
   stock(q: any) {
@@ -142,6 +161,7 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   /* --------------------------- sincronización --------------------------- */
   async estado() {
     const [e] = (await this.pool.query('SELECT * FROM metricas_estado WHERE id = 1')).rows;
+    const firma = (await this.pool.query(FIRMA_TIPOS)).rows[0]?.f ?? '';
     return {
       corriendo: this.corriendo,
       ultimaSync: e?.ultima_sync ?? null,
@@ -154,6 +174,8 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
       error: e?.error ?? '',
       /** Nunca se armó: hay que correr «todo» una vez (el reloj lo hace solo). */
       vacio: !e?.ultima_ok,
+      /** Alguien cambió el tipo (granel/entero) de un producto: el reloj rearma toda la historia en su próxima vuelta. */
+      tiposCambiaron: !!e?.ultima_ok && (e?.firma_tipos ?? '') !== firma,
     };
   }
 
@@ -175,6 +197,8 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
       if (!rows[0]?.ok) return { ok: false, modo, motivo: 'Otro proceso está sincronizando: probá en un minuto.' };
       try {
         const hoy = hoyAr();
+        // La firma se toma ANTES de rearmar: si alguien cambia un tipo mientras tanto, la próxima vuelta lo nota.
+        const firma = modo === 'todo' ? (await lock.query(FIRMA_TIPOS)).rows[0]?.f ?? '' : null;
         const rango = await rangoDe(lock, modo, hoy);
         let filas = 0;
         if (rango) {
@@ -185,12 +209,13 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
         const primer = (await lock.query('SELECT min(dia)::text AS d FROM metricas_venta_dia')).rows[0]?.d ?? null;
         const ms = Date.now() - inicio;
         await lock.query(
-          `INSERT INTO metricas_estado (id, ultima_sync, ultima_ok, ultima_noche, modo, duracion_ms, desde_dia, hasta_dia, primer_dato, filas, error)
-           VALUES (1, now(), now(), CASE WHEN $1 IN ('noche', 'todo') THEN now() END, $1, $2, $3, $4, $5, $6, '')
+          `INSERT INTO metricas_estado (id, ultima_sync, ultima_ok, ultima_noche, modo, duracion_ms, desde_dia, hasta_dia, primer_dato, filas, error, firma_tipos)
+           VALUES (1, now(), now(), CASE WHEN $1 IN ('noche', 'todo') THEN now() END, $1, $2, $3, $4, $5, $6, '', coalesce($7, ''))
            ON CONFLICT (id) DO UPDATE SET ultima_sync = now(), ultima_ok = now(),
              ultima_noche = CASE WHEN $1 IN ('noche', 'todo') THEN now() ELSE metricas_estado.ultima_noche END,
-             modo = $1, duracion_ms = $2, desde_dia = $3, hasta_dia = $4, primer_dato = $5, filas = $6, error = ''`,
-          [modo, ms, rango?.desde ?? null, rango?.hasta ?? null, primer, cuentas]);
+             modo = $1, duracion_ms = $2, desde_dia = $3, hasta_dia = $4, primer_dato = $5, filas = $6, error = '',
+             firma_tipos = coalesce($7, metricas_estado.firma_tipos)`,
+          [modo, ms, rango?.desde ?? null, rango?.hasta ?? null, primer, cuentas, firma]);
         if (modo !== 'reciente' || ms > 5_000) this.log.log(`Sincronización ${modo}: ${filas} filas en ${ms} ms`);
         return { ok: true, modo, filas, ms };
       } finally {
@@ -224,12 +249,15 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
     await this.pool.end().catch(() => undefined);
   }
 
-  /** Qué toca ahora: la primera vez todo, una vez por madrugada los 40 días, y si no, hoy y ayer. */
+  /**
+   * Qué toca ahora: la primera vez (o si cambió el tipo de un producto) todo,
+   * una vez por madrugada los 40 días, y si no, hoy y ayer.
+   */
   async tick() {
     try {
       if (this.corriendo) return;
       const e = await this.estado();
-      if (e.vacio) { await this.sincronizar('todo'); return; }
+      if (e.vacio || e.tiposCambiaron) { await this.sincronizar('todo'); return; }
       const ahora = new Date();
       const horaAr = Number(ahora.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires', hour: 'numeric', hour12: false }));
       const noche = e.ultimaNoche ? new Date(e.ultimaNoche) : null;
@@ -251,6 +279,8 @@ export class MetricasController {
   @Get('sucursales') sucursales() { return this.svc.sucursales(); }
   @Get('ventas') ventas(@Query() q: any) { return this.svc.ventas(q); }
   @Get('margenes') margenes(@Query() q: any) { return this.svc.margenes(q); }
+  @Get('granel') granel(@Query() q: any) { return this.svc.granel(q); }
+  @Get('comparar') comparar(@Query() q: any) { return this.svc.comparar(q); }
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
 
   /** El botón «Sincronizar»: por defecto, hoy y ayer (un instante). */

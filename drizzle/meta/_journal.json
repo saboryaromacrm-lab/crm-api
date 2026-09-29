@@ -862,6 +862,13 @@
       "when": 1790330000000,
       "tag": "0122_metricas",
       "breakpoints": true
+    },
+    {
+      "idx": 123,
+      "version": "7",
+      "when": 1790340000000,
+      "tag": "0123_metricas_granel",
+      "breakpoints": true
     }
   ]
 }

@@ -44,14 +44,16 @@ const VALIDA = `v.estado IN ('confirmada', 'pendiente_cae')`;
 const TABLAS_DIA = [
   'metricas_venta_prod_dia', 'metricas_venta_dia', 'metricas_venta_hora',
   'metricas_venta_cliente_dia', 'metricas_venta_pago_dia', 'metricas_compra_prov_dia',
+  'metricas_venta_mezcla_dia',
 ] as const;
 
 /** Las sentencias que rearman un rango, en orden. Cada una es un INSERT ... SELECT: nada se trae a Node. */
 const REARMAR: string[] = [
-  // Lo vendido por producto (rentabilidad, listas, rotación).
+  // Lo vendido por producto (rentabilidad, listas, rotación, granel y enteros).
+  // `granel` es el tipo actual del producto; si cambia, se rearma todo (ver FIRMA_TIPOS, 0123).
   `INSERT INTO metricas_venta_prod_dia
      (dia, sucursal_id, producto_id, presentacion_id, lista_id, unidades, cantidad_base, venta_neta,
-      venta_costeada, costo, iva_absorbido, renglones, con_costo)
+      venta_costeada, costo, iva_absorbido, renglones, con_costo, granel)
    SELECT ${DIA('v.fecha')}, coalesce(v.sucursal_id, 0), vi.producto_id, coalesce(vi.presentacion_id, 0),
      coalesce(vi.lista_id, 0),
      sum(vi.cantidad * ${SIGNO}),
@@ -61,12 +63,29 @@ const REARMAR: string[] = [
      coalesce(sum(vi.cantidad * vi.costo_unitario * ${SIGNO}), 0),
      coalesce(sum(vi.cantidad * vi.iva_absorbido_unitario * ${SIGNO}), 0),
      count(*) FILTER (WHERE NOT ${NOTA}),
-     count(vi.costo_unitario) FILTER (WHERE NOT ${NOTA})
+     count(vi.costo_unitario) FILTER (WHERE NOT ${NOTA}),
+     coalesce(bool_or(pr.tipo::text = 'granel'), false)
    FROM ventas v
      JOIN venta_items vi ON vi.venta_id = v.id
      LEFT JOIN presentaciones p ON p.id = vi.presentacion_id
+     LEFT JOIN productos pr ON pr.id = vi.producto_id
    WHERE ${VALIDA} AND ${RANGO('v.fecha')}
    GROUP BY 1, 2, 3, 4, 5`,
+
+  // Qué lleva cada ticket: solo enteros, solo granel o de los dos (0123). Solo ventas, no notas.
+  `INSERT INTO metricas_venta_mezcla_dia (dia, sucursal_id, mezcla, tickets, venta_neta)
+   SELECT t.dia, t.sucursal_id, t.mezcla, count(*), sum(t.venta_neta)
+   FROM (
+     SELECT ${DIA('v.fecha')} AS dia, coalesce(v.sucursal_id, 0) AS sucursal_id, v.subtotal_neto AS venta_neta,
+       CASE WHEN bool_and(pr.tipo::text = 'granel') THEN 'granel'
+            WHEN bool_or(pr.tipo::text = 'granel') THEN 'mixto' ELSE 'entero' END AS mezcla
+     FROM ventas v
+       JOIN venta_items vi ON vi.venta_id = v.id
+       LEFT JOIN productos pr ON pr.id = vi.producto_id
+     WHERE ${VALIDA} AND NOT ${NOTA} AND ${RANGO('v.fecha')}
+     GROUP BY v.id
+   ) t
+   GROUP BY 1, 2, 3`,
 
   // Por día, sucursal y quien cobró.
   `INSERT INTO metricas_venta_dia (dia, sucursal_id, usuario_id, tickets, notas, venta_neta, descuento, iva, total)
@@ -167,10 +186,18 @@ export function porMeses(desde: string, hasta: string): Array<[string, string]> 
   return out;
 }
 
+/**
+ * Qué productos son granel, resumido en un hash (0123). Si cambia (alguien
+ * corrigió el tipo de un producto), el reloj rearma toda la historia para que
+ * granel y enteros usen la misma clasificación en todos los días.
+ */
+export const FIRMA_TIPOS = `SELECT coalesce(md5(string_agg(id::text, ',' ORDER BY id)), '') AS f FROM productos WHERE tipo = 'granel'`;
+
 export const CUENTAS = `SELECT
   (SELECT count(*)::int FROM metricas_venta_prod_dia) AS prod_dia,
   (SELECT count(*)::int FROM metricas_venta_dia) AS venta_dia,
   (SELECT count(*)::int FROM metricas_venta_hora) AS venta_hora,
   (SELECT count(*)::int FROM metricas_venta_cliente_dia) AS cliente_dia,
   (SELECT count(*)::int FROM metricas_venta_pago_dia) AS pago_dia,
-  (SELECT count(*)::int FROM metricas_compra_prov_dia) AS compra_prov_dia`;
+  (SELECT count(*)::int FROM metricas_compra_prov_dia) AS compra_prov_dia,
+  (SELECT count(*)::int FROM metricas_venta_mezcla_dia) AS mezcla_dia`;
