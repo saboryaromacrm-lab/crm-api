@@ -103,6 +103,12 @@ class ComprobanteItemDto {
   @IsOptional() @IsString() @MaxLength(40) codigoProveedor?: string;
   /** La descripción del papel, para poder auditar el mapeo después. */
   @IsOptional() @IsString() @MaxLength(200) descripcionPapel?: string;
+  /**
+   * EL RENGLÓN ES PARA COFFIT (0119): lo tildó quien cargó la factura (o tildó
+   * «toda la factura es de Coffit»). Un artículo de uso exclusivo de Coffit lo
+   * es siempre, venga o no el tilde: la marca de la ficha no se destilda acá.
+   */
+  @IsOptional() @IsBoolean() paraCafeteria?: boolean;
 }
 
 /**
@@ -1091,8 +1097,10 @@ export class ComprobantesService {
     const {
       items, bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total,
     } = this.armarPie(dto, fiscal, ivaDefault, discriminaIva);
-    /* Lo que de este papel es del café, congelado con el documento (0101). */
-    const netoCafeteria = this.netoCafeteriaDe(items, (it) => delCafe.has(it.productoId));
+    /* Lo que de este papel es del café, congelado con el documento (0101): los
+     * exclusivos siempre, y los que se tildaron al cargar (0119). */
+    const esDelCafe = (it: { productoId: number; paraCafeteria?: boolean }) => delCafe.has(it.productoId) || it.paraCafeteria === true;
+    const netoCafeteria = this.netoCafeteriaDe(items, esDelCafe);
     /*
      * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
      *
@@ -1253,7 +1261,7 @@ export class ComprobantesService {
         comprobanteId: c.id, productoId: it.productoId, presentacionId: it.presentacionId ?? null,
         cantidad: Number(it.cantidad) || 0, costoUnitario: Number(it.costoUnitario) || 0,
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
-        paraCafeteria: delCafe.has(it.productoId),
+        paraCafeteria: esDelCafe(it as any),
       })));
 
       /*

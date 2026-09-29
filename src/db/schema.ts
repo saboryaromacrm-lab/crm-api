@@ -1630,11 +1630,14 @@ export const comprobanteItems = pgTable('comprobante_items', {
   subtotal: doublePrecision('subtotal').notNull().default(0),
   /**
    * EL RENGLÓN ES DE COFFIT (0101): el producto era de uso exclusivo de la
-   * cafetería cuando se cargó. CONGELADO acá y no leído de la ficha, porque la
+   * cafetería cuando se cargó, o (0119) quien cargó la factura lo tildó «para
+   * Coffit» — renglón por renglón o la factura entera. CONGELADO acá y no leído de la ficha, porque la
    * marca puede cambiar mañana y esta factura ya dijo de quién fue.
    */
   paraCafeteria: boolean('para_cafeteria').notNull().default(false),
 }, (t) => ({
+  /** Lo comprado para Coffit por artículo, para el cupo de los envíos (0119). */
+  ixCafe: index('ix_comprobante_items_cafe').on(t.productoId).where(sql`${t.paraCafeteria}`),
   /**
    * Igual que `venta_items`: los renglones se piden siempre por su documento.
    * Faltaba (0058) y era un scan completo en cada apertura de Facturación.
@@ -2681,6 +2684,14 @@ export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
    * que el costo: la marca de la ficha cambia, la historia no.
    */
   exclusivo: boolean('exclusivo').notNull().default(false),
+  /**
+   * CUÁNTO DEL RENGLÓN YA LO HABÍA PAGADO COFFIT (0119), en la unidad del
+   * renglón. Un exclusivo es el renglón entero; un artículo compartido que se
+   * tildó «para Coffit» en una factura toma de lo comprado y todavía no
+   * mandado. Solo `cantidad - cantidadExclusiva` mueve plata entre los dos
+   * negocios. `exclusivo` queda en true si hay algo de esto.
+   */
+  cantidadExclusiva: doublePrecision('cantidad_exclusiva').notNull().default(0),
   codigoBarras: text('codigo_barras').notNull().default(''),
   codigoPropio: text('codigo_propio').notNull().default(''),
   /** Lo que contó el que recibió (0113). Nulo = todavía no se recibió. */

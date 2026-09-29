@@ -353,8 +353,8 @@ export class RentabilidadService {
   /**
    * LO QUE DE LAS COMPRAS ES DE COFFIT (0101), en dos números que no se pisan:
    *
-   *  · compradoDirecto — la parte de las facturas que era de artículos
-   *    exclusivos del café (congelada en el documento, con signo por tipo).
+   *  · compradoDirecto — la parte de las facturas que era de Coffit (artículos
+   *    exclusivos o renglones tildados «para Coffit», 0119) (congelada en el documento, con signo por tipo).
    *  · enviadoDesdeStock — los renglones de envíos que salieron del stock
    *    PROPIO (no exclusivo), al costo congelado del envío. Los exclusivos no
    *    entran acá: su plata ya se movió arriba, y contarla dos veces es
@@ -371,13 +371,14 @@ export class RentabilidadService {
         eq(comprobantes.estado, 'confirmado' as any), gt(comprobantes.netoCafeteria, 0),
       )),
       this.db.select({
-        total: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad} * ${envioCafeteriaItems.costoUnitario}), 0)`,
+        /* Solo la parte que Coffit no había pagado ya (0119): un renglón puede
+         * salir en parte de lo que se compró para ella. */
+        total: sql<number>`coalesce(sum((${envioCafeteriaItems.cantidad} - ${envioCafeteriaItems.cantidadExclusiva}) * ${envioCafeteriaItems.costoUnitario}), 0)`,
       }).from(envioCafeteriaItems)
         .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
         .where(and(
           gte(enviosCafeteria.fecha, desde), lt(enviosCafeteria.fecha, hastaEx),
           eq(enviosCafeteria.estado, 'enviado' as any), eq(enviosCafeteria.sentido, 'salida' as any),
-          eq(envioCafeteriaItems.exclusivo, false),
         )),
     ]);
     return {

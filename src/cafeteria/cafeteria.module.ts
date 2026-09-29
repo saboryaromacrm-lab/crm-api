@@ -46,9 +46,9 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, ClaveServicio, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { PERMISO_METRICAS_CAFE, soloSuSucursal, tienePermiso, veMetricasDelCafe } from '../auth/auth.guard';
 import {
-  comprobantes, enviosCafeteria, envioCafeteriaItems, gastos, incidencias, listasVenta, pedidoCafeteriaItems,
+  comprobanteItems, comprobantes, enviosCafeteria, envioCafeteriaItems, gastoCategorias, gastoItems, gastos, incidencias, listasVenta, pedidoCafeteriaItems,
   pedidosCafeteria, precioHistorial, presentaciones, productoListas, productoProveedores, productos,
-  stock, sucursales, usuarios,
+  proveedores, stock, sucursales, usuarios,
 } from '../db/schema';
 import { ProductosModule, ProductosService } from '../productos/productos.module';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -753,6 +753,82 @@ export class CafeteriaService {
    * LA HUELLA DE UN DETALLE: qué se mandó, cuánto y a qué costo, sin importar
    * en qué orden se cargaron los renglones.
    */
+  /**
+   * LO QUE COFFIT YA PAGÓ Y TODAVÍA NO SE LE MANDÓ (0119), por artículo y en
+   * su unidad base (kg el granel, unidades el resto).
+   *
+   * Un artículo COMPARTIDO tildado «para Coffit» en una factura le cargó el
+   * costo al café al comprarlo, pero la mercadería se queda en el depósito
+   * mezclada con la de la distribuidora. El cupo es lo comprado así (remito,
+   * factura o liquidación; una NC que devuelve mercadería lo baja) menos lo que
+   * los envíos ya tomaron de ahí. Los envíos anulados devuelven lo que tomaron
+   * solos, porque dejan de contar.
+   */
+  private async cupoCafe(tx: any, ids: number[], exceptoEnvioId?: number) {
+    const condsEnvio: any[] = [
+      inArray(envioCafeteriaItems.productoId, ids), gt(envioCafeteriaItems.cantidadExclusiva, 0),
+      eq(enviosCafeteria.sentido, 'salida'), ne(enviosCafeteria.estado, 'anulado'),
+    ];
+    if (exceptoEnvioId) condsEnvio.push(ne(enviosCafeteria.id, exceptoEnvioId));
+    const [compras, tomado] = await Promise.all([
+      tx.select({
+        productoId: comprobanteItems.productoId,
+        base: sql<number>`coalesce(sum(${comprobanteItems.cantidad} * coalesce(${presentaciones.tamKg}, 1) * (case
+          when ${comprobantes.tipo} in ('remito', 'factura', 'liquidacion') then 1
+          when ${comprobantes.tipo} = 'nota_credito' and ${comprobantes.recepcion} then -1 else 0 end)), 0)`,
+      }).from(comprobanteItems)
+        .innerJoin(comprobantes, eq(comprobantes.id, comprobanteItems.comprobanteId))
+        .leftJoin(presentaciones, eq(presentaciones.id, comprobanteItems.presentacionId))
+        .where(and(
+          inArray(comprobanteItems.productoId, ids), eq(comprobanteItems.paraCafeteria, true),
+          eq(comprobantes.estado, 'confirmado'),
+        ))
+        .groupBy(comprobanteItems.productoId),
+      tx.select({
+        productoId: envioCafeteriaItems.productoId,
+        base: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidadExclusiva} * (case
+          when ${envioCafeteriaItems.modo} = 'unidad' then 1 else coalesce(nullif(${envioCafeteriaItems.tamKg}, 0), 1) end)), 0)`,
+      }).from(envioCafeteriaItems)
+        .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
+        .where(and(...condsEnvio))
+        .groupBy(envioCafeteriaItems.productoId),
+    ]);
+    const cupo = new Map<number, number>();
+    for (const c of compras) cupo.set(c.productoId, Number(c.base) || 0);
+    for (const e of tomado) cupo.set(e.productoId, (cupo.get(e.productoId) ?? 0) - (Number(e.base) || 0));
+    /* Sin piso en cero: si se anuló una compra que un envío ya había tomado, el
+     * faltante se descuenta de la próxima compra para Coffit, no se pierde. */
+    for (const [k, v] of cupo) cupo.set(k, r6(v));
+    return cupo;
+  }
+
+  /**
+   * CUÁNTO DE CADA RENGLÓN DE UNA SALIDA YA LO PAGÓ COFFIT (0119). El
+   * exclusivo, entero. El compartido, lo que alcance del cupo (`cupoCafe`),
+   * renglón por renglón en el orden del envío. El resto del renglón sale del
+   * stock propio de la distribuidora y es lo que le mueve la plata al café.
+   *
+   * El candado serializa solo a los envíos que traen compartidos: dos envíos a
+   * la vez no pueden tomar el mismo cupo dos veces.
+   */
+  private async asignarExclusivo(tx: any, filas: any[], exceptoEnvioId?: number) {
+    for (const f of filas) f.cantidadExclusiva = f.exclusivo ? Number(f.cantidad) : 0;
+    const compartidos = [...new Set(filas.filter((f) => !f.exclusivo).map((f) => Number(f.productoId)))];
+    if (!compartidos.length) return;
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('cafe:cupo'))`);
+    const cupo = await this.cupoCafe(tx, compartidos, exceptoEnvioId);
+    for (const f of filas) {
+      if (f.exclusivo) continue;
+      const queda = cupo.get(Number(f.productoId)) ?? 0;
+      if (queda <= 1e-9) continue;
+      const factor = f.modo === 'unidad' ? 1 : (Number(f.tamKg) || 1);
+      const toma = Math.min(Number(f.cantidad) * factor, queda);
+      cupo.set(Number(f.productoId), r6(queda - toma));
+      f.cantidadExclusiva = r6(toma / factor);
+    }
+    for (const f of filas) if (f.cantidadExclusiva > 0) f.exclusivo = true;
+  }
+
   private huella(filas: { productoId: number; presentacionId: number | null; cantidad: any; costoUnitario: any }[]) {
     return filas
       .map((f) => `${f.productoId}-${f.presentacionId ?? 0}:${Number(f.cantidad)}:${Number(f.costoUnitario)}`)
@@ -934,6 +1010,7 @@ export class CafeteriaService {
        * qué lado viene la mercadería. CAF = le mandamos, RCA = nos mandó. */
       const codigo = `${entrada ? 'RCA' : 'CAF'}${String(envio.id).padStart(4, '0')}`;
       await tx.update(enviosCafeteria).set({ codigo }).where(eq(enviosCafeteria.id, envio.id));
+      if (!entrada) await this.asignarExclusivo(tx, filas);
       await tx.insert(envioCafeteriaItems).values(filas.map((f) => ({ ...f, envioId: envio.id })));
       if (entrada) await this.llenarFichasVacias(tx, filas);
 
@@ -1062,6 +1139,10 @@ export class CafeteriaService {
           (d > 0 ? suben : bajan).push({ ...art, cantidad: Math.abs(d) });
         }
       }
+
+      /* Qué parte de cada renglón ya la pagó Coffit, sin contar lo que este
+       * mismo envío tomaba antes de la corrección (0119). */
+      if (!entrada) await this.asignarExclusivo(tx, filas, id);
 
       /* Lo contado viaja con cada renglón: se reparte por artículo en el orden
        * de los renglones (casi siempre hay uno solo por artículo). */
@@ -1845,10 +1926,10 @@ export class CafeteriaService {
      * (`compradoDirecto`), así que en la cuenta entre los dos negocios no vuelve
      * a entrar. Mismo corte que Gerencia (`enviadoDesdeStock`). */
     const [exclusivo] = await this.db.select({
-      total: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad} * ${envioCafeteriaItems.costoUnitario}), 0)`,
+      total: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidadExclusiva} * ${envioCafeteriaItems.costoUnitario}), 0)`,
     }).from(envioCafeteriaItems)
       .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
-      .where(and(...condsEnvio, eq(enviosCafeteria.sentido, 'salida'), eq(envioCafeteriaItems.exclusivo, true)));
+      .where(and(...condsEnvio, eq(enviosCafeteria.sentido, 'salida'), gt(envioCafeteriaItems.cantidadExclusiva, 0)));
     /*
      * LO COMPRADO DIRECTO PARA EL CAFÉ (0101): la parte de las facturas de
      * compra que era de artículos exclusivos, con el signo del documento.
@@ -1969,7 +2050,198 @@ export class CafeteriaService {
       a.total += f.cantidad;
       a.valor = r2(a.total * a.costoU);
     }
-    return [...porArticulo.values()].sort((x, y) => y.valor - x.valor);
+    return [...porArticulo.values(), ...await this.pendientesCompartidos()].sort((x, y) => y.valor - x.valor);
+  }
+
+  /**
+   * LOS COMPARTIDOS QUE COFFIT YA PAGÓ Y FALTA MANDARLE (0119). No tienen
+   * stock propio —están mezclados con los de la distribuidora—, así que se
+   * muestran por lo que falta mandar (`cupoCafe`) y sin reparto por sucursal.
+   */
+  private async pendientesCompartidos() {
+    const conCompra = await this.db.selectDistinct({ id: comprobanteItems.productoId }).from(comprobanteItems)
+      .innerJoin(productos, eq(productos.id, comprobanteItems.productoId))
+      .where(and(eq(comprobanteItems.paraCafeteria, true), eq(productos.soloCafeteria, false)));
+    if (!conCompra.length) return [];
+    const cupo = await this.cupoCafe(this.db, conCompra.map((f) => f.id));
+    const ids = [...cupo].filter(([, v]) => v > 1e-6).map(([k]) => k);
+    if (!ids.length) return [];
+    const [prods, provs] = await Promise.all([
+      this.db.select({
+        id: productos.id, nombre: productos.nombre, tipo: productos.tipo, iva: productos.iva,
+        codigoPropio: productos.codigoPropio,
+      }).from(productos).where(inArray(productos.id, ids)),
+      this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
+    ]);
+    return prods.map((p) => {
+      const costoU = r2(costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)) as any, p.iva));
+      const total = r3(cupo.get(p.id) ?? 0);
+      return {
+        productoId: p.id, presentacionId: null, nombre: p.nombre, codigoPropio: p.codigoPropio || '',
+        unidad: p.tipo === 'granel' ? 'kg' : 'u.', costoU,
+        porSucursal: {} as Record<number, number>, total, valor: r2(total * costoU),
+        /** Artículo que también vende la distribuidora: lo de Coffit es lo que falta mandar. */
+        compartido: true,
+      };
+    });
+  }
+
+  /* ==================================================================== *
+   * LAS COMPRAS Y LOS GASTOS DE COFFIT, EN DETALLE (29/9/2026)
+   * ==================================================================== *
+   * Pedido del dueño: ver qué se compró para el café, factura por factura y
+   * artículo por artículo, y aparte los gastos. Los totales son los MISMOS
+   * números que el resumen y Gerencia (`compradoDirecto` y `gastos`): mismas
+   * condiciones, mismo signo por tipo de documento.
+   */
+  async comprasDelCafe(q: { desde?: string; hasta?: string }) {
+    const desde = fechaLocal(q.desde);
+    const hasta = fechaLocal(q.hasta);
+    if (hasta) hasta.setHours(23, 59, 59, 999);
+    const conds: any[] = [eq(comprobantes.estado, 'confirmado'), gt(comprobantes.netoCafeteria, 0),
+      inArray(comprobantes.tipo, ['factura', 'liquidacion', 'nota_debito', 'nota_credito'])];
+    const condsRemito: any[] = [eq(comprobantes.estado, 'confirmado'), eq(comprobantes.tipo, 'remito')];
+    if (desde) { conds.push(gte(comprobantes.fecha, desde)); condsRemito.push(gte(comprobantes.fecha, desde)); }
+    if (hasta) { conds.push(lte(comprobantes.fecha, hasta)); condsRemito.push(lte(comprobantes.fecha, hasta)); }
+
+    const cabecera = {
+      id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra, puntoVenta: comprobantes.puntoVenta,
+      numero: comprobantes.numero, fecha: comprobantes.fecha, proveedor: proveedores.nombre,
+      sucursal: sucursales.nombre, subtotalNeto: comprobantes.subtotalNeto, total: comprobantes.total,
+      netoCafeteria: comprobantes.netoCafeteria,
+    };
+    const [docs, remitos] = await Promise.all([
+      this.db.select(cabecera).from(comprobantes)
+        .innerJoin(proveedores, eq(proveedores.id, comprobantes.proveedorId))
+        .leftJoin(sucursales, eq(sucursales.id, comprobantes.sucursalId))
+        .where(and(...conds)).orderBy(desc(comprobantes.fecha), desc(comprobantes.id)).limit(2000),
+      /* Los remitos todavía no tienen plata (llega con la factura): se listan
+       * aparte para que se vea que la mercadería ya está, sin sumarlos. */
+      this.db.select(cabecera).from(comprobantes)
+        .innerJoin(proveedores, eq(proveedores.id, comprobantes.proveedorId))
+        .leftJoin(sucursales, eq(sucursales.id, comprobantes.sucursalId))
+        .where(and(...condsRemito, sql`exists (select 1 from ${comprobanteItems}
+          where ${comprobanteItems.comprobanteId} = ${comprobantes.id} and ${comprobanteItems.paraCafeteria})`))
+        .orderBy(desc(comprobantes.fecha), desc(comprobantes.id)).limit(500),
+    ]);
+    const ids = [...docs, ...remitos].map((d) => d.id);
+    const items = ids.length
+      ? await this.db.select({
+        comprobanteId: comprobanteItems.comprobanteId, productoId: comprobanteItems.productoId,
+        nombre: productos.nombre, codigoPropio: productos.codigoPropio, tipoProd: productos.tipo,
+        tamKg: presentaciones.tamKg, cantidad: comprobanteItems.cantidad,
+        costoUnitario: comprobanteItems.costoUnitario, descuento: comprobanteItems.descuento,
+        subtotal: comprobanteItems.subtotal,
+      }).from(comprobanteItems)
+        .innerJoin(productos, eq(productos.id, comprobanteItems.productoId))
+        .leftJoin(presentaciones, eq(presentaciones.id, comprobanteItems.presentacionId))
+        .where(and(inArray(comprobanteItems.comprobanteId, ids), eq(comprobanteItems.paraCafeteria, true)))
+        .orderBy(comprobanteItems.id)
+      : [];
+    const porDoc = new Map<number, any[]>();
+    for (const it of items) {
+      const arr = porDoc.get(it.comprobanteId) ?? [];
+      arr.push(it);
+      porDoc.set(it.comprobanteId, arr);
+    }
+    const unidadDe = (it: any) => (it.tamKg != null ? 'paq.' : (it.tipoProd === 'granel' ? 'kg' : 'u.'));
+    /* La NC resta; el resto suma. Lo mismo que SIGNO_COMPRA en SQL. */
+    const signoDe = (tipo: string) => (tipo === 'nota_credito' ? -1 : 1);
+    const armar = (d: any, signo: number) => ({
+      id: d.id, tipo: d.tipo, letra: d.letra, puntoVenta: d.puntoVenta, numero: d.numero, fecha: d.fecha,
+      proveedor: d.proveedor, sucursal: d.sucursal ?? '',
+      neto: r2(signo * Number(d.netoCafeteria)),
+      subtotalNeto: r2(signo * Number(d.subtotalNeto)),
+      /** Toda la factura es de Coffit: su parte es el neto entero. */
+      todo: Math.abs(Number(d.netoCafeteria) - Number(d.subtotalNeto)) < 0.02,
+      items: (porDoc.get(d.id) ?? []).map((it) => ({
+        productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio || '',
+        unidad: unidadDe(it), cantidad: r3(signo * Number(it.cantidad)),
+        costoUnitario: r2(Number(it.costoUnitario)), descuento: Number(it.descuento) || 0,
+        subtotal: r2(signo * Number(it.subtotal)),
+      })),
+    });
+    const documentos = docs.map((d) => armar(d, signoDe(d.tipo)));
+
+    /* Por artículo: cuánto se compró de cada cosa en el período. */
+    const porArt = new Map<string, any>();
+    for (const d of documentos) {
+      for (const it of d.items) {
+        const k = `${it.productoId}|${it.unidad}`;
+        let a = porArt.get(k);
+        if (!a) {
+          a = { productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio, unidad: it.unidad, cantidad: 0, neto: 0, documentos: new Set<number>() };
+          porArt.set(k, a);
+        }
+        a.cantidad += it.cantidad;
+        a.neto += it.subtotal;
+        a.documentos.add(d.id);
+      }
+    }
+    const articulos = [...porArt.values()].map((a) => ({
+      productoId: a.productoId, nombre: a.nombre, codigoPropio: a.codigoPropio, unidad: a.unidad,
+      cantidad: r3(a.cantidad), neto: r2(a.neto),
+      costoPromedio: Math.abs(a.cantidad) > 1e-9 ? r2(a.neto / a.cantidad) : 0,
+      documentos: a.documentos.size,
+    })).sort((x, y) => y.neto - x.neto);
+
+    return {
+      documentos,
+      articulos,
+      remitos: remitos.map((d) => armar(d, 1)),
+      total: r2(documentos.reduce((a, d) => a + d.neto, 0)),
+      facturas: documentos.filter((d) => d.tipo === 'factura' || d.tipo === 'liquidacion').length,
+      limitado: docs.length >= 2000,
+    };
+  }
+
+  async gastosDelCafe(q: { desde?: string; hasta?: string }) {
+    const desde = fechaLocal(q.desde);
+    const hasta = fechaLocal(q.hasta);
+    if (hasta) hasta.setHours(23, 59, 59, 999);
+    const conds: any[] = [eq(gastos.negocio, 'cafeteria'), ne(gastos.estado, 'anulado')];
+    if (desde) conds.push(gte(gastos.fecha, desde));
+    if (hasta) conds.push(lte(gastos.fecha, hasta));
+    const filas = await this.db.select({
+      id: gastos.id, fecha: gastos.fecha, tipoDoc: gastos.tipoDoc, letra: gastos.letra, numero: gastos.numero,
+      proveedor: proveedores.nombre, proveedorTexto: gastos.proveedorTexto, rubro: gastoCategorias.nombre,
+      sucursal: sucursales.nombre, descripcion: gastos.descripcion, neto: gastos.neto, iva: gastos.iva,
+      total: gastos.total, pagado: gastos.pagado, estado: gastos.estado,
+    }).from(gastos)
+      .innerJoin(gastoCategorias, eq(gastoCategorias.id, gastos.categoriaId))
+      .leftJoin(proveedores, eq(proveedores.id, gastos.proveedorId))
+      .leftJoin(sucursales, eq(sucursales.id, gastos.sucursalId))
+      .where(and(...conds)).orderBy(desc(gastos.fecha), desc(gastos.id)).limit(2000);
+    const renglones = filas.length
+      ? await this.db.select({ gastoId: gastoItems.gastoId, concepto: gastoItems.concepto, monto: gastoItems.monto })
+        .from(gastoItems).where(inArray(gastoItems.gastoId, filas.map((f) => f.id))).orderBy(gastoItems.id)
+      : [];
+    const porGasto = new Map<number, any[]>();
+    for (const r of renglones) {
+      const arr = porGasto.get(r.gastoId) ?? [];
+      arr.push({ concepto: r.concepto, monto: r2(Number(r.monto)) });
+      porGasto.set(r.gastoId, arr);
+    }
+    const lista = filas.map((f) => ({
+      id: f.id, fecha: f.fecha, tipoDoc: f.tipoDoc, letra: f.letra, numero: f.numero,
+      proveedor: f.proveedor || f.proveedorTexto || '', rubro: f.rubro, sucursal: f.sucursal ?? '',
+      descripcion: f.descripcion, neto: r2(Number(f.neto)), iva: r2(Number(f.iva)),
+      total: r2(Number(f.total)), pagado: r2(Number(f.pagado)), estado: f.estado,
+      renglones: porGasto.get(f.id) ?? [],
+    }));
+    const rubros = new Map<string, { rubro: string; total: number; cantidad: number }>();
+    for (const g of lista) {
+      const r = rubros.get(g.rubro) ?? { rubro: g.rubro, total: 0, cantidad: 0 };
+      r.total = r2(r.total + g.total);
+      r.cantidad += 1;
+      rubros.set(g.rubro, r);
+    }
+    return {
+      gastos: lista,
+      porRubro: [...rubros.values()].sort((a, b) => b.total - a.total),
+      total: r2(lista.reduce((a, g) => a + g.total, 0)),
+      limitado: filas.length >= 2000,
+    };
   }
 
   /** La pantalla: qué hay guardado para el café, dónde y cuánto vale. */
@@ -2027,6 +2299,19 @@ export class CafeteriaController {
   @Permiso(PERMISO_METRICAS)
   resumen(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
     return this.svc.resumen({ desde, hasta });
+  }
+
+  /* Compras y gastos de Coffit en detalle (29/9/2026): plata, misma llave que el resumen. */
+  @Get('compras')
+  @Permiso(PERMISO_METRICAS)
+  compras(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
+    return this.svc.comprasDelCafe({ desde, hasta });
+  }
+
+  @Get('gastos')
+  @Permiso(PERMISO_METRICAS)
+  gastosDelCafe(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
+    return this.svc.gastosDelCafe({ desde, hasta });
   }
 
   /* ---- Los productos que hace la cafetería (la puerta chica a su catálogo) ----

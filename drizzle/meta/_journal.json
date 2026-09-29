@@ -834,6 +834,13 @@
       "when": 1790220000000,
       "tag": "0118_plantilla_factura_proveedor",
       "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1790300000000,
+      "tag": "0119_coffit_por_renglon",
+      "breakpoints": true
     }
   ]
 }
