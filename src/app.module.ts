@@ -33,6 +33,7 @@ import { GerenciaModule } from './gerencia/gerencia.module';
 import { AuditoriaModule } from './auditoria/auditoria.module';
 import { RespaldosModule } from './respaldos/respaldos.module';
 import { RespaldoDriveModule } from './respaldos/drive.service';
+import { MetricasModule } from './metricas/metricas.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { RespaldoDriveModule } from './respaldos/drive.service';
     AuditoriaModule,
     RespaldosModule,
     RespaldoDriveModule,
+    MetricasModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,
