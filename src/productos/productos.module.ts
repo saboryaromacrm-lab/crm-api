@@ -234,12 +234,18 @@ class FormatoVentaImportDto {
   @IsOptional() @IsString() @MaxLength(40) codigo?: string;
 }
 
+/** El archivo COMPLETO de formatos de venta trae ~7.000 renglones (29/9/2026). */
+export const MAX_FORMATOS_VENTA = 10_000;
+
 class ImportarFormatosVentaDto {
-  @IsInt() proveedorId!: number;
+  /** Un proveedor… */
+  @IsOptional() @IsInt() proveedorId?: number;
+  /** …o el archivo completo, sin filtro de proveedor. Uno de los dos. */
+  @IsOptional() @IsBoolean() todos?: boolean;
   @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ListaNuevaImportDto)
   listasNuevas!: ListaNuevaImportDto[];
-  @IsArray() @ArrayMaxSize(MAX_ITEMS_IMPORT, {
-    message: `Demasiados renglones en una sola importación (máximo ${MAX_ITEMS_IMPORT}). Partí el archivo.`,
+  @IsArray() @ArrayMaxSize(MAX_FORMATOS_VENTA, {
+    message: `Demasiados renglones en una sola importación (máximo ${MAX_FORMATOS_VENTA}). Partí el archivo.`,
   }) @ValidateNested({ each: true }) @Type(() => FormatoVentaImportDto)
   items!: FormatoVentaImportDto[];
 }
@@ -1215,17 +1221,22 @@ export class ProductosService {
    */
   async importarFormatosVenta(dto: ImportarFormatosVentaDto, usuarioId: number | null) {
     const items = dto.items || [];
-
-    const [prov] = await this.db.select().from(proveedores)
+    /* UN PROVEEDOR o TODOS (archivo completo, 29/9/2026). El archivo de ventas
+       no trae proveedor: en modo todos no se filtra, y la importación se anota
+       en la guía de CADA proveedor cuyos productos se tocaron. */
+    const todos = dto.todos === true;
+    if (!todos && !dto.proveedorId) throw new BadRequestException('Elegí el proveedor, o importá el archivo completo.');
+    const [prov] = todos ? [null] : await this.db.select().from(proveedores)
       .where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
-    if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
+    if (!todos && !prov) throw new BadRequestException('El proveedor elegido no existe.');
+    const quien = prov?.nombre ?? 'todos los proveedores';
 
     /* EL ARCHIVO YA COINCIDÍA: no hay nada que escribir, pero el proveedor
        quedó revisado. Se anota igual — si no, la guía lo mostraría como
        pendiente para siempre. */
     if (!items.length) {
-      await this.anotarImportacion(prov.id, 'Formatos de venta', 'sin cambios: el archivo ya coincidía', usuarioId);
-      return { ok: true, proveedor: prov.nombre, listasCreadas: [], actualizados: 0, agregados: 0, saltados: [] };
+      if (prov) await this.anotarImportacion(prov.id, 'Formatos de venta', 'sin cambios: el archivo ya coincidía', usuarioId);
+      return { ok: true, proveedor: quien, listasCreadas: [], actualizados: 0, agregados: 0, saltados: [], proveedoresAnotados: prov ? 1 : 0 };
     }
 
     /* ---- Las listas: las que existen y las que hay que crear ---- */
@@ -1252,20 +1263,24 @@ export class ProductosService {
       if (ya) existentesNuevas.set(clave, ya.id);
     }
 
-    /* ---- Los artículos ---- */
+    /* ---- Los artículos: todo en pocas consultas, no una por renglón ---- */
     const ids = [...new Set(items.map((it) => Number(it.productoId)))];
-    const prods = await this.db.select({ id: productos.id, nombre: productos.nombre, estado: productos.estado })
-      .from(productos).where(inArray(productos.id, ids));
-    const porId = new Map(prods.map((p) => [p.id, p]));
-    const delProv = new Set((await this.db.select({ productoId: productoProveedores.productoId })
-      .from(productoProveedores)
-      .where(and(inArray(productoProveedores.productoId, ids), eq(productoProveedores.proveedorId, prov.id))))
-      .map((f) => f.productoId));
     const presIds = [...new Set(items.map((it) => Number(it.presentacionId)).filter((x) => x > 0))];
-    const presDe = new Map((presIds.length
-      ? await this.db.select({ id: presentaciones.id, productoId: presentaciones.productoId })
-        .from(presentaciones).where(inArray(presentaciones.id, presIds))
-      : []).map((x) => [x.id, x.productoId]));
+    const [prods, delProvFilas, presFilas] = await Promise.all([
+      this.db.select({ id: productos.id, nombre: productos.nombre, estado: productos.estado })
+        .from(productos).where(inArray(productos.id, ids)),
+      prov
+        ? this.db.select({ productoId: productoProveedores.productoId }).from(productoProveedores)
+          .where(and(inArray(productoProveedores.productoId, ids), eq(productoProveedores.proveedorId, prov.id)))
+        : Promise.resolve([] as { productoId: number }[]),
+      presIds.length
+        ? this.db.select({ id: presentaciones.id, productoId: presentaciones.productoId })
+          .from(presentaciones).where(inArray(presentaciones.id, presIds))
+        : Promise.resolve([] as { id: number; productoId: number }[]),
+    ]);
+    const porId = new Map(prods.map((p) => [p.id, p]));
+    const delProv = new Set(delProvFilas.map((f) => f.productoId));
+    const presDe = new Map(presFilas.map((x) => [x.id, x.productoId]));
 
     const saltados: { codigo: string; nombre: string; motivo: string }[] = [];
     type Aplicar = { productoId: number; presentacionId: number | null; lista: { id?: number; clave?: string }; it: FormatoVentaImportDto };
@@ -1277,7 +1292,7 @@ export class ProductosService {
       const saltar = (motivo: string) => saltados.push({ codigo, nombre: p?.nombre ?? '', motivo });
       if (!p) { saltar('el producto no existe'); continue; }
       if (p.estado === 'archivado') { saltar('está archivado'); continue; }
-      if (!delProv.has(p.id)) { saltar(`no tiene a ${prov.nombre} en su formato de compra`); continue; }
+      if (prov && !delProv.has(p.id)) { saltar(`no tiene a ${prov.nombre} en su formato de compra`); continue; }
       const presentacionId = Number(it.presentacionId) > 0 ? Number(it.presentacionId) : null;
       if (presentacionId != null && presDe.get(presentacionId) !== p.id) { saltar('el paquete no es de este producto'); continue; }
       let lista: { id?: number; clave?: string };
@@ -1294,11 +1309,12 @@ export class ProductosService {
       vistos.add(k);
       aAplicar.push({ productoId: p.id, presentacionId, lista, it });
     }
-    if (!aAplicar.length) return { ok: true, proveedor: prov.nombre, listasCreadas: [], actualizados: 0, agregados: 0, saltados };
+    if (!aAplicar.length) return { ok: true, proveedor: quien, listasCreadas: [], actualizados: 0, agregados: 0, saltados, proveedoresAnotados: 0 };
 
     const listasCreadas: { id: number; nombre: string; numero: number }[] = [];
     let actualizados = 0;
     let agregados = 0;
+    const LOTE = 1000;
     await this.db.transaction(async (tx) => {
       /* Las nuevas, al final del orden, de a 10 como las carga la pantalla. */
       const idDeClave = new Map<string, number>();
@@ -1317,35 +1333,47 @@ export class ProductosService {
         }
       }
 
+      /* LAS FILAS QUE YA EXISTEN, en una sola lectura (29/9/2026): antes era
+         una consulta por renglón, y con el archivo completo eran miles. */
+      const previas = await tx.select().from(productoListas)
+        .where(inArray(productoListas.productoId, [...new Set(aAplicar.map((a) => a.productoId))]));
+      const previaDe = new Map(previas.map((f) => [`${f.productoId}:${f.presentacionId ?? ''}:${f.listaId}`, f]));
+
+      const aActualizar: { id: number; modo: string; markup: number; pf: number; u: number; cb: string }[] = [];
+      const aInsertar: (typeof productoListas.$inferInsert)[] = [];
       for (const a of aAplicar) {
         const listaId = a.lista.id ?? idDeClave.get(a.lista.clave!)!;
-        const ambito = a.presentacionId == null
-          ? and(eq(productoListas.productoId, a.productoId), sql`${productoListas.presentacionId} IS NULL`)
-          : eq(productoListas.presentacionId, a.presentacionId);
-        const [previa] = await tx.select().from(productoListas)
-          .where(and(ambito, eq(productoListas.listaId, listaId))).limit(1);
+        const previa = previaDe.get(`${a.productoId}:${a.presentacionId ?? ''}:${listaId}`);
         const unidades = Math.max(1, Number(a.it.unidades) || 1);
-        const valores = {
-          modoPrecio: (a.it.modoPrecio === 'precio' ? 'precio' : 'markup') as any,
-          markup: a.it.modoPrecio === 'precio' ? (previa?.markup ?? 0) : Number(a.it.markup) || 0,
-          precioFijo: a.it.modoPrecio === 'precio' ? Number(a.it.precioFijo) || 0 : (previa?.precioFijo ?? 0),
-          unidades,
-        };
+        const modo = a.it.modoPrecio === 'precio' ? 'precio' : 'markup';
+        const markup = modo === 'precio' ? (previa?.markup ?? 0) : Number(a.it.markup) || 0;
+        const precioFijo = modo === 'precio' ? Number(a.it.precioFijo) || 0 : (previa?.precioFijo ?? 0);
         if (previa) {
           /* El código propio es el de la CAJA: si el formato pasa a vender de
              a 1, ese código sería un segundo código del mismo artículo (la
              regla de `guardarFormato`). Se suelta. */
-          const codigoBarras = unidades > 1 ? previa.codigoBarras : '';
-          await tx.update(productoListas).set({ ...valores, codigoBarras }).where(eq(productoListas.id, previa.id));
-          actualizados += 1;
+          aActualizar.push({ id: previa.id, modo, markup, pf: precioFijo, u: unidades, cb: unidades > 1 ? previa.codigoBarras : '' });
         } else {
-          await tx.insert(productoListas).values({
-            productoId: a.productoId, presentacionId: a.presentacionId, listaId, ...valores,
-            codigoBarras: '', unidadesMinimas: 0,
+          aInsertar.push({
+            productoId: a.productoId, presentacionId: a.presentacionId, listaId,
+            modoPrecio: modo as any, markup, precioFijo, unidades, codigoBarras: '', unidadesMinimas: 0,
           });
-          agregados += 1;
         }
       }
+      for (let k = 0; k < aActualizar.length; k += LOTE) {
+        const valores = sql.join(aActualizar.slice(k, k + LOTE).map((f) => sql`(${f.id}::int, ${f.modo}::text, ${f.markup}::double precision, ${f.pf}::double precision, ${f.u}::double precision, ${f.cb}::text)`), sql`, `);
+        await tx.execute(sql`
+          UPDATE producto_listas AS t
+          SET modo_precio = v.modo::modo_precio, markup = v.markup, precio_fijo = v.pf, unidades = v.u, codigo_barras = v.cb
+          FROM (VALUES ${valores}) AS v(id, modo, markup, pf, u, cb)
+          WHERE t.id = v.id
+        `);
+      }
+      for (let k = 0; k < aInsertar.length; k += LOTE) {
+        await tx.insert(productoListas).values(aInsertar.slice(k, k + LOTE));
+      }
+      actualizados = aActualizar.length;
+      agregados = aInsertar.length;
     });
 
     // Markup nuevo = precio nuevo: queda en la evolución, firmada. (Los
@@ -1353,13 +1381,30 @@ export class ProductosService {
     const idsTocados = [...new Set(aAplicar.filter((a) => a.presentacionId == null).map((a) => a.productoId))];
     if (idsTocados.length) {
       await this.evolucion.snapshot(idsTocados, 'formato_venta', {
-        usuarioId, detalle: `Importación de formatos de venta · ${prov.nombre}`,
+        usuarioId, detalle: `Importación de formatos de venta · ${quien}`,
       });
     }
-    await this.anotarImportacion(prov.id, 'Formatos de venta',
-      `${actualizados} actualizado(s) · ${agregados} agregado(s)${listasCreadas.length ? ` · ${listasCreadas.length} lista(s) nueva(s)` : ''}`,
-      usuarioId);
-    return { ok: true, proveedor: prov.nombre, listasCreadas, actualizados, agregados, saltados };
+    const resumen = `${actualizados} actualizado(s) · ${agregados} agregado(s)${listasCreadas.length ? ` · ${listasCreadas.length} lista(s) nueva(s)` : ''}`;
+    let proveedoresAnotados = 0;
+    if (prov) {
+      await this.anotarImportacion(prov.id, 'Formatos de venta', resumen, usuarioId);
+      proveedoresAnotados = 1;
+    } else {
+      /* Archivo completo: queda en la guía de cada proveedor tocado, con
+         cuántos productos suyos entraron — así la guía los da por importados. */
+      const porProv = await this.db.select({
+        proveedorId: productoProveedores.proveedorId,
+        n: sql<number>`count(distinct ${productoProveedores.productoId})::int`,
+      }).from(productoProveedores)
+        .where(inArray(productoProveedores.productoId, [...new Set(aAplicar.map((a) => a.productoId))]))
+        .groupBy(productoProveedores.proveedorId);
+      await this.audit.registrar(porProv.map((x) => ({
+        entidad: 'proveedor', entidadId: x.proveedorId, ambito: 'Importación', campo: 'Formatos de venta',
+        antes: '', despues: `archivo completo · ${x.n} producto(s) suyos`, usuarioId,
+      })));
+      proveedoresAnotados = porProv.length;
+    }
+    return { ok: true, proveedor: quien, listasCreadas, actualizados, agregados, saltados, proveedoresAnotados };
   }
 
   /**
