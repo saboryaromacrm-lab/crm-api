@@ -1,5 +1,5 @@
 /**
- * WEB — administración del sitio desde el CRM
+ * WEB — administración del sitio desde el ERP
  * ============================================================================
  * El módulo Web NO define qué se vende ni a cuánto (eso es de Compras y del
  * formato de venta): administra la CARA del sitio. Sus mutaciones son pocas a
@@ -170,7 +170,7 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
    * imagen vuelve a salir por `GET /tienda/imagenes/...`, que es público y
    * vive en el MISMO ORIGEN que el dashboard: un archivo que se hace pasar
    * por imagen y en realidad ejecuta JavaScript (el caso clásico es el SVG)
-   * correría con la sesión del CRM de quien lo abra. Por eso se contrasta la
+   * correría con la sesión del ERP de quien lo abra. Por eso se contrasta la
    * firma y se guarda lo que los bytes dicen ser, no lo declarado.
    *
    * No le quita nada al uso real: el panel pasa toda imagen por el canvas y

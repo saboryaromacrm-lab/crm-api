@@ -14,7 +14,7 @@
  *    muchos clientes móviles comparten IP (CGNAT) — un cupo agresivo de
  *    lectura bloquearía a dos clientas reales detrás de la misma antena.
  *
- * Las IPs PRIVADAS y loopback están exentas: el SSR de Next y el CRM viven en
+ * Las IPs PRIVADAS y loopback están exentas: el SSR de Next y el ERP viven en
  * la misma máquina/red y todo su tráfico sale de ahí — limitarlos sería
  * limitar a la propia infraestructura. Los visitantes reales llegan por el
  * proxy con su IP pública en X-Forwarded-For.

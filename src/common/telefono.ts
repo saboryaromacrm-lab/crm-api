@@ -1,7 +1,7 @@
 /**
  * Teléfono argentino normalizado a área + abonado (10 dígitos), o '' si no
  * llega. Misma regla que el checkout del sitio (`saboryaroma-web/src/lib/format.ts`)
- * y que el link de WhatsApp del CRM (`telefonoWa`): tolera cómo escribe la
+ * y que el link de WhatsApp del ERP (`telefonoWa`): tolera cómo escribe la
  * gente — `+54`, el `9` de celular, el `0` de larga distancia y el viejo `15`
  * (0370 15 4123456). Está duplicada en los tres proyectos a propósito: son
  * procesos distintos; si cambia una, tienen que cambiar las tres.

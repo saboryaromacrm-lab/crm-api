@@ -1,4 +1,4 @@
-# Deploy — Sabor y Aroma CRM (Dokploy)
+# Deploy — Sabor y Aroma ERP (Dokploy)
 
 Runbook del VPS: **Ubuntu 24 + Dokploy**, o sea Docker por abajo y **Traefik**
 como única puerta de entrada.

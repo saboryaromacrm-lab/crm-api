@@ -396,7 +396,7 @@ export class ProveedoresService {
    *   - lo que no existe se CREA.
    *
    * La mitad CONTABLE del archivo (saldos, facturado, vencimientos) NO entra a
-   * propósito: el saldo del CRM nace de los comprobantes, y un número suelto
+   * propósito: el saldo del ERP nace de los comprobantes, y un número suelto
    * importado hoy queda viejo mañana. Los saldos iniciales son un paso propio
    * el día del corte — decisión del dueño, 26/8.
    */

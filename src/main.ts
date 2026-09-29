@@ -146,7 +146,7 @@ async function bootstrap() {
    * El dashboard vive en un dominio y la API en otro, así que el navegador
    * PIDE PERMISO antes de cada llamada: manda un `OPTIONS`, espera el visto
    * bueno, y recién entonces manda la llamada de verdad. Son dos viajes por
-   * cada cosa que el CRM pregunta.
+   * cada cosa que el ERP pregunta.
    *
    * Sin `maxAge`, Chrome se acuerda de ese permiso solo 5 segundos — menos que
    * el intervalo de casi todos los avisos del sidebar, así que en la práctica
@@ -195,7 +195,7 @@ async function bootstrap() {
    * llamada justo por una que Node está cerrando en ese mismo instante. Esa
    * llamada se pierde. El proxy responde 502, y como ESA respuesta la escribe
    * el proxy y no la API, viaja sin los permisos de CORS: el navegador la
-   * descarta antes de que el CRM pueda leerla y el cajero ve el error de red
+   * descarta antes de que el ERP pueda leerla y el cajero ve el error de red
    * genérico, sin código ni causa. En el log del servidor no queda nada,
    * porque la llamada nunca llegó a la API.
    *
@@ -223,6 +223,6 @@ async function bootstrap() {
 
   await app.listen(port, host);
   // eslint-disable-next-line no-console
-  console.log(`CRM API escuchando en http://${host}:${port}/api`);
+  console.log(`ERP API escuchando en http://${host}:${port}/api`);
 }
 bootstrap();

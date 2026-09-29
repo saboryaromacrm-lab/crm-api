@@ -10,7 +10,7 @@
  * EL MIME QUE LLEGA LO ESCRIBE EL CLIENTE. Decir `data:image/png;base64,` y
  * mandar cualquier otra cosa es gratis. Como después el archivo se sirve CON
  * ese mime, creerle es alojar contenido arbitrario en el dominio del sistema
- * — y el dominio del sistema es donde vive el token de sesión del CRM.
+ * — y el dominio del sistema es donde vive el token de sesión del ERP.
  *
  * El caso que lo vuelve grave y no teórico es el SVG: no es una imagen, es un
  * documento que ejecuta JavaScript. Un `<svg onload=...>` servido desde

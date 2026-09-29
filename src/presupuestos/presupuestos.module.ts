@@ -441,7 +441,7 @@ export class PresupuestosService {
    *   2. El que ya traía la orden (el DNI matcheó al entrar).
    *   3. El DNI matchea AHORA (se dio de alta mientras la orden esperaba).
    *   4. `crearCliente: true`: alta desde los datos del formulario (la pregunta
-   *      "¿agregarlo como cliente nuevo?" que respondió el admin en el CRM).
+   *      "¿agregarlo como cliente nuevo?" que respondió el admin en el ERP).
    * Sin ninguna de las cuatro, la aceptación se rechaza con el porqué.
    */
   async aceptar(id: number, o: AceptarOrdenDto, opciones: OpcionesPresupuesto = {}) {

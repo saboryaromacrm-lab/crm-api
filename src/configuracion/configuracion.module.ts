@@ -254,7 +254,7 @@ export const IMPRESION_DEFAULTS = {
 /**
  * Slides de la portada del sitio: SON DATO, no código — alta, baja, edición y
  * orden se manejan desde Web › Contenido. Estos tres son solo el arranque
- * (equivalen a la portada original); una vez guardados desde el CRM, mandan
+ * (equivalen a la portada original); una vez guardados desde el ERP, mandan
  * los guardados. `id` ata cada slide a su imagen (`web_imagenes` tipo
  * 'banner', refId = id) y NO se recicla al borrar. `posicion`: dónde va el
  * texto sobre la imagen (left | center | right).

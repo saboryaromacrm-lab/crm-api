@@ -216,7 +216,7 @@ export class HistorialPreciosService {
 
   /**
    * FIRMA DEL ÚLTIMO CAMBIO DE PRECIO. Endpoint deliberadamente barato: lo
-   * pollea cada CRM abierto para avisarle al cajero que los precios que tiene
+   * pollea cada ERP abierto para avisarle al cajero que los precios que tiene
    * en pantalla quedaron viejos.
    *
    * La firma es el `id` más alto del historial, no la fecha: es monotónico,
@@ -769,7 +769,7 @@ export class PreciosController {
   ) {}
 
   /**
-   * Firma del último cambio de precio. Lo pollea cada CRM abierto para avisarle
+   * Firma del último cambio de precio. Lo pollea cada ERP abierto para avisarle
    * al cajero que su catálogo quedó viejo; por eso tiene que ser barato.
    *
    * LLAVE PROPIA, Y ES TODO EL PUNTO (23/9/2026). La clase pide `precios` —la

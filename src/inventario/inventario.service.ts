@@ -549,7 +549,7 @@ export class InventarioService {
    * Viaja en la respuesta de cada operación de stock (venta suelta,
    * fraccionamiento, corrección, movimiento manual) para que la pantalla
    * actualice SOLO ese producto. Hasta ahora, después de cada una de esas
-   * operaciones el CRM volvía a bajar el inventario ENTERO —10 MB con 2.700
+   * operaciones el ERP volvía a bajar el inventario ENTERO —10 MB con 2.700
    * productos, y el armado de precios de todos ellos en el servidor— por un
    * fraccionamiento de tres paquetes. Con cuatro personas trabajando, ese
    * armado repetido era lo que dejaba la API sin responder a las cajas.
@@ -639,7 +639,7 @@ export class InventarioService {
 
   /**
    * Fraccionamiento de UN producto: descuenta granel y crea paquetes (misma
-   * sucursal). Lo usan los seeds y los CRM que todavía no tienen el registro
+   * sucursal). Lo usan los seeds y los ERP que todavía no tienen el registro
    * con renglones (el que queda abierto durante el deploy): por dentro es un
    * registro de un solo producto.
    */
@@ -2975,13 +2975,13 @@ export class InventarioService {
    *
    * Cada parte lleva una VERSIÓN (secuencia de Postgres que avanza un trigger
    * en cada escritura: migración 0094). El controlador la lee ANTES de armar
-   * nada: si el CRM ya tiene esa versión, contesta 304 y no toca una tabla
+   * nada: si el ERP ya tiene esa versión, contesta 304 y no toca una tabla
    * pesada. Así, después de una venta se vuelve a bajar el stock y nada más;
    * después de editar un producto, el catálogo y nada más. Y el 304 nunca
    * puede mentir, porque la versión la lleva la base y no el código.
    *
    * `bootstrap()` a secas sigue existiendo y devuelve las tres juntas con la
-   * forma de siempre: un CRM abierto con la versión anterior lo sigue llamando
+   * forma de siempre: un ERP abierto con la versión anterior lo sigue llamando
    * hasta que recargue.
    */
 
@@ -2992,7 +2992,7 @@ export class InventarioService {
    *
    * SE LEE ANTES DE LOS DATOS, a propósito (ver el controlador): si se leyera
    * después, una escritura entre medio podría dejar una versión más nueva que
-   * el contenido, y el CRM se quedaría con datos viejos creyendo que están al
+   * el contenido, y el ERP se quedaría con datos viejos creyendo que están al
    * día. Al revés —versión vieja, contenido nuevo— solo cuesta un 200 de más.
    *
    * `is_called` NO ES DECORATIVO. Una secuencia recién creada tiene
@@ -3246,7 +3246,7 @@ export class InventarioService {
 
   /**
    * El snapshot entero, con la forma de siempre: las tres partes juntas. Lo
-   * usa el CRM que todavía no recargó después del deploy; el nuevo pide las
+   * usa el ERP que todavía no recargó después del deploy; el nuevo pide las
    * partes por separado (`/bootstrap/base`, `/catalogo`, `/stock`).
    */
   async bootstrap(soloSuc: number | null = null, verCostos = true, ocultarUnitario = false) {

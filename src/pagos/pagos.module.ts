@@ -708,7 +708,7 @@ export class PagosProveedorService {
     };
   }
 
-  /** Contador liviano para el aviso del CRM: cuánta plata está sin rendir. */
+  /** Contador liviano para el aviso del ERP: cuánta plata está sin rendir. */
   async resumenSinAplicar(destino?: string) {
     const conds: any[] = [
       eq(proveedorPagos.estado, 'activo'),

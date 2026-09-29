@@ -19,8 +19,13 @@ const URL_TOKEN = 'https://oauth2.googleapis.com/token';
 const URL_REVOCAR = 'https://oauth2.googleapis.com/revoke';
 const API = 'https://www.googleapis.com/drive/v3';
 const API_SUBIDA = 'https://www.googleapis.com/upload/drive/v3/files';
-const NOMBRE_CARPETA = 'Respaldos CRM Sabor y Aroma';
-export const PREFIJO_ARCHIVO = 'respaldo-crm-';
+const NOMBRE_CARPETA = 'Respaldos ERP Sabor y Aroma';
+/** Hasta el 29/9/2026 el sistema se llamaba «CRM» en estos nombres: la carpeta y las copias ya subidas se siguen reconociendo. */
+const NOMBRE_CARPETA_ANTERIOR = 'Respaldos CRM Sabor y Aroma';
+export const PREFIJO_ARCHIVO = 'respaldo-erp-';
+const PREFIJOS_ANTERIORES = ['respaldo-crm-'];
+/** ¿Es una copia hecha por este sistema? (Lo único que la limpieza puede borrar.) */
+export const esCopiaDelSistema = (nombre: string) => [PREFIJO_ARCHIVO, ...PREFIJOS_ANTERIORES].some((p) => nombre.startsWith(p));
 
 export interface ConfigGoogle { clientId: string; clientSecret: string; redirectUri: string }
 
@@ -110,25 +115,32 @@ export async function emailDe(accessToken: string): Promise<string> {
 }
 
 /**
- * La carpeta donde caen las copias. Si la guardada sigue viva se usa; si la
- * borraron (o nunca hubo) se busca una del mismo nombre creada por el sistema
- * y, si no está, se crea. Devuelve el id.
+ * La carpeta donde caen las copias. Si la guardada sigue viva se usa (y se le
+ * pone el nombre actual si tenía el anterior); si la borraron (o nunca hubo) se
+ * busca una con el nombre actual o el anterior creada por el sistema y, si no
+ * está, se crea. Devuelve el id.
  */
 export async function asegurarCarpeta(accessToken: string, idGuardado: string): Promise<string> {
   if (idGuardado) {
-    const r = await pedir(`${API}/files/${encodeURIComponent(idGuardado)}?fields=id,trashed`, { headers: auth(accessToken) });
+    const r = await pedir(`${API}/files/${encodeURIComponent(idGuardado)}?fields=id,trashed,name`, { headers: auth(accessToken) });
     if (r.ok) {
       const d: any = await comoJson(r);
-      if (d?.id && !d.trashed) return String(d.id);
+      if (d?.id && !d.trashed) {
+        if (d.name !== NOMBRE_CARPETA) await renombrar(accessToken, String(d.id), NOMBRE_CARPETA);
+        return String(d.id);
+      }
     } else if (r.status !== 404) {
       await exigirOk(r, 'No se pudo revisar la carpeta de Drive');
     }
   }
-  const q = `name = '${NOMBRE_CARPETA}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-  const b = await pedir(`${API}/files?${new URLSearchParams({ q, fields: 'files(id)', pageSize: '1' })}`, { headers: auth(accessToken) });
+  const q = `(name = '${NOMBRE_CARPETA}' or name = '${NOMBRE_CARPETA_ANTERIOR}') and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  const b = await pedir(`${API}/files?${new URLSearchParams({ q, fields: 'files(id,name)', pageSize: '1' })}`, { headers: auth(accessToken) });
   await exigirOk(b, 'No se pudo buscar la carpeta en Drive');
   const hallada: any = await comoJson(b);
-  if (hallada?.files?.[0]?.id) return String(hallada.files[0].id);
+  if (hallada?.files?.[0]?.id) {
+    if (hallada.files[0].name !== NOMBRE_CARPETA) await renombrar(accessToken, String(hallada.files[0].id), NOMBRE_CARPETA);
+    return String(hallada.files[0].id);
+  }
   const c = await pedir(`${API}/files?fields=id`, {
     method: 'POST',
     headers: { ...auth(accessToken), 'content-type': 'application/json' },
@@ -136,6 +148,17 @@ export async function asegurarCarpeta(accessToken: string, idGuardado: string): 
   });
   await exigirOk(c, 'No se pudo crear la carpeta en Drive');
   return String(((await comoJson(c)) as any).id);
+}
+
+/** Le cambia el nombre a un archivo o carpeta del sistema. Mejor esfuerzo: si falla, la copia igual sale. */
+async function renombrar(accessToken: string, id: string, nombre: string) {
+  try {
+    await pedir(`${API}/files/${encodeURIComponent(id)}?fields=id`, {
+      method: 'PATCH',
+      headers: { ...auth(accessToken), 'content-type': 'application/json' },
+      body: JSON.stringify({ name: nombre }),
+    });
+  } catch { /* el nombre es cosmético */ }
 }
 
 /** Sube un archivo de disco a la carpeta (subida reanudable, en flujo). Devuelve el id. */

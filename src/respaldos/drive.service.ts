@@ -45,7 +45,7 @@ import { respaldoDrive } from '../db/schema';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { cifrarArchivo, cifrarTexto, descifrarTexto } from './cifrado';
 import {
-  ErrorGoogle, PREFIJO_ARCHIVO, asegurarCarpeta, borrarArchivo, canjearCodigo, emailDe, listarCopias, revocar,
+  ErrorGoogle, PREFIJO_ARCHIVO, asegurarCarpeta, borrarArchivo, canjearCodigo, emailDe, esCopiaDelSistema, listarCopias, revocar,
   subirArchivo, tokenDeAcceso, urlDeCarpeta, urlDeConsentimiento, type ConfigGoogle,
 } from './google';
 import { volcarA } from './volcado';
@@ -94,9 +94,10 @@ export class RespaldoDriveService implements OnModuleInit, OnModuleDestroy {
   }
   private clave() { return process.env.BACKUP_CLAVE?.trim() || ''; }
 
-  /** A dónde se vuelve al terminar de autorizar: el CRM (el primer origen permitido). */
+  /** A dónde se vuelve al terminar de autorizar: el ERP (el primer origen permitido). */
   private urlCrm() {
-    const explicita = process.env.CRM_URL?.trim();
+    /* `ERP_URL` es el nombre vigente; `CRM_URL` (el de antes) se sigue leyendo para no romper lo ya cargado. */
+    const explicita = (process.env.ERP_URL || process.env.CRM_URL)?.trim();
     if (explicita) return explicita.replace(/\/$/, '');
     const primero = (process.env.CORS_ORIGINS ?? '').split(',').map((x) => x.trim()).find((x) => x.startsWith('https://'));
     return (primero ?? 'http://localhost:5173').replace(/\/$/, '');
@@ -186,7 +187,7 @@ export class RespaldoDriveService implements OnModuleInit, OnModuleDestroy {
     return { url: urlDeConsentimiento(cfg, this.firmar({ u: usuarioId, e: Date.now() + DIAS_VALIDEZ_STATE_MS }, cfg.clientSecret)) };
   }
 
-  /** El regreso de Google. Siempre termina redirigiendo al CRM, con el resultado en la dirección. */
+  /** El regreso de Google. Siempre termina redirigiendo al ERP, con el resultado en la dirección. */
   async alVolver(q: { code?: string; state?: string; error?: string }, res: Response) {
     const crm = this.urlCrm();
     const salir = (r: string, motivo = '') => res.redirect(302, `${crm}/sistema?respaldo=${r}${motivo ? `&motivo=${encodeURIComponent(motivo)}` : ''}`);
@@ -361,7 +362,7 @@ export class RespaldoDriveService implements OnModuleInit, OnModuleDestroy {
 
   /** Borra de la carpeta las copias con más de `dias` días, dejando siempre las 3 más nuevas. */
   private async podar(acceso: string, carpetaId: string, idNuevo: string, dias: number): Promise<number> {
-    const copias = (await listarCopias(acceso, carpetaId)).filter((c) => c.name.startsWith(PREFIJO_ARCHIVO));
+    const copias = (await listarCopias(acceso, carpetaId)).filter((c) => esCopiaDelSistema(c.name));
     const limite = Date.now() - dias * 24 * 3600_000;
     let n = 0;
     for (const [i, c] of copias.entries()) {
@@ -481,7 +482,7 @@ export class PaginasPublicasController {
 <p class="suave">Última actualización: 29 de septiembre de 2026.</p>
 <p>ERP Sabor y Aroma es el sistema de gestión interno de Sabor y Aroma. No es una aplicación pública: la usa únicamente el personal autorizado por el titular del negocio.</p>
 <h2>Qué acceso pedimos a Google y para qué</h2>
-<p>Cuando el titular conecta su cuenta de Google Drive, el sistema pide un único permiso: <strong>ver, crear y modificar únicamente los archivos que el propio sistema crea</strong> en Drive. Se usa exclusivamente para guardar copias de seguridad de la información del negocio en una carpeta llamada «Respaldos CRM Sabor y Aroma».</p>
+<p>Cuando el titular conecta su cuenta de Google Drive, el sistema pide un único permiso: <strong>ver, crear y modificar únicamente los archivos que el propio sistema crea</strong> en Drive. Se usa exclusivamente para guardar copias de seguridad de la información del negocio en una carpeta llamada «Respaldos ERP Sabor y Aroma».</p>
 <ul>
   <li>El sistema <strong>no puede leer, listar ni modificar</strong> ningún otro archivo de tu Drive.</li>
   <li>Del perfil de Google solo se muestra la dirección de correo de la cuenta conectada, para que se sepa cuál está vinculada.</li>

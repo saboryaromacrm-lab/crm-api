@@ -536,7 +536,7 @@ export class GastosService {
 
   /**
    * Contador para el badge del sidebar: cuántos gastos están vencidos o vencen
-   * hoy. Endpoint chico a propósito — lo pollea el CRM cada 30 segundos.
+   * hoy. Endpoint chico a propósito — lo pollea el ERP cada 30 segundos.
    */
   async pendientes() {
     const hoy = new Date(); hoy.setHours(23, 59, 59, 999);

@@ -2,7 +2,7 @@
 /**
  * ABRIR UNA COPIA CIFRADA DEL SISTEMA (respaldo a Google Drive)
  * ============================================================================
- * Convierte el archivo que baja de Drive (respaldo-crm-AAAA-MM-DD-HHMM.sql.gz.enc)
+ * Convierte el archivo que baja de Drive (respaldo-erp-AAAA-MM-DD-HHMM.sql.gz.enc; las anteriores al 29/9/2026 se llaman respaldo-crm-…)
  * en el .sql de la base, listo para restaurar con `psql`.
  *
  * NO necesita el sistema ni instalar nada: solo Node.js (versión 18 o más) y

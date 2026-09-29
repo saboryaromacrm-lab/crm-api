@@ -3,16 +3,16 @@
  * ============================================================================
  * El dueño tiene DOS negocios con el MISMO CUIT: la distribuidora (este
  * sistema) y una cafetería cuyo stock maneja OTRO sistema (coffit). El envío
- * NO es una transferencia entre sucursales — no hay receptor en el CRM — sino
+ * NO es una transferencia entre sucursales — no hay receptor en el ERP — sino
  * un PUNTO DE SALIDA: la mercadería egresa del stock valorizada A COSTO
  * congelado y del otro lado coffit la ingresa en su almacén "Sabor y Aroma",
  * donde ELLA decide qué es cada cosa (góndola, insumo, lo que sea).
  *
  * Reglas que NO se negocian:
- *  - El CRM nunca muestra existencias de Cafetería (coffit es el dueño).
+ *  - El ERP nunca muestra existencias de Cafetería (coffit es el dueño).
  *  - El envío va a COSTO: la ganancia aparece donde se genera (cuando el café
  *    vende), no en un traspaso interno.
- *  - La CLASIFICACIÓN de la mercadería es de coffit. El CRM no pregunta
+ *  - La CLASIFICACIÓN de la mercadería es de coffit. El ERP no pregunta
  *    destinos: manda el detalle completo y ahí termina su responsabilidad.
  *
  * CICLO DE VIDA en dos estados (desde el 9/8/2026):
@@ -97,7 +97,7 @@ class EnvioItemDto {
   @IsNumber() @Min(0.001) @Max(100000) cantidad!: number;
   /**
    * EL COSTO QUE DECLARA LA CAFETERÍA (0097), solo en los envíos de ENTRADA.
-   * Ahí el CRM no puede saberlo — la medialuna la hizo coffit — así que lo
+   * Ahí el ERP no puede saberlo — la medialuna la hizo coffit — así que lo
    * dice quien lo sabe, y se congela igual que en una salida. En una salida
    * se ignora: ese costo sale del formato de compra y no se tipea.
    *
@@ -1492,7 +1492,7 @@ export class CafeteriaService {
   /* ==================================================================== *
    * PEDIDOS DE LA CAFETERÍA — la demanda, separada del envío
    * ==================================================================== *
-   * Los arma el usuario del rol Cafetería (su única pantalla del CRM) contra
+   * Los arma el usuario del rol Cafetería (su única pantalla del ERP) contra
    * el catálogo completo con disponibilidad. NO tocan stock ni costo: la
    * realidad entra con el envío, que se crea desde el pedido y lo cierra.
    */
@@ -1576,7 +1576,7 @@ export class CafeteriaService {
   /**
    * `soloSuc` es lo que devuelve `soloSuSucursal(sesion)`: **`null` = sin
    * límite**, y ese es el caso del jefe (ve todos, para que un pedido hecho a
-   * un local donde nadie mira el CRM no muera en silencio) y el de la
+   * un local donde nadie mira el ERP no muera en silencio) y el de la
    * cafetería (está afuera de las sucursales: todos los pedidos son suyos).
    * El personal de cada local ve SOLO los que le pidieron a él.
    *
@@ -2601,11 +2601,11 @@ export class CafeteriaController {
    *
    * Es el único que consume una aplicación EXTERNA, y por eso tiene su propia
    * llave: `COFFIT_TOKEN` en el `.env`, que se manda en `X-Coffit-Token`. Sin
-   * esa cabecera sigue valiendo la sesión del CRM, así que **hoy no rompe nada**
+   * esa cabecera sigue valiendo la sesión del ERP, así que **hoy no rompe nada**
    * y el día que se coordine con coffit alcanza con cargarle el secreto.
    *
    * Por qué hacía falta: hasta acá coffit se autenticaba con un token de sesión
-   * común de 12 h, o sea con usuario y contraseña de alguien del CRM guardados
+   * común de 12 h, o sea con usuario y contraseña de alguien del ERP guardados
    * en la configuración de otra máquina. Ese token no es "solo lectura de
    * envíos" — es el panel entero, y con él se mueve stock. El contrato
    * (`docs/contrato-coffit.md`) prometía un token de solo lectura desde el
@@ -2621,7 +2621,7 @@ export class CafeteriaController {
   /*
    * CADA SUCURSAL VE LOS PEDIDOS QUE LE HICIERON A ELLA (0098) — decisión del
    * dueño. El jefe los ve todos: si un pedido cae en un local donde nadie mira
-   * el CRM, alguien tiene que poder verlo. La cafetería también los ve todos,
+   * el ERP, alguien tiene que poder verlo. La cafetería también los ve todos,
    * por el motivo contrario: los hizo ella.
    *
    * El filtro sale de la SESIÓN, nunca de la query: si viniera por parámetro,

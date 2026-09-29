@@ -387,8 +387,8 @@ export class OperacionesController {
 
   /*
    * `POST /operaciones/fraccionar` (la de un solo producto) SE RETIRÓ el
-   * 26/9/2026. Quedaba abierta para el CRM viejo durante el deploy del 0102, y
-   * aceptaba "2,5 paquetes" redondeándolos en silencio a 3. El CRM usa
+   * 26/9/2026. Quedaba abierta para el ERP viejo durante el deploy del 0102, y
+   * aceptaba "2,5 paquetes" redondeándolos en silencio a 3. El ERP usa
    * `fraccionar-registro` desde entonces; `opFraccionar` sigue en el servicio
    * solo para las semillas.
    */

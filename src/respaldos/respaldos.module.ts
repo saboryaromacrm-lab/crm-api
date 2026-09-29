@@ -152,7 +152,7 @@ export class RespaldosService {
     const sello = fecha.toISOString().slice(0, 16).replace('T', '-').replace(':', '');
 
     res.setHeader('Content-Type', 'application/sql; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="respaldo-crm-${sello}.sql"`);
+    res.setHeader('Content-Disposition', `attachment; filename="respaldo-erp-${sello}.sql"`);
 
     /* El volcado en sí vive en `volcado.ts`: lo comparte con el respaldo a
      * Drive. Acá solo se decide a dónde va cada pedazo: a la respuesta. */

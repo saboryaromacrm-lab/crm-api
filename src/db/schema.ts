@@ -1,7 +1,7 @@
 /**
  * ESQUEMA DE BASE DE DATOS (Drizzle / PostgreSQL)
  * ============================================================================
- * Modela el subsistema de inventario del CRM (Compras + Almacén). Réplica del
+ * Modela el subsistema de inventario del ERP (Compras + Almacén). Réplica del
  * modelo que hoy vive en el frontend (localStorage), ahora persistido.
  *
  * Modelo de stock SIN LOTE: **Producto × Sucursal × Presentación × Estado**.
@@ -2511,10 +2511,10 @@ export const gastoItems = pgTable('gasto_items', {
  * ============================================================================
  * La cafetería es del MISMO dueño y el MISMO CUIT, pero su stock lo maneja
  * OTRO sistema (coffit). Por eso esto NO es una transferencia entre
- * sucursales: no hay receptor en el CRM. Es un PUNTO DE SALIDA — la mercadería
+ * sucursales: no hay receptor en el ERP. Es un PUNTO DE SALIDA — la mercadería
  * egresa del stock de la distribuidora valorizada A COSTO (congelado en el
  * documento, porque los costos cambian) y ahí termina la responsabilidad del
- * CRM. El CRM nunca muestra existencias de Cafetería: dos sistemas contando la
+ * ERP. El ERP nunca muestra existencias de Cafetería: dos sistemas contando la
  * misma leche siempre terminan descuadrando.
  *
  * Los renglones llevan SNAPSHOT (nombre, unidad, códigos): el remito que lee
@@ -2524,7 +2524,7 @@ export const gastoItems = pgTable('gasto_items', {
 /*
  * Sin `tipo_envio_cafe` ni `destino_envio_cafe` desde el 9/8/2026: no hay
  * devoluciones (coffit recibe y punto: una corrección es EDITAR el envío), y el
- * destino de cada renglón (venta/uso) es una decisión DE COFFIT — el CRM la
+ * destino de cada renglón (venta/uso) es una decisión DE COFFIT — el ERP la
  * pedía, la guardaba y jamás la leía. La clasificación vive donde vive el stock.
  */
 /**
@@ -2533,7 +2533,7 @@ export const gastoItems = pgTable('gasto_items', {
  * recibió) y solo puede pasar a 'anulado' (reversión completa). Las etapas
  * pedido/transito/recibido se colapsaron el 9/8/2026: eran teatro de un viaje
  * que en la práctica es cruzar la calle, y cada etapa era un lugar más donde
- * el estado del CRM y el de coffit podían divergir.
+ * el estado del ERP y el de coffit podían divergir.
  */
 export const estadoEnvioCafeEnum = pgEnum('estado_envio_cafe', ['enviado', 'anulado']);
 /**
@@ -2551,7 +2551,7 @@ export const modoEnvioCafeEnum = pgEnum('modo_envio_cafe', ['granel', 'paquete',
  * cambia es de qué lado se mueve el stock y de dónde sale el costo:
  *
  *   · `salida`  — la distribuidora le manda al café. El stock EGRESA y el
- *     costo lo sabe el CRM (el del formato de compra).
+ *     costo lo sabe el ERP (el del formato de compra).
  *   · `entrada` — el café manda lo que elabora a una sucursal, para
  *     venderse en el mostrador. El stock INGRESA y el costo lo DECLARA la
  *     cafetería, porque es la única que lo sabe.
@@ -2565,7 +2565,7 @@ export const sentidoEnvioCafeEnum = pgEnum('sentido_envio_cafe', ['salida', 'ent
 /**
  * EL PEDIDO DE LA CAFETERÍA — la demanda, no el envío.
  *
- * Lo arma el usuario del rol Cafetería desde SU pantalla (el CRM con una sola
+ * Lo arma el usuario del rol Cafetería desde SU pantalla (el ERP con una sola
  * sección visible): elige del catálogo completo con disponibilidad a la vista.
  * NO toca stock ni congela costo — es un pedido, la vieja lección: la realidad
  * entra recién con el ENVÍO, que se crea desde el pedido y lo cierra.

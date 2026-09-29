@@ -40,7 +40,7 @@ export async function volcarA(
   const out = async (s: string) => { bytes += Buffer.byteLength(s); await escribir(s); };
 
   await out([
-    `-- Respaldo del CRM Sabor y Aroma — ${fecha.toISOString()}`,
+    `-- Respaldo del ERP Sabor y Aroma — ${fecha.toISOString()}`,
     `-- ${tablas.length} tablas. Generado desde Sistema › Respaldos.`,
     '--',
     '-- CÓMO SE RESTAURA (en una base NUEVA):',

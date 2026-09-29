@@ -543,7 +543,7 @@ export class TiendaService {
     /*
      * Cliente: se busca por DNI. Si ya existe, el pedido queda adjudicado a ESE
      * cliente. Si no, NO se da de alta acá: los datos del formulario viajan en
-     * `webCliente` y el alta se decide al ACEPTAR la orden en el CRM — así una
+     * `webCliente` y el alta se decide al ACEPTAR la orden en el ERP — así una
      * prueba o un spam no ensucian la base de clientes.
      */
     const [existente] = await this.db.select().from(clientes)
@@ -577,7 +577,7 @@ export class TiendaService {
         apellido: String(c.apellido ?? '').trim().slice(0, 60),
         telefono, dni,
         // La dirección viaja con los datos del cliente (jsonb, sin migración):
-        // el CRM la muestra en la orden y la usa al darlo de alta.
+        // el ERP la muestra en la orden y la usa al darlo de alta.
         ...(domicilio ?? {}),
       },
       items,
@@ -588,7 +588,7 @@ export class TiendaService {
 /**
  * Los CUATRO endpoints públicos del sistema — los únicos pensados para recibir
  * internet directo. Cada uno con su cupo por IP (ver rate-limit.guard.ts);
- * el resto de la API no se limita: el CRM le pega todo el día desde la red local.
+ * el resto de la API no se limita: el ERP le pega todo el día desde la red local.
  */
 @Controller('tienda')
 @Publico()
@@ -613,7 +613,7 @@ export class TiendaController {
    *
    * ESTE ENDPOINT ES EL QUE VUELVE PELIGROSA UNA SUBIDA. Es público, y nginx lo
    * publica en el MISMO ORIGEN que el dashboard (`location /api/`), donde vive
-   * el token de sesión del CRM. Un archivo que el navegador trate como
+   * el token de sesión del ERP. Un archivo que el navegador trate como
    * documento —un SVG, por ejemplo— correría ahí adentro con la sesión de quien
    * abra el link. Tres candados, y ninguno reemplaza a los otros:
    *
