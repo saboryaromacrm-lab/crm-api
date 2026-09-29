@@ -30,10 +30,18 @@ import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm'
 import { mimeReal, nombreSeguro } from '../common/archivos';
 import { fechaLocal } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { ajustePorAnulacion, fechaDeCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
+  auditoria, gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
+
+/**
+ * LO QUE UN GASTO DE COFFIT LE SUMA A SU CUENTA (0120): el total menos lo que
+ * la empresa recupera (IVA y percepciones). Con signo: la NC resta.
+ */
+const paraCuentaCoffit = (g: { total: number; iva: number; percDgi: number; percDgr: number }) =>
+  Math.round((Number(g.total) - Number(g.iva) - Number(g.percDgi) - Number(g.percDgr)) * 100) / 100;
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { PagosModule, PagosProveedorService, esAdminPagos, exigirFechaPago } from '../pagos/pagos.module';
@@ -861,6 +869,8 @@ export class GastosService {
         descripcion: descripcion ?? (dto.descripcion ?? '').trim(),
         condicionPago: (dto.condicionPago ?? 'contado') as any,
         negocio: (dto.negocio ?? 'distribuidora') as any,
+        /* De Coffit y con fecha de un mes ya cerrado en su cuenta: entra hoy. */
+        cuentaFecha: dto.negocio === 'cafeteria' ? await fechaDeCuenta(this.db, fechaLocal(dto.fecha) ?? new Date()) : null,
         vencimiento: fechaLocal(dto.vencimiento),
         neto, iva, otros, impInternos, percDgi, percDgr, total,
         pagado: 0,
@@ -1067,7 +1077,38 @@ export class GastosService {
       );
     }
     if (refFin !== (g.refGastoId ?? null)) patch.refGastoId = refFin;
+
+    /*
+     * LA CUENTA CON COFFIT (0120). Si el gasto es (o pasa a ser) de Coffit y
+     * cambia lo que le suma a su cuenta —negocio, importes o fecha—:
+     *   · si ya está en un mes cerrado, no se toca: el cierre lo contó. Se
+     *     anula y se carga de nuevo (la anulación deja el ajuste sola);
+     *   · si la fecha nueva cae en un mes cerrado, entra a la cuenta hoy;
+     *   · el cambio de negocio queda en la auditoría: quién y cuándo.
+     */
+    const negocioFin = patch.negocio ?? g.negocio;
+    if (g.negocio === 'cafeteria' || negocioFin === 'cafeteria') {
+      const antes = g.negocio === 'cafeteria' ? paraCuentaCoffit(g) : 0;
+      const despues = negocioFin === 'cafeteria' ? paraCuentaCoffit({ ...g, ...patch }) : 0;
+      const tocaCuenta = Math.abs(antes - despues) > 0.004 || (cambiaFecha && negocioFin === 'cafeteria');
+      if (tocaCuenta && g.negocio === 'cafeteria' && await fechaDeCuenta(this.db, g.cuentaFecha ?? g.fecha)) {
+        throw new BadRequestException(
+          'Este gasto de Coffit ya está en un mes cerrado de su cuenta: no se cambia por atrás. '
+          + 'Anulalo y cargalo de nuevo (la anulación deja el ajuste en la cuenta), o cargá un ajuste.',
+        );
+      }
+      if (negocioFin === 'cafeteria' && (tocaCuenta || g.negocio !== 'cafeteria')) {
+        patch.cuentaFecha = await fechaDeCuenta(this.db, patch.fecha ? new Date(patch.fecha) : g.fecha);
+      }
+    }
     if (Object.keys(patch).length) await this.db.update(gastos).set(patch).where(eq(gastos.id, id));
+    if (negocioFin !== g.negocio) {
+      const nombre = (n: string) => (n === 'cafeteria' ? 'Coffit' : 'Sabor y Aroma');
+      await this.db.insert(auditoria).values({
+        usuarioId: sesion?.usuarioId ?? null, entidad: 'gasto', entidadId: id, ambito: 'Negocio',
+        detalle: `Gasto #${id}`, campo: 'Negocio', antes: nombre(g.negocio), despues: nombre(negocioFin),
+      });
+    }
     await this.pagos.recalcularGastoAhora(g.refGastoId);
     if (refFin !== g.refGastoId) await this.pagos.recalcularGastoAhora(refFin);
     return this.get(id);
@@ -1087,10 +1128,19 @@ export class GastosService {
         : 'Tiene pagos registrados: revertilos primero — la plata que salió tiene que quedar rastreable.');
     }
     const nota = (motivo ?? '').trim().slice(0, 300);
-    await this.db.update(gastos).set({
-      estado: 'anulado',
-      observaciones: nota ? `${g.observaciones ? `${g.observaciones}\n` : ''}Anulado: ${nota}` : g.observaciones,
-    }).where(eq(gastos.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.update(gastos).set({
+        estado: 'anulado',
+        observaciones: nota ? `${g.observaciones ? `${g.observaciones}\n` : ''}Anulado: ${nota}` : g.observaciones,
+      }).where(eq(gastos.id, id));
+      /* De Coffit y en un mes cerrado de su cuenta: el ajuste contrario (0120). */
+      if (g.negocio === 'cafeteria') {
+        await ajustePorAnulacion(tx, {
+          fechaCuenta: g.cuentaFecha ?? g.fecha, efecto: paraCuentaCoffit(g),
+          documento: `el gasto #${id}${g.numero ? ` (${g.numero})` : ''}`,
+        });
+      }
+    });
     // Una NC anulada deja de descontar: su gasto recupera el saldo (0115).
     await this.pagos.recalcularGastoAhora(g.refGastoId);
     return this.get(id);

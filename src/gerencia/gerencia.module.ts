@@ -22,6 +22,7 @@ import { Controller, Get, Inject, Injectable, Module, Query } from '@nestjs/comm
 import { and, asc, eq, gt, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { veMetricasDelCafe } from '../auth/auth.guard';
+import { totalesCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, gastos, marcas, productoProveedores,
@@ -361,30 +362,11 @@ export class RentabilidadService {
    *    exactamente lo que este par de números vino a evitar.
    */
   private async parteDeCoffit(desde: Date, hastaEx: Date) {
-    const [[directo], [envios]] = await Promise.all([
-      this.db.select({
-        total: sql<number>`coalesce(sum(${comprobantes.netoCafeteria} * (case
-          when ${comprobantes.tipo} in ('factura', 'liquidacion', 'nota_debito') then 1
-          when ${comprobantes.tipo} = 'nota_credito' then -1 else 0 end)), 0)`,
-      }).from(comprobantes).where(and(
-        gte(comprobantes.fecha, desde), lt(comprobantes.fecha, hastaEx),
-        eq(comprobantes.estado, 'confirmado' as any), gt(comprobantes.netoCafeteria, 0),
-      )),
-      this.db.select({
-        /* Solo la parte que Coffit no había pagado ya (0119): un renglón puede
-         * salir en parte de lo que se compró para ella. */
-        total: sql<number>`coalesce(sum((${envioCafeteriaItems.cantidad} - ${envioCafeteriaItems.cantidadExclusiva}) * ${envioCafeteriaItems.costoUnitario}), 0)`,
-      }).from(envioCafeteriaItems)
-        .innerJoin(enviosCafeteria, eq(enviosCafeteria.id, envioCafeteriaItems.envioId))
-        .where(and(
-          gte(enviosCafeteria.fecha, desde), lt(enviosCafeteria.fecha, hastaEx),
-          eq(enviosCafeteria.estado, 'enviado' as any), eq(enviosCafeteria.sentido, 'salida' as any),
-        )),
-    ]);
-    return {
-      compradoDirecto: r2(Number(directo?.total) || 0),
-      enviadoDesdeStock: r2(Number(envios?.total) || 0),
-    };
+    /* LA MISMA REGLA QUE LA CUENTA CON COFFIT (`cafeteria/cuenta.ts`, 0120),
+     * por la fecha del papel: lo que se le cobra de un envío es sin lo que ya
+     * había pagado y con los faltantes al recibir descontados. */
+    const t = await totalesCuenta(this.db, desde, new Date(hastaEx.getTime() - 1), true);
+    return { compradoDirecto: t.compras, enviadoDesdeStock: t.envios };
   }
 
   private async creditoGastos(desde: Date, hastaEx: Date) {

@@ -17,7 +17,7 @@ import { PreciosModule, HistorialPreciosService } from '../precios/precios.modul
 import { CatalogosModule } from '../catalogos/catalogos.module';
 import { AuditoriaModule, AuditoriaService, type CambioAuditado } from '../auditoria/auditoria.module';
 import {
-  categorias, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
+  categorias, coffitMovimientos, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
   modalidadesVenta, movimientos, pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
   productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
   transferenciaItems, vencimientos, ventaItems,
@@ -27,6 +27,7 @@ import {
   precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
+import { costoUltimaFactura, cupoCafe } from '../cafeteria/cuenta';
 
 /*
  * Las alícuotas legales de IVA viven en `common/iva`: es una lista cerrada a
@@ -1669,7 +1670,7 @@ export class ProductosService {
     };
   }
 
-  async update(id: number, dto: UpsertProductoDto) {
+  async update(id: number, dto: UpsertProductoDto, usuarioId?: number | null) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
 
@@ -1683,9 +1684,44 @@ export class ProductosService {
     await this.validarClasificacion(dto);
     await this.validarCodigos(dto, id);
 
-    await this.db.update(productos).set(this.valores(dto, p)).where(eq(productos.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.update(productos).set(this.valores(dto, p)).where(eq(productos.id, id));
+      if (dto.soloCafeteria === true && !p.soloCafeteria) await this.cobrarStockAlMarcarExclusivo(tx, p, usuarioId);
+    });
     if (dto.etiquetas) await this.setEtiquetas(id, dto.etiquetas);
     return this.get(id);
+  }
+
+  /**
+   * MARCAR «USO EXCLUSIVO DE COFFIT» UN ARTÍCULO QUE YA TIENE STOCK (0120,
+   * acordado en la conciliación entre los dos negocios). Desde ese momento los
+   * envíos lo mandan sin cobrar —es de Coffit—, así que el stock que había (de
+   * la distribuidora) se le cobra ACÁ, una vez, al costo de la última factura.
+   * Lo que Coffit ya había pagado en facturas (su cupo) no se cobra de nuevo.
+   * El movimiento guarda la cantidad: si mañana se desmarca, esas unidades
+   * siguen siendo suyas (suman a su cupo).
+   */
+  private async cobrarStockAlMarcarExclusivo(tx: any, p: any, usuarioId?: number | null) {
+    const filas = await tx.select({ cantidad: stock.cantidad, tamKg: presentaciones.tamKg })
+      .from(stock).leftJoin(presentaciones, eq(presentaciones.id, stock.presentacionId))
+      .where(and(eq(stock.productoId, p.id), eq(stock.estado, 'disponible'), gt(stock.cantidad, 0)));
+    const enStock = filas.reduce((a: number, f: any) => a + Number(f.cantidad) * (f.tamKg != null ? Number(f.tamKg) : 1), 0);
+    if (enStock <= 1e-6) return;
+    const yaPagado = Math.max(0, (await cupoCafe(tx, [p.id])).get(p.id) ?? 0);
+    const cantidad = Math.round((enStock - yaPagado) * 1e6) / 1e6;
+    if (cantidad <= 1e-6) return;
+    let costo = (await costoUltimaFactura(tx, [p.id])).get(p.id);
+    if (costo == null) {
+      const provs = await tx.select().from(productoProveedores).where(eq(productoProveedores.productoId, p.id));
+      costo = costoNetoEntry(formatoActivo(provs) as any, p.iva);
+    }
+    const importe = Math.round(cantidad * (Number(costo) || 0) * 100) / 100;
+    if (importe < 0.01) return;
+    const unidad = p.tipo === 'granel' ? 'kg' : 'u.';
+    await tx.insert(coffitMovimientos).values({
+      tipo: 'marca_exclusivo', aFavor: 'sya', importe, productoId: p.id, cantidad, usuarioId: usuarioId ?? null,
+      descripcion: `${p.nombre} pasó a uso exclusivo de Coffit con ${cantidad} ${unidad} en stock, a ${Math.round(Number(costo) * 100) / 100} por ${unidad}`,
+    });
   }
 
   /* ==================== CICLO DE VIDA ====================
@@ -2325,8 +2361,8 @@ export class ProductosController {
   }
 
   @Permiso('compras.productos')
-  @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto) {
-    return this.svc.update(id, dto);
+  @Patch(':id') update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertProductoDto, @Auth() sesion: Sesion) {
+    return this.svc.update(id, dto, sesion?.usuarioId ?? null);
   }
 
   /**

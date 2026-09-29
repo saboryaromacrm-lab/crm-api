@@ -22,6 +22,7 @@ import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { etiquetaDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { ajustePorAnulacion, fechaDeCuenta } from '../cafeteria/cuenta';
 import { normalizarPuntoVenta } from '../facturas/facturas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
@@ -1099,7 +1100,18 @@ export class ComprobantesService {
     } = this.armarPie(dto, fiscal, ivaDefault, discriminaIva);
     /* Lo que de este papel es del café, congelado con el documento (0101): los
      * exclusivos siempre, y los que se tildaron al cargar (0119). */
-    const esDelCafe = (it: { productoId: number; paraCafeteria?: boolean }) => delCafe.has(it.productoId) || it.paraCafeteria === true;
+    /* LA NOTA HEREDA LA MARCA DE SU FACTURA (0120, acordado en la conciliación
+     * con Coffit): lo que en la factura era de Coffit lo es también en la NC o
+     * ND que la ajusta, aunque no se tilde. Si no, la devolución de algo que
+     * Coffit pagó le quedaba a la distribuidora. */
+    const heredados = new Set<number>();
+    if (dto.refComprobanteId != null && (dto.tipo === 'nota_credito' || dto.tipo === 'nota_debito')) {
+      const filas = await this.db.select({ productoId: comprobanteItems.productoId }).from(comprobanteItems)
+        .where(and(eq(comprobanteItems.comprobanteId, dto.refComprobanteId), eq(comprobanteItems.paraCafeteria, true)));
+      for (const f of filas) heredados.add(f.productoId);
+    }
+    const esDelCafe = (it: { productoId: number; paraCafeteria?: boolean }) => delCafe.has(it.productoId)
+      || heredados.has(it.productoId) || it.paraCafeteria === true;
     const netoCafeteria = this.netoCafeteriaDe(items, esDelCafe);
     /*
      * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
@@ -1240,6 +1252,11 @@ export class ComprobantesService {
          * si ya viene con hora (el store la agrega) se respeta tal cual. */
         fecha: dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : undefined,
         fechaCarga: dto.fechaCarga ? new Date(dto.fechaCarga.length <= 10 ? `${dto.fechaCarga}T00:00:00` : dto.fechaCarga) : undefined,
+        /* Con renglones de Coffit y fecha de un mes ya cerrado en su cuenta,
+         * entra a la cuenta hoy (0120). */
+        cuentaFecha: items.some((it) => esDelCafe(it as any))
+          ? await fechaDeCuenta(tx, dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : new Date())
+          : null,
         proveedorId: prov.id, sucursalId: dto.sucursalId ?? null,
         estado, condicionPago: dto.condicionPago ?? 'cuenta_corriente',
         vencimientoPago: dto.vencimientoPago ? new Date(dto.vencimientoPago.length <= 10 ? `${dto.vencimientoPago}T00:00:00` : dto.vencimientoPago) : null,
@@ -1922,6 +1939,16 @@ export class ComprobantesService {
         estado: 'anulado', anuladoEn: new Date(), anuladoPor: dto.usuarioId ?? null, motivoAnulacion: motivo,
       }).where(and(eq(comprobantes.id, c.id), ne(comprobantes.estado, 'anulado'))).returning();
       if (!anulado) throw new BadRequestException('Ya está anulado.');
+      /* Si ya estaba en un mes cerrado de la cuenta con Coffit, el cierre lo
+       * contó: la anulación deja el ajuste contrario en el mes abierto (0120). */
+      if (Number(c.netoCafeteria) > 0 && ['factura', 'liquidacion', 'nota_debito', 'nota_credito'].includes(c.tipo)) {
+        await ajustePorAnulacion(tx, {
+          fechaCuenta: c.cuentaFecha ?? c.fecha,
+          efecto: Number(c.netoCafeteria) * (c.tipo === 'nota_credito' ? -1 : 1),
+          documento: etiquetaDoc(c),
+          usuarioId: dto.usuarioId ?? null,
+        });
+      }
       return { c: anulado, plan, tocados };
     });
 
@@ -2075,6 +2102,9 @@ export class ComprobantesService {
         numero: dto.numero ?? c.numero ?? null,
         // La fecha pasa a ser LA DEL PAPEL: es la que define el período fiscal.
         fecha: dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : c.fecha,
+        cuentaFecha: netoCafeteria > 0
+          ? await fechaDeCuenta(tx, dto.fecha ? new Date(dto.fecha.length <= 10 ? `${dto.fecha}T00:00:00` : dto.fecha) : c.fecha)
+          : null,
         fechaCarga: dto.fechaCarga
           ? new Date(dto.fechaCarga.length <= 10 ? `${dto.fechaCarga}T00:00:00` : dto.fechaCarga)
           : new Date(),

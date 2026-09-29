@@ -841,6 +841,13 @@
       "when": 1790300000000,
       "tag": "0119_coffit_por_renglon",
       "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "7",
+      "when": 1790310000000,
+      "tag": "0120_cuenta_coffit",
+      "breakpoints": true
     }
   ]
 }

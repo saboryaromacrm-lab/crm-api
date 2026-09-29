@@ -1527,6 +1527,11 @@ export const comprobantes = pgTable('comprobantes', {
    * fiscal es del CUIT, y el CUIT es uno solo.
    */
   netoCafeteria: doublePrecision('neto_cafeteria').notNull().default(0),
+  /**
+   * CUÁNDO ENTRA A LA CUENTA CON COFFIT, si no es su fecha (0120): una factura
+   * con fecha de un mes ya cerrado entra el día que se carga. Vacía = su fecha.
+   */
+  cuentaFecha: timestamp('cuenta_fecha', { withTimezone: true }),
   // NC/ND referencian la factura que ajustan (sin FK dura para evitar autorreferencia).
   refComprobanteId: integer('ref_comprobante_id'),
   observaciones: text('observaciones').notNull().default(''),
@@ -2465,6 +2470,8 @@ export const gastos = pgTable('gastos', {
   pagado: doublePrecision('pagado').notNull().default(0),
   estado: estadoGastoEnum('estado').notNull().default('pendiente'),
   negocio: negocioGastoEnum('negocio').notNull().default('distribuidora'),
+  /** Cuándo entra a la cuenta con Coffit si su fecha cae en un mes cerrado (0120). */
+  cuentaFecha: timestamp('cuenta_fecha', { withTimezone: true }),
   /** Si lo generó un gasto fijo, de cuál salió (para no duplicar el período). */
   recurrenteId: integer('recurrente_id'),
   /** La NC de un gasto (0115): contra qué gasto descuenta. Su saldo baja por la NC. */
@@ -2648,6 +2655,8 @@ export const enviosCafeteria = pgTable('envios_cafeteria', {
   ixFecha: index('ix_envios_cafe_fecha').on(t.fecha),
   // La consulta de sincronización de coffit entra por acá.
   ixActualizado: index('ix_envios_cafe_actualizado').on(t.actualizadoEn),
+  /** Las diferencias al recibir cuentan en la fecha de recepción (0120). */
+  ixRecibido: index('ix_envios_cafe_recibido').on(t.recibidoEn),
 }));
 
 export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
@@ -2696,6 +2705,64 @@ export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
   codigoPropio: text('codigo_propio').notNull().default(''),
   /** Lo que contó el que recibió (0113). Nulo = todavía no se recibió. */
   cantidadRecibida: doublePrecision('cantidad_recibida'),
+});
+
+/* ============================================================================
+ * LA CUENTA CORRIENTE ENTRE SABOR Y AROMA Y COFFIT (0120)
+ * ==========================================================================*/
+/**
+ * Lo que NO sale de un documento: saldo inicial, pagos, compensaciones,
+ * ajustes y el stock que pasa a Coffit al marcar un artículo exclusivo. El
+ * resto de la cuenta (compras, envíos, entradas, gastos) se calcula de los
+ * documentos — ver `cafeteria/cuenta.ts`.
+ *
+ * `aFavor` dice a quién le suma: 'sya' = Coffit le debe más a Sabor y Aroma
+ * (o S&A le pagó a Coffit); 'coffit' = baja lo que Coffit debe (Coffit pagó,
+ * o S&A le reconoce algo). El importe siempre positivo.
+ */
+export const coffitMovimientos = pgTable('coffit_movimientos', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  tipo: text('tipo').notNull(),
+  aFavor: text('a_favor').notNull(),
+  importe: doublePrecision('importe').notNull(),
+  descripcion: text('descripcion').notNull().default(''),
+  medio: text('medio').notNull().default(''),
+  referencia: text('referencia').notNull().default(''),
+  productoId: integer('producto_id').references(() => productos.id, { onDelete: 'set null' }),
+  /** En `marca_exclusivo`: cuánto stock (kg o u.) pasó a Coffit. Suma a su cupo. */
+  cantidad: doublePrecision('cantidad'),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  anulado: boolean('anulado').notNull().default(false),
+  motivoAnulacion: text('motivo_anulacion').notNull().default(''),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+}, (t) => ({
+  ixFecha: index('ix_coffit_mov_fecha').on(t.fecha),
+}));
+
+/**
+ * EL CIERRE MENSUAL: el saldo congelado hasta `hasta` (inclusive) y la foto de
+ * los renglones que lo explican. Después de un cierre no se carga ni se toca
+ * nada con fecha de ese período; las correcciones van como ajuste del mes en
+ * curso. Solo el último cierre se puede reabrir (queda anulado, con motivo).
+ */
+export const coffitCierres = pgTable('coffit_cierres', {
+  id: serial('id').primaryKey(),
+  desde: date('desde', { mode: 'string' }),
+  hasta: date('hasta', { mode: 'string' }).notNull(),
+  saldoAnterior: doublePrecision('saldo_anterior').notNull().default(0),
+  totales: jsonb('totales').notNull().default({}),
+  saldoFinal: doublePrecision('saldo_final').notNull().default(0),
+  detalle: jsonb('detalle').notNull().default([]),
+  observaciones: text('observaciones').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  anulado: boolean('anulado').notNull().default(false),
+  motivoAnulacion: text('motivo_anulacion').notNull().default(''),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
 });
 
 /* ============================================================================

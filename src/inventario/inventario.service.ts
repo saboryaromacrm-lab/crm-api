@@ -6,7 +6,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
-  comprobantes, facturaLecturas, pedidosCafeteria, vencimientos,
+  comprobantes, facturaLecturas, pedidosCafeteria, vencimientos, enviosCafeteria, envioCafeteriaItems,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   conteos, conteoItems, ventas, clientes,
   fraccionOperadores, fraccionamientos, fraccionamientoItems,
@@ -2580,9 +2580,33 @@ export class InventarioService {
   private async cerrarRecepcionCafe(tx: any, inc: any, resolucion: string) {
     const TEXTO: Record<string, string> = {
       corregido: 'No había salido: se corrigió el envío.',
-      perdida: 'Se perdió o se rompió en el camino.',
+      perdida: 'Se perdió o se rompió en el camino: la pérdida es de quien lo mandó (ya se descontó de la cuenta con Coffit al recibir).',
     };
     if (!TEXTO[resolucion]) throw new BadRequestException('Resolución inválida para un faltante de envío de Coffit.');
+    /* «CORREGIDO» TIENE QUE SER VERDAD (0120): el envío ya no puede decir que
+     * salió más de lo que llegó. Si no, cerrarla así escondía el faltante. */
+    if (resolucion === 'corregido') {
+      const codigo = String(inc.motivo ?? '').split(' ')[0];
+      const [envio] = codigo
+        ? await tx.select({ id: enviosCafeteria.id }).from(enviosCafeteria).where(eq(enviosCafeteria.codigo, codigo)).limit(1)
+        : [];
+      if (envio) {
+        const [r] = await tx.select({
+          mandado: sql<number>`coalesce(sum(${envioCafeteriaItems.cantidad}), 0)`,
+          llego: sql<number>`coalesce(sum(coalesce(${envioCafeteriaItems.cantidadRecibida}, ${envioCafeteriaItems.cantidad})), 0)`,
+        }).from(envioCafeteriaItems).where(and(
+          eq(envioCafeteriaItems.envioId, envio.id), eq(envioCafeteriaItems.productoId, inc.productoId),
+          inc.presentacionId == null ? isNull(envioCafeteriaItems.presentacionId) : eq(envioCafeteriaItems.presentacionId, inc.presentacionId),
+        ));
+        if (Number(r?.mandado) > Number(r?.llego) + 1e-9) {
+          throw new BadRequestException(
+            `${codigo} todavía dice que se mandaron ${Number(r.mandado)} y llegaron ${Number(r.llego)}. `
+            + 'Si en realidad no salió, primero corregí el envío con Editar (bajalo a lo que salió) y después cerrá esta incidencia. '
+            + 'Si se perdió en el camino, cerrala como pérdida.',
+          );
+        }
+      }
+    }
     await tx.update(incidencias).set({
       resolucion, fechaResolucion: new Date(), activa: false,
       motivo: `${inc.motivo} · ${TEXTO[resolucion]}`,
