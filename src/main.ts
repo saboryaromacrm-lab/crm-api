@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { BadRequestException, ValidationPipe, type ValidationError } from '@nestjs/common';
+import { BadRequestException, RequestMethod, ValidationPipe, type ValidationError } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { json } from 'express';
 import helmet from 'helmet';
@@ -118,7 +118,16 @@ async function bootstrap() {
   const trustProxy = /^\d+$/.test(trustProxyCrudo) ? Number(trustProxyCrudo) : trustProxyCrudo;
   app.getHttpAdapter().getInstance().set('trust proxy', trustProxy);
 
-  app.setGlobalPrefix('api');
+  /* Las tres páginas públicas del dominio (inicio, privacidad y condiciones)
+   * cuelgan de la raíz y no de /api: son las que Google pide para publicar la
+   * conexión con Drive (ver respaldos/drive.service.ts). */
+  app.setGlobalPrefix('api', {
+    exclude: [
+      { path: '/', method: RequestMethod.GET },
+      { path: 'privacidad', method: RequestMethod.GET },
+      { path: 'condiciones', method: RequestMethod.GET },
+    ],
+  });
   app.useGlobalPipes(new ValidationPipe({
     whitelist: true,
     transform: true,

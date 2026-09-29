@@ -32,6 +32,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { auditoria, usuarios } from '../db/schema';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
+import { tablasDelEsquema, volcarA } from './volcado';
 
 /** Literal SQL: comillas simples dobladas. `standard_conforming_strings` es el
  *  default de Postgres, así que la barra invertida no necesita nada. */
@@ -88,6 +89,8 @@ const TABLAS_PRACTICA = [
   // cafetería
   'pedidos_cafeteria', 'pedido_cafeteria_items',
   'envios_cafeteria', 'envio_cafeteria_items',
+  // la cuenta corriente con Coffit (0120): sus pagos y cierres son de la práctica
+  'coffit_movimientos', 'coffit_cierres',
   // tienda: eventos (las fotos quedan)
   'web_eventos',
   // el rastro de la práctica; el primer registro de la era nueva es la limpieza
@@ -105,13 +108,8 @@ export class RespaldosService {
     return (this.db as any).$client as Pool;
   }
 
-  /** Tablas del esquema público, orden alfabético (las FKs no importan: el
-   *  archivo carga con los triggers apagados). */
-  private async tablas(): Promise<string[]> {
-    const r = await this.pool.query(
-      "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
-    );
-    return r.rows.map((x: any) => x.tablename as string);
+  private tablas(): Promise<string[]> {
+    return tablasDelEsquema(this.pool);
   }
 
   async info() {
@@ -125,6 +123,8 @@ export class RespaldosService {
         (SELECT count(*) FROM clientes)      AS clientes`),
       this.db.select({
         fecha: auditoria.fecha,
+        /* Qué fue (descarga, copia a Drive, falla, conexión…): desde el respaldo a Drive el registro trae varios tipos. */
+        campo: auditoria.campo,
         detalle: auditoria.despues,
         usuario: sql<string>`coalesce(${usuarios.nombre}, '')`,
       })
@@ -132,7 +132,7 @@ export class RespaldosService {
         .leftJoin(usuarios, eq(usuarios.id, auditoria.usuarioId))
         .where(and(eq(auditoria.entidad, 'sistema'), eq(auditoria.ambito, 'Respaldos')))
         .orderBy(desc(auditoria.id))
-        .limit(10),
+        .limit(25),
     ]);
     return {
       tamano: tam.rows[0]?.pretty ?? '—',
@@ -148,59 +148,17 @@ export class RespaldosService {
    * exactamente lo que Postgres sabe volver a leer.
    */
   async volcar(res: Response, usuarioId: number | null) {
-    const tablas = await this.tablas();
     const fecha = new Date();
     const sello = fecha.toISOString().slice(0, 16).replace('T', '-').replace(':', '');
 
     res.setHeader('Content-Type', 'application/sql; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="respaldo-crm-${sello}.sql"`);
 
-    let bytes = 0;
-    let filasTotal = 0;
-    const escribir = (s: string) => { bytes += Buffer.byteLength(s); res.write(s); };
-
-    escribir([
-      `-- Respaldo del CRM Sabor y Aroma — ${fecha.toISOString()}`,
-      `-- ${tablas.length} tablas. Generado desde Sistema › Respaldos.`,
-      '--',
-      '-- CÓMO SE RESTAURA (en una base NUEVA):',
-      '--   1. Crear la base y correr las migraciones del sistema:  node dist/db/migrate.js',
-      '--   2. Cargar este archivo como superusuario (postgres):    psql "DATABASE_URL" -f este_archivo.sql',
-      '-- El archivo vacía las tablas y las vuelve a llenar; corre con los',
-      '-- triggers apagados (session_replication_role), por eso pide superusuario.',
-      '',
-      'BEGIN;',
-      'SET session_replication_role = replica;',
-      `TRUNCATE ${tablas.map((t) => `"${t}"`).join(', ')} CASCADE;`,
-      '',
-    ].join('\n'));
-
-    // Sin parsers: cada valor llega como el texto que Postgres emitiría en un COPY.
-    const crudo = { getTypeParser: () => (v: string) => v } as any;
-
-    for (const t of tablas) {
-      const r = await this.pool.query({ text: `SELECT * FROM "${t}"`, types: crudo });
-      if (!r.rows.length) continue;
-      const cols = r.fields.map((f: any) => `"${f.name}"`).join(', ');
-      escribir(`-- ${t}: ${r.rows.length} fila(s)\n`);
-      const LOTE = 200;
-      for (let i = 0; i < r.rows.length; i += LOTE) {
-        const filas = r.rows.slice(i, i + LOTE)
-          .map((row: any) => `(${r.fields.map((f: any) => literal(row[f.name])).join(', ')})`);
-        escribir(`INSERT INTO "${t}" (${cols}) VALUES\n${filas.join(',\n')};\n`);
-      }
-      filasTotal += r.rows.length;
-    }
-
-    // Las secuencias arrancan después del último id insertado, tabla por tabla.
-    const conSerial = await this.pool.query(`
-      SELECT table_name FROM information_schema.columns
-      WHERE table_schema = 'public' AND column_name = 'id' AND column_default LIKE 'nextval%'`);
-    escribir('\n-- Secuencias al día\n');
-    for (const row of conSerial.rows as any[]) {
-      escribir(`SELECT setval(pg_get_serial_sequence('"${row.table_name}"', 'id'), COALESCE((SELECT MAX(id) FROM "${row.table_name}"), 0) + 1, false);\n`);
-    }
-    escribir('\nSET session_replication_role = DEFAULT;\nCOMMIT;\n');
+    /* El volcado en sí vive en `volcado.ts`: lo comparte con el respaldo a
+     * Drive. Acá solo se decide a dónde va cada pedazo: a la respuesta. */
+    const { tablas, filas: filasTotal, bytes } = await volcarA(this.pool, async (s) => {
+      if (!res.write(s)) await new Promise<void>((ok) => res.once('drain', () => ok()));
+    });
     res.end();
 
     /* El rastro: quién bajó la copia, cuándo y qué tamaño tenía. Después de
@@ -210,7 +168,7 @@ export class RespaldosService {
     await this.audit.registrar([{
       entidad: 'sistema', entidadId: 0, ambito: 'Respaldos',
       campo: 'Descarga del respaldo', usuarioId,
-      despues: `${tablas.length} tablas · ${filasTotal.toLocaleString('es-AR')} filas · ${mb} MB`,
+      despues: `${tablas} tablas · ${filasTotal.toLocaleString('es-AR')} filas · ${mb} MB`,
     }]);
   }
 

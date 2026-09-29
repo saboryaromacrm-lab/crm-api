@@ -32,6 +32,7 @@ import { VencimientosModule } from './vencimientos/vencimientos.module';
 import { GerenciaModule } from './gerencia/gerencia.module';
 import { AuditoriaModule } from './auditoria/auditoria.module';
 import { RespaldosModule } from './respaldos/respaldos.module';
+import { RespaldoDriveModule } from './respaldos/drive.service';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { RespaldosModule } from './respaldos/respaldos.module';
     AuthModule,
     AuditoriaModule,
     RespaldosModule,
+    RespaldoDriveModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,

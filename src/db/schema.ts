@@ -20,6 +20,7 @@ import {
   index,
   uniqueIndex,
   date,
+  bigint,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -3267,3 +3268,25 @@ export const schema = {
   proveedorCuentas, pedidosProveedor, proveedorCompromisos, proveedorEcheqs, proveedorAjustes, pagoFormas,
   auditoria,
 };
+
+/**
+ * EL RESPALDO A GOOGLE DRIVE (0121): una sola fila. Ver `respaldos/drive.service.ts`.
+ * El token viaja cifrado; nunca se devuelve a la pantalla.
+ */
+export const respaldoDrive = pgTable('respaldo_drive', {
+  id: integer('id').primaryKey().default(1),
+  email: text('email').notNull().default(''),
+  tokenCifrado: text('token_cifrado').notNull().default(''),
+  carpetaId: text('carpeta_id').notNull().default(''),
+  activo: boolean('activo').notNull().default(true),
+  hora: text('hora').notNull().default('03:00'),
+  dias: integer('dias').notNull().default(30),
+  cifrar: boolean('cifrar').notNull().default(true),
+  conectadoEn: timestamp('conectado_en', { withTimezone: true }),
+  ultimoIntento: timestamp('ultimo_intento', { withTimezone: true }),
+  ultimoOk: timestamp('ultimo_ok', { withTimezone: true }),
+  ultimoArchivo: text('ultimo_archivo').notNull().default(''),
+  ultimoTamano: bigint('ultimo_tamano', { mode: 'number' }).notNull().default(0),
+  ultimoError: text('ultimo_error').notNull().default(''),
+  ultimoOrigen: text('ultimo_origen').notNull().default(''),
+});
