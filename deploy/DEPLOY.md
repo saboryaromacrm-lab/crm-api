@@ -34,7 +34,7 @@ Con Dokploy, un **proyecto** agrupa los servicios. Para esta ronda son tres:
 
 ```
 api.saboryaroma.com   →  crm-api:3001        (Path /, Strip Path apagado)
-crm.saboryaroma.com   →  crm-dashboard:8080  (Path /)
+erp.saboryaroma.com   →  crm-dashboard:8080  (Path /)   (decidido 29/9/2026: era crm.)
 saboryaroma.com       →  la tienda, cuando entre
 ```
 
@@ -103,13 +103,13 @@ PORT=3001
 HOST=0.0.0.0
 TZ=America/Argentina/Buenos_Aires
 TRUST_PROXY=1
-CORS_ORIGINS=https://crm.saboryaroma.com
+CORS_ORIGINS=https://erp.saboryaroma.com
 # COFFIT_TOKEN=   (recién cuando se coordine con la cafetería)
 ```
 
 Cuando entre la tienda, se le suma su origen separado por coma y **sin espacios
 de más** (se recortan, pero es fácil equivocarse):
-`https://crm.saboryaroma.com,https://saboryaroma.com`
+`https://erp.saboryaroma.com,https://saboryaroma.com`
 
 `HOST_INTERNO` es el que muestra la ficha de la base en Dokploy: los servicios
 del proyecto se ven por nombre dentro de la red de Docker. **No** se usa
@@ -140,7 +140,7 @@ variable se ignora en silencio.
 **`CORS_ORIGINS`.** Con la API en su propio subdominio, cada llamada del
 dashboard es de origen cruzado y el navegador la bloquea salvo que la API diga
 que ese origen está permitido. Va el origen COMPLETO y con esquema
-(`https://crm.saboryaroma.com`), sin barra final.
+(`https://erp.saboryaroma.com`), sin barra final.
 
 El dashboard no lleva variables de entorno, pero sí **un Build Arg**:
 `VITE_API_BASE_URL=https://api.saboryaroma.com/api`. Las `VITE_*` se hornean al
@@ -231,13 +231,13 @@ trámite de nuevo (es gratis y evita mover un archivo secreto).
 3. **`crm-dashboard`**: Application → Git (`crm-dashboard`, rama `main`), Build
    Type **Dockerfile**, con el **Build Arg**
    `VITE_API_BASE_URL=https://api.saboryaroma.com/api`. Dominio
-   `crm.saboryaroma.com`, path `/`, puerto `8080`, HTTPS.
+   `erp.saboryaroma.com`, path `/`, puerto `8080`, HTTPS.
 
 > **El DNS va antes que el deploy.** Cada subdominio necesita su registro **A**
 > apuntando a la IP del VPS *antes* de encender HTTPS: Let's Encrypt valida
 > contra el DNS real, y si no resuelve, el certificado no se emite.
 4. **Deploy de la API primero.** Al arrancar corre las migraciones sola (§5) y
-   recién después escucha. Verificá `https://crm.TUDOMINIO.com/api/health` →
+   recién después escucha. Verificá `https://api.TUDOMINIO.com/api/health` →
    `{"status":"ok",…}`.
 5. **Deploy del dashboard.** Entrá, y **probá recargar con F5 parado en una
    pantalla interna** (`/gastos`): tiene que seguir ahí, no dar 404. Eso prueba
