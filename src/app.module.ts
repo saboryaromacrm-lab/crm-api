@@ -34,6 +34,7 @@ import { AuditoriaModule } from './auditoria/auditoria.module';
 import { RespaldosModule } from './respaldos/respaldos.module';
 import { RespaldoDriveModule } from './respaldos/drive.service';
 import { MetricasModule } from './metricas/metricas.module';
+import { MercadoPagoModule } from './mercadopago/mercadopago.module';
 
 @Module({
   imports: [
@@ -65,6 +66,8 @@ import { MetricasModule } from './metricas/metricas.module';
     CajaModule,
     OfertasModule,
     VentasModule,
+    // Cobro con QR de Mercado Pago (0126).
+    MercadoPagoModule,
     CobranzasModule,
     PresupuestosModule,
     TiendaModule,

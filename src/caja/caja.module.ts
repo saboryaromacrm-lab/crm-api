@@ -23,7 +23,7 @@ import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import {
-  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, sucursales, ventaPagos, ventas,
+  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, mpCobros, sucursales, ventaPagos, ventas,
 } from '../db/schema';
 
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -150,6 +150,20 @@ function arqueoCiego<T extends { medios: Record<string, unknown>; controles: any
     controles: a.controles.map((c) => ({ ...c, esperadoEfectivo: null, diferencia: null })),
     ciego: true,
   };
+}
+
+/**
+ * NO SE CIERRA UN TURNO CON UN COBRO POR QR ESPERANDO (0126). El pago puede
+ * entrar después del cierre y su plata quedaría fuera del arqueo firmado.
+ */
+async function sinCobrosQrVivos(tx: any, sucursalId: number) {
+  const [f] = await tx.select({ n: sql<number>`count(*)::int` }).from(mpCobros)
+    .where(and(eq(mpCobros.sucursalId, sucursalId), sql`${mpCobros.estado} in ('esperando', 'procesando', 'error')`));
+  if (Number(f?.n) > 0) {
+    throw new BadRequestException(
+      'Hay un cobro por QR de Mercado Pago sin terminar en esta sucursal (esperando el pago, o pagado sin cerrar la venta): resolvelo antes de cerrar la caja.',
+    );
+  }
 }
 
 @Injectable()
@@ -501,6 +515,7 @@ export class CajaService {
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+      await sinCobrosQrVivos(tx, sesion.sucursalId);
 
       const a = await this.arqueo(id);
       const diferencia = money(declarado - a.esperadoEfectivo);
@@ -570,6 +585,7 @@ export class CajaService {
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+      await sinCobrosQrVivos(tx, sesion.sucursalId);
 
       const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
         .where(eq(sucursales.id, sesion.sucursalId)).limit(1);

@@ -32,7 +32,7 @@ import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
-  listasVenta, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
+  listasVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
   type ReceptorVenta,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
@@ -455,6 +455,8 @@ export interface OpcionesVenta {
   puedePisarPrecio?: boolean;
   /** Rol admin/superadmin: puede fechar la venta y anular contra un turno cerrado. */
   esJefe?: boolean;
+  /** El cierre automático de un cobro por QR de Mercado Pago (0126): el único que pasa el candado del cobro vivo. */
+  desdeMercadoPago?: boolean;
 }
 
 class VentaItemDto {
@@ -3454,6 +3456,7 @@ export class VentasService {
     if (opciones.soloSuSucursal && actual.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }
+    await this.sinCobroQrVivo(id, opciones);
     // El relevo (0088): quien está en la registradora firma el borrador que toca.
     const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
     const config = await this.cfg.get('ventas');
@@ -3555,6 +3558,7 @@ export class VentasService {
     if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }
+    await this.sinCobroQrVivo(id, opciones);
     if (!borrador.items.length) throw new BadRequestException('El ticket está vacío.');
     // El borrador pudo nacer antes de que el producto se marcara "solo para
     // fraccionar" o se archivara: se re-valida acá, que es donde el stock sale.
@@ -4592,11 +4596,30 @@ export class VentasService {
    * que devuelve `GET /ventas?estado=borrador` limpiaba los tickets abiertos de
    * todas las cajas en el momento de más gente.
    */
+  /**
+   * EL CANDADO DEL COBRO POR QR (0126). Con el monto ya en el QR de la caja,
+   * el ticket no se edita, no se cobra por otro lado y no se descarta: el
+   * cliente puede estar pagando en ese momento, y el pago tiene que encontrar
+   * su venta tal cual se la mandó. Se destraba cuando el cobro se paga, se
+   * cancela o vence.
+   */
+  private async sinCobroQrVivo(id: number, opciones: OpcionesVenta) {
+    if (opciones.desdeMercadoPago) return;
+    const [vivo] = await this.db.select({ id: mpCobros.id, estado: mpCobros.estado }).from(mpCobros)
+      .where(and(eq(mpCobros.ventaId, id), inArray(mpCobros.estado, ['esperando', 'procesando', 'error']))).limit(1);
+    if (vivo) {
+      throw new BadRequestException(vivo.estado === 'error'
+        ? 'Este ticket ya se cobró por QR de Mercado Pago y la venta quedó sin cerrar: resolvelo desde el cobro (Reintentar) antes de tocarlo. Cobrarlo de nuevo le cobraría dos veces al cliente.'
+        : 'Este ticket tiene un cobro por QR de Mercado Pago en curso: esperá a que el cliente pague o cancelá el cobro primero.');
+    }
+  }
+
   async descartar(id: number, opciones: OpcionesVenta = {}) {
     const borrador = await this.exigirBorrador(id);
     if (opciones.soloSuSucursal && borrador.sucursalId !== opciones.soloSuSucursal) {
       throw new ForbiddenException('Ese ticket es de otra sucursal.');
     }
+    await this.sinCobroQrVivo(id, opciones);
     await this.db.delete(ventas).where(eq(ventas.id, id));
     return { ok: true };
   }

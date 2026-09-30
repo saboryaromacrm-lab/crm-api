@@ -3049,6 +3049,45 @@ export const padronCuit = pgTable('padron_cuit', {
   consultadoEn: timestamp('consultado_en', { withTimezone: true }).notNull().defaultNow(),
 });
 
+/* ============================================================================
+ * COBRO CON QR DE MERCADO PAGO (0126). Ver `mercadopago/`.
+ * ========================================================================== */
+export const mpSucursales = pgTable('mp_sucursales', {
+  sucursalId: integer('sucursal_id').primaryKey().references(() => sucursales.id, { onDelete: 'cascade' }),
+  mpStoreId: text('mp_store_id').notNull(),
+  externalId: text('external_id').notNull(),
+  creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const mpCajas = pgTable('mp_cajas', {
+  id: serial('id').primaryKey(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  terminalId: integer('terminal_id').references(() => terminales.id, { onDelete: 'set null' }),
+  nombre: text('nombre').notNull(),
+  mpPosId: text('mp_pos_id').notNull().default(''),
+  externalPosId: text('external_pos_id').notNull(),
+  qrImagen: text('qr_imagen').notNull().default(''),
+  qrPdf: text('qr_pdf').notNull().default(''),
+  activa: boolean('activa').notNull().default(true),
+  creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const mpCobros = pgTable('mp_cobros', {
+  id: serial('id').primaryKey(),
+  ventaId: integer('venta_id').notNull().references(() => ventas.id, { onDelete: 'cascade' }),
+  cajaId: integer('caja_id').notNull().references(() => mpCajas.id),
+  sucursalId: integer('sucursal_id').notNull(),
+  orderId: text('order_id'),
+  estado: text('estado').notNull().default('esperando'),
+  monto: doublePrecision('monto').notNull(),
+  confirmar: jsonb('confirmar').notNull(),
+  paymentId: text('payment_id').notNull().default(''),
+  detalle: text('detalle').notNull().default(''),
+  usuarioId: integer('usuario_id'),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const arcaTokens = pgTable('arca_tokens', {
   service: text('service').primaryKey(),
   token: text('token').notNull(),
