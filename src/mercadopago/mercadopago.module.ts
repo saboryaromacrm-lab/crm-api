@@ -170,11 +170,10 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
     let r: any;
     try {
       r = await mp.crearCaja({
-        name: `${s.nombre} - ${t.nombre}`.slice(0, 60),
+        // Solo lo que pide la documentación de /v2/pos (nombre ≤45, letras/números/espacios/guiones).
+        name: `${s.nombre} ${t.nombre}`.replace(/[^A-Za-z0-9_ -]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 45).trim(),
         store_id: ms.mpStoreId,
-        external_store_id: ms.externalId,
         external_id: externalPosId,
-        fixed_amount: true,
         config: { qr: { operating_mode: 'pdv' } },
       }, `sya-caja-${externalPosId}`);
     } catch (e) {

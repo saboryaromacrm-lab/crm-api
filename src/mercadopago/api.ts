@@ -37,7 +37,11 @@ function motivoDe(d: any): string {
   if (!d) return '';
   const errs = Array.isArray(d.errors) ? d.errors.map((e: any) => e?.message || e?.code).filter(Boolean) : [];
   const causas = Array.isArray(d.cause) ? d.cause.map((c: any) => c?.description || c?.code).filter(Boolean) : [];
-  return [d.message, ...errs, ...causas].filter(Boolean).join(' · ') || d.error || '';
+  const detalles = Array.isArray(d.errors) ? d.errors.flatMap((e: any) => (Array.isArray(e?.details) ? e.details : [])).filter((x: any) => typeof x === 'string') : [];
+  const base = [d.message, ...errs, ...causas, ...detalles].filter(Boolean).join(' · ') || d.error || '';
+  // Si Mercado Pago solo dice "error validating payload", mostramos lo que contestó para poder corregirlo.
+  if (typeof d === 'object' && /validating payload/i.test(base) && !detalles.length) return `${base} [${JSON.stringify(d).slice(0, 400)}]`;
+  return base;
 }
 
 async function llamar<T = any>(metodo: string, ruta: string, cuerpo?: unknown, idempotencia?: string): Promise<T> {
