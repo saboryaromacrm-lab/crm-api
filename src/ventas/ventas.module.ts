@@ -813,7 +813,14 @@ export class VentasService {
     const offset = Math.max(Number(q.offset) || 0, 0);
     const vivas = and(...conds, ne(ventas.estado, 'anulada'));
 
-    const [filas, [tot], porMedio, [ofe]] = await Promise.all([
+    /*
+     * FACTURADO vs LIQUIDADO (30/9/2026, pedido del dueño). Facturado = lo que
+     * se cobró con «Facturar» (F8): facturas y sus notas de crédito, más los
+     * provisorios que esperan a ARCA (se pidió factura). Liquidado = «Liquidar»
+     * (F10): tickets internos y sus devoluciones. Las NC restan en su lado.
+     */
+    const FACTURADO = sql`(${ventas.tipo}::text like 'factura%' or (${ventas.tipo}::text like 'nota_credito_%' and ${ventas.tipo}::text <> 'nota_credito_ticket') or ${ventas.facturarPendiente})`;
+    const [filas, [tot], porMedio, [ofe], [fac], porLista] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -865,6 +872,32 @@ export class VentasService {
         .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .where(vivas),
+
+      this.db.select({
+        facturado: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${FACTURADO}), 0)`,
+        facturadoCae: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${FACTURADO} and ${ventas.cae} <> ''), 0)`,
+        facturas: sql<number>`count(*) filter (where ${FACTURADO} and ${ventas.tipo}::text not like 'nota_credito%')::int`,
+        liquidado: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where not ${FACTURADO}), 0)`,
+        liquidaciones: sql<number>`count(*) filter (where not ${FACTURADO} and ${ventas.tipo}::text not like 'nota_credito%')::int`,
+      }).from(ventas)
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .where(vivas),
+
+      /* POR LISTA DE PRECIOS (30/9/2026): la mercadería con IVA de cada lista
+       * (la NC resta). Agrupa por la lista; el nombre es el de hoy, o el
+       * congelado en el renglón si la lista ya no existe. Recargos y envíos no
+       * son de ninguna lista: quedan fuera de este reparto. */
+      this.db.select({
+        listaId: ventaItems.listaId,
+        nombre: sql<string>`coalesce(max(${listasVenta.nombre}), max(nullif(${ventaItems.lista}, '')), 'Sin lista')`,
+        importe: sql<number>`coalesce(sum(${ventaItems.subtotal} * (1 + coalesce(${ventaItems.iva}, 21) / 100.0) * ${SIGNO_NC}), 0)`,
+        ventas: sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+      }).from(ventaItems)
+        .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .leftJoin(listasVenta, eq(listasVenta.id, ventaItems.listaId))
+        .where(vivas)
+        .groupBy(ventaItems.listaId),
     ]);
 
     const ids = filas.map((f) => f.v.id);
@@ -946,6 +979,23 @@ export class VentasService {
         sinFacturar: Number(tot?.sinFacturar) || 0,
         ofertas: { plata: money(Number(ofe?.plata)), ventas: Number(ofe?.ventas) || 0 },
         porMedio: porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) })),
+        facturacion: (() => {
+          const f = money(Number(fac?.facturado)); const l = money(Number(fac?.liquidado));
+          const base = f + l;
+          const pct = (x: number) => (base > 0 ? Math.round((x / base) * 1000) / 10 : null);
+          return {
+            facturado: f, facturadoCae: money(Number(fac?.facturadoCae)), facturadoSinCae: money(f - Number(fac?.facturadoCae)),
+            facturas: Number(fac?.facturas) || 0, pctFacturado: pct(f),
+            liquidado: l, liquidaciones: Number(fac?.liquidaciones) || 0, pctLiquidado: pct(l),
+          };
+        })(),
+        porLista: (() => {
+          const filasL = porLista.map((x) => ({ listaId: x.listaId, nombre: x.nombre, importe: money(Number(x.importe)), ventas: Number(x.ventas) || 0 }));
+          const base = filasL.reduce((a, x) => a + x.importe, 0);
+          return filasL
+            .map((x) => ({ ...x, pct: base > 0 ? Math.round((x.importe / base) * 1000) / 10 : null }))
+            .sort((a, b) => b.importe - a.importe);
+        })(),
       },
     };
   }

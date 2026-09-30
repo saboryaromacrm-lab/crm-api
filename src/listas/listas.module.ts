@@ -20,7 +20,7 @@
  */
 import {
   Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Patch, Post, Put,
+  NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { ArrayMaxSize, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
 import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
@@ -217,11 +217,48 @@ export class ListasService {
   /**
    * Con ventas hechas se **desactiva** en vez de borrarse: los renglones viejos
    * la referencian y su precio tiene que seguir siendo explicable.
+   *
+   * CANDADOS (30/9/2026, «eliminar las listas vacías»). Antes, borrar una lista
+   * se llevaba por cascada a los CLIENTES que la tenían asignada (perdían su
+   * precio en silencio) y, con un descuento atado, fallaba con un error de
+   * base. Ahora:
+   *   · la lista base (el piso del sistema) no se borra;
+   *   · con clientes, descuentos u ofertas vigentes que la usan, se frena y se
+   *     dice cuántos;
+   *   · `soloVacia` (el botón de Listas de precios): con artículos cargados no
+   *     se borra — para eso está «Mover a otra lista»;
+   *   · un descuento viejo (inactivo) atado a ella: se desactiva, no se borra.
    */
-  async borrarLista(id: number) {
+  async borrarLista(id: number, opciones: { soloVacia?: boolean } = {}) {
+    const [l] = await this.db.select().from(listasVenta).where(eq(listasVenta.id, id)).limit(1);
+    if (!l) throw new NotFoundException('Lista inexistente.');
+    const r = await this.db.execute(sql`
+      SELECT
+        (SELECT (valor->>'listaBaseId')::int FROM configuracion WHERE clave = 'ventas') AS base,
+        (SELECT count(*)::int FROM producto_listas WHERE lista_id = ${id}) AS articulos,
+        (SELECT count(*)::int FROM descuentos WHERE lista_id = ${id}) AS descuentos_todos`);
+    const f: any = r.rows[0] ?? {};
+    if (Number(f.base) === id) {
+      throw new BadRequestException(`«${l.nombre}» es la lista base (el piso con que cotiza el sistema): no se puede eliminar.`);
+    }
+    if (opciones.soloVacia && Number(f.articulos) > 0) {
+      throw new BadRequestException(
+        `«${l.nombre}» tiene ${f.articulos} artículo(s) con precio (puede haber archivados): no está vacía. Pasalos antes con «Mover a otra lista».`,
+      );
+    }
+    const uso = await this.usoLista(id);
+    const frenos = [
+      uso.clientes ? `${uso.clientes} cliente(s) la tienen asignada` : '',
+      uso.descuentos ? `${uso.descuentos} descuento(s) activos la usan` : '',
+      uso.ofertas ? `${uso.ofertas} oferta(s) vigentes la usan` : '',
+    ].filter(Boolean);
+    if (frenos.length) {
+      throw new BadRequestException(`No se puede eliminar «${l.nombre}»: ${frenos.join(', ')}. Sacásela primero.`);
+    }
+
     const [usada] = await this.db.select({ n: sql<number>`count(*)` })
       .from(ventaItems).where(eq(ventaItems.listaId, id));
-    if (Number(usada?.n) > 0) {
+    if (Number(usada?.n) > 0 || Number(f.descuentos_todos) > 0) {
       const [l] = await this.db.update(listasVenta).set({ activa: false })
         .where(eq(listasVenta.id, id)).returning();
       return { ok: true, desactivada: true, lista: l };
@@ -567,7 +604,10 @@ export class ListasController {
     return this.svc.editarLista(id, dto);
   }
   @Permiso('ventas.listas', 'precios')
-  @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarLista(id); }
+  /** `?soloVacia=1`: el botón de Listas de precios — con artículos cargados no borra. */
+  @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number, @Query('soloVacia') soloVacia?: string) {
+    return this.svc.borrarLista(id, { soloVacia: soloVacia === '1' });
+  }
 }
 
 @Module({
