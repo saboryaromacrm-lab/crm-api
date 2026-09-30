@@ -32,7 +32,8 @@ import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
-  listasVenta, ventaExtras, ventaItems, ventaPagos, ventas,
+  listasVenta, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
+  type ReceptorVenta,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
 import { agruparPor, grupo } from '../common/agrupar';
@@ -50,6 +51,7 @@ import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 import { faltaIdentificar } from '../arca/comprobante';
+import { consultarCuit, cuitValido, ErrorPadron, soloDigitos } from '../arca/padron';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
 
@@ -569,7 +571,27 @@ export class CreateVentaDto {
   @IsOptional() @IsArray() @IsInt({ each: true }) descuentos?: number[];
 }
 
+/** Los datos cargados A MANO cuando ARCA no respondió la consulta del CUIT (0125). */
+class ReceptorManualDto {
+  @IsString() @MaxLength(160) nombre!: string;
+  @IsIn(['responsable_inscripto', 'monotributo', 'exento', 'consumidor_final']) condicionIva!: ReceptorVenta['condicionIva'];
+  @IsOptional() @IsString() @MaxLength(200) direccion?: string;
+  @IsOptional() @IsString() @MaxLength(120) localidad?: string;
+}
+
+/**
+ * FACTURA A UN CUIT DESDE LA CAJA (0125). Solo el CUIT: el nombre y la
+ * condición de IVA los pone ARCA (el servidor consulta, no le cree a la
+ * pantalla). `manual` solo cuenta si ARCA no tiene el dato a mano.
+ */
+class FacturaCuitDto {
+  @IsString() @MaxLength(20) cuit!: string;
+  @IsOptional() @ValidateNested() @Type(() => ReceptorManualDto) manual?: ReceptorManualDto;
+}
+
 class ConfirmarVentaDto {
+  /** Facturar a un CUIT que no es el cliente del ticket (vendiendo a Consumidor Final). */
+  @IsOptional() @ValidateNested() @Type(() => FacturaCuitDto) facturaCuit?: FacturaCuitDto;
   /**
    * Cómo se cierra: 'ticket' = liquidar (comprobante interno), 'factura' =
    * facturar (la letra la resuelve el backend según las dos condiciones de
@@ -794,7 +816,8 @@ export class VentasService {
     const [filas, [tot], porMedio, [ofe]] = await Promise.all([
       this.db.select({
         v: ventas,
-        clienteNombre: clientes.nombre,
+        // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
+        clienteNombre: sql<string>`coalesce(${ventas.receptor}->>'nombre', ${clientes.nombre})`,
         sucursalNombre: sucursales.nombre,
         cajeroNombre: usuarios.nombre,
       }).from(ventas)
@@ -1045,10 +1068,13 @@ export class VentasService {
       ? 0
       : saldoCrudo;
 
+    /* Factura a un CUIT (0125): el papel lleva al comprador congelado, no al
+     * cliente de la venta («Consumidor Final») ni a como esté hoy ese cliente. */
+    const comprador = v.receptor ? this.compradorDe(cli ?? {}, v.receptor) : cli;
     return {
       ...v,
-      clienteNombre: cli?.nombre ?? '—',
-      cliente: cli ?? null,
+      clienteNombre: comprador?.nombre ?? '—',
+      cliente: comprador ?? null,
       /* El QR de la RG 4892, ya armado. Lo calcula la API porque acá viven la
        * tabla de códigos y el CUIT del certificado; el navegador solo lo
        * dibuja. `null` = este comprobante no lleva QR (ticket interno, o sin
@@ -1056,7 +1082,7 @@ export class VentasService {
       qrArca: urlQrFiscal({
         tipo: v.tipo, puntoVenta: v.puntoVenta, numero: v.numero,
         fecha: v.fecha, total: v.total, cae: v.cae,
-        receptor: cli ? { tipoDoc: cli.tipoDoc, numeroDoc: cli.numeroDoc } : null,
+        receptor: comprador ? { tipoDoc: comprador.tipoDoc, numeroDoc: comprador.numeroDoc } : null,
       }),
       codigoComprobante: codigoComprobante(v.tipo),
       sucursalNombre: suc?.nombre ?? '—',
@@ -2555,6 +2581,81 @@ export class VentasService {
     return { ...config, arcaHabilitado: !!config.arcaHabilitado && suc.habilitada };
   }
 
+  /**
+   * FACTURA A UN CUIT DESDE LA CAJA (0125, pedido del dueño). Arma el comprador
+   * congelado de la factura y dice si ese CUIT ya es cliente.
+   *
+   * Reglas (decididas con el dueño):
+   *   · Solo facturando, al contado, con el ticket a Consumidor Final y en una
+   *     sucursal que factura con ARCA.
+   *   · La condición de IVA la pone ARCA (padrón, con lo guardado 7 días): la
+   *     pantalla solo manda el CUIT. Eso decide si sale A o B.
+   *   · Si ARCA no responde, los datos cargados a mano valen —también los de
+   *     un cajero— y la factura queda marcada `manual` para revisarla.
+   *   · Si el CUIT ya es cliente, la venta queda a su nombre, sin recalcular
+   *     los precios del ticket.
+   */
+  private async resolverFacturaCuit(
+    dto: ConfirmarVentaDto, cliente: any, config: any, condicionPago: string,
+    suc: { habilitada: boolean; nombre: string },
+  ): Promise<{ receptor: ReceptorVenta; clienteExistente: any | null }> {
+    const f = dto.facturaCuit!;
+    if (dto.tipo !== 'factura') throw new BadRequestException('«Factura a CUIT» es para facturar (F8), no para liquidar.');
+    if (condicionPago !== 'contado') throw new BadRequestException('«Factura a CUIT» es al contado. Para cuenta corriente, el comprador tiene que ser cliente.');
+    if (!cliente?.esConsumidorFinal) {
+      throw new BadRequestException(`El ticket ya está a nombre de ${cliente?.nombre ?? 'un cliente'}: se factura a él. «Factura a CUIT» es para ventas a Consumidor Final.`);
+    }
+    if (!config.arcaHabilitado || !suc.habilitada) {
+      throw new BadRequestException(`${suc.nombre} todavía no factura con ARCA: no se puede facturar a un CUIT desde esta caja.`);
+    }
+    const cuit = soloDigitos(f.cuit);
+    if (!cuitValido(cuit)) throw new BadRequestException('Ese CUIT no es válido: revisá los 11 números.');
+
+    let receptor: ReceptorVenta;
+    try {
+      /* Con datos a mano NO se vuelve a esperar a ARCA (la caja ya esperó y no
+       * contestó): vale lo guardado si lo hay, y si no, lo cargado. */
+      if (f.manual) {
+        const [g] = await this.db.select({ datos: padronCuit.datos }).from(padronCuit).where(eq(padronCuit.cuit, cuit)).limit(1);
+        if (g?.datos) {
+          const d = g.datos as any;
+          receptor = { nombre: d.nombre, tipoDoc: 'cuit', numeroDoc: cuit, condicionIva: d.condicionIva, direccion: d.direccion ?? '', localidad: d.localidad ?? '', manual: false };
+        } else {
+          const nombre = f.manual.nombre.trim();
+          if (!nombre) throw new BadRequestException('Cargá el nombre o la razón social del comprador.');
+          receptor = {
+            nombre, tipoDoc: 'cuit', numeroDoc: cuit, condicionIva: f.manual.condicionIva,
+            direccion: (f.manual.direccion ?? '').trim(), localidad: (f.manual.localidad ?? '').trim(), manual: true,
+          };
+        }
+      } else {
+        const d = await consultarCuit(this.db, cuit);
+        receptor = { nombre: d.nombre, tipoDoc: 'cuit', numeroDoc: cuit, condicionIva: d.condicionIva, direccion: d.direccion, localidad: d.localidad, manual: false };
+      }
+    } catch (e) {
+      if (e instanceof ErrorPadron) {
+        throw new BadRequestException(e.reintentable
+          ? `${e.message} Cargá los datos a mano para facturar igual.`
+          : e.message);
+      }
+      throw e;
+    }
+
+    const [existente] = await this.db.select().from(clientes)
+      .where(and(eq(clientes.numeroDoc, cuit), eq(clientes.esConsumidorFinal, false), eq(clientes.activo, true)))
+      .limit(1);
+    return { receptor, clienteExistente: existente ?? null };
+  }
+
+  /** El comprador de la factura: el congelado si se facturó a un CUIT (0125), si no el cliente. */
+  private compradorDe(cliente: any, receptor: ReceptorVenta | null | undefined) {
+    if (!receptor) return cliente;
+    return {
+      ...cliente, nombre: receptor.nombre, tipoDoc: receptor.tipoDoc, numeroDoc: receptor.numeroDoc,
+      condicionIva: receptor.condicionIva, direccion: receptor.direccion, localidad: receptor.localidad, esConsumidorFinal: false,
+    };
+  }
+
   private async resolverFiscal(
     quiereFactura: boolean,
     cliente: any,
@@ -3412,9 +3513,26 @@ export class VentasService {
     await this.validarCantidadesEnteras(borrador.items);
 
     const config = await this.cfg.get('ventas');
-    const cliente = await this.cli.get(borrador.clienteId);
+    let cliente: any = await this.cli.get(borrador.clienteId);
     const condicionPago = dto.condicionPago ?? borrador.condicionPago;
     const sucursalId = borrador.sucursalId!;
+    // ARCA visto desde ESTA sucursal (0124).
+    const suc = await this.fiscalSucursal(sucursalId);
+
+    /*
+     * FACTURA A UN CUIT (0125): el ticket está a Consumidor Final y se factura
+     * a un CUIT. `cliente` pasa a ser el comprador para la factura (con los
+     * datos de ARCA); si ese CUIT ya es cliente, la venta queda a su nombre
+     * —sin recalcular precios: se cobra lo que marca el ticket—.
+     */
+    let receptor: ReceptorVenta | null = null;
+    let clienteIdFinal = borrador.clienteId;
+    if (dto.facturaCuit) {
+      const r = await this.resolverFacturaCuit(dto, cliente, config, condicionPago, suc);
+      receptor = r.receptor;
+      if (r.clienteExistente) { cliente = r.clienteExistente; clienteIdFinal = r.clienteExistente.id; }
+      cliente = this.compradorDe(cliente, receptor);
+    }
     /* EL RELEVO (0088): quien está en la caja firma el cobro y el movimiento
      * de stock. La venta sigue siendo de quien la armó (0060). */
     const cobrador = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
@@ -3580,8 +3698,6 @@ export class VentasService {
      * puede existir en ARCA: se consulta y se adopta en vez de emitir otro. */
     const [reserva] = await this.db.select({ nro: ventas.facturarCbteNro, tipo: ventas.facturarCbteTipo })
       .from(ventas).where(eq(ventas.id, id)).limit(1);
-    // ARCA visto desde ESTA sucursal (0124).
-    const suc = await this.fiscalSucursal(sucursalId);
     /* Un número reservado en ARCA por un intento anterior y la sucursal que
      * mientras tanto dejó de facturar: cobrarlo como comprobante interno podría
      * dejar una factura real en ARCA sin su venta. Se frena y se explica. */
@@ -3687,6 +3803,8 @@ export class VentasService {
         facturarCbteNro: fiscal.facturarPendiente ? undefined : null,
         facturarCbteTipo: fiscal.facturarPendiente ? undefined : null,
         cajaSesionId: turno?.id ?? null,
+        // Factura a un CUIT (0125): el comprador congelado, y el cliente si ese CUIT ya lo era.
+        ...(receptor ? { receptor, clienteId: clienteIdFinal } : {}),
         /*
          * LA VENTA ES DE QUIEN LA ARMÓ, y quien la cobró va aparte (0060).
          *
@@ -3741,6 +3859,38 @@ export class VentasService {
    * error dice por qué y la venta sigue en la pestaña — reintentar no rompe
    * nada, se puede apretar mil veces.
    */
+  /**
+   * «¿AGREGARLO COMO CLIENTE?» DESPUÉS DE FACTURAR A UN CUIT (0125).
+   *
+   * Crea el cliente con los datos con que se facturó (los de ARCA, o los
+   * cargados a mano) y le pasa la venta —y sus notas, si ya las tuviera—, así
+   * aparece en sus compras. Si ese CUIT ya es cliente no se duplica: se usa el
+   * que está. Los precios y la factura no cambian: el comprador congelado sigue
+   * siendo el mismo.
+   */
+  async agregarCompradorComoCliente(id: number, opciones: OpcionesVenta = {}) {
+    const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
+    if (!v) throw new NotFoundException('Esa venta no existe.');
+    if (opciones.soloSuSucursal && v.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Esa venta es de otra sucursal.');
+    }
+    const r = v.receptor;
+    if (!r) throw new BadRequestException('Esta venta no se facturó a un CUIT: no hay comprador para agregar.');
+    const actual = await this.cli.get(v.clienteId);
+    if (!actual.esConsumidorFinal) return { cliente: actual, creado: false };
+
+    const [ya] = await this.db.select().from(clientes)
+      .where(and(eq(clientes.numeroDoc, r.numeroDoc), eq(clientes.esConsumidorFinal, false))).limit(1);
+    const cliente = ya ?? await this.cli.create({
+      nombre: r.nombre, tipoDoc: 'cuit', numeroDoc: r.numeroDoc,
+      condicionIva: r.condicionIva === 'no_categorizado' ? 'consumidor_final' : r.condicionIva,
+      direccion: r.direccion, localidad: r.localidad,
+    } as any, false);
+    await this.db.update(ventas).set({ clienteId: cliente.id })
+      .where(or(eq(ventas.id, v.id), eq(ventas.refVentaId, v.id)));
+    return { cliente, creado: !ya };
+  }
+
   async facturarAhora(id: number, opciones: OpcionesVenta = {}) {
     return this.unaEmisionPorVenta(id, () => this.facturarAhoraSinCandado(id, opciones));
   }
@@ -3796,7 +3946,8 @@ export class VentasService {
         + 'La venta queda como ticket; se puede facturar desde acá cuando la sucursal esté habilitada.',
       );
     }
-    const cliente = await this.cli.get(v.clienteId);
+    // Facturada a un CUIT (0125): se reintenta al MISMO comprador, no a «Consumidor Final».
+    const cliente = this.compradorDe(await this.cli.get(v.clienteId), v.receptor);
     const completa = await this.get(id);
 
     const fiscal = await this.resolverFiscal(true, cliente, config, {
@@ -4061,7 +4212,8 @@ export class VentasService {
 
     /* -- El comprobante fiscal, ANTES de la transacción (igual que la venta) -- */
     const config = await this.cfg.get('ventas');
-    const cliente = await this.cli.get(original.clienteId);
+    // Facturada a un CUIT (0125): la nota va al MISMO comprador que la factura que ajusta.
+    const cliente = this.compradorDe(await this.cli.get(original.clienteId), original.receptor);
     const letra = letraDe(original.tipo);
     const tipoNc = esTicket ? 'nota_credito_ticket' : `nota_credito_${(letra ?? 'b').toLowerCase()}`;
 
@@ -4225,6 +4377,8 @@ export class VentasService {
       const [nc] = await tx.insert(ventas).values({
         tipo: tipoNc as any, puntoVenta: puntoVentaFinal, numero, fecha,
         clienteId: original.clienteId, sucursalId,
+        // La nota hereda el comprador congelado de la factura (0125): se reimprime igual.
+        receptor: original.receptor ?? null,
         usuarioId: dto.usuarioId ?? null,
         cajaSesionId: turnoId,
         estado: 'confirmada',
@@ -4788,6 +4942,13 @@ export class VentasController {
    * que se acumuló. Quien administra la facturación tiene que poder reintentar
    * sin pedirle permiso de listado a nadie.
    */
+  /** «¿Agregarlo como cliente?» tras facturar a un CUIT (0125). Llave de crear clientes (el cajero la tiene). */
+  @Post(':id/agregar-cliente')
+  @Permiso('ventas.clientes')
+  agregarCliente(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.agregarCompradorComoCliente(id, this.opciones(sesion));
+  }
+
   @Post(':id/facturar')
   @Permiso('ventas.listado', 'ventas.configuracion')
   facturar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {

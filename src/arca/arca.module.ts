@@ -27,8 +27,8 @@
  *        reintento consulta antes de emitir.
  */
 import {
-  BadRequestException, Body, Controller, Get, Inject, Injectable, Logger, Module, Post,
-  type OnApplicationBootstrap,
+  BadRequestException, Body, Controller, Get, Inject, Injectable, Logger, Module, Param, Post, Query,
+  ServiceUnavailableException, type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { IsString, MaxLength } from 'class-validator';
 import { and, eq, ne, sql } from 'drizzle-orm';
@@ -48,6 +48,7 @@ import {
   consultarComprobante, feDummy, solicitarCae, ultimoAutorizado, ErrorArca,
 } from './wsfe';
 import { obtenerTicket } from './wsaa';
+import { consultarCuit, ErrorPadron, soloDigitos } from './padron';
 import {
   ErrorCertificado, certificadoInstalado, generarPedido, hayClave, instalarCertificado,
   volumenPersistente,
@@ -618,6 +619,36 @@ export class ArcaController {
   @Permiso('ventas.configuracion')
   probar() {
     return this.svc.diagnostico();
+  }
+
+  /**
+   * CONSULTA DE CUIT (0125): la usa la caja para «Factura a CUIT» y la pantalla
+   * de ARCA para probar el servicio. Permiso `ventas` (el cajero la necesita).
+   *
+   * Devuelve también si ese CUIT YA ES CLIENTE: la caja lo avisa y factura a
+   * ese cliente en vez de a un comprador suelto.
+   *
+   * Sin ARCA disponible (o sin la autorización del servicio) contesta 503 con
+   * el motivo: la caja ofrece cargar los datos a mano.
+   */
+  @Get('padron/:cuit')
+  @Permiso('ventas', 'ventas.configuracion')
+  async padron(@Param('cuit') cuit: string, @Query('forzar') forzar?: string) {
+    const numero = soloDigitos(cuit);
+    const [existente] = await this.db.select({ id: clientes.id, nombre: clientes.nombre, activo: clientes.activo })
+      .from(clientes)
+      .where(and(eq(clientes.numeroDoc, numero), eq(clientes.esConsumidorFinal, false)))
+      .limit(1);
+    try {
+      const datos = await consultarCuit(this.db, numero, { forzar: forzar === '1' });
+      return { ...datos, cliente: existente ?? null };
+    } catch (e) {
+      if (e instanceof ErrorPadron) {
+        if (!e.reintentable) throw new BadRequestException(e.message);
+        throw new ServiceUnavailableException({ message: e.message, cliente: existente ?? null });
+      }
+      throw new ServiceUnavailableException({ message: `No se pudo consultar ARCA: ${(e as Error).message}`, cliente: existente ?? null });
+    }
   }
 
   /* --------------------- El trámite del certificado --------------------- */

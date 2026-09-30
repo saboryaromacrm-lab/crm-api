@@ -876,6 +876,13 @@
       "when": 1790350000000,
       "tag": "0124_factura_por_sucursal",
       "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1790360000000,
+      "tag": "0125_factura_a_cuit",
+      "breakpoints": true
     }
   ]
 }

@@ -2019,6 +2019,15 @@ export const ventas = pgTable('ventas', {
    */
   facturarCbteNro: integer('facturar_cbte_nro'),
   facturarCbteTipo: integer('facturar_cbte_tipo'),
+  /*
+   * FACTURA A UN CUIT DESDE LA CAJA (0125). Los datos del comprador CONGELADOS
+   * al emitir: la factura, su reimpresión, el QR, la nota de crédito y el
+   * reintento de una caída salen con ESTOS datos, no con los de «Consumidor
+   * Final» (el cliente de la venta) ni con los que tenga el cliente mañana.
+   * `null` = venta común: el comprador es el cliente de la venta, como siempre.
+   * `manual` = ARCA no respondió y los cargó quien cobró (para revisar).
+   */
+  receptor: jsonb('receptor').$type<ReceptorVenta | null>(),
   refVentaId: integer('ref_venta_id'),                    // NC/ND → venta que ajustan
   observaciones: text('observaciones').notNull().default(''),
   /*
@@ -3017,6 +3026,29 @@ export const configuracion = pgTable('configuracion', {
  * NO guarda secretos propios: `token` y `sign` son credenciales EFÍMERAS que
  * ARCA emite. La clave privada nunca toca la base.
  */
+/** El comprador congelado en una venta facturada a un CUIT (0125). */
+export interface ReceptorVenta {
+  nombre: string;
+  tipoDoc: 'cuit';
+  numeroDoc: string;
+  condicionIva: 'responsable_inscripto' | 'monotributo' | 'exento' | 'consumidor_final' | 'no_categorizado';
+  direccion: string;
+  localidad: string;
+  /** true = ARCA no respondió y los datos los cargó quien cobró. */
+  manual: boolean;
+}
+
+/*
+ * LAS CONSULTAS AL PADRÓN DE ARCA (0125), guardadas unos días: el mismo CUIT
+ * no se le vuelve a preguntar a ARCA en cada venta (responde al instante y no
+ * depende de que ARCA esté arriba). `datos` es lo que devolvió, ya traducido.
+ */
+export const padronCuit = pgTable('padron_cuit', {
+  cuit: text('cuit').primaryKey(),
+  datos: jsonb('datos').notNull(),
+  consultadoEn: timestamp('consultado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const arcaTokens = pgTable('arca_tokens', {
   service: text('service').primaryKey(),
   token: text('token').notNull(),
