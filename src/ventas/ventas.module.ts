@@ -46,7 +46,7 @@ import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila, r6 } from '../inventario/pricing';
+import { bultoCerrado, costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila, r6 } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
@@ -383,7 +383,7 @@ const etiquetaVenta = (v: { tipo: string; puntoVenta: string; numero: number | n
   return `${nombre} ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
 };
 
-const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto', 'presupuesto'] as const;
+const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto', 'presupuesto', 'bulto'] as const;
 
 /**
  * Renglón YA pasado por `resolverRenglones`. El tipo es distinto del DTO a
@@ -1432,11 +1432,14 @@ export class VentasService {
     const formatosDe = agruparPor(formatos, (f) => `${f.productoId}:${f.presentacionId ?? ''}`);
 
     const costoPorProd = new Map<number, number>();
+    const bultoPorProd = new Map<number, number>();
     for (const p of prods) {
       const suyos = grupo(provsDe, p.id);
       // La BASE del precio (0072): la parte sin factura entra sin el IVA que
       // el negocio absorbe. El costo real no viaja al POS — acá se cotiza.
       costoPorProd.set(p.id, costoPrecioEntry(formatoDeCosto(p, suyos) as any, p.iva));
+      // El bulto cerrado (ficha o caja del proveedor): la MISMA cuenta que valida la venta.
+      bultoPorProd.set(p.id, bultoCerrado(p, suyos));
     }
 
     /** Stock por (producto, presentación, sucursal); presentación `null` = suelto. */
@@ -1557,7 +1560,12 @@ export class VentasService {
         unidad: p.tipo === 'granel' ? 'kg' : 'u',
         fraccionable: p.tipo === 'granel',   // admite cantidad decimal
         /*
-         * EL BULTO DE LA FICHA (21/9/2026): cuántas unidades trae la caja que
+         * EL BULTO (21/9/2026; 1/10/2026 también el del proveedor, ver
+         * `bultoCerrado`): cuántas unidades trae la caja cerrada. Además de
+         * sumar de a un bulto, abre la sugerencia de precio mayorista por
+         * bulto cerrado.
+         *
+         * Antes era solo el de la ficha, el que
          * identifica el DUN. Viaja para que la caja registradora pueda sumar
          * de a un bulto tambien en MOSTRADOR — donde la lista vende suelto y
          * el "vende por N" del formato no existe.
@@ -1570,7 +1578,7 @@ export class VentasService {
          * Los PAQUETES fraccionados no lo llevan: este número es el de la caja
          * de la madre y no dice nada de cuántos paquetes entran en un bulto.
          */
-        unidadesPorBulto: p.tipo === 'granel' || !(p.unidadesPorBulto > 1) ? 0 : p.unidadesPorBulto,
+        unidadesPorBulto: bultoPorProd.get(p.id) ?? 0,
         iva: p.iva,
         codigoBarras: p.codigoBarras,
         precio: filaBase?.netoExacto ?? 0,
@@ -1685,6 +1693,20 @@ export class VentasService {
        * sobre precios y aplicarlo baja el total, así que auto-aplicarlo podría
        * dejar el ticket bajo el umbral y revertirse en un ciclo.
        */
+      /**
+       * EL PRECIO MAYORISTA (1/10/2026, pedido del dueño): qué modalidad es,
+       * con qué medios se paga (vale para TODO renglón de esa modalidad, llegue
+       * como llegue) y si el bulto cerrado la sugiere. Todas las puertas se
+       * SUGIEREN: por defecto la caja cobra minorista.
+       */
+      mayorista: cfg.modalidadMontoId
+        ? {
+            modalidadId: cfg.modalidadMontoId,
+            modalidad: cat.modalidades.find((m: any) => m.id === cfg.modalidadMontoId)?.nombre ?? '',
+            mediosPago: cfg.mediosPagoMonto ?? [],
+            porBulto: cfg.mayoristaPorBulto !== false,
+          }
+        : null,
       montoMayorista: cfg.montoMinimoMayorista > 0 && cfg.modalidadMontoId
         ? {
             monto: cfg.montoMinimoMayorista,
@@ -1952,7 +1974,7 @@ export class VentasService {
      * el ticket declara. Es la dirección generosa a propósito: el motor del POS
      * la sugiere después de aplicar el beneficio (que baja el total), así que
      * medirla sobre el bruto rechazaría ventas legítimas. El medio de pago que
-     * esa modalidad exige lo sigue validando `validarMediosPagoMonto`.
+     * esa modalidad exige lo valida `validarMediosMayorista`.
      */
     /*
      * CON PRECIOS DEL SERVIDOR, NO LOS QUE DECLARA EL TICKET (26/9/2026): se
@@ -1977,7 +1999,17 @@ export class VentasService {
       const piso = suyas.find((f) => f.listaId === baseId) ?? suyas[suyas.length - 1];
       return precioVentaFila(costo, piso, { iva: prod.iva, redondeo: prod.redondeo ?? redondeo }).netoExacto;
     };
-    const brutoTicket = items.reduce((a, it) => a + (Number(it.cantidad) || 0) * netoPisoDe(it), 0);
+    /*
+     * CON IVA (1/10/2026). La configuración dice "se mide sobre el total con
+     * IVA" y la caja sugiere sobre ese número, pero acá se sumaba el NETO: un
+     * ticket de $110.000 con un mínimo de $100.000 se sugería en la caja y el
+     * servidor lo rechazaba (neto $90.909). Ahora los dos miden lo mismo: el
+     * total a precio de MOSTRADOR, con IVA.
+     */
+    const brutoTicket = items.reduce((a, it) => {
+      const iva = Number(prodDe.get(Number(it.productoId))?.iva) || 0;
+      return a + (Number(it.cantidad) || 0) * netoPisoDe(it) * (1 + iva / 100);
+    }, 0);
     const modalidadPorMonto = config.montoMinimoMayorista > 0 && config.modalidadMontoId
       && brutoTicket + 1e-9 >= config.montoMinimoMayorista
       ? config.modalidadMontoId
@@ -2067,13 +2099,32 @@ export class VentasService {
        * rechazado por la API — y el cajero se enteraría al cobrar.
        */
       const llevadas = porProducto.get(prod.id) ?? cantidad;
-      const porOtraPuerta = esPiso
-        || !!congelado
-        || delCliente.has(elegida.fila.listaId)
-        || (minimo > 0 && llevadas + 1e-9 >= minimo)
-        || !!modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId);
-      const porMonto = modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto;
-      const habilitada = porOtraPuerta || porMonto;
+      /*
+       * EL BULTO CERRADO (1/10/2026, pedido del dueño): llevar la caja entera
+       * abre el precio de bulto aunque el ticket no llegue al monto. Dos casos,
+       * la misma idea:
+       *   · la lista vende "de a N" (caja x12) y el ticket lleva N o más;
+       *   · la PRIMERA lista mayorista del artículo, y el ticket lleva un bulto
+       *     cerrado del producto (`bultoCerrado`: ficha o caja del proveedor).
+       * Los paquetes fraccionados no: su bulto no es el de la madre.
+       */
+      const bultoLista = Number(elegida.fila.unidades) || 1;
+      const primeraMayorista = suyas.find((s) => s.lista.modalidadId === config.modalidadMontoId);
+      const bultoProd = !pres && config.mayoristaPorBulto !== false
+        && primeraMayorista?.fila.listaId === elegida.fila.listaId
+        ? bultoCerrado(prod, suyos) : 0;
+      const bultoNecesario = bultoLista > 1 ? bultoLista : bultoProd;
+      /* La puerta que abrió la lista, en el orden en que se explica: es lo que
+       * queda escrito en el renglón (`listaOrigen`) para poder auditarlo. */
+      const puerta: 'base' | 'cliente' | 'auto' | 'marca' | 'bulto' | 'monto' | null = esPiso ? 'base'
+        : delCliente.has(elegida.fila.listaId) ? 'cliente'
+          : (minimo > 0 && llevadas + 1e-9 >= minimo) ? 'auto'
+            : modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId) ? 'marca'
+              : prod.tipo !== 'granel' && bultoNecesario > 1 && llevadas + 1e-9 >= bultoNecesario ? 'bulto'
+                : (modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto) ? 'monto'
+                  : congelado ? 'auto'
+                    : null;
+      const habilitada = puerta != null;
       if (!habilitada && !puedePisarPrecio) {
         throw new BadRequestException(
           `${etiqueta}: el ticket no habilita la lista ${elegida.lista.nombre}`
@@ -2278,12 +2329,12 @@ export class VentasService {
          * el mostrador. Confundirlos volvería inútil esta columna, que existe
          * justamente para poder auditar quién regala precio mayorista.
          */
-        /* 'monto' cuando SOLO el monto del ticket habilita la lista: es lo que
-         * dispara la regla de medios de pago de esa modalidad
-         * (`validarMediosPagoMonto`), que hasta el 26/9/2026 no corría nunca
-         * porque este origen no se escribía. */
-        listaOrigen: honraCotizado ? 'presupuesto'
-          : (pisado ? 'manual' : (esPiso ? 'base' : (!porOtraPuerta && porMonto ? 'monto' : 'auto'))),
+        /* La puerta exacta (1/10/2026): cliente, cantidad ('auto'), marca,
+         * bulto o monto; 'manual' si ninguna la abrió y la habilitó el permiso
+         * de pisar precios — antes eso quedaba como 'auto' y parecía ganado.
+         * Los medios de pago ya no dependen del origen sino de la modalidad
+         * (`validarMediosMayorista`). */
+        listaOrigen: honraCotizado ? 'presupuesto' : (pisado ? 'manual' : (puerta ?? 'manual')),
         /*
          * `precioLista` es el de la fila... salvo en el cotizado, donde el precio
          * de referencia ES el que se prometió: si acá quedara el de hoy, el
@@ -2549,16 +2600,6 @@ export class VentasService {
     if (tercerizados.length) await this.ctasDisp.registrarDeVenta(tx, tercerizados, ctx);
   }
 
-  /**
-   * El precio desbloqueado POR MONTO puede exigir un medio de pago ("mayorista
-   * solo en efectivo"). No se puede chequear al cargar el ticket —el medio se
-   * elige al cobrar, después de que el precio ya se armó— así que se valida
-   * acá, que es el último momento en que todavía se puede rechazar.
-   *
-   * Solo mira los renglones con `listaOrigen: 'monto'`: los que llegaron por
-   * cantidad o por regla de marca se ganaron el precio con volumen y no dependen
-   * de cómo se pague.
-   */
   /* ---------------------- Facturación electrónica ---------------------- */
 
   /**
@@ -2851,22 +2892,44 @@ export class VentasService {
     }
   }
 
-  private validarMediosPagoMonto(items: any[], condicionPago: string, pagos: VentaPagoDto[], config: any) {
-    const permitidos: string[] = config.mediosPagoMonto ?? [];
-    if (!permitidos.length) return;                                  // sin restricción
-    if (!items.some((it) => it.listaOrigen === 'monto')) return;     // nada que proteger
+  /**
+   * EL PRECIO MAYORISTA SE PAGA CON LOS MEDIOS DEL MAYORISTA (1/10/2026, pedido
+   * del dueño: "siempre es en efectivo y transferencia").
+   *
+   * Antes solo miraba los renglones con origen 'monto': el que llegaba al
+   * mayorista por cantidad o por marca podía pagarlo con tarjeta. Ahora la regla
+   * es de la MODALIDAD: todo renglón cotizado con una lista mayorista —por
+   * bulto, marca, monto, cliente, presupuesto o elegida a mano— exige esos
+   * medios. Vacío = sin restricción. No se puede chequear al cargar el ticket
+   * (el medio se elige al cobrar), así que se valida acá, el último momento en
+   * que todavía se puede rechazar.
+   *
+   * Es pública porque el cobro con QR de Mercado Pago la corre ANTES de mandar
+   * el monto al QR: rechazarla después de que el cliente pagó dejaría la plata
+   * cobrada y la venta sin cerrar.
+   */
+  async validarMediosMayorista(items: { listaId?: number | null }[], condicionPago: string, pagos: { medio: string; importe: number | string }[], config?: any) {
+    const cfg = config ?? await this.cfg.get('ventas');
+    const permitidos: string[] = cfg.mediosPagoMonto ?? [];
+    if (!permitidos.length || !cfg.modalidadMontoId) return;          // sin restricción
+    const ids = [...new Set((items ?? []).map((it) => it.listaId).filter((x): x is number => x != null))];
+    if (!ids.length) return;
+    const mayoristas = new Set((await this.db.select({ id: listasVenta.id }).from(listasVenta)
+      .where(and(inArray(listasVenta.id, ids), eq(listasVenta.modalidadId, cfg.modalidadMontoId)))).map((l) => l.id));
+    const cuantos = items.filter((it) => it.listaId != null && mayoristas.has(it.listaId)).length;
+    if (!cuantos) return;                                               // nada que proteger
 
-    const legibles = permitidos.join(' / ');
+    const legibles = permitidos.map((m) => NOMBRE_MEDIO[m] ?? m).join(' o ');
+    const quePasa = `${cuantos} artículo${cuantos === 1 ? '' : 's'} a precio mayorista`;
     if (condicionPago !== 'contado') {
       throw new BadRequestException(
-        `El precio por monto de compra solo vale pagando al contado (${legibles}). Quitá el beneficio o cambiá la condición de pago.`,
+        `El precio mayorista se paga al contado con ${legibles} (hay ${quePasa}). Volvé a precio minorista o cambiá la condición de pago.`,
       );
     }
-    const usados = (pagos ?? []).filter((p) => Number(p.importe) > 0).map((p) => p.medio);
-    const invalido = usados.find((m) => !permitidos.includes(m));
+    const invalido = (pagos ?? []).filter((p) => Number(p.importe) > 0).map((p) => p.medio).find((m) => !permitidos.includes(m));
     if (invalido) {
       throw new BadRequestException(
-        `El precio por monto de compra solo vale pagando con ${legibles}. Se está usando "${invalido}".`,
+        `El precio mayorista se paga con ${legibles}, y se está usando ${NOMBRE_MEDIO[invalido] ?? invalido} (hay ${quePasa}). Volvé a precio minorista para cobrar con otro medio.`,
       );
     }
   }
@@ -3263,7 +3326,7 @@ export class VentasService {
     // Sobre el tipo PEDIDO: si se pidió factura y ARCA cae, el ticket
     // provisorio pendiente cumple la regla (la intención quedó registrada).
     this.validarMediosFacturar(tipo, pagos, config);
-    this.validarMediosPagoMonto(tot.items, condicionPago, pagos, config);
+    await this.validarMediosMayorista(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
     this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista.values());
     await this.validarCredito(cliente, config, condicionPago, tot.total);
@@ -3704,7 +3767,7 @@ export class VentasService {
     }
 
     const pagos = this.validarPagos(condicionPago, fin.pagos, borrador.total);
-    this.validarMediosPagoMonto(borrador.items, condicionPago, pagos, config);
+    await this.validarMediosMayorista(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
     /*
      * LOS DESCUENTOS CON NOMBRE, RELEÍDOS DE LA BASE.

@@ -334,6 +334,31 @@ export function formatoDeCosto<T extends { usarParaPrecio?: boolean; id?: number
   return formatoActivo(entries);
 }
 
+/**
+ * EL BULTO CERRADO DE UN PRODUCTO (1/10/2026): cuántas unidades trae la caja
+ * que abre el precio mayorista "por bulto cerrado".
+ *
+ * Manda el de la FICHA (el que identifica el DUN) cuando está cargado; si no,
+ * el del formato de compra que define el costo ("Caja x12" del proveedor
+ * principal) — es la misma caja vista desde la compra, y así la puerta anda
+ * sin cargar a mano el bulto de cada artículo. 0 = no tiene bulto: el granel
+ * se vende por kg y una "caja x1" no es un bulto.
+ *
+ * Es la ÚNICA definición: la usan el catálogo del POS (que sugiere) y la venta
+ * (que valida). Dos cuentas distintas harían que la caja ofrezca un precio que
+ * el servidor rechaza.
+ */
+export function bultoCerrado(
+  prod: (ProductoConCosto & { tipo?: string | null; unidadesPorBulto?: number | null }) | null | undefined,
+  entries: { usarParaPrecio?: boolean; id?: number | string; cantidad?: number | null }[],
+): number {
+  if (!prod || prod.tipo === 'granel') return 0;
+  const ficha = Number(prod.unidadesPorBulto) || 0;
+  if (ficha > 1) return ficha;
+  const compra = Number((formatoDeCosto(prod, entries as any) as any)?.cantidad) || 0;
+  return compra > 1 && Number.isInteger(compra) ? compra : 0;
+}
+
 /* ------------------------------------------------------------------ *
  * Formato de venta: la fila producto×lista hecha precio
  * ------------------------------------------------------------------ */

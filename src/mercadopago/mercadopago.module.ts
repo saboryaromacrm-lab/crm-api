@@ -236,6 +236,11 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`Los pagos suman $${suma.toFixed(2)} y el ticket es de $${Number(venta.total).toFixed(2)}.`);
     }
 
+    /* El precio mayorista se paga con sus medios (1/10/2026): si el QR no está
+     * entre ellos, se rechaza ACÁ — después de que el cliente pagó, la venta no
+     * cerraría y la plata quedaría cobrada. */
+    await this.ventas.validarMediosMayorista(venta.items as any[], 'contado', [...otros, { medio: 'qr', importe: montoQr }]);
+
     const confirmar = {
       tipo: dto.confirmar.tipo, condicionPago: 'contado',
       cajaSesionId: dto.confirmar.cajaSesionId, operadorId: dto.confirmar.operadorId, usuarioId: sesion.usuarioId,

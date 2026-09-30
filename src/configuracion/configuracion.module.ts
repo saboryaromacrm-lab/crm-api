@@ -84,6 +84,14 @@ export const VENTAS_DEFAULTS = {
    */
   mediosPagoMonto: [] as string[],
   /**
+   * EL BULTO CERRADO SUGIERE EL MAYORISTA (1/10/2026): llevar la caja entera
+   * de un producto (ficha o caja del proveedor) lo pone en la sugerencia de
+   * precio mayorista aunque el ticket no llegue al monto. Como toda puerta al
+   * mayorista, se SUGIERE —la caja cobra minorista por defecto— y se paga con
+   * `mediosPagoMonto`, que desde esa fecha vale para todo precio mayorista.
+   */
+  mayoristaPorBulto: true as boolean,
+  /**
    * Cambiar la lista de un renglón a mano esquiva por completo el tope de
    * descuento (pasar de minorista a mayorista puede ser −40% sin registrarse
    * como descuento). Con esto en `true`, solo un admin puede hacerlo; el

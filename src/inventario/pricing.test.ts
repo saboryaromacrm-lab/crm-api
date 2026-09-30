@@ -12,6 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  bultoCerrado,
   costosFormato,
   costoNetoPresentacion,
   descuentoEfectivo,
@@ -169,4 +170,14 @@ test('formatoDeCosto: lo que elabora Coffit cuesta lo que ella declaró', () => 
 test('costoNetoPresentacion: el paquete hereda el costo del kilo por lo que consume', () => {
   assert.equal(costoNetoPresentacion(1000, 0.5), 500);
   assert.equal(costoNetoPresentacion(1000, 0), 0);
+});
+
+test('bultoCerrado: la ficha manda; si no, la caja del proveedor que define el costo', () => {
+  const provs = [{ id: 1, cantidad: 6 }, { id: 2, cantidad: 12, usarParaPrecio: true }];
+  assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 24 }, provs), 24, 'la ficha (DUN) gana');
+  assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, provs), 12, 'sin ficha: el formato que define el costo');
+  assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, [{ id: 1, cantidad: 1 }]), 0, 'caja x1 no es bulto');
+  assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, []), 0, 'sin proveedor no hay bulto');
+  assert.equal(bultoCerrado({ tipo: 'granel', unidadesPorBulto: 25 }, provs), 0, 'el granel se vende por kg');
+  assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, [{ id: 1, cantidad: 2.5 }]), 0, 'medio bulto no es bulto');
 });

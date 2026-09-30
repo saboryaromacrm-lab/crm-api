@@ -816,7 +816,8 @@ export const origenListaEnum = pgEnum('origen_lista', [
   'auto',      // llegó al mínimo de unidades de ESE producto
   'manual',    // la eligió una persona
   'marca',     // una regla de marca desbloqueó la modalidad
-  'monto',     // el monto del ticket la desbloqueó (sujeta a medio de pago)
+  'monto',     // el monto del ticket la desbloqueó
+  'bulto',     // el ticket lleva el bulto cerrado del producto (0127)
   /*
    * La casa se lo prometió por escrito (0061): el renglón viene de un
    * presupuesto confirmado y vigente, y se cobra al precio con el que se
