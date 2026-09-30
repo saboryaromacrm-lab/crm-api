@@ -16,6 +16,8 @@ class UpsertSucursalDto {
   @IsOptional() @IsString() @MaxLength(5) puntoVenta?: string;
   /** El domicilio comercial declarado para ese punto de venta. */
   @IsOptional() @IsString() @MaxLength(200) direccion?: string;
+  /** Factura electrónicamente con su punto de venta (0124). Sin el campo, queda como estaba. */
+  @IsOptional() @IsBoolean() facturaElectronica?: boolean;
   /** El fondo fijo de caja (0111). Solo lo cambia quien edita sucursales: el superadmin. */
   @IsOptional() @IsNumber() @Min(0, { message: 'El fondo de caja no puede ser negativo.' }) @Max(100_000_000) fondoCaja?: number;
 }
@@ -53,8 +55,27 @@ export class SucursalesService {
    * sucursales con el mismo punto de venta pedirían el mismo próximo número a
    * ARCA y se pisarían, y un error de índice único no explica nada de eso.
    */
-  private async normalizar(dto: UpsertSucursalDto, idPropio?: number) {
+  private async normalizar(dto: UpsertSucursalDto, idPropio?: number, actual?: { facturaElectronica: boolean }) {
     const puntoVenta = normalizarPuntoVentaFiscal(dto.puntoVenta);
+    const direccion = (dto.direccion ?? '').trim();
+    /*
+     * FACTURA ELECTRÓNICA (0124): sin el campo queda como estaba; sin punto de
+     * venta se apaga sola (no hay con qué facturar). Encenderla pide las dos
+     * cosas que van impresas y declaradas: el punto de venta y su domicilio.
+     */
+    let facturaElectronica = dto.facturaElectronica ?? actual?.facturaElectronica ?? false;
+    if (!puntoVenta) facturaElectronica = false;
+    if (dto.facturaElectronica && !puntoVenta) {
+      throw new BadRequestException(
+        'Para facturar electrónicamente, la sucursal necesita su propio punto de venta de ARCA (tipo Web Services). '
+        + 'Cargalo primero; así nunca factura con el de otro local.',
+      );
+    }
+    if (dto.facturaElectronica && !direccion) {
+      throw new BadRequestException(
+        'Para facturar electrónicamente, cargá el domicilio del local tal como está declarado en ARCA para ese punto de venta: va impreso en cada factura.',
+      );
+    }
     if (puntoVenta) {
       const dueño = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
         .from(sucursales).where(eq(sucursales.puntoVenta, puntoVenta)).limit(1);
@@ -70,7 +91,8 @@ export class SucursalesService {
       nombre: dto.nombre.trim(),
       tipo: dto.tipo ?? ('express' as const),
       puntoVenta,
-      direccion: (dto.direccion ?? '').trim(),
+      direccion,
+      facturaElectronica,
       // Sin el campo, el fondo queda como estaba: editar el nombre no lo borra.
       ...(dto.fondoCaja !== undefined ? { fondoCaja: Math.round(Number(dto.fondoCaja) * 100) / 100 } : {}),
     };
@@ -82,9 +104,9 @@ export class SucursalesService {
   }
 
   async update(id: number, dto: UpsertSucursalDto) {
-    await this.get(id);
+    const actual = await this.get(id);
     const [s] = await this.db.update(sucursales)
-      .set(await this.normalizar(dto, id)).where(eq(sucursales.id, id)).returning();
+      .set(await this.normalizar(dto, id, actual)).where(eq(sucursales.id, id)).returning();
     return s;
   }
 

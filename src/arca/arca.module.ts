@@ -63,6 +63,8 @@ interface DiagnosticoPunto {
   numero: number;
   /** `false` = no tiene el suyo cargado y usa el de la configuración. */
   propio: boolean;
+  /** Esa sucursal ya factura con él (0124); `false` = cargado pero todavía apagado. */
+  factura: boolean;
   tipos: Array<{ tipo: string; ultimo: number | null; error?: string }>;
 }
 
@@ -344,48 +346,32 @@ export class ArcaService implements OnApplicationBootstrap {
    * el estado se relee del disco sin reiniciar la API.
    */
   /**
-   * LOS PUNTOS DE VENTA EN USO, uno por sucursal (0077).
+   * LOS PUNTOS DE VENTA A PROBAR, uno por sucursal que tenga el suyo (0077).
    *
-   * Una sucursal sin el suyo cargado **cae al de la variable de entorno** —lo
-   * correcto en una instalación de un solo local, donde no hay nada que
-   * elegir— y viaja marcada con `propio: false` para que el panel lo muestre:
-   * con varios locales, eso significa que sus facturas saldrían por la boca de
-   * expendio de otro, y hay que verlo.
-   *
-   * Las que caen al mismo número se agrupan en una fila: preguntarle dos veces
-   * a ARCA por el mismo punto de venta daría la misma respuesta dos veces.
+   * FACTURA POR SUCURSAL (0124): se prueban TODOS los cargados, también los de
+   * sucursales que todavía no facturan (`factura: false`) — es justamente como
+   * se comprueba que un punto de venta nuevo está autorizado ANTES de
+   * encenderlo. Las sucursales sin punto de venta propio no se prueban: ya no
+   * usan el de la variable de entorno para nada (antes caían a ese, con el
+   * domicilio de otro local).
    */
   private async puntosDeVenta() {
     const filas = await this.db.select({
-      id: sucursales.id, nombre: sucursales.nombre, pv: sucursales.puntoVenta,
+      id: sucursales.id, nombre: sucursales.nombre, pv: sucursales.puntoVenta, fe: sucursales.facturaElectronica,
     }).from(sucursales).orderBy(sucursales.id);
 
     const salida: Array<{
       sucursalId: number | null; sucursal: string; puntoVenta: string;
-      numero: number; propio: boolean;
+      numero: number; propio: boolean; factura: boolean;
     }> = [];
-    const sinPropio: string[] = [];
-
     for (const f of filas) {
       const numero = Number(String(f.pv ?? '').replace(/\D/g, '')) || 0;
       if (numero) {
         salida.push({
           sucursalId: f.id, sucursal: f.nombre, puntoVenta: this.puntoVenta(numero),
-          numero, propio: true,
+          numero, propio: true, factura: !!f.fe,
         });
-      } else {
-        sinPropio.push(f.nombre);
       }
-    }
-
-    if (sinPropio.length && ARCA.ptoVta) {
-      salida.push({
-        sucursalId: null,
-        sucursal: sinPropio.join(', '),
-        puntoVenta: this.puntoVenta(),
-        numero: ARCA.ptoVta,
-        propio: false,
-      });
     }
     return salida;
   }
@@ -599,6 +585,7 @@ export class ArcaController {
         tipo: sucursales.tipo,
         puntoVenta: sucursales.puntoVenta,
         direccion: sucursales.direccion,
+        facturaElectronica: sucursales.facturaElectronica,
       }).from(sucursales).orderBy(sucursales.id),
     ]);
     return {

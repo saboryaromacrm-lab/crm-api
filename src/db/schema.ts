@@ -100,6 +100,13 @@ export const sucursales = pgTable('sucursales', {
    */
   puntoVenta: text('punto_venta').notNull().default(''),
   /*
+   * FACTURA ELECTRÓNICAMENTE (0124). Se enciende de a una sucursal: solo con
+   * esto tildado, ARCA prendido y punto de venta propio se pide CAE. Si no,
+   * el local trabaja como antes de ARCA (comprobante interno, sin CAE) — y
+   * nunca factura con el punto de venta de otro domicilio.
+   */
+  facturaElectronica: boolean('factura_electronica').notNull().default(false),
+  /*
    * El domicilio COMERCIAL de este local, el que ARCA tiene declarado para su
    * punto de venta. Va impreso en la factura: la de Belgrano 728 tiene que
    * decir Belgrano 728, no el domicilio fiscal de la empresa.

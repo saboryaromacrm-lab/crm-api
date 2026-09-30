@@ -2527,17 +2527,32 @@ export class VentasService {
    * en Belgrano 728, y su correlativo no tiene nada que ver con el de la
    * Distribuidora.
    *
-   * `null` = esta sucursal no tiene el suyo cargado. NO es un error acá: el
-   * emisor cae al de la variable de entorno, que es exactamente lo correcto en
-   * una instalación de un solo local (donde no hay nada que elegir). Lo que sí
-   * hace ruido es el caso de varios locales con uno sin cargar, y de eso avisa
-   * el panel de diagnóstico, que los lista uno por uno.
+   * FACTURA POR SUCURSAL (0124, 30/9/2026). Una sucursal factura
+   * electrónicamente SOLO si tiene su punto de venta Y la marca
+   * `facturaElectronica`. Antes, una sin punto de venta propio caía al de la
+   * variable de entorno: con ARCA prendido, una venta de un Express salía como
+   * factura REAL por el punto de venta de la Distribuidora, con otro
+   * domicilio. Ya no hay caída: sin lo suyo, esa sucursal trabaja como antes
+   * de ARCA (ver `configFiscal`).
    */
-  private async ptoVtaFiscal(sucursalId?: number | null): Promise<number | null> {
-    if (!sucursalId) return null;
-    const [s] = await this.db.select({ pv: sucursales.puntoVenta })
+  private async fiscalSucursal(sucursalId?: number | null): Promise<{ ptoVta: number | null; habilitada: boolean; nombre: string }> {
+    if (!sucursalId) return { ptoVta: null, habilitada: false, nombre: 'sin sucursal' };
+    const [s] = await this.db.select({ pv: sucursales.puntoVenta, fe: sucursales.facturaElectronica, nombre: sucursales.nombre })
       .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
-    return Number(String(s?.pv ?? '').replace(/\D/g, '')) || null;
+    const ptoVta = Number(String(s?.pv ?? '').replace(/\D/g, '')) || null;
+    return { ptoVta, habilitada: !!s?.fe && !!ptoVta, nombre: s?.nombre ?? 'sucursal' };
+  }
+
+  /**
+   * La configuración de ventas VISTA DESDE ESA SUCURSAL: ARCA cuenta como
+   * prendido solo si el interruptor general está prendido Y la sucursal
+   * factura. Todo lo demás (tipo por defecto, medios que exigen factura, la
+   * emisión) sigue leyendo `arcaHabilitado` como siempre, así que una sucursal
+   * sin factura electrónica se comporta exactamente como el sistema antes de
+   * ARCA: comprobante interno, numeración propia, sin CAE.
+   */
+  private configFiscal(config: any, suc: { habilitada: boolean }) {
+    return { ...config, arcaHabilitado: !!config.arcaHabilitado && suc.habilitada };
   }
 
   private async resolverFiscal(
@@ -2548,7 +2563,7 @@ export class VentasService {
     opciones: {
       reservado?: { cbteNro: number; cbteTipo: number } | null;
       reservar?: (nro: number, tipo: number) => Promise<void>;
-      /** El punto de venta del local que emite (0077). Ver `ptoVtaFiscal`. */
+      /** El punto de venta del local que emite (0077). Ver `fiscalSucursal`. */
       ptoVta?: number | null;
     } = {},
   ) {
@@ -2580,6 +2595,13 @@ export class VentasService {
      * sin CAE: es la etapa previa y no cambia nada de lo que ya funcionaba.
      */
     if (!config.arcaHabilitado) return { ...vacio, tipo: letra };
+
+    /* Red de seguridad (0124): con ARCA prendido para esta sucursal SIEMPRE hay
+     * punto de venta propio (`fiscalSucursal`). Si igual faltara, no se cae al
+     * de la variable de entorno —sería facturar con el domicilio de otro local—. */
+    if (!opciones.ptoVta) {
+      throw new BadRequestException('Esta sucursal no tiene punto de venta de ARCA propio: no se puede facturar electrónicamente desde acá.');
+    }
 
     /*
      * EL COMPRADOR SIN IDENTIFICAR, POR ENCIMA DEL TOPE (28/9/2026). ARCA
@@ -3046,7 +3068,9 @@ export class VentasService {
       throw new BadRequestException('El total de la venta tiene que ser mayor a 0.');
     }
 
-    const tipo = dto.tipo ?? (tipoVentaPara(cliente, config) as (typeof TIPOS)[number]);
+    // ARCA visto desde ESTA sucursal (0124): sin factura electrónica propia, el tipo por defecto es ticket.
+    const suc = await this.fiscalSucursal(sucursalId);
+    const tipo = dto.tipo ?? (tipoVentaPara(cliente, this.configFiscal(config, suc)) as (typeof TIPOS)[number]);
     const puntoVenta = String(config.puntoVenta || '0001');
     /*
      * LA FECHA es AHORA, salvo para un jefe. Un cajero podía emitir un ticket
@@ -3099,10 +3123,10 @@ export class VentasService {
      * de la caja: acá no hay fila previa donde reservar el número, así que la
      * red contra la respuesta perdida es la consulta inmediata que hace
      * `ArcaService`. El camino del mostrador —`confirmar()`— sí reserva. */
-    const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, config, {
+    const fiscal = await this.resolverFiscal(String(tipo).startsWith('factura'), cliente, this.configFiscal(config, suc), {
       total: tot.total, neto: tot.subtotalNeto, iva: tot.ivaTotal,
       items: tot.items, extras: tot.extras, fecha,
-    }, { ptoVta: await this.ptoVtaFiscal(sucursalId) });
+    }, { ptoVta: suc.ptoVta });
     const tipoFinal = (fiscal.tipo ?? tipo) as (typeof TIPOS)[number];
     const puntoVentaFinal = fiscal.puntoVenta ?? puntoVenta;
 
@@ -3556,11 +3580,22 @@ export class VentasService {
      * puede existir en ARCA: se consulta y se adopta en vez de emitir otro. */
     const [reserva] = await this.db.select({ nro: ventas.facturarCbteNro, tipo: ventas.facturarCbteTipo })
       .from(ventas).where(eq(ventas.id, id)).limit(1);
-    const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, config, {
+    // ARCA visto desde ESTA sucursal (0124).
+    const suc = await this.fiscalSucursal(sucursalId);
+    /* Un número reservado en ARCA por un intento anterior y la sucursal que
+     * mientras tanto dejó de facturar: cobrarlo como comprobante interno podría
+     * dejar una factura real en ARCA sin su venta. Se frena y se explica. */
+    if (reserva?.nro && config.arcaHabilitado && !suc.habilitada) {
+      throw new BadRequestException(
+        `Este ticket quedó con una factura a medio emitir en ARCA y ${suc.nombre} ya no factura electrónicamente. `
+        + 'Volvé a habilitarla en Gerencia › Sucursales para terminarla, o consultá antes de cobrarlo de otra forma.',
+      );
+    }
+    const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, this.configFiscal(config, suc), {
       total: borrador.total, neto: borrador.subtotalNeto, iva: borrador.ivaTotal,
       items: borrador.items, extras: borrador.extras, fecha,
     }, {
-      ptoVta: await this.ptoVtaFiscal(sucursalId),
+      ptoVta: suc.ptoVta,
       reservado: reserva?.nro && reserva?.tipo ? { cbteNro: reserva.nro, cbteTipo: reserva.tipo } : null,
       reservar: async (nro, cbteTipo) => {
         await this.db.update(ventas)
@@ -3751,6 +3786,16 @@ export class VentasService {
     }
 
     const config = await this.cfg.get('ventas');
+    /* FACTURA POR SUCURSAL (0124): la venta se factura con el punto de venta
+     * de SU sucursal, y solo si esa sucursal factura electrónicamente. Si no,
+     * no hay con qué: queda como ticket hasta que la sucursal se habilite. */
+    const suc = await this.fiscalSucursal(v.sucursalId);
+    if (!suc.habilitada) {
+      throw new BadRequestException(
+        `${suc.nombre} todavía no factura electrónicamente (${suc.ptoVta ? 'la facturación está apagada en Gerencia › Sucursales' : 'no tiene su punto de venta de ARCA cargado'}). `
+        + 'La venta queda como ticket; se puede facturar desde acá cuando la sucursal esté habilitada.',
+      );
+    }
     const cliente = await this.cli.get(v.clienteId);
     const completa = await this.get(id);
 
@@ -3763,7 +3808,7 @@ export class VentasService {
        * — sigue en `fecha`, y el rastro queda en observaciones. */
       fecha: new Date(),
     }, {
-      ptoVta: await this.ptoVtaFiscal(v.sucursalId),
+      ptoVta: suc.ptoVta,
       /* LA RECUPERACIÓN: si quedó un número reservado de un intento anterior,
        * se consulta ANTES de emitir. Si ese comprobante ya salió con nuestros
        * importes, se adopta su CAE en vez de emitir una segunda factura. */
@@ -4249,6 +4294,14 @@ export class VentasService {
      * pedir ni nada que declarar. Sale numerada por el sistema, como el ticket. */
     if (tipoNc === 'nota_credito_ticket') return vacio;
     if (!config.arcaHabilitado) return vacio;
+    /*
+     * UNA FACTURA SIN CAE ES UN COMPROBANTE INTERNO (0124): la emitió una
+     * sucursal que no factura electrónicamente, o es de antes de ARCA. Cuando
+     * ARCA falla, la venta sale como TICKET provisorio, nunca como factura sin
+     * CAE; así que esto no es una caída. Su nota tampoco va a ARCA: quedaba
+     * «pendiente» para siempre pidiendo facturar algo que no se puede facturar.
+     */
+    if (String(original.tipo ?? '').startsWith('factura') && !original.cae) return vacio;
     if (!this.arca.disponible()) {
       return {
         ...vacio, facturarPendiente: true,

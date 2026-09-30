@@ -869,6 +869,13 @@
       "when": 1790340000000,
       "tag": "0123_metricas_granel",
       "breakpoints": true
+    },
+    {
+      "idx": 124,
+      "version": "7",
+      "when": 1790350000000,
+      "tag": "0124_factura_por_sucursal",
+      "breakpoints": true
     }
   ]
 }
