@@ -292,8 +292,14 @@ export class TiendaService {
        * Es el único dato de stock que el sitio conoce, y solo se muestra al
        * llegar al tope: no es un cartel de "quedan pocos".
        */
-      const disponibleParaWeb = Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
-      const disponibleWeb = disponibleParaWeb > 1e-9;
+      /*
+       * GRANEL SIN CONTROL DE STOCK (1/10/2026, pedido del dueño: "que la web
+       * siga la misma regla"). Con `controlStockGranel` apagado el granel se
+       * ofrece siempre y sin tope (`disponible: null`), igual que en la caja.
+       */
+      const sinTope = cfg.controlStockGranel === false && p.tipo === 'granel';
+      const disponibleParaWeb = sinTope ? null : Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
+      const disponibleWeb = sinTope || (disponibleParaWeb ?? 0) > 1e-9;
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];
 
       /* Una promo por producto: la de mayor beneficio entre las que alcanzan
@@ -335,7 +341,7 @@ export class TiendaService {
         /** Mínimo de compra PROPIO del producto (0 = sin mínimo). */
         unidadesMinimas: filaTienda.unidadesMinimas || 0,
         enStock: disponibleWeb,
-        /** Cuánto puede vender el sitio (ya descontado el piso del mostrador). */
+        /** Cuánto puede vender el sitio (ya descontado el piso del mostrador). `null` = sin tope (granel sin control). */
         disponible: disponibleParaWeb,
         // La imagen subida en el módulo Web manda; la URL externa es el plan B.
         imagenUrl: urlImagen('producto', p.id) || p.imagenUrl || '',
@@ -491,7 +497,7 @@ export class TiendaService {
         + 'Sacalo del carrito y volvé a intentar.',
       );
     }
-    const excedidos = resueltos.filter((r) => r.cantidad > r.prod.disponible);
+    const excedidos = resueltos.filter((r) => r.prod.disponible != null && r.cantidad > r.prod.disponible);
     if (excedidos.length) {
       throw new BadRequestException(
         'No tenemos esa cantidad: '

@@ -417,11 +417,18 @@ export class PresupuestosService {
    */
   async orden(id: number) {
     const p = await this.getRow(id);
-    const [items, st] = await Promise.all([
+    const [items, st, cfgV] = await Promise.all([
       this.db.select().from(presupuestoItems).where(eq(presupuestoItems.presupuestoId, id)),
       this.db.select().from(stock)
         .where(and(eq(stock.sucursalId, p.sucursalId), eq(stock.estado, 'disponible'))),
+      this.cfg.get('ventas'),
     ]);
+    /* Granel sin control de stock (1/10/2026): alcanza siempre, como en la caja. */
+    const granelLibre = cfgV?.controlStockGranel === false;
+    const granelIds = new Set(granelLibre && items.length
+      ? (await this.db.select({ id: productos.id }).from(productos)
+        .where(and(inArray(productos.id, [...new Set(items.map((it) => it.productoId))]), eq(productos.tipo, 'granel')))).map((x) => x.id)
+      : []);
     const disponibleDe = (it: any) => st
       .filter((s) => s.productoId === it.productoId && (s.presentacionId ?? null) === (it.presentacionId ?? null))
       .reduce((a, s) => a + s.cantidad, 0);
@@ -429,7 +436,7 @@ export class PresupuestosService {
       ...p,
       items: items.map((it) => {
         const disponible = money(disponibleDe(it));
-        return { ...it, disponible, alcanza: disponible + 1e-9 >= it.cantidad };
+        return { ...it, disponible, alcanza: granelIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad };
       }),
     };
   }
