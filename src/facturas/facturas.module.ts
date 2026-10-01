@@ -41,6 +41,7 @@ import type { Response } from 'express';
 import { createHash } from 'crypto';
 import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, MaxLength, Min, ValidateNested,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -90,7 +91,7 @@ class PieLeidoDto {
 class EncabezadoLeidoDto {
   @IsOptional() @IsInt() tipoArca?: number | null;
   @IsOptional() @IsString() @MaxLength(8) puntoVenta?: string | null;
-  @IsOptional() @IsInt() numero?: number | null;
+  @IsOptional() @IsInt() @Max(99_999_999, { message: 'El número del comprobante tiene hasta 8 cifras, sin el punto de venta.' }) numero?: number | null;
   @IsOptional() @IsString() @MaxLength(10) fecha?: string | null;
   @IsOptional() @IsString() @MaxLength(20) cae?: string | null;
   @IsOptional() @IsString() @MaxLength(10) vencimiento?: string | null;
@@ -313,7 +314,7 @@ class PatchLecturaDto {
   tipo?: 'orden_compra' | 'remito' | 'factura' | 'liquidacion' | 'nota_credito' | 'nota_debito';
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
   @IsOptional() @IsString() puntoVenta?: string;
-  @IsOptional() @IsInt() numero?: number;
+  @IsOptional() @IsInt() @Max(99_999_999, { message: 'El número del comprobante tiene hasta 8 cifras, sin el punto de venta.' }) numero?: number;
   @IsOptional() @IsString() fecha?: string;
   /* El total del papel es la prueba de que los renglones cierran: en negativo no
    * prueba nada, y con 0 el semáforo ya avisa que no se puede validar. */

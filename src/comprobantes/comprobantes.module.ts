@@ -180,7 +180,12 @@ class CreateComprobanteDto {
   @IsIn(TIPOS as unknown as string[]) tipo!: (typeof TIPOS)[number];
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
   @IsOptional() @IsString() puntoVenta?: string;
-  @IsOptional() @IsInt() @Min(1, { message: 'El número del comprobante va desde 1.' }) numero?: number;
+  /* Hasta 8 cifras (1/10/2026): es el formato de ARCA (0001-00012345). Antes un
+   * número de 11 cifras —punto de venta y número pegados— pasaba y la base lo
+   * rechazaba con un 500 genérico («falló algo en el servidor»). */
+  @IsOptional() @IsInt() @Min(1, { message: 'El número del comprobante va desde 1.' })
+  @Max(99_999_999, { message: 'El número del comprobante tiene hasta 8 cifras, sin el punto de venta (en 0885-18518519 el número es 18518519).' })
+  numero?: number;
   @IsInt() proveedorId!: number;
   @IsOptional() @IsInt() sucursalId?: number;
   /**
@@ -274,7 +279,12 @@ class AnularComprobanteDto {
 class FacturarRemitoDto {
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
   @IsOptional() @IsString() puntoVenta?: string;
-  @IsOptional() @IsInt() @Min(1, { message: 'El número del comprobante va desde 1.' }) numero?: number;
+  /* Hasta 8 cifras (1/10/2026): es el formato de ARCA (0001-00012345). Antes un
+   * número de 11 cifras —punto de venta y número pegados— pasaba y la base lo
+   * rechazaba con un 500 genérico («falló algo en el servidor»). */
+  @IsOptional() @IsInt() @Min(1, { message: 'El número del comprobante va desde 1.' })
+  @Max(99_999_999, { message: 'El número del comprobante tiene hasta 8 cifras, sin el punto de venta (en 0885-18518519 el número es 18518519).' })
+  numero?: number;
   /** La fecha DEL PAPEL: define el período fiscal de la factura. */
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() fechaCarga?: string;
