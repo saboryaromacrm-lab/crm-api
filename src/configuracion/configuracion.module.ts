@@ -92,6 +92,13 @@ export const VENTAS_DEFAULTS = {
    */
   mayoristaPorBulto: true as boolean,
   /**
+   * CONTROL DEL STOCK A GRANEL (1/10/2026, pedido del dueño). `true` = como
+   * siempre: no se vende, fracciona ni mueve lo que no hay. `false` = el granel
+   * (madre y paquetes) se opera sin mirar si alcanza; el stock se sigue
+   * registrando y puede quedar en negativo. Ver `granelLibre` en inventario.
+   */
+  controlStockGranel: true as boolean,
+  /**
    * Cambiar la lista de un renglón a mano esquiva por completo el tope de
    * descuento (pasar de minorista a mayorista puede ser −40% sin registrarse
    * como descuento). Con esto en `true`, solo un admin puede hacerlo; el

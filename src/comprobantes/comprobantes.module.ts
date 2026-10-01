@@ -1836,7 +1836,7 @@ export class ComprobantesService {
       : (['factura', 'remito', 'liquidacion'].includes(c.tipo) ? -1 : (c.tipo === 'nota_credito' ? 1 : 0));
     const renglones = items.map((it: any) => ({ productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: Number(it.cantidad) || 0 }));
     const stock = sentido === 0 ? [] : (await this.inv.stockDeRenglones(c.sucursalId, renglones))
-      .map((x) => ({ ...x, alcanza: sentido > 0 || x.hay + 1e-9 >= x.cantidad }));
+      .map((x) => ({ ...x, alcanza: sentido > 0 || x.libre || x.hay + 1e-9 >= x.cantidad }));
     const noAlcanza = stock.filter((x) => !x.alcanza);
     /* Con una nota viva, lo que falta en el stock suele ser justamente lo que
      * esa nota devolvió: se revisa después de anularla, no antes. */

@@ -246,6 +246,13 @@ export class StockController {
   existencias(@Auth() sesion: Sesion) {
     return this.inv.existencias(soloSuSucursal(sesion));
   }
+
+  /** Cuánto granel quedó en negativo: lo que hay que contar antes de prender el control (1/10/2026). */
+  @Get('granel-negativo')
+  @Permiso('ventas.configuracion', 'almacen.existencias')
+  granelNegativo() {
+    return this.inv.granelNegativo();
+  }
 }
 
 @Controller('bootstrap')

@@ -223,6 +223,63 @@ export class InventarioService {
              motivo_baja = 'Volvió a haber stock (devolución, anulación o ajuste): se reabrió para poder venderlo'
        WHERE id = ${productoId} AND estado = 'archivado'`);
   }
+  /**
+   * EL STOCK A GRANEL, CON O SIN CONTROL (1/10/2026, pedido del dueño).
+   *
+   * `ventas.controlStockGranel` en false libera TODO lo que es a granel —la
+   * madre en kg y sus paquetes fraccionados—: se vende, se fracciona, se
+   * transfiere, se reserva, se da de baja y se anula sin mirar si alcanza. Lo
+   * que NO cambia es el registro: cada operación sigue moviendo el stock y
+   * dejando su movimiento, así que el número puede quedar en negativo y la
+   * película del almacén sigue completa. Al volver a prender el control, todo
+   * vuelve a frenar sobre ese número — por eso la configuración avisa cuántos
+   * quedaron en negativo y conviene contarlos.
+   *
+   * Es la ÚNICA puerta: cada control de "no alcanza" de este servicio pregunta
+   * acá. Un control que no preguntara volvería a trabar al granel por un
+   * camino que nadie miró.
+   */
+  async granelLibre(): Promise<boolean> {
+    return (await this.cfg.get('ventas'))?.controlStockGranel === false;
+  }
+
+  /**
+   * EL GRANEL QUE QUEDÓ EN NEGATIVO: con el control apagado se vende sin mirar,
+   * y al prenderlo de nuevo esos números frenan todo. La configuración lo
+   * muestra para contarlos antes (Almacén › Control de inventario).
+   */
+  async granelNegativo() {
+    const r: any = await this.db.execute(sql`
+      SELECT p.id, p.nombre, s.nombre AS sucursal, st.presentacion_id, st.cantidad
+        FROM stock st
+        JOIN productos p ON p.id = st.producto_id
+        JOIN sucursales s ON s.id = st.sucursal_id
+       WHERE p.tipo = 'granel' AND st.estado = 'disponible' AND st.cantidad < -1e-9
+       ORDER BY st.cantidad
+       LIMIT 500`);
+    const filas = r.rows ?? r;
+    return {
+      renglones: filas.length,
+      productos: new Set(filas.map((f: any) => f.id)).size,
+      ejemplos: filas.slice(0, 8).map((f: any) => ({
+        nombre: f.nombre, sucursal: f.sucursal, paquete: f.presentacion_id != null, cantidad: Math.round(Number(f.cantidad) * 1000) / 1000,
+      })),
+    };
+  }
+
+  /** Por transacción: no se pregunta dos veces el tipo del mismo producto. */
+  private readonly tiposEnTx = new WeakMap<object, Map<number, boolean>>();
+
+  /** ¿Este producto se mueve sin mirar si alcanza? Solo el granel, y solo con el control apagado. */
+  private async stockLibre(tx: any, prod: number | { id: number; tipo?: string | null } | null | undefined): Promise<boolean> {
+    if (!prod || !(await this.granelLibre())) return false;
+    if (typeof prod === 'object') return prod.tipo === 'granel';
+    let m = this.tiposEnTx.get(tx);
+    if (!m) { m = new Map(); this.tiposEnTx.set(tx, m); }
+    if (!m.has(prod)) m.set(prod, (await this.getProducto(tx, prod))?.tipo === 'granel');
+    return m.get(prod)!;
+  }
+
   private async cant(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
     const e = await this.getEntry(tx, { productoId, sucursalId, presentacionId, estado });
     return e ? e.cantidad : 0;
@@ -300,13 +357,15 @@ export class InventarioService {
    */
   private async move(tx: any, base: Omit<Coord, 'estado'>, desde: EstadoStock, hacia: EstadoStock, c: number): Promise<void> {
     const from = await this.getOrCreate(tx, { ...base, estado: desde });
-    if (from.cantidad + 1e-9 < c) this.sinStock(desde, from.cantidad, c);
+    // Granel sin control (ver `granelLibre`): mueve igual, aunque quede en negativo.
+    const libre = await this.stockLibre(tx, base.productoId);
+    if (!libre && from.cantidad + 1e-9 < c) this.sinStock(desde, from.cantidad, c);
     // El WHERE re-verifica el saldo EN el UPDATE: si otra transacción se llevó
     // el stock entre la lectura y acá, no descuenta de más — no toca ninguna
     // fila, y la operación se corta igual que arriba.
-    const res: any = await tx.execute(
-      sql`UPDATE stock SET cantidad = cantidad - ${c} WHERE id = ${from.id} AND cantidad >= ${c} - 1e-9`,
-    );
+    const res: any = await tx.execute(libre
+      ? sql`UPDATE stock SET cantidad = cantidad - ${c} WHERE id = ${from.id}`
+      : sql`UPDATE stock SET cantidad = cantidad - ${c} WHERE id = ${from.id} AND cantidad >= ${c} - 1e-9`);
     if (!res.rowCount) this.sinStock(desde, from.cantidad, c);
     const to = await this.getOrCreate(tx, { ...base, estado: hacia });
     await tx.execute(sql`UPDATE stock SET cantidad = cantidad + ${c} WHERE id = ${to.id}`);
@@ -622,7 +681,7 @@ export class InventarioService {
       this.exigirEntero(prod, presId, c);
       // Con candado (ver `cantConCandado`): dos a la vez no pasan las dos.
       const disp = await this.cantConCandado(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`Stock insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
+      if (c > disp + 1e-9 && !(await this.stockLibre(tx, prod))) throw new BadRequestException(`Stock insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
       await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, -c);
       const precioU = presId ? await this.precioPres(tx, presId) : await this.precioBase(tx, prod.id);
       const importe = c * precioU;
@@ -708,7 +767,7 @@ export class InventarioService {
         const total = this.cant3(asign.reduce((a, x) => a + x.q * x.pres.tamKg, 0));
         // Con candado: ver `cantConCandado` (los productos van en orden de id).
         const disp = await this.cantConCandado(tx, pid, sucId, null, 'disponible');
-        if (total > disp + 1e-9) {
+        if (total > disp + 1e-9 && !(await this.stockLibre(tx, prod))) {
           throw new BadRequestException(`No alcanza el granel de ${prod.nombre}: hay ${this.cant3(disp)} kg y se necesitan ${total} kg.`);
         }
         await this.addDelta(tx, { productoId: pid, sucursalId: sucId, presentacionId: null, estado: 'disponible' }, -total);
@@ -811,7 +870,7 @@ export class InventarioService {
       const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, delta > 0);
 
       const kg = Math.round(Math.abs(delta) * pres.tamKg * 1000) / 1000;
-      if (delta > 0 && kg > granel + 1e-9) {
+      if (delta > 0 && kg > granel + 1e-9 && !(await this.stockLibre(tx, prod))) {
         // Sumar paquetes es fraccionar más: tiene que haber granel para eso.
         throw new BadRequestException(
           `Para llegar a ${real} paquetes hacen falta ${kg} kg de granel y hay ${this.fmtCantFin(prod.tipo, null, granel)}.`,
@@ -898,7 +957,7 @@ export class InventarioService {
        * probó). Con `FOR UPDATE` la segunda espera a la primera y lee 2.
        */
       const disp = await this.cantConCandado(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
+      if (c > disp + 1e-9 && !(await this.stockLibre(tx, prod))) throw new BadRequestException(`Stock disponible insuficiente. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
     }
     await this.addDelta(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId, estado: 'disponible' }, signo * c);
     let estadoHacia: EstadoStock | null = signo > 0 ? 'disponible' : null;
@@ -950,7 +1009,7 @@ export class InventarioService {
       await this.exigirPresDelProducto(tx, prod, presId);
       this.exigirEntero(prod, presId, c);
       const hay = await this.cantConCandado(tx, prod.id, o.sucursalId, presId, o.estado);
-      if (c > hay + 1e-9) {
+      if (c > hay + 1e-9 && !(await this.stockLibre(tx, prod))) {
         throw new BadRequestException(`Como ${o.estado} hay ${this.fmtCant(prod.tipo, presId, hay)}: no se pueden descartar ${this.fmtCantFin(prod.tipo, presId, c)}.`);
       }
       await this.addDelta(tx, { productoId: prod.id, sucursalId: o.sucursalId, presentacionId: presId, estado: o.estado }, -c);
@@ -1070,7 +1129,9 @@ export class InventarioService {
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, estado);
       const faltante = cantidad - disp;
-      if (faltante > 1e-9) {
+      /* Granel sin control: sale igual y sin incidencia de "venta sin stock" —
+       * con el control apagado, que no alcance es lo esperado, no un hallazgo. */
+      if (faltante > 1e-9 && !(await this.stockLibre(tx, prod))) {
         if (!o.permitirNegativo) {
           throw new BadRequestException(
             `Stock insuficiente de ${prod.nombre}. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`,
@@ -1133,7 +1194,7 @@ export class InventarioService {
       const faltan: string[] = [];
       for (const f of filas) {
         const hay = await this.cantConCandado(tx, f.productoId, o.sucursalId, f.presentacionId, 'disponible');
-        if (f.cantidad > hay + 1e-9) {
+        if (f.cantidad > hay + 1e-9 && !(await this.stockLibre(tx, prodDe.get(f.productoId)))) {
           const prod = prodDe.get(f.productoId);
           faltan.push(`${prod?.nombre ?? `#${f.productoId}`}: ingresaron ${this.fmtCant(prod?.tipo, f.presentacionId, f.cantidad)} y hoy hay ${this.fmtCant(prod?.tipo, f.presentacionId, hay)}`);
         }
@@ -1159,7 +1220,8 @@ export class InventarioService {
 
   /** Cuánto hay hoy de cada renglón (sin candado): la vista previa de la anulación. */
   async stockDeRenglones(sucursalId: number, items: { productoId: number; presentacionId: number | null; cantidad: number }[]) {
-    const out: { productoId: number; presentacionId: number | null; nombre: string; unidad: string; cantidad: number; hay: number }[] = [];
+    const out: { productoId: number; presentacionId: number | null; nombre: string; unidad: string; cantidad: number; hay: number; libre: boolean }[] = [];
+    const granelLibre = await this.granelLibre();
     const juntos = new Map<string, any>();
     for (const it of items) {
       const k = `${it.productoId}:${it.presentacionId ?? ''}`;
@@ -1173,6 +1235,8 @@ export class InventarioService {
       out.push({
         ...f, nombre: prod?.nombre ?? `#${f.productoId}`, unidad: this.unidadDe(prod?.tipo, f.presentacionId),
         hay: await this.cant(this.db, f.productoId, sucursalId, f.presentacionId, 'disponible'),
+        /** Granel sin control: puede salir aunque no alcance (ver `granelLibre`). */
+        libre: granelLibre && prod?.tipo === 'granel',
       });
     }
     return out;
@@ -1271,7 +1335,7 @@ export class InventarioService {
       if (c <= 0) continue;
       const presId = it.presentacionId || null;
       const hay = await this.cant(tx, it.productoId, o.sucursalId, presId, desde);
-      if (c > hay + 1e-9) {
+      if (c > hay + 1e-9 && !(await this.stockLibre(tx, it.productoId))) {
         const prod = await this.getProducto(tx, it.productoId);
         faltas.push(`${prod?.nombre ?? '#' + it.productoId}: hace falta ${this.fmtCant(prod?.tipo ?? 'entero', presId, c)}, hay ${this.fmtCant(prod?.tipo ?? 'entero', presId, hay)}`);
       }
@@ -1317,7 +1381,7 @@ export class InventarioService {
         if (c <= 0) continue;
         const presId = it.presentacionId || null;
         const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, 'disponible');
-        if (c > disp + 1e-9) {
+        if (c > disp + 1e-9 && !(await this.stockLibre(tx, it.productoId))) {
           const prod = await this.getProducto(tx, it.productoId);
           faltas.push(`${prod?.nombre ?? '#' + it.productoId}: pedido ${this.fmtCant(prod?.tipo ?? 'entero', presId, c)}, disponible ${this.fmtCant(prod?.tipo ?? 'entero', presId, disp)}`);
         }
@@ -2050,6 +2114,9 @@ export class InventarioService {
       }
 
       if (it.cantidadPreparada <= disp + 1e-9) continue;
+      /* Granel sin control: lo que no alcanzó a armarse viaja igual (el stock
+       * del origen queda en negativo). Recortarlo sería frenar por stock. */
+      if (await this.stockLibre(tx, prod)) continue;
 
       /* Lo que queda va como viaja: paquetes y unidades ENTEROS —medio paquete
        * no sube al camión—, el granel suelto con sus tres decimales. */
@@ -2415,7 +2482,7 @@ export class InventarioService {
       await this.exigirPresDelProducto(tx, prod, presId);
       this.exigirEntero(prod, presId, c);
       const disp = await this.cant(tx, prod.id, sucId, presId, 'disponible');
-      if (c > disp + 1e-9) throw new BadRequestException(`No hay tanto stock disponible. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
+      if (c > disp + 1e-9 && !(await this.stockLibre(tx, prod))) throw new BadRequestException(`No hay tanto stock disponible. Disponible: ${this.fmtCantFin(prod.tipo, presId, disp)}.`);
       await this.move(tx, { productoId: prod.id, sucursalId: sucId, presentacionId: presId }, 'disponible', 'comprometido', c);
       const [inc] = await tx.insert(incidencias).values({
         codigo: '', tipo: o.tipo, estado: 'pendiente', responsableId: o.responsableId ?? null, motivo: o.motivo || '',

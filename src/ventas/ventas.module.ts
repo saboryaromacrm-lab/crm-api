@@ -1581,6 +1581,8 @@ export class VentasService {
         categoria: nombreCategoria.get(p.categoriaId as number) ?? '',
         etiquetas: etiquetasDe.get(p.id) ?? [],
         proveedorIds: proveedoresDe.get(p.id) ?? [],
+        /** Granel sin control de stock (1/10/2026): la caja no frena ni marca «sin stock». */
+        stockLibre: p.tipo === 'granel' && cfg.controlStockGranel === false,
         detalle: p.tipo === 'granel' ? 'Suelto (por kg)' : 'Unidad',
         tipo: p.tipo,
         /* Uso exclusivo de Cafetería (0089): viaja al POS para MOSTRARSE
@@ -1659,6 +1661,7 @@ export class VentasService {
           categoria: nombreCategoria.get(p.categoriaId as number) ?? '',
           etiquetas: etiquetasDe.get(p.id) ?? [],
           proveedorIds: proveedoresDe.get(p.id) ?? [],
+          stockLibre: p.tipo === 'granel' && cfg.controlStockGranel === false,
           detalle: pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`,
           tipo: p.tipo,
           // El paquete hereda la exclusividad de la madre: si el granel es de
