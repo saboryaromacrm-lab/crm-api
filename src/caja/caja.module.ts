@@ -170,6 +170,16 @@ async function sinCobrosQrVivos(tx: any, sucursalId: number) {
 export class CajaService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
+  /**
+   * ¿El cajero ve lo que tiene que haber en caja? (`ventas.cajaVeEsperado`,
+   * 1/10/2026). Se lee de la base en cada pedido —no del caché de la
+   * configuración de otro proceso—: apagarlo tiene que cegar la caja ya.
+   */
+  async cajeroVeEsperado(): Promise<boolean> {
+    const r: any = await this.db.execute(sql`SELECT (valor->>'cajaVeEsperado') = 'true' AS ve FROM configuracion WHERE clave = 'ventas'`);
+    return !!(r.rows ?? r)[0]?.ve;
+  }
+
   /* ------------------------------ Lectura ------------------------------ */
 
   async get(id: number) {
@@ -622,9 +632,12 @@ export class CajaService {
         observaciones: `Cierre por envío (conteo por billetes): envió ${$(envio)}, quedan ${$(queda)} de fondo`,
         usuarioId: cerrador ?? null,
       });
+      /* El esperado y la diferencia viajan: el controlador los saca si el que
+       * cierra cuenta a ciegas (`cajaVeEsperado` apagado y no es jefe). */
       return {
-        sesion: sesionCiega(c),
+        sesion: c,
         contado, envio, fondo, fondoQueda: queda, faltaFondo, billetes,
+        esperadoEfectivo: a.esperadoEfectivo, diferencia,
       };
     });
   }
@@ -705,6 +718,15 @@ export class CajaService {
 export class CajaController {
   constructor(private readonly svc: CajaService) {}
 
+  /**
+   * ¿Este que mira cuenta a ciegas? El que no es jefe, mientras la
+   * configuración no le deje ver lo que tiene que haber (`cajaVeEsperado`).
+   * Administración y superadmin ven siempre: revisan las diferencias.
+   */
+  private async ciego(sesion: Sesion): Promise<boolean> {
+    return !esJefe(sesion) && !(await this.svc.cajeroVeEsperado());
+  }
+
   /*
    * También con `ventas.pos`: el punto de venta pregunta si hay turno abierto
    * para saber si puede cobrar (PosPanel), y un cajero que vende sin administrar
@@ -736,8 +758,8 @@ export class CajaController {
       sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
       estado, limit: limit ? Number(limit) : undefined,
     });
-    // El historial también a ciegas para el que no es jefe (0111).
-    return esJefe(sesion) ? filas : filas.map((f) => sesionCiega(f));
+    // El historial también a ciegas para el que cuenta a ciegas (0111).
+    return (await this.ciego(sesion)) ? filas.map((f) => sesionCiega(f)) : filas;
   }
 
   /*
@@ -748,14 +770,14 @@ export class CajaController {
   @Get(':id/arqueo')
   async arqueo(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     await this.exigirMiTurno(id, sesion);
-    return this.svc.arqueo(id, { ciego: !esJefe(sesion) });
+    return this.svc.arqueo(id, { ciego: await this.ciego(sesion) });
   }
 
   @Get(':id')
   async get(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
     await this.exigirMiTurno(id, sesion);
     const t = await this.svc.get(id);
-    return esJefe(sesion) ? t : sesionCiega(t);
+    return (await this.ciego(sesion)) ? sesionCiega(t) : t;
   }
 
   /** El turno tiene que ser de mi sucursal, salvo que sea un jefe (`null`). */
@@ -790,26 +812,24 @@ export class CajaController {
   }
 
   /*
-   * EL CIERRE CON MONTO DECLARADO Y EL "VER RESULTADO" SON DEL JEFE (0111).
-   * El que no es jefe cierra por `enviar`, contando billetes: con estas dos
-   * puertas abiertas podía tipear un monto y leer el esperado por la API.
+   * EL CIERRE CON MONTO DECLARADO Y EL "VER RESULTADO" SE DIERON DE BAJA
+   * (1/10/2026, pedido del dueño: «eliminame la opción de que puedan ver el
+   * resultado»). Todos —también administración— cierran por `enviar`, contando
+   * los billetes: un solo cierre, con su comprobante billete por billete. Si el
+   * cajero ve o no lo que tiene que haber lo decide `cajaVeEsperado`.
    */
   @Post(':id/cerrar')
-  cerrar(@Param('id', ParseIntPipe) id: number, @Body() dto: CerrarCajaDto, @Auth() sesion: Sesion) {
-    this.soloJefe(sesion);
-    return this.svc.cerrar(id, dto, soloSuSucursal(sesion));
+  cerrar() {
+    throw new ForbiddenException('La caja se cierra contando los billetes y enviando («Cerrar caja»). El cierre con monto se dio de baja.');
   }
 
-  /** El cierre del cajero: contar billetes, dejar el fondo y enviar el resto (0111). */
+  /** El cierre: contar billetes, dejar el fondo y enviar el resto (0111). Para todos. */
   @Post(':id/enviar')
-  enviar(@Param('id', ParseIntPipe) id: number, @Body() dto: EnviarCierreDto, @Auth() sesion: Sesion) {
-    return this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion));
-  }
-
-  private soloJefe(sesion: Sesion) {
-    if (!esJefe(sesion)) {
-      throw new ForbiddenException('Cerrá la caja con "Enviar": contando los billetes del cajón.');
-    }
+  async enviar(@Param('id', ParseIntPipe) id: number, @Body() dto: EnviarCierreDto, @Auth() sesion: Sesion) {
+    const r = await this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion));
+    return (await this.ciego(sesion))
+      ? { ...r, sesion: sesionCiega(r.sesion), esperadoEfectivo: null, diferencia: null, ciego: true }
+      : { ...r, ciego: false };
   }
 
   /* El control intermedio del que no es jefe queda registrado igual, pero la
@@ -817,7 +837,7 @@ export class CajaController {
   @Post(':id/control')
   async control(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
     const c = await this.svc.control(id, dto, soloSuSucursal(sesion));
-    return esJefe(sesion) ? c : { ...c, esperadoEfectivo: null, diferencia: null, ciego: true };
+    return (await this.ciego(sesion)) ? { ...c, esperadoEfectivo: null, diferencia: null, ciego: true } : c;
   }
 
   @Patch(':id/control/:controlId')
@@ -830,10 +850,10 @@ export class CajaController {
     return this.svc.explicarControl(id, controlId, dto, soloSuSucursal(sesion));
   }
 
+  /* El «Ver resultado» del cierre con monto: dado de baja con él (1/10/2026). */
   @Post(':id/conteo-cierre')
-  conteoCierre(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlCajaDto, @Auth() sesion: Sesion) {
-    this.soloJefe(sesion);
-    return this.svc.conteoCierre(id, dto, soloSuSucursal(sesion));
+  conteoCierre() {
+    throw new ForbiddenException('La caja se cierra contando los billetes y enviando («Cerrar caja»). El «Ver resultado» se dio de baja.');
   }
 
   /*

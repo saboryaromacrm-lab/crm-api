@@ -101,6 +101,15 @@ export const VENTAS_DEFAULTS = {
   /** Lo mismo para los ENTEROS (1/10/2026, pedido del dueño): independiente del granel. */
   controlStockEnteros: true as boolean,
   /**
+   * EL CAJERO VE LO QUE TIENE QUE HABER EN CAJA (1/10/2026, pedido del dueño).
+   * `false` (como venía): a ciegas — ni durante el turno ni al cerrar ve el
+   * efectivo esperado ni la diferencia; cuenta los billetes y envía. `true`:
+   * ve el detalle (fondo + efectivo cobrado + ingresos − egresos) y, al cerrar,
+   * la diferencia contra lo que contó. El cierre es SIEMPRE por envío contando
+   * billetes, para todos: el "Ver resultado" con monto se dio de baja.
+   */
+  cajaVeEsperado: false as boolean,
+  /**
    * Cambiar la lista de un renglón a mano esquiva por completo el tope de
    * descuento (pasar de minorista a mayorista puede ser −40% sin registrarse
    * como descuento). Con esto en `true`, solo un admin puede hacerlo; el
