@@ -45,7 +45,7 @@ import { CajaModule, CajaService } from '../caja/caja.module';
 import { ListasModule, ListasService } from '../listas/listas.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { InventarioModule } from '../inventario/inventario.module';
-import { InventarioService } from '../inventario/inventario.service';
+import { InventarioService, stockSinControl } from '../inventario/inventario.service';
 import { bultoCerrado, costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila, r6 } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
@@ -1587,8 +1587,8 @@ export class VentasService {
         categoria: nombreCategoria.get(p.categoriaId as number) ?? '',
         etiquetas: etiquetasDe.get(p.id) ?? [],
         proveedorIds: proveedoresDe.get(p.id) ?? [],
-        /** Granel sin control de stock (1/10/2026): la caja no frena ni marca «sin stock». */
-        stockLibre: p.tipo === 'granel' && cfg.controlStockGranel === false,
+        /** Sin control de stock para su tipo (1/10/2026): la caja no frena ni marca «sin stock». */
+        stockLibre: stockSinControl(cfg, p.tipo),
         detalle: p.tipo === 'granel' ? 'Suelto (por kg)' : 'Unidad',
         tipo: p.tipo,
         /* Uso exclusivo de Cafetería (0089): viaja al POS para MOSTRARSE
@@ -1667,7 +1667,7 @@ export class VentasService {
           categoria: nombreCategoria.get(p.categoriaId as number) ?? '',
           etiquetas: etiquetasDe.get(p.id) ?? [],
           proveedorIds: proveedoresDe.get(p.id) ?? [],
-          stockLibre: p.tipo === 'granel' && cfg.controlStockGranel === false,
+          stockLibre: stockSinControl(cfg, p.tipo),
           detalle: pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`,
           tipo: p.tipo,
           // El paquete hereda la exclusividad de la madre: si el granel es de

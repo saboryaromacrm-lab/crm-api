@@ -31,7 +31,7 @@ import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
 import { clientes, presupuestoItems, presupuestos, productos, stock } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
-import { InventarioService } from '../inventario/inventario.service';
+import { InventarioService, stockSinControl } from '../inventario/inventario.service';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 
@@ -423,11 +423,12 @@ export class PresupuestosService {
         .where(and(eq(stock.sucursalId, p.sucursalId), eq(stock.estado, 'disponible'))),
       this.cfg.get('ventas'),
     ]);
-    /* Granel sin control de stock (1/10/2026): alcanza siempre, como en la caja. */
-    const granelLibre = cfgV?.controlStockGranel === false;
-    const granelIds = new Set(granelLibre && items.length
-      ? (await this.db.select({ id: productos.id }).from(productos)
-        .where(and(inArray(productos.id, [...new Set(items.map((it) => it.productoId))]), eq(productos.tipo, 'granel')))).map((x) => x.id)
+    /* Sin control de stock para su tipo (1/10/2026): alcanza siempre, como en la caja. */
+    const algunoLibre = cfgV?.controlStockGranel === false || cfgV?.controlStockEnteros === false;
+    const granelIds = new Set(algunoLibre && items.length
+      ? (await this.db.select({ id: productos.id, tipo: productos.tipo }).from(productos)
+        .where(inArray(productos.id, [...new Set(items.map((it) => it.productoId))])))
+        .filter((x) => stockSinControl(cfgV, x.tipo)).map((x) => x.id)
       : []);
     const disponibleDe = (it: any) => st
       .filter((s) => s.productoId === it.productoId && (s.presentacionId ?? null) === (it.presentacionId ?? null))

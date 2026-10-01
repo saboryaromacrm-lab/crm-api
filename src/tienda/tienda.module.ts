@@ -38,6 +38,7 @@ import { ConfiguracionModule, ConfiguracionService } from '../configuracion/conf
 import { PresupuestosModule } from '../presupuestos/presupuestos.module';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
+import { stockSinControl } from '../inventario/inventario.service';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -297,7 +298,7 @@ export class TiendaService {
        * siga la misma regla"). Con `controlStockGranel` apagado el granel se
        * ofrece siempre y sin tope (`disponible: null`), igual que en la caja.
        */
-      const sinTope = cfg.controlStockGranel === false && p.tipo === 'granel';
+      const sinTope = stockSinControl(cfg, p.tipo);   // y los enteros, con su propio interruptor
       const disponibleParaWeb = sinTope ? null : Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
       const disponibleWeb = sinTope || (disponibleParaWeb ?? 0) > 1e-9;
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];

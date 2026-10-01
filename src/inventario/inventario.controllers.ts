@@ -251,7 +251,14 @@ export class StockController {
   @Get('granel-negativo')
   @Permiso('ventas.configuracion', 'almacen.existencias')
   granelNegativo() {
-    return this.inv.granelNegativo();
+    return this.inv.granelNegativo('granel');
+  }
+
+  /** Lo mismo para los enteros. */
+  @Get('enteros-negativo')
+  @Permiso('ventas.configuracion', 'almacen.existencias')
+  enterosNegativo() {
+    return this.inv.granelNegativo('entero');
   }
 }
 

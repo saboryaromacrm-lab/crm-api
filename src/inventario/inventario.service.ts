@@ -60,6 +60,17 @@ type Coord = { productoId: number; sucursalId: number; presentacionId: number | 
  * `TIPOS_INCIDENCIA` del dashboard. Los internos —faltante de transferencia,
  * venta sin stock, faltante de envío de Cafetería— los escribe solo el sistema.
  */
+/**
+ * ¿El stock de un producto de este tipo se opera SIN control? (1/10/2026)
+ * Granel → `controlStockGranel`; entero (todo lo que no es granel) →
+ * `controlStockEnteros`. `false` en la configuración = sin control. La usan
+ * inventario, la caja, la tienda y los pedidos web: una sola regla.
+ */
+export function stockSinControl(cfgVentas: any, tipo: string | null | undefined): boolean {
+  if (!tipo) return false;
+  return tipo === 'granel' ? cfgVentas?.controlStockGranel === false : cfgVentas?.controlStockEnteros === false;
+}
+
 export const TIPOS_INCIDENCIA_MANUAL = [
   'Etiqueta incorrecta', 'Producto mal pesado', 'Bolsa rota',
   'Diferencia de inventario', 'Producto defectuoso', 'Producto vencido',
@@ -243,18 +254,25 @@ export class InventarioService {
     return (await this.cfg.get('ventas'))?.controlStockGranel === false;
   }
 
+  /** ¿Hay algún tipo sin control? Si no, nadie paga la consulta del tipo del producto. */
+  private async algunoLibre(): Promise<boolean> {
+    const c = await this.cfg.get('ventas');
+    return c?.controlStockGranel === false || c?.controlStockEnteros === false;
+  }
+
   /**
    * EL GRANEL QUE QUEDÓ EN NEGATIVO: con el control apagado se vende sin mirar,
    * y al prenderlo de nuevo esos números frenan todo. La configuración lo
    * muestra para contarlos antes (Almacén › Control de inventario).
    */
-  async granelNegativo() {
+  async granelNegativo(tipo: 'granel' | 'entero' = 'granel') {
     const r: any = await this.db.execute(sql`
       SELECT p.id, p.nombre, s.nombre AS sucursal, st.presentacion_id, st.cantidad
         FROM stock st
         JOIN productos p ON p.id = st.producto_id
         JOIN sucursales s ON s.id = st.sucursal_id
-       WHERE p.tipo = 'granel' AND st.estado = 'disponible' AND st.cantidad < -1e-9
+       WHERE ${tipo === 'granel' ? sql`p.tipo = 'granel'` : sql`p.tipo <> 'granel'`}
+         AND st.estado = 'disponible' AND st.cantidad < -1e-9
        ORDER BY st.cantidad
        LIMIT 500`);
     const filas = r.rows ?? r;
@@ -268,16 +286,22 @@ export class InventarioService {
   }
 
   /** Por transacción: no se pregunta dos veces el tipo del mismo producto. */
-  private readonly tiposEnTx = new WeakMap<object, Map<number, boolean>>();
+  private readonly tiposEnTx = new WeakMap<object, Map<number, string | null>>();
 
-  /** ¿Este producto se mueve sin mirar si alcanza? Solo el granel, y solo con el control apagado. */
+  /**
+   * ¿Este producto se mueve sin mirar si alcanza? Según su TIPO: el granel
+   * (madre y paquetes) con `controlStockGranel` apagado, el entero con
+   * `controlStockEnteros` apagado (1/10/2026). Es la regla única: la misma
+   * cuenta hacen la caja, la tienda y los pedidos (`stockSinControl`).
+   */
   private async stockLibre(tx: any, prod: number | { id: number; tipo?: string | null } | null | undefined): Promise<boolean> {
-    if (!prod || !(await this.granelLibre())) return false;
-    if (typeof prod === 'object') return prod.tipo === 'granel';
+    if (!prod || !(await this.algunoLibre())) return false;
+    const cfg = await this.cfg.get('ventas');
+    if (typeof prod === 'object') return stockSinControl(cfg, prod.tipo);
     let m = this.tiposEnTx.get(tx);
     if (!m) { m = new Map(); this.tiposEnTx.set(tx, m); }
-    if (!m.has(prod)) m.set(prod, (await this.getProducto(tx, prod))?.tipo === 'granel');
-    return m.get(prod)!;
+    if (!m.has(prod)) m.set(prod, (await this.getProducto(tx, prod))?.tipo ?? null);
+    return stockSinControl(cfg, m.get(prod));
   }
 
   private async cant(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
@@ -357,7 +381,7 @@ export class InventarioService {
    */
   private async move(tx: any, base: Omit<Coord, 'estado'>, desde: EstadoStock, hacia: EstadoStock, c: number): Promise<void> {
     const from = await this.getOrCreate(tx, { ...base, estado: desde });
-    // Granel sin control (ver `granelLibre`): mueve igual, aunque quede en negativo.
+    // Sin control de stock para su tipo (ver `stockLibre`): mueve igual, aunque quede en negativo.
     const libre = await this.stockLibre(tx, base.productoId);
     if (!libre && from.cantidad + 1e-9 < c) this.sinStock(desde, from.cantidad, c);
     // El WHERE re-verifica el saldo EN el UPDATE: si otra transacción se llevó
@@ -1129,7 +1153,7 @@ export class InventarioService {
       if (!prod) throw new BadRequestException('Producto inválido en el detalle.');
       const disp = await this.cant(tx, it.productoId, o.sucursalId, presId, estado);
       const faltante = cantidad - disp;
-      /* Granel sin control: sale igual y sin incidencia de "venta sin stock" —
+      /* Sin control de stock (granel o enteros): sale igual y sin incidencia de "venta sin stock" —
        * con el control apagado, que no alcance es lo esperado, no un hallazgo. */
       if (faltante > 1e-9 && !(await this.stockLibre(tx, prod))) {
         if (!o.permitirNegativo) {
@@ -1221,7 +1245,7 @@ export class InventarioService {
   /** Cuánto hay hoy de cada renglón (sin candado): la vista previa de la anulación. */
   async stockDeRenglones(sucursalId: number, items: { productoId: number; presentacionId: number | null; cantidad: number }[]) {
     const out: { productoId: number; presentacionId: number | null; nombre: string; unidad: string; cantidad: number; hay: number; libre: boolean }[] = [];
-    const granelLibre = await this.granelLibre();
+    const cfgStock = await this.cfg.get('ventas');
     const juntos = new Map<string, any>();
     for (const it of items) {
       const k = `${it.productoId}:${it.presentacionId ?? ''}`;
@@ -1235,8 +1259,8 @@ export class InventarioService {
       out.push({
         ...f, nombre: prod?.nombre ?? `#${f.productoId}`, unidad: this.unidadDe(prod?.tipo, f.presentacionId),
         hay: await this.cant(this.db, f.productoId, sucursalId, f.presentacionId, 'disponible'),
-        /** Granel sin control: puede salir aunque no alcance (ver `granelLibre`). */
-        libre: granelLibre && prod?.tipo === 'granel',
+        /** Sin control de stock para su tipo: puede salir aunque no alcance (ver `stockLibre`). */
+        libre: !!prod && stockSinControl(cfgStock, prod.tipo),
       });
     }
     return out;
@@ -2114,7 +2138,7 @@ export class InventarioService {
       }
 
       if (it.cantidadPreparada <= disp + 1e-9) continue;
-      /* Granel sin control: lo que no alcanzó a armarse viaja igual (el stock
+      /* Sin control de stock: lo que no alcanzó viaja igual (el stock
        * del origen queda en negativo). Recortarlo sería frenar por stock. */
       if (await this.stockLibre(tx, prod)) continue;
 

@@ -98,6 +98,8 @@ export const VENTAS_DEFAULTS = {
    * registrando y puede quedar en negativo. Ver `granelLibre` en inventario.
    */
   controlStockGranel: true as boolean,
+  /** Lo mismo para los ENTEROS (1/10/2026, pedido del dueño): independiente del granel. */
+  controlStockEnteros: true as boolean,
   /**
    * Cambiar la lista de un renglón a mano esquiva por completo el tope de
    * descuento (pasar de minorista a mayorista puede ser −40% sin registrarse
