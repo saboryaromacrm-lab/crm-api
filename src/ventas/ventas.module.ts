@@ -665,6 +665,8 @@ type ListadoVentasQ = {
   estado?: string; medioPago?: string; origen?: string;
   conOferta?: boolean; sinFacturar?: boolean; q?: string;
   offset?: number; limit?: number;
+  /** Quien puede ver costos recibe la rentabilidad del filtro (1/10/2026). */
+  verRentabilidad?: boolean;
 };
 
 @Injectable()
@@ -822,7 +824,7 @@ export class VentasService {
      * (F10): tickets internos y sus devoluciones. Las NC restan en su lado.
      */
     const FACTURADO = sql`(${ventas.tipo}::text like 'factura%' or (${ventas.tipo}::text like 'nota_credito_%' and ${ventas.tipo}::text <> 'nota_credito_ticket') or ${ventas.facturarPendiente})`;
-    const [filas, [tot], porMedio, [ofe], [fac], porLista] = await Promise.all([
+    const [filas, [tot], porMedio, [fac], porLista, [ren]] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -868,14 +870,6 @@ export class VentasService {
         .groupBy(ventaPagos.medio),
 
       this.db.select({
-        plata: sql<number>`coalesce(sum(${ventaItems.ofertaDescuento}), 0)`,
-        ventas: sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventaItems.ofertaId} is not null)::int`,
-      }).from(ventaItems)
-        .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
-        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
-        .where(vivas),
-
-      this.db.select({
         facturado: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${FACTURADO}), 0)`,
         facturadoCae: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${FACTURADO} and ${ventas.cae} <> ''), 0)`,
         facturas: sql<number>`count(*) filter (where ${FACTURADO} and ${ventas.tipo}::text not like 'nota_credito%')::int`,
@@ -900,6 +894,25 @@ export class VentasService {
         .leftJoin(listasVenta, eq(listasVenta.id, ventaItems.listaId))
         .where(vivas)
         .groupBy(ventaItems.listaId),
+
+      /* RENTABILIDAD DEL FILTRO (1/10/2026, pedido del dueño): la mercadería
+       * SIN IVA contra el costo CONGELADO al vender (0072) — la misma cuenta
+       * que Gerencia › Métricas. Los renglones sin costo (anteriores a 0072)
+       * no entran en el margen, y se dice cuántos son. Las NC restan. Solo
+       * para quien puede ver costos: el margen es el dato más sensible. */
+      q.verRentabilidad
+        ? this.db.select({
+          ventaNeta: sql<number>`coalesce(sum(${ventaItems.subtotal} * ${SIGNO_NC}), 0)`,
+          ventaCosteada: sql<number>`coalesce(sum(${ventaItems.subtotal} * ${SIGNO_NC}) filter (where ${ventaItems.costoUnitario} is not null), 0)`,
+          costo: sql<number>`coalesce(sum(${ventaItems.cantidad} * ${ventaItems.costoUnitario} * ${SIGNO_NC}), 0)`,
+          ivaAbsorbido: sql<number>`coalesce(sum(${ventaItems.cantidad} * ${ventaItems.ivaAbsorbidoUnitario} * ${SIGNO_NC}), 0)`,
+          renglones: sql<number>`count(*) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+          sinCosto: sql<number>`count(*) filter (where ${ventaItems.costoUnitario} is null and ${ventas.tipo}::text not like 'nota_credito%')::int`,
+        }).from(ventaItems)
+          .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+          .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+          .where(vivas)
+        : Promise.resolve([null]),
     ]);
 
     const ids = filas.map((f) => f.v.id);
@@ -979,8 +992,25 @@ export class VentasService {
         plataAcreditada: money(Number(tot?.plataAcreditada)),
         promedio: tickets ? money(plata / tickets) : 0,
         sinFacturar: Number(tot?.sinFacturar) || 0,
-        ofertas: { plata: money(Number(ofe?.plata)), ventas: Number(ofe?.ventas) || 0 },
-        porMedio: porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) })),
+        /* Con el % de cada medio sobre lo cobrado (1/10/2026), de mayor a menor. */
+        porMedio: (() => {
+          const filasM = porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) }));
+          const base = filasM.reduce((a, x) => a + Math.max(0, x.importe), 0);
+          return filasM
+            .map((x) => ({ ...x, pct: base > 0 ? Math.round((Math.max(0, x.importe) / base) * 1000) / 10 : null }))
+            .sort((a, b) => b.importe - a.importe);
+        })(),
+        rentabilidad: ren ? (() => {
+          const ventaCosteada = money(Number(ren.ventaCosteada)); const costo = money(Number(ren.costo));
+          const margen = money(ventaCosteada - costo);
+          return {
+            ventaNeta: money(Number(ren.ventaNeta)), ventaCosteada, costo, margen,
+            margenPct: ventaCosteada > 0 ? Math.round((margen / ventaCosteada) * 1000) / 10 : null,
+            markupPct: costo > 0 ? Math.round((margen / costo) * 1000) / 10 : null,
+            ivaAbsorbido: money(Number(ren.ivaAbsorbido)),
+            renglones: Number(ren.renglones) || 0, sinCosto: Number(ren.sinCosto) || 0,
+          };
+        })() : null,
         facturacion: (() => {
           const f = money(Number(fac?.facturado)); const l = money(Number(fac?.liquidado));
           const base = f + l;
@@ -4993,6 +5023,7 @@ export class VentasController {
       conOferta: conOferta === 'true',
       sinFacturar: sinFacturar === 'true',
       offset: num(offset), limit: num(limit),
+      verRentabilidad: tienePermiso(sesion.permisos, ['precios', 'compras.productos']),
     });
   }
 
