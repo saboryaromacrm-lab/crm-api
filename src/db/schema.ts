@@ -1975,6 +1975,11 @@ export const ventas = pgTable('ventas', {
   estado: estadoVentaEnum('estado').notNull().default('confirmada'),
   condicionPago: condicionPagoEnum('condicion_pago').notNull().default('contado'),
   vencimientoPago: timestamp('vencimiento_pago', { withTimezone: true }),
+  /**
+   * Tiene renglones a precio mayorista (0128): congelado al confirmar. A cuenta
+   * corriente, esta factura se cobra solo con los medios del mayorista.
+   */
+  mayorista: boolean('mayorista').notNull().default(false),
   /** De qué presupuesto nació esta venta (null = venta de mostrador común). */
   presupuestoId: integer('presupuesto_id'),
   listaPrecio: text('lista_precio').notNull().default(''),

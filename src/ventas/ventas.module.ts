@@ -1320,7 +1320,10 @@ export class VentasService {
       }
     }
 
-    const imput = await this.imputadoPorVenta(pendientes.map((v) => v.id));
+    const [imput, regla] = await Promise.all([
+      this.imputadoPorVenta(pendientes.map((v) => v.id)),
+      this.reglaMayorista(),
+    ]);
 
     /*
      * EL CENTAVO DEL REDONDEO NO ES UNA DEUDA.
@@ -1343,7 +1346,8 @@ export class VentasService {
       const tolerancia = 0.01 * (cuantasNotas.get(v.id) ?? 0);
       const saldo = crudo > 0 && crudo <= tolerancia + 1e-9 ? 0 : crudo;
       if (saldo === 0 && crudo > 0) perdonado = money(perdonado + crudo);
-      return { ...v, cobrado, acreditado: money(nc), saldo };
+      /* Mayorista (1/10/2026): se cobra solo con `mediosMayorista`. */
+      return { ...v, cobrado, acreditado: money(nc), saldo, mayorista: !!regla && !!v.mayorista };
     });
 
     // El saldo global incluye lo cobrado "a cuenta" (no imputado a un documento),
@@ -1368,6 +1372,8 @@ export class VentasService {
       cobrado: money(cobradoTotal),
       limiteCredito: cliente.limiteCredito,
       disponible,
+      /** Con qué se cobran las facturas mayoristas (vacío = sin restricción). */
+      mediosMayorista: regla?.permitidos ?? [],
       comprobantes: comprobantes.filter((c) => c.saldo > 0.009),
     };
   }
@@ -2926,45 +2932,106 @@ export class VentasService {
   }
 
   /**
+   * LA REGLA DEL MAYORISTA: con qué medios se paga lo que va a precio
+   * mayorista. `null` = sin restricción (sin medios configurados o sin
+   * modalidad mayorista). `listas` = las listas de esa modalidad.
+   */
+  async reglaMayorista(config?: any): Promise<{ permitidos: string[]; legibles: string; listas: Set<number> } | null> {
+    const cfg = config ?? await this.cfg.get('ventas');
+    const permitidos: string[] = cfg.mediosPagoMonto ?? [];
+    if (!permitidos.length || !cfg.modalidadMontoId) return null;
+    const listas = new Set((await this.db.select({ id: listasVenta.id }).from(listasVenta)
+      .where(eq(listasVenta.modalidadId, cfg.modalidadMontoId))).map((l) => l.id));
+    return { permitidos, legibles: permitidos.map((m) => NOMBRE_MEDIO[m] ?? m).join(' o '), listas };
+  }
+
+  /**
+   * LA PARTE MAYORISTA DE UN TICKET, con IVA: la suma de sus renglones
+   * cotizados con una lista mayorista, con la MISMA cuenta renglón por renglón
+   * que `calcularTotales` (neto redondeado + el IVA del neto sin redondear,
+   * redondeado). Si se calculara distinto, un ticket todo mayorista podía
+   * quedar unos centavos por encima de su propio total y no cerrar nunca. El
+   * resto —renglones minoristas, envíos, recargo de la tarjeta— es la parte que
+   * se puede pagar con cualquier medio.
+   */
+  private parteMayorista(items: any[], listas: Set<number>) {
+    let monto = 0; let renglones = 0;
+    for (const it of items ?? []) {
+      if (it.listaId == null || !listas.has(it.listaId)) continue;
+      const cantidad = Number(it.cantidad) || 0;
+      const precio = Number(it.precioUnitario ?? it.precioLista) || 0;
+      const bonificado = cantidad * precio * (1 - (Number(it.descuento) || 0) / 100);
+      const netoCrudo = bonificado - Math.min(Math.max(0, Number(it.ofertaDescuento) || 0), bonificado);
+      const ivaP = it.iva != null ? Number(it.iva) : 21;
+      monto += money(netoCrudo) + money((netoCrudo * ivaP) / 100);
+      renglones += 1;
+    }
+    return { monto: money(monto), renglones };
+  }
+
+  /**
    * EL PRECIO MAYORISTA SE PAGA CON LOS MEDIOS DEL MAYORISTA (1/10/2026, pedido
    * del dueño: "siempre es en efectivo y transferencia").
    *
-   * Antes solo miraba los renglones con origen 'monto': el que llegaba al
-   * mayorista por cantidad o por marca podía pagarlo con tarjeta. Ahora la regla
-   * es de la MODALIDAD: todo renglón cotizado con una lista mayorista —por
-   * bulto, marca, monto, cliente, presupuesto o elegida a mano— exige esos
-   * medios. Vacío = sin restricción. No se puede chequear al cargar el ticket
-   * (el medio se elige al cobrar), así que se valida acá, el último momento en
-   * que todavía se puede rechazar.
+   * La regla es de la MODALIDAD: todo renglón cotizado con una lista mayorista
+   * —por bulto, marca, monto, cliente, presupuesto o elegida a mano— cuenta.
+   * Y se mide por PARTES, en la misma operación (pedido del dueño: "lo que es
+   * mayorista cómo se tiene que pagar y lo que suma minorista con sus formas
+   * de pago"): lo pagado con los medios del mayorista tiene que cubrir AL MENOS
+   * la parte mayorista del ticket; el resto —la parte minorista, envíos,
+   * recargo de la tarjeta— se paga con cualquier medio. Un ticket todo
+   * mayorista se paga entero con esos medios, como antes.
+   *
+   * A CUENTA CORRIENTE SÍ (1/10/2026, pedido del dueño): la venta mayorista se
+   * puede fiar, y la regla de medios se aplica al COBRARLA — ver
+   * `facturasMayoristas` y la cobranza.
    *
    * Es pública porque el cobro con QR de Mercado Pago la corre ANTES de mandar
    * el monto al QR: rechazarla después de que el cliente pagó dejaría la plata
    * cobrada y la venta sin cerrar.
    */
-  async validarMediosMayorista(items: { listaId?: number | null }[], condicionPago: string, pagos: { medio: string; importe: number | string }[], config?: any) {
-    const cfg = config ?? await this.cfg.get('ventas');
-    const permitidos: string[] = cfg.mediosPagoMonto ?? [];
-    if (!permitidos.length || !cfg.modalidadMontoId) return;          // sin restricción
-    const ids = [...new Set((items ?? []).map((it) => it.listaId).filter((x): x is number => x != null))];
-    if (!ids.length) return;
-    const mayoristas = new Set((await this.db.select({ id: listasVenta.id }).from(listasVenta)
-      .where(and(inArray(listasVenta.id, ids), eq(listasVenta.modalidadId, cfg.modalidadMontoId)))).map((l) => l.id));
-    const cuantos = items.filter((it) => it.listaId != null && mayoristas.has(it.listaId)).length;
-    if (!cuantos) return;                                               // nada que proteger
+  async validarMediosMayorista(
+    items: any[], condicionPago: string, pagos: { medio: string; importe: number | string }[], config?: any,
+  ): Promise<boolean> {
+    const regla = await this.reglaMayorista(config);
+    if (!regla) return false;                                         // sin restricción
+    const parte = this.parteMayorista(items, regla.listas);
+    if (!parte.renglones) return false;                               // nada que proteger
+    // A cuenta corriente no hay pagos: la regla se aplica al COBRAR la factura,
+    // que queda marcada (`ventas.mayorista`) con lo que devuelve esta función.
+    if (condicionPago !== 'contado') return true;
+    const pagado = money((pagos ?? []).filter((p) => Number(p.importe) > 0).reduce((a, p) => a + Number(p.importe), 0));
+    const conSusMedios = money((pagos ?? [])
+      .filter((p) => Number(p.importe) > 0 && regla.permitidos.includes(p.medio))
+      .reduce((a, p) => a + Number(p.importe), 0));
+    /* Lo exigido nunca supera lo que se paga: pagar TODO con efectivo siempre
+     * cumple, aunque el redondeo de la parte diera un centavo de más. */
+    const exigido = Math.min(parte.monto, pagado);
+    if (conSusMedios + 0.01 < exigido) {
+      const otros = money(pagado - parte.monto);
+      throw new BadRequestException(
+        `La parte a precio mayorista ($${parte.monto.toFixed(2)}, ${parte.renglones} artículo${parte.renglones === 1 ? '' : 's'}) se paga con ${regla.legibles}, `
+        + `y con esos medios hay $${conSusMedios.toFixed(2)}. Con otros medios se puede cobrar hasta $${Math.max(0, otros).toFixed(2)} (la parte minorista). `
+        + 'Ajustá los pagos o volvé a precio minorista.',
+      );
+    }
+    return true;
+  }
 
-    const legibles = permitidos.map((m) => NOMBRE_MEDIO[m] ?? m).join(' o ');
-    const quePasa = `${cuantos} artículo${cuantos === 1 ? '' : 's'} a precio mayorista`;
-    if (condicionPago !== 'contado') {
-      throw new BadRequestException(
-        `El precio mayorista se paga al contado con ${legibles} (hay ${quePasa}). Volvé a precio minorista o cambiá la condición de pago.`,
-      );
-    }
-    const invalido = (pagos ?? []).filter((p) => Number(p.importe) > 0).map((p) => p.medio).find((m) => !permitidos.includes(m));
-    if (invalido) {
-      throw new BadRequestException(
-        `El precio mayorista se paga con ${legibles}, y se está usando ${NOMBRE_MEDIO[invalido] ?? invalido} (hay ${quePasa}). Volvé a precio minorista para cobrar con otro medio.`,
-      );
-    }
+  /**
+   * LAS FACTURAS MAYORISTAS (1/10/2026): de estas ventas, cuáles se cobran solo
+   * con los medios del mayorista. Una factura así se cobra ENTERA con esos
+   * medios (decisión del dueño: un pago no se parte por renglón). Lee la marca
+   * congelada al confirmar; vacío si hoy no hay restricción configurada.
+   */
+  async facturasMayoristas(ventaIds: number[], config?: any): Promise<Set<number>> {
+    const ids = [...new Set(ventaIds.filter((x) => x != null))];
+    if (!ids.length) return new Set();
+    if (!(await this.reglaMayorista(config))) return new Set();
+    // La marca CONGELADA al confirmar (0128), no la configuración de hoy.
+    const filas = await this.db.select({ id: ventas.id }).from(ventas)
+      .where(and(inArray(ventas.id, ids), eq(ventas.mayorista, true)));
+    return new Set(filas.map((f) => f.id));
   }
 
   /**
@@ -3359,7 +3426,7 @@ export class VentasService {
     // Sobre el tipo PEDIDO: si se pidió factura y ARCA cae, el ticket
     // provisorio pendiente cumple la regla (la intención quedó registrada).
     this.validarMediosFacturar(tipo, pagos, config);
-    await this.validarMediosMayorista(tot.items, condicionPago, pagos, config);
+    const esMayorista = await this.validarMediosMayorista(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
     this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista.values());
     await this.validarCredito(cliente, config, condicionPago, tot.total);
@@ -3389,7 +3456,7 @@ export class VentasService {
       const [v] = await tx.insert(ventas).values({
         tipo: tipoFinal, puntoVenta: puntoVentaFinal, numero, fecha, clienteId: cliente.id, sucursalId,
         usuarioId: autor, cajaSesionId: turno?.id ?? null,
-        estado: 'confirmada', condicionPago, vencimientoPago,
+        estado: 'confirmada', condicionPago, vencimientoPago, mayorista: esMayorista,
         presupuestoId: dto.presupuestoId ?? null,
         listaPrecio: dto.listaPrecio ?? '',
         subtotalNeto: tot.subtotalNeto, descuentoTotal: tot.descuentoTotal,
@@ -3800,7 +3867,7 @@ export class VentasService {
     }
 
     const pagos = this.validarPagos(condicionPago, fin.pagos, borrador.total);
-    await this.validarMediosMayorista(borrador.items, condicionPago, pagos, config);
+    const esMayorista = await this.validarMediosMayorista(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
     /*
      * LOS DESCUENTOS CON NOMBRE, RELEÍDOS DE LA BASE.
@@ -3939,7 +4006,7 @@ export class VentasService {
       // Con CAE el número lo dio ARCA; sin CAE sigue el correlativo local.
       const numero = fiscal.cbteNro ?? await this.siguienteNumero(tx, tipo, puntoVentaFinal);
       await tx.update(ventas).set({
-        tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago,
+        tipo, numero, fecha, estado: 'confirmada', condicionPago, vencimientoPago, mayorista: esMayorista,
         subtotalNeto: borrador.subtotalNeto,
         descuentoTotal: borrador.descuentoTotal,
         ivaTotal: borrador.ivaTotal,

@@ -38,6 +38,12 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 // proveedor (Cuentas disponibles). Lleva `cuentaDisponibleId`.
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'transferencia_proveedor'] as const;
 
+/** Los medios como se leen en un mensaje. */
+const NOMBRE_MEDIO_COBRO: Record<string, string> = {
+  efectivo: 'efectivo', transferencia: 'transferencia', tarjeta_debito: 'débito', tarjeta_credito: 'crédito',
+  cheque: 'cheque', qr: 'QR', otro: 'otro medio', transferencia_proveedor: 'transferencia a proveedor',
+};
+
 /** Tolerancia de comparación monetaria (medio centavo). */
 const EPS = 0.005;
 
@@ -275,16 +281,37 @@ export class CobranzasService {
       );
     }
 
+    /*
+     * LAS FACTURAS MAYORISTAS SE COBRAN CON SUS MEDIOS (1/10/2026, pedido del
+     * dueño). La venta mayorista se puede fiar; la regla de medios se aplica
+     * acá, al cobrarla. Un recibo que lleva algún medio fuera de los del
+     * mayorista (tarjeta, QR…) no puede tocar una factura mayorista —el
+     * recibo entero, decisión del dueño: si el cliente quiere pagar otras con
+     * tarjeta, son dos recibos— ni dejar plata «a cuenta».
+     *
+     * NUNCA «A CUENTA» CON ESOS MEDIOS (revisión de cobros, 1/10/2026): el saldo
+     * del cliente resta TODOS los recibos, así que la plata a cuenta paga
+     * cualquier deuda — también una factura mayorista fiada DESPUÉS. Mirar solo
+     * si hoy debe mayoristas dejaba pasar ese orden (tarjeta a cuenta hoy,
+     * mayorista fiado mañana). Con tarjeta o QR se cobra contra facturas
+     * minoristas, y punto.
+     */
+    const regla = await this.vtas.reglaMayorista(config);
+    const fueraDeRegla = regla ? [...new Set(pagos.filter((p) => !regla.permitidos.includes(p.medio)).map((p) => p.medio))] : [];
+    const cuenta = regla && fueraDeRegla.length ? await this.vtas.cuenta(cliente.id) : null;
+
     /* -- Qué se imputa: lo que mandó el cliente, o FIFO sobre lo más viejo -- */
     let imputaciones = (dto.imputaciones ?? [])
       .map((i) => ({ ventaId: Number(i.ventaId), importe: money(i.importe) }))
       .filter((i) => i.importe > 0);
 
     if (!imputaciones.length && dto.auto) {
-      const { comprobantes } = await this.vtas.cuenta(cliente.id);
+      const { comprobantes } = cuenta ?? await this.vtas.cuenta(cliente.id);
       let resto = total;
       for (const c of comprobantes) {
         if (resto <= EPS) break;
+        // Con un medio fuera de la regla, lo automático saltea las mayoristas.
+        if (fueraDeRegla.length && (c as any).mayorista) continue;
         const aplica = money(Math.min(resto, c.saldo));
         if (aplica > 0) { imputaciones.push({ ventaId: c.id, importe: aplica }); resto = money(resto - aplica); }
       }
@@ -302,6 +329,26 @@ export class CobranzasService {
       throw new BadRequestException(`Estás imputando $${imputado.toFixed(2)} y la cobranza es de $${total.toFixed(2)}.`);
     }
     const aCuenta = money(total - imputado);
+
+    if (regla && fueraDeRegla.length) {
+      const legiblesFuera = fueraDeRegla.map((m) => NOMBRE_MEDIO_COBRO[m] ?? m).join(', ');
+      const tocadas = await this.vtas.facturasMayoristas(imputaciones.map((i) => i.ventaId), config);
+      if (tocadas.size) {
+        const nros = (cuenta?.comprobantes ?? []).filter((c: any) => tocadas.has(c.id)).map((c: any) => `${c.puntoVenta}-${String(c.numero).padStart(8, '0')}`);
+        throw new BadRequestException(
+          `Este recibo cancela factura${tocadas.size === 1 ? '' : 's'} a precio mayorista${nros.length ? ` (${nros.join(', ')})` : ''}: `
+          + `se cobra${tocadas.size === 1 ? '' : 'n'} solo con ${regla.legibles}, y el recibo lleva ${legiblesFuera}. `
+          + 'Cobrá las mayoristas en un recibo aparte, o cambiá el medio de pago.',
+        );
+      }
+      if (aCuenta > EPS) {
+        throw new BadRequestException(
+          `Lo cobrado con ${legiblesFuera} no puede quedar a cuenta ($${aCuenta.toFixed(2)}): esa plata bajaría también `
+          + `deudas a precio mayorista, que se cobran solo con ${regla.legibles}. `
+          + `Imputalo entero a facturas que no sean mayoristas, o cobrá lo que sobra con ${regla.legibles}.`,
+        );
+      }
+    }
 
     const puntoVenta = String(config.puntoVenta || '0001');
     /*
@@ -344,6 +391,14 @@ export class CobranzasService {
           const { doc, saldo } = entry;
           if (doc.clienteId !== cliente.id) throw new BadRequestException('Un comprobante no pertenece a este cliente.');
           if (doc.estado !== 'confirmada') throw new BadRequestException('Solo se imputa a comprobantes confirmados.');
+          /* La marca mayorista, releída CON CANDADO (revisión de cobros): la de
+           * afuera se lee antes de la transacción, y una factura que se estaba
+           * confirmando en ese instante todavía decía false. */
+          if (regla && fueraDeRegla.length && doc.mayorista) {
+            throw new BadRequestException(
+              `Este recibo cancela una factura a precio mayorista: se cobra solo con ${regla.legibles}. Cobrala en un recibo aparte, o cambiá el medio de pago.`,
+            );
+          }
           /* A UNA NOTA DE CRÉDITO NO SE LE COBRA NADA: es plata que la casa
            * devolvió. `cuenta()` ya no la ofrece, pero una imputación mandada
            * a mano llegaría acá — y su "saldo" (total menos nada) daría
