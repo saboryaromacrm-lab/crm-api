@@ -42,6 +42,7 @@ import {
   type Filtro, type Lente, type Paso, type TipoVenta,
 } from './consultas';
 import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
+import { reporteProductos } from './productos';
 import { reporteStock } from './stock';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
@@ -135,6 +136,22 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   }
 
   granel(q: any) { const f = this.filtro(q); return this.leer((c) => reporteGranel(c, f, this.paso(q.paso))); }
+
+  /**
+   * Productos, categorías y subcategorías (2/10/2026). `categoriaId` y
+   * `subcategoriaId` dicen dónde se está parado en el árbol (`0` = sin
+   * clasificar), `productoId` abre el detalle de uno y `plano=1` lista todos
+   * los productos del nivel. `tipo`: solo granel o solo enteros.
+   */
+  productos(q: any) {
+    const f = this.filtro(q);
+    const tipo = (TIPOS as readonly string[]).includes(q.tipo) ? (q.tipo as TipoVenta) : null;
+    const id = (v: unknown) => { if (v === undefined || v === null || v === '') return null; const n = Number(v); return Number.isInteger(n) && n >= 0 ? n : null; };
+    const productoId = id(q.productoId);
+    return this.leer((c) => reporteProductos(c, { ...f, tipo }, this.paso(q.paso), {
+      categoriaId: id(q.categoriaId), subcategoriaId: id(q.subcategoriaId), productoId: productoId || null, plano: q.plano === '1' || q.plano === 'true',
+    }));
+  }
 
   /**
    * A = desde/hasta (el período de arriba); B = bDesde/bHasta. Sin B, el período
@@ -280,6 +297,7 @@ export class MetricasController {
   @Get('ventas') ventas(@Query() q: any) { return this.svc.ventas(q); }
   @Get('margenes') margenes(@Query() q: any) { return this.svc.margenes(q); }
   @Get('granel') granel(@Query() q: any) { return this.svc.granel(q); }
+  @Get('productos') productos(@Query() q: any) { return this.svc.productos(q); }
   @Get('comparar') comparar(@Query() q: any) { return this.svc.comparar(q); }
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
 

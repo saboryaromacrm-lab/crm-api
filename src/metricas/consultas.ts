@@ -23,10 +23,10 @@ export type TipoVenta = (typeof TIPOS)[number];
 
 export interface Filtro { desde: string; hasta: string; sucursalId: number | null; tipo?: TipoVenta | null }
 
-const N = (x: unknown) => Number(x ?? 0) || 0;
-const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
-const pct = (parte: number, base: number) => (base > 0 ? r2((parte / base) * 100) : null);
-const variacion = (ahora: number, antes: number) => (antes > 0 ? r2(((ahora - antes) / antes) * 100) : null);
+export const N = (x: unknown) => Number(x ?? 0) || 0;
+export const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+export const pct = (parte: number, base: number) => (base > 0 ? r2((parte / base) * 100) : null);
+export const variacion = (ahora: number, antes: number) => (antes > 0 ? r2(((ahora - antes) / antes) * 100) : null);
 
 const MS_DIA = 86_400_000;
 const diasEntre = (a: string, b: string) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / MS_DIA);
@@ -57,7 +57,7 @@ export function periodos(desde: string, hasta: string, paso: Paso): string[] {
  * Parámetros y filtro de sucursal ($3 solo si hay). `a` es el alias de la tabla.
  * `conTipo`: solo para `metricas_venta_prod_dia`, la única que sabe si lo vendido es granel.
  */
-const donde = (f: Filtro, a: string, conTipo = false) => ({
+export const donde = (f: Filtro, a: string, conTipo = false) => ({
   sql: `${a}.dia BETWEEN $1::date AND $2::date${f.sucursalId ? ` AND ${a}.sucursal_id = $3` : ''}`
     + (conTipo && f.tipo ? ` AND ${f.tipo === 'granel' ? '' : 'NOT '}${a}.granel` : ''),
   params: f.sucursalId ? [f.desde, f.hasta, f.sucursalId] : [f.desde, f.hasta],
@@ -156,7 +156,7 @@ export async function reporteVentas(c: PoolClient, f: Filtro, paso: Paso) {
 
 /* ============================== MÁRGENES ============================== */
 
-const sumaMargen = async (c: PoolClient, f: Filtro) => {
+export const sumaMargen = async (c: PoolClient, f: Filtro) => {
   const w = donde(f, 'f', true);
   const r = await c.query(
     `SELECT coalesce(sum(f.venta_neta), 0) AS venta_neta, coalesce(sum(f.venta_costeada), 0) AS venta_costeada,
@@ -196,7 +196,7 @@ const DEF_LENTE: Record<Lente, { porProducto: boolean; sel: string; join: string
   sucursal: { porProducto: false, sel: `f.sucursal_id AS clave, coalesce(s.nombre, 'Sin sucursal') AS nombre`, join: 'LEFT JOIN sucursales s ON s.id = f.sucursal_id', group: `f.sucursal_id, coalesce(s.nombre, 'Sin sucursal')` },
 };
 
-const SUMAS = (a: string) => `sum(${a}.venta_neta) AS venta_neta, sum(${a}.venta_costeada) AS venta_costeada, sum(${a}.costo) AS costo,
+export const SUMAS = (a: string) => `sum(${a}.venta_neta) AS venta_neta, sum(${a}.venta_costeada) AS venta_costeada, sum(${a}.costo) AS costo,
   sum(${a}.iva_absorbido) AS iva_absorbido, sum(${a}.renglones)::float8 AS renglones, sum(${a}.con_costo)::float8 AS con_costo`;
 
 export async function reporteMargenes(c: PoolClient, f: Filtro, paso: Paso, lente: Lente) {
@@ -284,7 +284,7 @@ export async function reporteMargenes(c: PoolClient, f: Filtro, paso: Paso, lent
 const CLASE = (a: string) => `(CASE WHEN ${a}.granel THEN (CASE WHEN ${a}.presentacion_id > 0 THEN 'fraccionado' ELSE 'suelto' END) ELSE 'entero' END)`;
 
 /** Una fila de sumas de `metricas_venta_prod_dia` → números con el margen calculado. */
-const armarSuma = (x: any) => {
+export const armarSuma = (x: any) => {
   const ventaCosteada = r2(N(x?.venta_costeada)); const costo = r2(N(x?.costo));
   const margen = r2(ventaCosteada - costo);
   return {
