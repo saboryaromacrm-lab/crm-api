@@ -46,6 +46,14 @@ export const Publico = () => SetMetadata(PUBLICO_KEY, true);
  */
 export const Permiso = (...claves: string[]) => SetMetadata(PERMISO_KEY, claves);
 
+/**
+ * CUALQUIER USUARIO CON SESIÓN, aunque el controller pida un permiso a nivel
+ * de clase. Sigue exigiendo sesión (no es `@Publico()`): solo anula la llave
+ * de la clase para ESTE endpoint. Funciona porque el guard toma la metadata del
+ * handler primero y una lista vacía no exige nada.
+ */
+export const CualquierUsuario = () => SetMetadata(PERMISO_KEY, []);
+
 /** Lo que el guard resolvió para esta request. Nunca viene del cliente. */
 export interface Sesion {
   sesionId: number;

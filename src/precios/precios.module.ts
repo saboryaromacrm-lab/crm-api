@@ -27,7 +27,8 @@ import {
 } from 'class-validator';
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, CualquierUsuario, Permiso, Sesion } from '../auth/auth.decoradores';
+import { tienePermiso } from '../auth/auth.guard';
 import {
   listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
   productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
@@ -787,18 +788,30 @@ export class PreciosController {
   @Permiso('precios', 'ventas.pos')
   ultimoCambio() { return this.evolucionSvc.ultimoCambio(); }
 
-  /** Evolución del PRECIO DE VENTA (no del costo): para Alt+F5 y la pestaña del producto. */
+  /**
+   * Evolución del PRECIO DE VENTA (no del costo): para Alt+F5 y la pestaña del producto.
+   *
+   * PARA TODOS LOS USUARIOS (2/10/2026, pedido del dueño): el Alt+F5 se abre
+   * desde cualquier pantalla y el cajero recibía 403 — el modal abría vacío.
+   * Lo que viaja son precios de GÓNDOLA, los mismos que cobra la caja. Sin la
+   * llave `precios` se quitan el detalle (puede nombrar al proveedor o la
+   * importación de costos) y quién hizo el cambio: eso es de quien los maneja.
+   */
   @Get('evolucion')
-  evolucion(
+  @CualquierUsuario()
+  async evolucion(
+    @Auth() sesion: Sesion,
     @Query('productoId') productoId?: string,
     @Query('desde') desde?: string,
     @Query('limit') limit?: string,
   ) {
-    return this.evolucionSvc.evolucion({
+    const filas = await this.evolucionSvc.evolucion({
       productoId: productoId ? Number(productoId) : undefined,
       desde,
       limit: limit ? Number(limit) : undefined,
     });
+    if (tienePermiso(sesion.permisos, ['precios'])) return filas;
+    return filas.map(({ detalle: _d, usuario: _u, ...f }) => f);
   }
 
   @Get('historial')
