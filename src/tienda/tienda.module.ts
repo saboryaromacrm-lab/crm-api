@@ -28,7 +28,7 @@ import type { Response } from 'express';
 import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
+  categorias, subcategorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
 import { costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
@@ -136,7 +136,7 @@ export class TiendaService {
   async catalogo() {
     const suc = await this.sucursalTienda();
     const desdeReingreso = new Date(Date.now() - DIAS_REINGRESO * 86400000);
-    const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web] = await Promise.all([
+    const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web, subs] = await Promise.all([
       /* El sitio no publica ARCHIVADOS, tengan precio mayorista o no: el estado
        * corta antes que el criterio de publicación. El discontinuado se sigue
        * ofreciendo mientras tenga stock — el `webStockMin` ya lo saca de la web
@@ -166,6 +166,8 @@ export class TiendaService {
       this.db.select({ tipo: webImagenes.tipo, refId: webImagenes.refId, actualizadoEn: webImagenes.actualizadoEn })
         .from(webImagenes),
       this.cfg.get('web'),
+      // Las subcategorías (2/10/2026): el menú de Categorías del sitio las muestra debajo de cada una.
+      this.db.select({ id: subcategorias.id, nombre: subcategorias.nombre, categoriaId: subcategorias.categoriaId }).from(subcategorias),
     ]);
 
     /** URL de una imagen subida en el módulo Web ('' si no hay). `?v=` rompe el caché al re-subir. */
@@ -191,6 +193,7 @@ export class TiendaService {
 
     const nombreMarca = new Map(ms.map((m) => [m.id, m.nombre]));
     const nombreCategoria = new Map(cs.map((c) => [c.id, c.nombre]));
+    const subcategoriaDe = new Map(subs.map((s) => [s.id, s]));
     const nombreEtiqueta = new Map(ets.map((e) => [e.id, e.nombre]));
     const etiquetasDe = new Map<number, number[]>();
     for (const e of petiq) {
@@ -332,6 +335,13 @@ export class TiendaService {
         marca: p.marcaId ? (nombreMarca.get(p.marcaId) ?? '') : '',
         categoriaId: p.categoriaId,
         categoria: p.categoriaId ? (nombreCategoria.get(p.categoriaId) ?? '') : '',
+        /* La subcategoría SOLO si cuelga de la categoría del producto: una que
+         * quedó de otra categoría (se cambió la categoría y no la sub) armaría
+         * en el menú una rama que no lleva a ningún lado. */
+        ...((): { subcategoriaId: number | null; subcategoria: string } => {
+          const sc = p.subcategoriaId ? subcategoriaDe.get(p.subcategoriaId) : undefined;
+          return sc && sc.categoriaId === p.categoriaId ? { subcategoriaId: sc.id, subcategoria: sc.nombre } : { subcategoriaId: null, subcategoria: '' };
+        })(),
         etiquetas: etiquetasIds
           .map((id) => ({ id, nombre: nombreEtiqueta.get(id) ?? '' }))
           .filter((e) => e.nombre),
@@ -361,8 +371,10 @@ export class TiendaService {
       mapa.set(id, e);
     };
     const catMap = new Map<number, any>(); const marcaMap = new Map<number, any>(); const etiqMap = new Map<number, any>();
+    const subMap = new Map<number, any>();
     for (const it of items) {
       contar(catMap, it.categoriaId, it.categoria);
+      contar(subMap, it.subcategoriaId, it.subcategoria);
       contar(marcaMap, it.marcaId, it.marca);
       for (const e of it.etiquetas) contar(etiqMap, e.id, e.nombre);
     }
@@ -379,6 +391,9 @@ export class TiendaService {
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [...catMap.values()].sort(porNombre)
         .map((c) => ({ ...c, imagenUrl: urlImagen('categoria', c.id) })),
+      /** Las subcategorías con productos publicados, con su categoría: el menú las cuelga debajo de cada una. */
+      subcategorias: [...subMap.values()].sort(porNombre)
+        .map((s) => ({ ...s, categoriaId: subcategoriaDe.get(s.id)?.categoriaId ?? null })),
       marcas: [...marcaMap.values()].sort(porNombre)
         .map((m) => ({ ...m, imagenUrl: urlImagen('marca', m.id) })),
       etiquetas: [...etiqMap.values()].sort(porNombre),
