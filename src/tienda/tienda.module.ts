@@ -490,11 +490,14 @@ export class TiendaService {
           vistos.add(porCaja);
           const disponible = sinTope ? null : Math.floor(paquetes / porCaja + 1e-9);
           const clave = porCaja > 1 ? `s${pres.id}x${porCaja}` : `s${pres.id}`;
+          /* «Por N» se ofrece como BOLSA con el total de kilos (pedido del dueño, 3/10/2026):
+           * «Bolsa x5 kg»; el renglón del pedido aclara qué paquetes lleva adentro. */
+          const bolsaN = `Bolsa x${textoKg(r3(pres.tamKg * porCaja))}`;
           listaDeOpcion.set(`${p.id}:${clave}`, lista);
           delTamano.push({
-            clave, presentacionId: pres.id, etiqueta: porCaja > 1 ? `Caja de ${porCaja} × ${tam}` : tam,
+            clave, presentacionId: pres.id, etiqueta: porCaja > 1 ? `${bolsaN} (${porCaja} × ${tam})` : tam,
             kgPorUnidad: r3(pres.tamKg * porCaja), paquetesPorUnidad: porCaja,
-            grupo: `s${pres.id}`, grupoEtiqueta: tam, forma: porCaja > 1 ? `Caja de ${porCaja}` : 'Por unidad',
+            grupo: `s${pres.id}`, grupoEtiqueta: tam, forma: porCaja > 1 ? bolsaN : 'Por unidad',
             precio: pv.finalFormato, precioKg: money(pv.finalFormato / (pres.tamKg * porCaja)),
             precioPaquete: money(pv.finalFormato / porCaja),
             unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0,
