@@ -12,7 +12,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { ocultaCostoUnitario, tienePermiso } from '../auth/auth.guard';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { ListasModule, ListasService } from '../listas/listas.module';
+import { ListasModule, ListasService, exigirUnaListaGranel } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
 import { CatalogosModule } from '../catalogos/catalogos.module';
 import { AuditoriaModule, AuditoriaService, type CambioAuditado } from '../auditoria/auditoria.module';
@@ -1046,6 +1046,7 @@ export class ProductosService {
 
         const delProducto = filasVenta(it.listas, null);
         if (delProducto.length) await tx.insert(productoListas).values(delProducto);
+        if (p.esGranel && delProducto.length > 1) await exigirUnaListaGranel(tx, [creado.id]);
 
         /*
          * Las presentaciones son del granel: en un producto entero no existen.
@@ -1413,6 +1414,8 @@ export class ProductosService {
       for (let k = 0; k < aInsertar.length; k += LOTE) {
         await tx.insert(productoListas).values(aInsertar.slice(k, k + LOTE));
       }
+      // Un granel con su fila de madre en otra lista quedaría con dos: se rechaza todo el archivo con los nombres.
+      await exigirUnaListaGranel(tx, aInsertar.filter((x) => x.presentacionId == null).map((x) => x.productoId));
       actualizados = aActualizar.length;
       agregados = aInsertar.length;
     });

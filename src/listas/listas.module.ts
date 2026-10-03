@@ -82,6 +82,35 @@ class UpsertReglaMarcaDto {
   @IsOptional() @IsBoolean() activa?: boolean;
 }
 
+/**
+ * UN GRANEL, UNA LISTA (3/10/2026, pedido del dueño). El producto madre a
+ * granel no se vende suelto: se vende como dice SU formato de venta («Bolsa de
+ * 10 kg»), y ese formato es uno solo. Con dos listas la caja y la tienda no
+ * sabrían qué bolsa es. Los paquetes fraccionados siguen pudiendo tener varias.
+ *
+ * Corre DENTRO de la transacción que escribe: si quedó algún granel con dos
+ * filas propias, la escritura entera vuelve atrás con los nombres.
+ */
+export async function exigirUnaListaGranel(tx: any, productoIds: number[]) {
+  const ids = [...new Set(productoIds.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
+  const malos: string[] = [];
+  for (let k = 0; k < ids.length; k += 5000) {
+    const filas = await tx.select({ nombre: productos.nombre })
+      .from(productoListas)
+      .innerJoin(productos, eq(productos.id, productoListas.productoId))
+      .where(and(inArray(productoListas.productoId, ids.slice(k, k + 5000)), isNull(productoListas.presentacionId), eq(productos.tipo, 'granel')))
+      .groupBy(productos.id, productos.nombre)
+      .having(sql`count(*) > 1`);
+    malos.push(...filas.map((f: any) => f.nombre));
+  }
+  if (malos.length) {
+    throw new BadRequestException(
+      `Un producto a granel se vende con UNA sola lista (su formato: la bolsa de N kg), y ${malos.length === 1 ? 'este quedaría' : 'estos quedarían'} con dos o más: `
+      + `${malos.slice(0, 10).join(', ')}${malos.length > 10 ? ` y ${malos.length - 10} más` : ''}. Dejá una sola lista para cada uno.`,
+    );
+  }
+}
+
 @Injectable()
 export class ListasService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
@@ -496,6 +525,13 @@ export class ListasService {
         throw new BadRequestException('Con precio definido, el precio del formato tiene que ser mayor a 0.');
       }
     }
+    /* El madre a granel: una sola lista (ver `exigirUnaListaGranel`). Acá con el mensaje de la pantalla. */
+    if (presentacionId == null && rows.length > 1) {
+      const [prod] = await this.db.select({ tipo: productos.tipo }).from(productos).where(eq(productos.id, productoId)).limit(1);
+      if (prod?.tipo === 'granel') {
+        throw new BadRequestException('Un producto a granel se vende con UNA sola lista: su formato de venta (la bolsa de N kg). Dejá una sola fila; los paquetes fraccionados sí pueden tener varias.');
+      }
+    }
 
     /*
      * EL CÓDIGO DE LA FILA ES EL DE LA CAJA.
@@ -555,6 +591,7 @@ export class ListasService {
     await this.db.transaction(async (tx) => {
       await tx.delete(productoListas).where(this.ambito(productoId, presentacionId));
       if (rows.length) await tx.insert(productoListas).values(rows);
+      if (presentacionId == null) await exigirUnaListaGranel(tx, [productoId]);
     });
     return presentacionId == null
       ? (await this.formatoDe(productoId)).filter((f) => !f.presentacionId)

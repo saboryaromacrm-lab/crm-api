@@ -1566,6 +1566,14 @@ export class VentasService {
       // nada. Si el producto no tiene el piso cargado, la más cara de las suyas.
       const filaBase = efectivas.find((ef) => ef.listaId === listaBase?.id)
         ?? efectivas[efectivas.length - 1] ?? null;
+      /*
+       * EL GRANEL SE VENDE COMO SU FORMATO (3/10/2026, pedido del dueño): el
+       * madre no se vende suelto, se vende como dice su formato de venta —una
+       * sola lista—: «Bolsa de 10 kg». El renglón sigue en KILOS (stock, precio
+       * por kg, presupuestos y la API no cambian); la caja suma de a una bolsa
+       * y avisa si la cantidad no da bolsas justas, como con el «vende por N».
+       */
+      const bolsaKg = p.tipo === 'granel' && filaBase ? Math.round((Number(filaBase.unidades) || 1) * 1000) / 1000 : 0;
 
       /*
        * El "solo para fraccionar" (la Pimienta de Jamaica que llega 1 kg y se
@@ -1589,7 +1597,13 @@ export class VentasService {
         proveedorIds: proveedoresDe.get(p.id) ?? [],
         /** Sin control de stock (el propio del producto o la llave de su tipo): la caja no frena ni marca «sin stock». */
         stockLibre: stockSinControl(cfg, p),
-        detalle: p.tipo === 'granel' ? 'Suelto (por kg)' : 'Unidad',
+        detalle: p.tipo === 'granel'
+          ? (bolsaKg > 0 ? `Bolsa de ${bolsaKg < 1 ? `${Math.round(bolsaKg * 1000)} g` : `${String(bolsaKg).replace('.', ',')} kg`}` : 'Suelto (por kg)')
+          : 'Unidad',
+        /** Los kilos de la bolsa del formato (granel madre; 0 = no aplica). La caja suma de a esto. */
+        bolsaKg,
+        /** Lo que sale la bolsa cerrada, para mostrarlo sin recalcularlo. */
+        precioBolsa: bolsaKg > 0 ? money(filaBase!.finalFormato) : 0,
         tipo: p.tipo,
         /* Uso exclusivo de Cafetería (0089): viaja al POS para MOSTRARSE
          * bloqueado con su motivo — esconderlo haría que un código escaneado
