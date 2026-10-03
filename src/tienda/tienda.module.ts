@@ -224,6 +224,13 @@ export class TiendaService {
         instagram: String(web.redInstagram ?? ''),
         facebook: String(web.redFacebook ?? ''),
       },
+      /** El cartel de bienvenida (3/10/2026): editable en Web › Configuración del sitio. */
+      popup: {
+        activo: web.popupActivo !== false,
+        etiqueta: String(web.popupEtiqueta ?? ''),
+        titulo: String(web.popupTitulo ?? ''),
+        texto: String(web.popupTexto ?? ''),
+      },
     };
 
     const vacio = {

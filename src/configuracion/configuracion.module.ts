@@ -301,6 +301,16 @@ export const WEB_DEFAULTS = {
   contactoUbicacion: 'Formosa, Argentina' as string,
   redInstagram: 'saboryaroma__' as string,
   redFacebook: '' as string,
+  /*
+   * EL CARTEL DE BIENVENIDA de la tienda (3/10/2026, pedido del dueño: «hacelo
+   * editable desde el ERP»). Es el mismo que abre el botón «Info de compra».
+   * `popupActivo` decide solo si aparece SOLO al entrar; el botón lo abre igual.
+   * La etiqueta y el texto pueden quedar vacíos (no se muestran); el título no.
+   */
+  popupActivo: true as boolean,
+  popupEtiqueta: '🍃 Bienvenido' as string,
+  popupTitulo: 'Sabor y Aroma mayorista, ahora online' as string,
+  popupTexto: 'Armá tu pedido cuando quieras, las 24 horas. Coordinamos el pago y la entrega por WhatsApp, igual que siempre.' as string,
   slides: [
     {
       id: 1,
@@ -478,6 +488,10 @@ const REGLAS: Record<string, {
   'empresa.colorMarca': { texto: colorNormalizado },
   'empresa.inicioActividades': { texto: fechaIsoONada },
   'empresa.ingresosBrutos': { texto: (v: string) => String(v ?? '').trim().slice(0, 60) },
+  /* El cartel de bienvenida de la tienda: con tope, para que no desborde el cartel en el celular. */
+  'web.popupEtiqueta': { texto: (v: string) => String(v ?? '').trim().slice(0, 40) },
+  'web.popupTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 90) },
+  'web.popupTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 400) },
 };
 
 /**
@@ -574,6 +588,13 @@ const rutaInterna = (v: string): string => {
 const NORMALIZADORES: Record<string, (v: string) => string> = { ctaUrl: rutaInterna };
 
 /**
+ * Textos que SÍ pueden guardarse vacíos (`área.campo`). Por defecto un texto
+ * vacío vuelve al default —un número de WhatsApp en blanco rompe el sitio—,
+ * pero en estos vacío quiere decir «no mostrar esa línea».
+ */
+const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto']);
+
+/**
  * Limpia un ítem de un array de objetos contra su plantilla (el primer
  * elemento del default): solo sus claves, con su tipo. A diferencia del
  * sanitize de arriba, un string VACÍO acá es válido — el badge de un slide
@@ -630,7 +651,7 @@ function sanitize(defaults: Record<string, any>, raw: any, clave = ''): Record<s
       const n = Number(v);
       out[k] = aplicarRegla(clave, k, Number.isFinite(n) ? n : def, def);
     } else {
-      const s = typeof v === 'string' && v.trim() ? v.trim() : def;
+      const s = typeof v === 'string' && (v.trim() || VACIO_VALIDO.has(`${clave}.${k}`)) ? v.trim() : def;
       out[k] = aplicarRegla(clave, k, s, def);
     }
   }
