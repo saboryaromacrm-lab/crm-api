@@ -2225,7 +2225,12 @@ export class VentasService {
         : delCliente.has(elegida.fila.listaId) ? 'cliente'
           : (minimo > 0 && llevadas + 1e-9 >= minimo) ? 'auto'
             : modalidadesDeMarca.get(prod.marcaId as number)?.has(elegida.lista.modalidadId) ? 'marca'
-              : prod.tipo !== 'granel' && bultoNecesario > 1 && llevadas + 1e-9 >= bultoNecesario ? 'bulto'
+              /* El «vende por N» de la LISTA vale también para el granel (el paquete
+               * de 1 kg «por 5», la bolsa del madre): lo que se excluye del granel
+               * es solo el bulto del proveedor de la ficha, que está en kg. Misma
+               * regla que el motor del POS (3/10/2026: la caja abría la lista por
+               * «bulto cerrado de 5» y acá se rechazaba la venta). */
+              : (bultoLista > 1 || prod.tipo !== 'granel') && bultoNecesario > 1 && llevadas + 1e-9 >= bultoNecesario ? 'bulto'
                 : (modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto) ? 'monto'
                   : congelado ? 'auto'
                     : null;
