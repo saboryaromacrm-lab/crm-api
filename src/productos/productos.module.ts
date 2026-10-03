@@ -149,6 +149,17 @@ class CartelDto {
 }
 
 /**
+ * EL CONTROL DE STOCK DE UN PRODUCTO (0129). Obligatorio y de tres valores:
+ * `true` controlar siempre, `false` no controlar, `null` como la configuración
+ * general. Que falte es un error (no «dejar como estaba»): este endpoint no
+ * hace otra cosa, y un pedido vacío que respondiera bien escondería un bug.
+ */
+class ControlStockDto {
+  @IsIn([true, false, null], { message: 'El control de stock es «controlar», «no controlar» o «como la configuración general».' })
+  controlStock!: boolean | null;
+}
+
+/**
  * IMPORTACIÓN MASIVA. El plan llega armado desde el navegador, que ya parseó
  * los archivos y mostró la vista previa: acá se valida contra la base y se
  * escribe. Las marcas y los rubros viajan por NOMBRE porque el que importa no
@@ -656,6 +667,35 @@ export class ProductosService {
     if (!Object.keys(patch).length) return p;
     const [n] = await this.db.update(productos).set(patch).where(eq(productos.id, id)).returning();
     return n;
+  }
+
+  /**
+   * EL CONTROL DE STOCK DE UN PRODUCTO (0129, 3/10/2026, pedido del dueño).
+   *
+   * Endpoint propio y no parte de la ficha: guardar la ficha manda el
+   * formulario entero, y el control de stock se cambia con un check desde el
+   * detalle — si viajara con la ficha, una ficha abierta antes del cambio lo
+   * pisaría al guardarse. Acá no se toca ninguna otra cosa del producto.
+   *
+   * Queda en la auditoría (quién, cuándo, antes → después) en la MISMA
+   * transacción: este dato decide si la caja frena una venta. Cambiarlo al
+   * mismo valor no escribe nada.
+   */
+  async cambiarControlStock(id: number, valor: boolean | null, usuarioId: number | null) {
+    return this.db.transaction(async (tx) => {
+      const [p] = await tx.select({ id: productos.id, nombre: productos.nombre, controlStock: productos.controlStock })
+        .from(productos).where(eq(productos.id, id)).for('update');
+      if (!p) throw new NotFoundException('Producto inexistente.');
+      const antes = p.controlStock ?? null;
+      if (antes === valor) return { id, controlStock: antes, cambio: false };
+      await tx.update(productos).set({ controlStock: valor }).where(eq(productos.id, id));
+      const texto = (v: boolean | null) => (v === true ? 'Controlar siempre' : v === false ? 'No controlar' : 'Como la configuración general');
+      await this.audit.registrar([{
+        entidad: 'producto', entidadId: id, ambito: 'Ficha', detalle: p.nombre,
+        campo: 'Control de stock', antes: texto(antes), despues: texto(valor), usuarioId,
+      }], tx);
+      return { id, controlStock: valor, cambio: true };
+    });
   }
 
   private valores(dto: UpsertProductoDto, previo?: any) {
@@ -2383,6 +2423,12 @@ export class ProductosController {
   @Permiso('compras.productos', 'ventas.cambios', 'ventas.carteles')
   @Patch(':id/cartel') cartel(@Param('id', ParseIntPipe) id: number, @Body() dto: CartelDto) {
     return this.svc.guardarCartel(id, dto);
+  }
+  /** El control de stock del producto (0129): misma llave que editar la ficha. */
+  @Permiso('compras.productos')
+  @Patch(':id/control-stock')
+  controlStock(@Param('id', ParseIntPipe) id: number, @Body() dto: ControlStockDto, @Auth() sesion: Sesion) {
+    return this.svc.cambiarControlStock(id, dto.controlStock, sesion?.usuarioId ?? null);
   }
   @Permiso('compras.productos')
   @Delete(':id') remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }

@@ -1,0 +1,12 @@
+-- ===========================================================================
+-- 0129 · CONTROL DE STOCK POR PRODUCTO (3/10/2026)
+-- ===========================================================================
+-- Pedido del dueño: poder controlar el stock de UN producto («darle un check»)
+-- sin depender de las dos llaves generales (granel / enteros) de Ventas ›
+-- Configuración. Tres estados, en una sola columna:
+--   NULL  → como la configuración general (lo de siempre; así arrancan todos)
+--   true  → se controla SIEMPRE, aunque la llave general esté apagada
+--   false → NO se controla, aunque la llave general esté prendida
+-- La regla que lo lee es una sola (`stockSinControl`): caja, almacén, tienda y
+-- pedidos. Nadie cambia de comportamiento con esta migración.
+ALTER TABLE "productos" ADD COLUMN IF NOT EXISTS "control_stock" boolean;

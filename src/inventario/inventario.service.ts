@@ -60,15 +60,33 @@ type Coord = { productoId: number; sucursalId: number; presentacionId: number | 
  * `TIPOS_INCIDENCIA` del dashboard. Los internos —faltante de transferencia,
  * venta sin stock, faltante de envío de Cafetería— los escribe solo el sistema.
  */
-/**
- * ¿El stock de un producto de este tipo se opera SIN control? (1/10/2026)
- * Granel → `controlStockGranel`; entero (todo lo que no es granel) →
- * `controlStockEnteros`. `false` en la configuración = sin control. La usan
- * inventario, la caja, la tienda y los pedidos web: una sola regla.
- */
-export function stockSinControl(cfgVentas: any, tipo: string | null | undefined): boolean {
+/** Lo que la regla necesita saber del producto: su tipo y su control propio (0129). */
+export interface ProductoControlStock { tipo?: string | null; controlStock?: boolean | null }
+
+/** La llave GENERAL para un tipo: granel → `controlStockGranel`, el resto → `controlStockEnteros`. */
+export function generalSinControl(cfgVentas: any, tipo: string | null | undefined): boolean {
   if (!tipo) return false;
   return tipo === 'granel' ? cfgVentas?.controlStockGranel === false : cfgVentas?.controlStockEnteros === false;
+}
+
+/**
+ * ¿El stock de ESTE producto se opera SIN control? La regla única: la usan
+ * inventario, la caja, la tienda y los pedidos web.
+ *
+ *   1. El control PROPIO del producto manda (0129, 3/10/2026): `true` = se
+ *      controla siempre, `false` = nunca — sin importar la llave general.
+ *   2. Si no tiene (`null`, como arrancan todos), decide la llave general de
+ *      su tipo (1/10/2026).
+ *
+ * Pide el PRODUCTO y no solo su tipo a propósito: con el tipo solo, un lugar
+ * que se olvide del control propio compilaría igual y dejaría un camino que
+ * frena (o no frena) distinto que el resto.
+ */
+export function stockSinControl(cfgVentas: any, prod: ProductoControlStock | null | undefined): boolean {
+  if (!prod) return false;
+  if (prod.controlStock === true) return false;
+  if (prod.controlStock === false) return true;
+  return generalSinControl(cfgVentas, prod.tipo);
 }
 
 export const TIPOS_INCIDENCIA_MANUAL = [
@@ -246,62 +264,79 @@ export class InventarioService {
    * vuelve a frenar sobre ese número — por eso la configuración avisa cuántos
    * quedaron en negativo y conviene contarlos.
    *
-   * Es la ÚNICA puerta: cada control de "no alcanza" de este servicio pregunta
-   * acá. Un control que no preguntara volvería a trabar al granel por un
-   * camino que nadie miró.
+   * La puerta de cada control de «no alcanza» de este servicio es
+   * `stockLibre` (más abajo), que además mira el control PROPIO del producto
+   * (0129). Esta solo dice cómo está la llave general del granel.
    */
   async granelLibre(): Promise<boolean> {
     return (await this.cfg.get('ventas'))?.controlStockGranel === false;
   }
 
-  /** ¿Hay algún tipo sin control? Si no, nadie paga la consulta del tipo del producto. */
-  private async algunoLibre(): Promise<boolean> {
-    const c = await this.cfg.get('ventas');
-    return c?.controlStockGranel === false || c?.controlStockEnteros === false;
-  }
-
   /**
-   * EL GRANEL QUE QUEDÓ EN NEGATIVO: con el control apagado se vende sin mirar,
-   * y al prenderlo de nuevo esos números frenan todo. La configuración lo
-   * muestra para contarlos antes (Almacén › Control de inventario).
+   * LO QUE QUEDÓ EN NEGATIVO: con el control apagado se vende sin mirar, y al
+   * prenderlo de nuevo esos números frenan todo. La configuración lo muestra
+   * para contarlos antes (Almacén › Control de inventario).
+   *
+   * Solo los productos que SIGUEN a la llave general (`control_stock` nulo,
+   * 0129): son los únicos a los que mover la llave les cambia algo. Los que
+   * tienen control propio se cuentan aparte (`propios`), para que la pantalla
+   * diga que esos no se mueven con la llave.
    */
   async granelNegativo(tipo: 'granel' | 'entero' = 'granel') {
-    const r: any = await this.db.execute(sql`
-      SELECT p.id, p.nombre, s.nombre AS sucursal, st.presentacion_id, st.cantidad
-        FROM stock st
-        JOIN productos p ON p.id = st.producto_id
-        JOIN sucursales s ON s.id = st.sucursal_id
-       WHERE ${tipo === 'granel' ? sql`p.tipo = 'granel'` : sql`p.tipo <> 'granel'`}
-         AND st.estado = 'disponible' AND st.cantidad < -1e-9
-       ORDER BY st.cantidad
-       LIMIT 500`);
+    const delTipo = tipo === 'granel' ? sql`p.tipo = 'granel'` : sql`p.tipo <> 'granel'`;
+    const [r, prop]: any[] = await Promise.all([
+      this.db.execute(sql`
+        SELECT p.id, p.nombre, s.nombre AS sucursal, st.presentacion_id, st.cantidad
+          FROM stock st
+          JOIN productos p ON p.id = st.producto_id
+          JOIN sucursales s ON s.id = st.sucursal_id
+         WHERE ${delTipo} AND p.control_stock IS NULL
+           AND st.estado = 'disponible' AND st.cantidad < -1e-9
+         ORDER BY st.cantidad
+         LIMIT 500`),
+      this.db.execute(sql`
+        SELECT count(*) FILTER (WHERE p.control_stock IS TRUE)::int AS controlan,
+               count(*) FILTER (WHERE p.control_stock IS FALSE)::int AS libres
+          FROM productos p
+         WHERE ${delTipo} AND p.estado <> 'archivado'`),
+    ]);
     const filas = r.rows ?? r;
+    const pr = (prop.rows ?? prop)[0] ?? {};
     return {
       renglones: filas.length,
       productos: new Set(filas.map((f: any) => f.id)).size,
       ejemplos: filas.slice(0, 8).map((f: any) => ({
         nombre: f.nombre, sucursal: f.sucursal, paquete: f.presentacion_id != null, cantidad: Math.round(Number(f.cantidad) * 1000) / 1000,
       })),
+      /** Productos de este tipo con control PROPIO (0129): la llave general no los mueve. */
+      propios: { controlan: Number(pr.controlan) || 0, libres: Number(pr.libres) || 0 },
     };
   }
 
-  /** Por transacción: no se pregunta dos veces el tipo del mismo producto. */
-  private readonly tiposEnTx = new WeakMap<object, Map<number, string | null>>();
+  /** Por transacción: no se pregunta dos veces por el mismo producto. */
+  private readonly controlEnTx = new WeakMap<object, Map<number, ProductoControlStock | null>>();
 
   /**
-   * ¿Este producto se mueve sin mirar si alcanza? Según su TIPO: el granel
-   * (madre y paquetes) con `controlStockGranel` apagado, el entero con
-   * `controlStockEnteros` apagado (1/10/2026). Es la regla única: la misma
-   * cuenta hacen la caja, la tienda y los pedidos (`stockSinControl`).
+   * ¿Este producto se mueve sin mirar si alcanza? Lo decide `stockSinControl`
+   * (la regla única: control propio del producto, si no la llave general de
+   * su tipo). La misma cuenta hacen la caja, la tienda y los pedidos.
+   *
+   * Con la FILA del producto se decide al toque. Con un id —o con un objeto al
+   * que le falte el tipo o el control propio— se lee el producto: decidir con
+   * un dato a medias haría que el control propio se ignore en silencio.
    */
-  private async stockLibre(tx: any, prod: number | { id: number; tipo?: string | null } | null | undefined): Promise<boolean> {
-    if (!prod || !(await this.algunoLibre())) return false;
+  private async stockLibre(tx: any, prod: number | ({ id: number } & ProductoControlStock) | null | undefined): Promise<boolean> {
+    if (!prod) return false;
     const cfg = await this.cfg.get('ventas');
-    if (typeof prod === 'object') return stockSinControl(cfg, prod.tipo);
-    let m = this.tiposEnTx.get(tx);
-    if (!m) { m = new Map(); this.tiposEnTx.set(tx, m); }
-    if (!m.has(prod)) m.set(prod, (await this.getProducto(tx, prod))?.tipo ?? null);
-    return stockSinControl(cfg, m.get(prod));
+    if (typeof prod === 'object' && prod.tipo !== undefined && prod.controlStock !== undefined) return stockSinControl(cfg, prod);
+    const id = typeof prod === 'object' ? prod.id : prod;
+    let m = this.controlEnTx.get(tx);
+    if (!m) { m = new Map(); this.controlEnTx.set(tx, m); }
+    if (!m.has(id)) {
+      const p = await this.getProducto(tx, id);
+      m.set(id, p ? { tipo: p.tipo, controlStock: p.controlStock ?? null } : null);
+    }
+    return stockSinControl(cfg, m.get(id));
   }
 
   private async cant(tx: any, productoId: number, sucursalId: number, presentacionId: number | null, estado: EstadoStock) {
@@ -1259,8 +1294,8 @@ export class InventarioService {
       out.push({
         ...f, nombre: prod?.nombre ?? `#${f.productoId}`, unidad: this.unidadDe(prod?.tipo, f.presentacionId),
         hay: await this.cant(this.db, f.productoId, sucursalId, f.presentacionId, 'disponible'),
-        /** Sin control de stock para su tipo: puede salir aunque no alcance (ver `stockLibre`). */
-        libre: !!prod && stockSinControl(cfgStock, prod.tipo),
+        /** Sin control de stock (el propio del producto o la llave de su tipo): puede salir aunque no alcance. */
+        libre: !!prod && stockSinControl(cfgStock, prod),
       });
     }
     return out;

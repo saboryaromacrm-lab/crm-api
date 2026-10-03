@@ -581,6 +581,17 @@ export const productos = pgTable('productos', {
    * en el módulo Web.
    */
   webStockMin: doublePrecision('web_stock_min').notNull().default(0),
+  /**
+   * CONTROL DE STOCK DE ESTE PRODUCTO (0129, 3/10/2026). Tres estados:
+   *   null  → como la configuración general (`controlStockGranel` /
+   *           `controlStockEnteros`, según su tipo) — lo de siempre
+   *   true  → se controla SIEMPRE, aunque la llave general esté apagada
+   *   false → NO se controla, aunque la llave general esté prendida
+   * Vale para el producto y sus paquetes. La lee UNA sola regla
+   * (`stockSinControl` en inventario.service) y se cambia solo por
+   * `PATCH /productos/:id/control-stock`, que deja el cambio en la auditoría.
+   */
+  controlStock: boolean('control_stock'),
 
   // Proveedor "activo" (con el que vino la última vez); define costo y precios.
   /*

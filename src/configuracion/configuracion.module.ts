@@ -95,7 +95,10 @@ export const VENTAS_DEFAULTS = {
    * CONTROL DEL STOCK A GRANEL (1/10/2026, pedido del dueño). `true` = como
    * siempre: no se vende, fracciona ni mueve lo que no hay. `false` = el granel
    * (madre y paquetes) se opera sin mirar si alcanza; el stock se sigue
-   * registrando y puede quedar en negativo. Ver `granelLibre` en inventario.
+   * registrando y puede quedar en negativo. Es la regla de los productos SIN
+   * control propio: desde la 0129 cada producto puede tener el suyo («controlar
+   * siempre» / «no controlar»), que manda sobre esta llave. Ver
+   * `stockSinControl` en inventario.
    */
   controlStockGranel: true as boolean,
   /** Lo mismo para los ENTEROS (1/10/2026, pedido del dueño): independiente del granel. */

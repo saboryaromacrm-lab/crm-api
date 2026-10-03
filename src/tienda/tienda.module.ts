@@ -301,7 +301,7 @@ export class TiendaService {
        * siga la misma regla"). Con `controlStockGranel` apagado el granel se
        * ofrece siempre y sin tope (`disponible: null`), igual que en la caja.
        */
-      const sinTope = stockSinControl(cfg, p.tipo);   // y los enteros, con su propio interruptor
+      const sinTope = stockSinControl(cfg, p);   // el control propio del producto (0129) o la llave de su tipo
       const disponibleParaWeb = sinTope ? null : Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
       const disponibleWeb = sinTope || (disponibleParaWeb ?? 0) > 1e-9;
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];

@@ -423,12 +423,13 @@ export class PresupuestosService {
         .where(and(eq(stock.sucursalId, p.sucursalId), eq(stock.estado, 'disponible'))),
       this.cfg.get('ventas'),
     ]);
-    /* Sin control de stock para su tipo (1/10/2026): alcanza siempre, como en la caja. */
-    const algunoLibre = cfgV?.controlStockGranel === false || cfgV?.controlStockEnteros === false;
-    const granelIds = new Set(algunoLibre && items.length
-      ? (await this.db.select({ id: productos.id, tipo: productos.tipo }).from(productos)
+    /* Sin control de stock (el propio del producto, 0129, o la llave de su tipo):
+     * alcanza siempre, como en la caja. Se mira SIEMPRE: con las dos llaves
+     * prendidas igual puede haber un producto marcado «no controlar». */
+    const libresIds = new Set(items.length
+      ? (await this.db.select({ id: productos.id, tipo: productos.tipo, controlStock: productos.controlStock }).from(productos)
         .where(inArray(productos.id, [...new Set(items.map((it) => it.productoId))])))
-        .filter((x) => stockSinControl(cfgV, x.tipo)).map((x) => x.id)
+        .filter((x) => stockSinControl(cfgV, x)).map((x) => x.id)
       : []);
     const disponibleDe = (it: any) => st
       .filter((s) => s.productoId === it.productoId && (s.presentacionId ?? null) === (it.presentacionId ?? null))
@@ -437,7 +438,7 @@ export class PresupuestosService {
       ...p,
       items: items.map((it) => {
         const disponible = money(disponibleDe(it));
-        return { ...it, disponible, alcanza: granelIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad };
+        return { ...it, disponible, alcanza: libresIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad };
       }),
     };
   }
