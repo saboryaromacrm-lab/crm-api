@@ -3,9 +3,10 @@
  * ============================================================================
  * Todo lo que el sitio Next.js necesita, en un shape chico y sin datos
  * internos (nada de costos, nada de stock por sucursal, nada de otras
- * listas). Un solo precio por producto: el de la lista "tienda" (la que
- * apunta la modalidad configurada como mayorista; si un producto no la
- * tiene cargada, cae a la lista base).
+ * listas). El entero lleva un solo precio: el de la lista "tienda" (la que
+ * apunta la modalidad configurada como mayorista). El granel se vende por
+ * opciones, que pueden salir de cualquier lista de esa misma modalidad (la
+ * caja de 5 de Mayorista 2, por ejemplo).
  *
  * MÍNIMO DE COMPRA — como en el sitio real: NO cambia el precio, HABILITA el
  * checkout. Se cumple con CUALQUIERA de los dos caminos:
@@ -148,7 +149,11 @@ export class TiendaService {
    * paquetes armados), que solo usa el pedido para validar el stock entre
    * opciones del mismo producto. El pozo no se publica.
    */
-  private async armarCatalogo(): Promise<{ catalogo: any; pozos: Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number> }> }> {
+  private async armarCatalogo(): Promise<{
+    catalogo: any;
+    pozos: Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number> }>;
+    listaDeOpcion: Map<string, { id: number; nombre: string }>;
+  }> {
     const suc = await this.sucursalTienda();
     const desdeReingreso = new Date(Date.now() - DIAS_REINGRESO * 86400000);
     const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web, subs, press] = await Promise.all([
@@ -270,7 +275,7 @@ export class TiendaService {
       categorias: [], marcas: [], etiquetas: [], reglasMarca: [], items: [],
       sitio,
     };
-    if (!listaTienda) return { catalogo: vacio, pozos: new Map() };
+    if (!listaTienda) return { catalogo: vacio, pozos: new Map(), listaDeOpcion: new Map() };
 
     /*
      * PRE-ÍNDICE de las tablas hijas, un solo pase cada una. Sin esto, adentro
@@ -282,15 +287,37 @@ export class TiendaService {
      * producto en la lista de la tienda, pero por las dudas).
      */
     const filaTiendaPorProducto = new Map<number, any>();
-    /** La fila de la lista de la tienda de cada PAQUETE (3/10/2026): el granel se vende por ellos. */
-    const filaTiendaPorPres = new Map<number, any>();
+    /*
+     * EL GRANEL MIRA TODAS LAS LISTAS DE LA MODALIDAD DE LA TIENDA (3/10/2026,
+     * pedido del dueño): un paquete puede venderse «por 1» en Mayorista 1 y
+     * «caja de 5» en Mayorista 2, y el sitio ofrece las dos formas. Primero la
+     * lista de la tienda y después las otras por su orden: ante dos filas que
+     * venden IGUAL (mismas unidades) gana la primera, así una lista «por 1»
+     * más barata —la de un cliente con contrato— no se publica para todos.
+     */
+    const listasGranel = activas
+      .filter((l: any) => l.modalidadId === listaTienda.modalidadId)
+      .sort((a: any, b: any) => (a.id === listaTienda.id ? -1 : b.id === listaTienda.id ? 1 : 0)
+        || (a.orden ?? 0) - (b.orden ?? 0) || (a.numero ?? 0) - (b.numero ?? 0) || a.id - b.id);
+    const rangoLista = new Map<number, number>(listasGranel.map((l: any, i: number): [number, number] => [l.id, i]));
+    type FilaLista = { fila: any; lista: { id: number; nombre: string } };
+    const filasGranelProducto = new Map<number, FilaLista[]>();
+    /** Las filas de cada PAQUETE (3/10/2026): el granel se vende por ellos. */
+    const filasGranelPres = new Map<number, FilaLista[]>();
     for (const f of filas) {
-      if (f.listaId !== listaTienda.id) continue;
-      if (f.presentacionId == null) {
-        if (!filaTiendaPorProducto.has(f.productoId)) filaTiendaPorProducto.set(f.productoId, f);
-      } else if (!filaTiendaPorPres.has(f.presentacionId)) {
-        filaTiendaPorPres.set(f.presentacionId, f);
+      if (f.listaId === listaTienda.id && f.presentacionId == null && !filaTiendaPorProducto.has(f.productoId)) {
+        filaTiendaPorProducto.set(f.productoId, f);
       }
+      if (!rangoLista.has(f.listaId)) continue;
+      const l = listasGranel[rangoLista.get(f.listaId)!];
+      const x = { fila: f, lista: { id: l.id, nombre: l.nombre } };
+      const mapa = f.presentacionId == null ? filasGranelProducto : filasGranelPres;
+      const k = f.presentacionId == null ? f.productoId : f.presentacionId;
+      const arr = mapa.get(k);
+      if (arr) arr.push(x); else mapa.set(k, [x]);
+    }
+    for (const arr of [...filasGranelProducto.values(), ...filasGranelPres.values()]) {
+      arr.sort((a, b) => rangoLista.get(a.lista.id)! - rangoLista.get(b.lista.id)!);
     }
     const provsPorProducto = new Map<number, any[]>();
     for (const x of provs) {
@@ -306,6 +333,8 @@ export class TiendaService {
      * bolsa y los paquetes) no se vendan dos veces los mismos kilos.
      */
     const pozos = new Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number> }>();
+    /** De qué lista sale cada opción de granel (`productoId:clave`): el pedido la anota en el renglón. No se publica. */
+    const listaDeOpcion = new Map<string, { id: number; nombre: string }>();
     for (const p of prods) {
       // La BASE del precio (0072): el sitio publica el mismo precio que el POS.
       const costoNeto = costoPrecioEntry(formatoDeCosto(p, provsPorProducto.get(p.id) ?? []) as any, p.iva);
@@ -413,18 +442,33 @@ export class TiendaService {
       const granelKg = Math.max(0, r3(stockDe(p.id, null) - (p.webStockMin || 0)));
       const armados = new Map<number, number>();
       const variantes: any[] = [];
-      const filaMadre = filaTiendaPorProducto.get(p.id);
-      if (filaMadre && !p.soloFraccionar) {
-        const pv = precioVentaFila(costoNeto, filaMadre, opts);
-        const kgBolsa = r3(Number(filaMadre.unidades) || 1);
-        if (pv.finalUnitario > 0 && kgBolsa > 0) {
+      /*
+       * LAS OPCIONES SE AGRUPAN POR TAMAÑO (3/10/2026): el cliente elige
+       * primero QUÉ lleva (1 kg, Bolsa de 10 kg) y, si ese tamaño se vende de
+       * más de una forma, CÓMO (por unidad o en caja de 5), viendo cuánto le
+       * sale cada paquete y cuánto ahorra. `grupo` es el tamaño; `forma`, el
+       * texto de la forma de compra; `precioPaquete`, lo que sale cada paquete.
+       * Cada bolsa del madre es un tamaño propio.
+       */
+      if (!p.soloFraccionar) {
+        const vistos = new Set<number>();
+        for (const { fila, lista } of filasGranelProducto.get(p.id) ?? []) {
+          const kgBolsa = r3(Number(fila.unidades) || 1);
+          if (!(kgBolsa > 0) || vistos.has(kgBolsa)) continue;
+          const pv = precioVentaFila(costoNeto, fila, opts);
+          if (!(pv.finalUnitario > 0)) continue;
+          vistos.add(kgBolsa);
           const disponible = sinTope ? null : Math.floor(granelKg / kgBolsa + 1e-9);
+          const etiqueta = `Bolsa de ${textoKg(kgBolsa)}`;
+          const clave = `p${kgBolsa}`;
+          listaDeOpcion.set(`${p.id}:${clave}`, lista);
           variantes.push({
-            clave: 'p', presentacionId: null, etiqueta: `Bolsa de ${textoKg(kgBolsa)}`, kgPorUnidad: kgBolsa,
+            clave, presentacionId: null, etiqueta, kgPorUnidad: kgBolsa,
+            grupo: clave, grupoEtiqueta: etiqueta, forma: 'Bolsa cerrada',
             /** Lo que se cobra por bolsa, y el kilo de referencia. */
-            precio: pv.finalFormato, precioKg: pv.finalUnitario,
+            precio: pv.finalFormato, precioKg: pv.finalUnitario, precioPaquete: pv.finalFormato, ahorroPct: 0,
             /** El mínimo del formato viene en kilos: en bolsas, redondeado para arriba. */
-            unidadesMinimas: (Number(filaMadre.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(filaMadre.unidadesMinimas) / kgBolsa - 1e-9) : 0,
+            unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / kgBolsa - 1e-9) : 0,
             enStock: sinTope || (disponible ?? 0) >= 1,
             disponible,
             oferta: ofertaDe(null, pv.finalUnitario, kgBolsa),
@@ -432,28 +476,52 @@ export class TiendaService {
         }
       }
       for (const pres of presPorProducto.get(p.id) ?? []) {
-        const fila = filaTiendaPorPres.get(pres.id);
-        if (!fila || !(pres.tamKg > 0)) continue;
-        const pv = precioVentaFila(costoNetoPresentacion(costoNeto, pres.tamKg, p.merma), fila, opts);
-        if (!(pv.finalUnitario > 0)) continue;
-        const porCaja = Math.max(1, Math.round(Number(fila.unidades) || 1));
+        if (!(pres.tamKg > 0)) continue;
         const hay = Math.max(0, stockDe(p.id, pres.id));
-        armados.set(pres.id, hay);
         const paquetes = hay + Math.floor(granelKg / pres.tamKg + 1e-9);
-        const disponible = sinTope ? null : Math.floor(paquetes / porCaja + 1e-9);
         const tam = textoKg(pres.tamKg);
-        variantes.push({
-          clave: `s${pres.id}`, presentacionId: pres.id, etiqueta: porCaja > 1 ? `Caja de ${porCaja} × ${tam}` : tam,
-          kgPorUnidad: r3(pres.tamKg * porCaja), paquetesPorUnidad: porCaja,
-          precio: pv.finalFormato, precioKg: money(pv.finalFormato / (pres.tamKg * porCaja)),
-          unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0,
-          enStock: sinTope || (disponible ?? 0) >= 1,
-          disponible,
-          oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja),
-        });
+        const delTamano: any[] = [];
+        const vistos = new Set<number>();
+        for (const { fila, lista } of filasGranelPres.get(pres.id) ?? []) {
+          const porCaja = Math.max(1, Math.round(Number(fila.unidades) || 1));
+          if (vistos.has(porCaja)) continue;
+          const pv = precioVentaFila(costoNetoPresentacion(costoNeto, pres.tamKg, p.merma), fila, opts);
+          if (!(pv.finalUnitario > 0)) continue;
+          vistos.add(porCaja);
+          const disponible = sinTope ? null : Math.floor(paquetes / porCaja + 1e-9);
+          const clave = porCaja > 1 ? `s${pres.id}x${porCaja}` : `s${pres.id}`;
+          listaDeOpcion.set(`${p.id}:${clave}`, lista);
+          delTamano.push({
+            clave, presentacionId: pres.id, etiqueta: porCaja > 1 ? `Caja de ${porCaja} × ${tam}` : tam,
+            kgPorUnidad: r3(pres.tamKg * porCaja), paquetesPorUnidad: porCaja,
+            grupo: `s${pres.id}`, grupoEtiqueta: tam, forma: porCaja > 1 ? `Caja de ${porCaja}` : 'Por unidad',
+            precio: pv.finalFormato, precioKg: money(pv.finalFormato / (pres.tamKg * porCaja)),
+            precioPaquete: money(pv.finalFormato / porCaja),
+            unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0,
+            enStock: sinTope || (disponible ?? 0) >= 1,
+            disponible,
+            oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja),
+          });
+        }
+        if (!delTamano.length) continue;
+        armados.set(pres.id, hay);
+        /* El ahorro de cada forma contra la más cara del mismo tamaño, por paquete y sin promos. */
+        const masCaro = Math.max(...delTamano.map((v) => v.precioPaquete));
+        for (const v of delTamano) {
+          const pct = masCaro > 0 ? Math.round(100 * (1 - v.precioPaquete / masCaro)) : 0;
+          v.ahorroPct = pct >= 1 ? pct : 0;
+        }
+        variantes.push(...delTamano);
       }
       if (!variantes.length) continue;
-      variantes.sort((a, b) => a.kgPorUnidad - b.kgPorUnidad);
+      /* Por tamaño (el kilo de su forma más chica) y, adentro, de la forma más chica a la caja más grande. */
+      const kgGrupo = new Map<string, number>();
+      for (const v of variantes) {
+        const kg = v.kgPorUnidad / (v.paquetesPorUnidad || 1);
+        kgGrupo.set(v.grupo, Math.min(kgGrupo.get(v.grupo) ?? Infinity, kg));
+      }
+      variantes.sort((a, b) => kgGrupo.get(a.grupo)! - kgGrupo.get(b.grupo)! || a.grupo.localeCompare(b.grupo)
+        || (a.paquetesPorUnidad || 1) - (b.paquetesPorUnidad || 1));
       pozos.set(p.id, { sinTope, granelKg, armados });
       // Lo de la tarjeta, por defecto: la primera opción CON stock (o la primera).
       const v0 = variantes.find((v) => v.enStock) ?? variantes[0];
@@ -511,7 +579,7 @@ export class TiendaService {
       items,
       sitio,
     };
-    return { catalogo: publico, pozos };
+    return { catalogo: publico, pozos, listaDeOpcion };
   }
 
   /**
@@ -583,7 +651,7 @@ export class TiendaService {
       throw new BadRequestException(`Un pedido no puede tener más de ${MAX_RENGLONES_PEDIDO} renglones.`);
     }
 
-    const { catalogo: cat, pozos } = await this.armarCatalogo();
+    const { catalogo: cat, pozos, listaDeOpcion } = await this.armarCatalogo();
     const porId = new Map<number, any>(cat.items.map((i: any): [number, any] => [i.id, i]));
 
     /*
@@ -746,13 +814,17 @@ export class TiendaService {
       const esPorcentaje = x.oferta?.tipo === 'porcentaje' && x.oferta.precioOferta != null;
       const precioCompra = esPorcentaje ? x.precio : precioEfectivo(r);
       const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio)) : 0;
+      /* La lista de la opción (la caja de 5 puede ser Mayorista 2): con esa se cotizó y con esa cierra la caja. */
+      const lista = r.v ? listaDeOpcion.get(`${r.prod.id}:${r.v.clave}`) : null;
       return {
         productoId: r.prod.id, presentacionId: r.v?.presentacionId ?? null,
         nombre: r.prod.nombre,
         detalle: r.v ? r.v.etiqueta : 'Unidad',
         cantidad: r3(r.cantidad * unidadesStock),
-        precioLista: money(precioCompra / unidadesStock / (1 + iva / 100)),
-        descuento, iva, lista: cat.listaNombre, listaId: cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
+        /* Sin cortar a 2 decimales: el total del presupuesto se suma con este número y
+         * tiene que dar EXACTO lo que el cliente vio (la caja de 6 daba 2 centavos menos). */
+        precioLista: Math.round((precioCompra / unidadesStock / (1 + iva / 100)) * 1e6) / 1e6,
+        descuento, iva, lista: lista?.nombre ?? cat.listaNombre, listaId: lista?.id ?? cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
       };
     });
 
