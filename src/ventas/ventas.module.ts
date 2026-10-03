@@ -776,7 +776,18 @@ export class VentasService {
      * y NO la hizo el cajero en la caja. */
     if (q.origen === 'pos') conds.push(sql`${ventas.presupuestoId} is null`);
     if (q.origen === 'presupuesto') conds.push(sql`${ventas.presupuestoId} is not null`);
-    if (q.medioPago) {
+    /*
+     * QR MERCADO PAGO, APARTE (3/10/2026, pedido del dueño): el cobro con el QR
+     * de la caja se guarda como `qr` con la referencia «MP <operación>» (ver
+     * mercadopago.module, `cerrarVenta`). Se distingue por eso —también las
+     * ventas viejas, sin migración—: «QR Mercado Pago» son esas, y «QR /
+     * billetera» las otras (un QR cobrado por fuera del sistema).
+     */
+    if (q.medioPago === 'qr_mp') {
+      conds.push(sql`exists (select 1 from venta_pagos vp where vp.venta_id = ${ventas.id} and vp.medio = 'qr' and vp.referencia like 'MP %')`);
+    } else if (q.medioPago === 'qr') {
+      conds.push(sql`exists (select 1 from venta_pagos vp where vp.venta_id = ${ventas.id} and vp.medio = 'qr' and vp.referencia not like 'MP %')`);
+    } else if (q.medioPago) {
       conds.push(sql`exists (select 1 from venta_pagos vp where vp.venta_id = ${ventas.id} and vp.medio = ${q.medioPago})`);
     }
     if (q.conOferta) {
@@ -861,13 +872,13 @@ export class VentasService {
         .where(donde),
 
       this.db.select({
-        medio: ventaPagos.medio,
+        medio: sql<string>`case when ${ventaPagos.medio} = 'qr' and ${ventaPagos.referencia} like 'MP %' then 'qr_mp' else ${ventaPagos.medio}::text end`,
         importe: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)`,
       }).from(ventaPagos)
         .innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .where(vivas)
-        .groupBy(ventaPagos.medio),
+        .groupBy(sql`1`),
 
       this.db.select({
         facturado: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}) filter (where ${FACTURADO}), 0)`,
@@ -965,7 +976,8 @@ export class VentasService {
            * total la haría ver como deuda del cliente, que es exactamente lo
            * contrario de lo que dice el comprobante. */
           saldo: esNotaCredito(v.tipo) ? 0 : money(v.total - cobrado - acreditado),
-          medios: pagos.filter((p: any) => p.ventaId === v.id).map((p: any) => ({ medio: p.medio, importe: p.importe })),
+          medios: pagos.filter((p: any) => p.ventaId === v.id)
+            .map((p: any) => ({ medio: p.medio === 'qr' && /^MP /.test(String(p.referencia ?? '')) ? 'qr_mp' : p.medio, importe: p.importe })),
           renglones: Number(a?.renglones) || 0,
           unidades: money(Number(a?.unidades)),
           ofertaDescuento: money(Number(a?.ofertaDescuento)),
@@ -5102,7 +5114,7 @@ export class VentasController {
     const r = await this.svc.listado({
       desde, hasta, q,
       estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
-      medioPago: uno(medioPago, MEDIOS, 'Medio de pago'),
+      medioPago: uno(medioPago, [...MEDIOS, 'qr_mp'], 'Medio de pago'),
       origen: uno(origen, ['pos', 'presupuesto'], 'Origen'),
       sucursalId: esJefe(sesion) ? num(sucursalId) : sesion.sucursalId,
       usuarioId: num(usuarioId),
