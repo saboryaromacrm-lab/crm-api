@@ -524,6 +524,10 @@ export class TiendaService {
           });
         }
         if (!delTamano.length) continue;
+        /* Un tamaño que se vende de UNA sola forma y de a N (la Avena 1 kg «vende
+         * por 5»): el botón dice lo que se compra —«Bolsa x5 kg»—, no el tamaño
+         * del paquete, que haría creer que se lleva 1 kg (3/10/2026, pedido del dueño). */
+        if (delTamano.length === 1 && (delTamano[0].paquetesPorUnidad || 1) > 1) delTamano[0].grupoEtiqueta = delTamano[0].forma;
         armados.set(pres.id, hay);
         /* El ahorro de cada forma contra la más cara del mismo tamaño, por paquete y sin promos. */
         const masCaro = Math.max(...delTamano.map((v) => v.precioPaquete));
