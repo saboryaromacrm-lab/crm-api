@@ -171,6 +171,14 @@ export const CATALOGO_PERMISOS = [
        */
       { clave: 'almacen.cafeteria-pedidos', nombre: 'Pedido a la distribuidora (SOLO para el rol Coffit)' },
       { clave: 'almacen.cafeteria-entradas', nombre: 'Envíos DE Coffit a las sucursales (rol Coffit)' },
+      /*
+       * Las llaves de STOCK (3/10/2026, pedido del dueño: se mudaron de Ventas
+       * a Almacén): controlar el stock a granel y de los enteros, y permitir
+       * vender sin stock. Quien tiene «Configuración de ventas» las sigue
+       * pudiendo cambiar; esta clave sirve para dárselas a alguien de depósito
+       * sin abrirle toda la configuración de ventas.
+       */
+      { clave: 'almacen.configuracion', nombre: 'Configuración de almacén (control de stock y vender sin stock)' },
     ],
     acciones: [
       { clave: 'pedidos', nombre: 'Pedir y recibir mercadería' },

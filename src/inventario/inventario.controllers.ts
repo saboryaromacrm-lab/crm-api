@@ -249,14 +249,14 @@ export class StockController {
 
   /** Cuánto granel quedó en negativo: lo que hay que contar antes de prender el control (1/10/2026). */
   @Get('granel-negativo')
-  @Permiso('ventas.configuracion', 'almacen.existencias')
+  @Permiso('ventas.configuracion', 'almacen.configuracion', 'almacen.existencias')
   granelNegativo() {
     return this.inv.granelNegativo('granel');
   }
 
   /** Lo mismo para los enteros. */
   @Get('enteros-negativo')
-  @Permiso('ventas.configuracion', 'almacen.existencias')
+  @Permiso('ventas.configuracion', 'almacen.configuracion', 'almacen.existencias')
   enterosNegativo() {
     return this.inv.granelNegativo('entero');
   }

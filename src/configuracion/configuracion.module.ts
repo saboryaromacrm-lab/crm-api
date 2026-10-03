@@ -735,6 +735,20 @@ const DUENO_DE_AREA: Record<string, string[]> = {
   web: ['web.configuracion'],
 };
 
+/**
+ * LAS LLAVES DE STOCK viven en la config de ventas (las lee la caja) pero se
+ * manejan desde Almacén › Configuración (3/10/2026, pedido del dueño). Un
+ * guardado que toca SOLO estas llaves lo puede hacer también quien tiene
+ * `almacen.configuracion`; si trae cualquier otra, vuelve a pedir la de ventas.
+ */
+const LLAVES_STOCK = new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo']);
+export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
+  const base = DUENO_DE_AREA[clave];
+  if (!base || clave !== 'ventas') return base;
+  const keys = body && typeof body === 'object' ? Object.keys(body) : [];
+  return keys.length > 0 && keys.every((k) => LLAVES_STOCK.has(k)) ? [...base, 'almacen.configuracion'] : base;
+}
+
 @Controller('configuracion')
 export class ConfiguracionController {
   constructor(private readonly svc: ConfiguracionService) {}
@@ -749,7 +763,7 @@ export class ConfiguracionController {
 
   @Put(':clave')
   set(@Param('clave') clave: string, @Body() body: any, @Auth() sesion: Sesion) {
-    const claves = DUENO_DE_AREA[clave];
+    const claves = permisosParaGuardar(clave, body);
     // Área desconocida: 404 como el servicio, sin filtrar si existe o no.
     if (!claves) throw new NotFoundException(`No existe la configuración "${clave}".`);
     if (!tienePermiso(sesion.permisos, claves)) {
