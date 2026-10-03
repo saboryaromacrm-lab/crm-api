@@ -19,6 +19,11 @@
  *      caja (`VentasService.confirmar`) — stock, caja, factura, todo igual.
  *   4. Red por si el aviso no llega: la caja consulta mientras espera y un
  *      reloj revisa cada 20 s los cobros que siguen esperando.
+ *   5. Segunda vía (3/10/2026): si la orden no dice que se pagó, se busca el
+ *      PAGO por la referencia del cobro. Y si igual no aparece, la caja tiene
+ *      «El cliente ya pagó: buscar el pago» — pagos aprobados por el monto,
+ *      la caja elige uno, se verifica en Mercado Pago y se cierra.
+ *   Cada consulta deja escrito en el cobro qué contestó Mercado Pago.
  *
  * NUNCA SE PIERDE UN PAGO: si entró la plata pero la venta no pudo cerrarse
  * (sin stock, precio cambiado…), el cobro queda en `error` con el motivo y el
@@ -39,7 +44,7 @@ import { esJefe } from '../auth/auth.guard';
 import { mpCajas, mpCobros, mpSucursales, sucursales, terminales } from '../db/schema';
 import { terminalPorToken } from '../sucursales/sucursales.module';
 import { VentasModule, VentasService } from '../ventas/ventas.module';
-import { MP, firmaValida, importeMp, mp } from './api';
+import { MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve } from './api';
 
 /* ------------------------------- DTOs ------------------------------- */
 
@@ -367,31 +372,178 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
   async procesarOrden(orderId: string) {
     const [c] = await this.db.select().from(mpCobros).where(eq(mpCobros.orderId, orderId)).limit(1);
     if (!c || !ESTADOS_VIVOS.includes(c.estado)) return;
-    const orden: any = await mp.orden(orderId);
-    await this.db.update(mpCobros).set({ actualizadoEn: new Date() }).where(eq(mpCobros.id, c.id));
-    const estado = String(orden?.status ?? '');
-    if (estado === 'processed') {
-      const ref = String(orden?.external_reference ?? '');
+    const ref = `SYA-V${c.ventaId}-C${c.id}`;
+    const hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'America/Argentina/Buenos_Aires' });
+    /*
+     * LO QUE CONTESTÓ MERCADO PAGO QUEDA A LA VISTA (3/10/2026). El primer cobro
+     * real quedó «esperando» con la plata acreditada y el motivo solo estaba en
+     * el log del servidor: ahora cada consulta escribe en el cobro qué dijo
+     * Mercado Pago (o por qué no se pudo preguntar), y la caja lo muestra.
+     */
+    let orden: any = null;
+    let falla = '';
+    try {
+      orden = await mp.orden(orderId);
+    } catch (e) {
+      falla = (e as Error).message;
+      this.log.warn(`cobro ${c.id}: no se pudo consultar la orden ${orderId}: ${falla}`);
+    }
+    const estado = String(orden?.status ?? '').toLowerCase();
+    const { pagado, paymentId } = orden ? pagoDeOrden(orden, c.monto) : { pagado: false, paymentId: '' };
+
+    if (pagado) {
+      const refOrden = String(orden?.external_reference ?? '');
       const total = Number(orden?.total_amount ?? orden?.total_paid_amount ?? 0);
-      if (ref !== `SYA-V${c.ventaId}-C${c.id}` || Math.abs(total - c.monto) > 0.01) {
+      if (refOrden !== ref || Math.abs(total - c.monto) > 0.01) {
         await this.db.update(mpCobros).set({
-          estado: 'error', detalle: `Mercado Pago informó un pago que no coincide (referencia ${ref}, $${total}). Revisalo en tu cuenta antes de entregar la mercadería.`, actualizadoEn: new Date(),
+          estado: 'error', detalle: `Mercado Pago informó un pago que no coincide (referencia ${refOrden}, $${total}). Revisalo en tu cuenta antes de entregar la mercadería.`, actualizadoEn: new Date(),
         }).where(eq(mpCobros.id, c.id));
         return;
       }
-      const pagos = orden?.transactions?.payments ?? [];
-      const pago = pagos.find((p: any) => /processed|approved|accredited/i.test(String(p?.status ?? ''))) ?? pagos[0];
-      await this.db.update(mpCobros).set({ paymentId: String(pago?.id ?? '') }).where(eq(mpCobros.id, c.id));
+      await this.db.update(mpCobros).set({ paymentId, actualizadoEn: new Date() }).where(eq(mpCobros.id, c.id));
       await this.cerrarVenta(c.id, ['esperando']);
       return;
     }
     if (estado === 'canceled' || estado === 'cancelled') {
       await this.db.update(mpCobros).set({ estado: 'cancelado', detalle: 'Cancelado en Mercado Pago.', actualizadoEn: new Date() })
         .where(and(eq(mpCobros.id, c.id), eq(mpCobros.estado, 'esperando')));
-    } else if (estado === 'expired') {
+      return;
+    }
+
+    /*
+     * LA SEGUNDA VÍA: la orden no dice que se pagó (o no se pudo consultar).
+     * Se busca el PAGO por la referencia de este cobro: si hay uno aprobado y
+     * por el monto, se cierra con ese. Antes de vencer, también: el pago puede
+     * haber entrado justo al límite.
+     */
+    let porPago: any = null;
+    let fallaPago = '';
+    if (c.estado === 'esperando') {
+      try {
+        const r = await mp.buscarPagos({ external_reference: ref, sort: 'date_created', criteria: 'desc', limit: '10' });
+        porPago = (r?.results ?? []).find((p: any) => String(p?.external_reference ?? '') === ref && pagoSirve(p, c.monto)) ?? null;
+      } catch (e) {
+        fallaPago = (e as Error).message;
+        this.log.warn(`cobro ${c.id}: no se pudo buscar el pago ${ref}: ${fallaPago}`);
+      }
+    }
+    if (porPago) {
+      this.log.log(`cobro ${c.id}: la orden dice «${estado || falla}» pero el pago ${porPago.id} está aprobado: se cierra con el pago.`);
+      await this.db.update(mpCobros).set({ paymentId: String(porPago.id), actualizadoEn: new Date() }).where(eq(mpCobros.id, c.id));
+      await this.cerrarVenta(c.id, ['esperando']);
+      return;
+    }
+    if (estado === 'expired') {
       await this.db.update(mpCobros).set({ estado: 'vencido', detalle: 'Nadie pagó en el tiempo del cobro.', actualizadoEn: new Date() })
         .where(and(eq(mpCobros.id, c.id), eq(mpCobros.estado, 'esperando')));
+      return;
     }
+    const legible: Record<string, string> = {
+      created: 'todavía no se pagó', at_terminal: 'el cliente lo está pagando', action_required: 'el pago necesita una acción del cliente',
+      processing: 'el pago se está procesando', refunded: 'el pago fue devuelto', failed: 'el pago falló',
+    };
+    const dice = falla
+      ? `no se pudo consultar el cobro (${falla})${fallaPago ? `; tampoco el pago (${fallaPago})` : ''}`
+      : `${legible[estado] ?? `estado «${estado || 'sin estado'}»`}${orden?.status_detail && String(orden.status_detail).toLowerCase() !== estado ? ` (${orden.status_detail})` : ''}`;
+    await this.db.update(mpCobros).set({ detalle: `Mercado Pago, ${hora}: ${dice}.`.slice(0, 600), actualizadoEn: new Date() })
+      .where(and(eq(mpCobros.id, c.id), eq(mpCobros.estado, 'esperando')));
+  }
+
+  /* --------------------- el rescate: «el cliente ya pagó» --------------------- */
+
+  /** El cobro, con el permiso de la sucursal. */
+  private async cobroDeSucursal(id: number, sesion: Sesion) {
+    const [c] = await this.db.select().from(mpCobros).where(eq(mpCobros.id, id)).limit(1);
+    if (!c) throw new NotFoundException('Cobro inexistente.');
+    if (!esJefe(sesion) && c.sucursalId !== sesion.sucursalId) throw new ForbiddenException('Ese cobro es de otra sucursal.');
+    return c;
+  }
+
+  /** Pagos ya usados por OTRO cobro: no se vinculan dos veces. */
+  private async pagosUsados(exceptoCobro: number, ids: string[]) {
+    if (!ids.length) return new Set<string>();
+    const filas = await this.db.select({ paymentId: mpCobros.paymentId }).from(mpCobros)
+      .where(and(inArray(mpCobros.paymentId, ids), sql`${mpCobros.id} <> ${exceptoCobro}`, inArray(mpCobros.estado, ['procesando', 'pagado', 'error'])));
+    return new Set(filas.map((f) => String(f.paymentId)));
+  }
+
+  /**
+   * LOS PAGOS QUE PUEDEN SER DE ESTE COBRO: aprobados, por el MISMO monto,
+   * recibidos desde 2 minutos antes de mandar el cobro, y que no estén usados
+   * en otro. La caja elige y confirma; nada se cierra solo por esto.
+   */
+  async pagosCandidatos(id: number, sesion: Sesion) {
+    const c = await this.cobroDeSucursal(id, sesion);
+    if (c.estado !== 'esperando') throw new BadRequestException('Este cobro ya no está esperando el pago.');
+    const desde = new Date(c.creadoEn).getTime() - 2 * 60_000;
+    const horas = Math.min(24, Math.max(1, Math.ceil((Date.now() - desde) / 3_600_000)));
+    let r: any;
+    try {
+      r = await mp.buscarPagos({ sort: 'date_created', criteria: 'desc', range: 'date_created', begin_date: `NOW-${horas}HOURS`, end_date: 'NOW', limit: '100' });
+    } catch (e) {
+      throw new BadRequestException(`No se pudieron consultar los pagos en Mercado Pago: ${(e as Error).message}`);
+    }
+    const ref = `SYA-V${c.ventaId}-C${c.id}`;
+    const sirven = (r?.results ?? []).filter((p: any) => pagoSirve(p, c.monto) && new Date(p?.date_created ?? 0).getTime() >= desde);
+    const usados = await this.pagosUsados(c.id, sirven.map((p: any) => String(p.id)));
+    return {
+      monto: c.monto,
+      desde: new Date(desde).toISOString(),
+      pagos: sirven.filter((p: any) => !usados.has(String(p.id))).map((p: any) => ({
+        id: String(p.id),
+        monto: Number(p.transaction_amount),
+        fecha: p.date_approved ?? p.date_created,
+        pagador: [p?.payer?.first_name, p?.payer?.last_name].filter(Boolean).join(' ') || p?.payer?.email || '',
+        medio: String(p?.payment_method_id ?? p?.payment_type_id ?? ''),
+        /** Es el de este cobro (la misma referencia): el más seguro. */
+        deEsteCobro: String(p?.external_reference ?? '') === ref,
+      })),
+    };
+  }
+
+  /**
+   * VINCULAR UN PAGO A MANO y cerrar la venta. El pago se vuelve a pedir a
+   * Mercado Pago (no se le cree a la pantalla): aprobado, por el monto, de
+   * después del cobro y sin usar. Un candado por pago evita que dos cajas
+   * usen el mismo a la vez.
+   */
+  async vincularPago(id: number, paymentId: string, sesion: Sesion) {
+    const c = await this.cobroDeSucursal(id, sesion);
+    if (c.estado !== 'esperando') return this.vista(c);
+    const pid = String(paymentId ?? '').trim();
+    if (!/^\d{1,20}$/.test(pid)) throw new BadRequestException('Ese número de pago no es válido.');
+    let p: any;
+    try {
+      p = await mp.pago(pid);
+    } catch (e) {
+      throw new BadRequestException(`No se pudo verificar el pago en Mercado Pago: ${(e as Error).message}`);
+    }
+    if (!pagoSirve(p, c.monto)) {
+      throw new BadRequestException(`Ese pago no sirve para este cobro: tiene que estar aprobado y ser de $${c.monto.toFixed(2)} (es de $${Number(p?.transaction_amount ?? 0).toFixed(2)}, ${p?.status ?? 'sin estado'}).`);
+    }
+    if (new Date(p?.date_created ?? 0).getTime() < new Date(c.creadoEn).getTime() - 2 * 60_000) {
+      throw new BadRequestException('Ese pago es de antes de mandar el cobro: no puede ser de este ticket.');
+    }
+    const tomado = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`mp-pago-${pid}`}))`);
+      const [otro] = await tx.select({ id: mpCobros.id }).from(mpCobros)
+        .where(and(eq(mpCobros.paymentId, pid), sql`${mpCobros.id} <> ${c.id}`, inArray(mpCobros.estado, ['procesando', 'pagado', 'error']))).limit(1);
+      if (otro) throw new BadRequestException('Ese pago ya está usado en otro cobro.');
+      const [d] = await tx.update(mpCobros).set({
+        paymentId: pid, detalle: `Pago ${pid} vinculado a mano por el usuario ${sesion.usuarioId}.`, actualizadoEn: new Date(),
+      }).where(and(eq(mpCobros.id, c.id), eq(mpCobros.estado, 'esperando'))).returning();
+      return d;
+    });
+    if (!tomado) {
+      const [d] = await this.db.select().from(mpCobros).where(eq(mpCobros.id, c.id)).limit(1);
+      return this.vista(d);
+    }
+    this.log.log(`cobro ${c.id}: pago ${pid} vinculado a mano por el usuario ${sesion.usuarioId}.`);
+    // La orden ya no se tiene que poder pagar: se intenta anular (si ya se pagó, Mercado Pago no deja y está bien).
+    if (c.orderId) await mp.cancelarOrden(c.orderId, `sya-cancelar-${c.id}`).catch(() => undefined);
+    await this.cerrarVenta(c.id, ['esperando']);
+    const [d] = await this.db.select().from(mpCobros).where(eq(mpCobros.id, c.id)).limit(1);
+    return this.vista(d);
   }
 
   /**
@@ -510,6 +662,16 @@ export class MercadoPagoController {
   @Post('cobros/:id/resolver') @Permiso('ventas')
   resolver(@Param('id', ParseIntPipe) id: number, @Body() body: { motivo?: string }, @Auth() sesion: Sesion) {
     return this.svc.resolverAMano(id, String(body?.motivo ?? ''), sesion);
+  }
+
+  /** «El cliente ya pagó»: los pagos aprobados por el monto que pueden ser de este cobro. */
+  @Get('cobros/:id/pagos') @Permiso('ventas')
+  pagosCandidatos(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.pagosCandidatos(id, sesion); }
+
+  /** Vincula uno de esos pagos (se verifica de nuevo en Mercado Pago) y cierra la venta. */
+  @Post('cobros/:id/vincular') @Permiso('ventas')
+  vincular(@Param('id', ParseIntPipe) id: number, @Body() body: { paymentId?: string }, @Auth() sesion: Sesion) {
+    return this.svc.vincularPago(id, String(body?.paymentId ?? ''), sesion);
   }
 
   @Post('cobros/:id/reintentar') @Permiso('ventas')

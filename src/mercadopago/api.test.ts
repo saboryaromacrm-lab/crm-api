@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { firmaValida, importeMp } from './api';
+import { firmaValida, importeMp, pagoDeOrden, pagoSirve } from './api';
 
 const SECRETO = 'clave-de-prueba';
 const firmar = (manifiesto: string, ts = '1742505638683') => `ts=${ts},v1=${createHmac('sha256', SECRETO).update(manifiesto).digest('hex')}`;
@@ -34,4 +34,25 @@ test('importe como lo pide la API de Orders', () => {
   assert.equal(importeMp(2917.8), '2917.80');
   assert.equal(importeMp(0.1 + 0.2), '0.30');
   assert.equal(importeMp(1234.565), '1234.57');
+});
+
+test('¿la orden está paga? (3/10/2026: el primer cobro real quedó esperando)', () => {
+  const pagos = (status: string, extra: any = {}) => ({ transactions: { payments: [{ id: 'PAY1', amount: '20920.00', status, ...extra }] } });
+  assert.deepEqual(pagoDeOrden({ status: 'processed', status_detail: 'accredited', ...pagos('processed') }, 20920), { pagado: true, paymentId: 'PAY1' });
+  assert.equal(pagoDeOrden({ status: 'at_terminal', status_detail: 'accredited', ...pagos('processed') }, 20920).pagado, true, 'accredited aunque el estado de arriba no diga processed');
+  assert.equal(pagoDeOrden({ status: 'created', ...pagos('processed', { status_detail: 'accredited', paid_amount: '20920.00' }) }, 20920).pagado, true, 'el pago acreditado cubre el monto');
+  assert.equal(pagoDeOrden({ status: 'created', ...pagos('approved') }, 20920).pagado, true, 'pago approved');
+  assert.equal(pagoDeOrden({ status: 'created', ...pagos('created') }, 20920).pagado, false, 'sin pagar');
+  assert.equal(pagoDeOrden({ status: 'created', ...pagos('processed', { paid_amount: '100.00' }) }, 20920).pagado, false, 'pagó menos: no');
+  assert.equal(pagoDeOrden({ status: 'refunded', status_detail: 'refunded', ...pagos('refunded') }, 20920).pagado, false, 'devuelto: no');
+  assert.equal(pagoDeOrden({ status: 'expired', ...pagos('expired') }, 20920).pagado, false, 'vencido: no');
+  assert.equal(pagoDeOrden(null, 20920).pagado, false);
+});
+
+test('un pago de la búsqueda sirve si está aprobado, por el monto y sin devolver', () => {
+  assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20920 }, 20920), true);
+  assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20920.004 }, 20920), true);
+  assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20919 }, 20920), false, 'otro monto');
+  assert.equal(pagoSirve({ status: 'pending', transaction_amount: 20920 }, 20920), false, 'pendiente');
+  assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20920, transaction_amount_refunded: 20920 }, 20920), false, 'devuelto');
 });

@@ -77,7 +77,42 @@ export const mp = {
   crearOrden: (cuerpo: unknown, idempotencia: string) => llamar('POST', '/v1/orders', cuerpo, idempotencia),
   orden: (id: string) => llamar('GET', `/v1/orders/${encodeURIComponent(id)}`),
   cancelarOrden: (id: string, idempotencia: string) => llamar('POST', `/v1/orders/${encodeURIComponent(id)}/cancel`, undefined, idempotencia),
+  /*
+   * LA SEGUNDA VÍA (3/10/2026): los PAGOS de la cuenta, no la orden. Si la
+   * orden no dice que se pagó (o no se puede consultar), se busca el pago por
+   * su referencia; y la caja puede buscar los pagos aprobados por el monto.
+   *   GET /v1/payments/search   ?external_reference / range+begin_date (NOW-xHOURS)
+   *   GET /v1/payments/{id}     un pago, para verificarlo antes de usarlo
+   */
+  buscarPagos: (filtros: Record<string, string>) => llamar<{ results?: any[] }>('GET', `/v1/payments/search?${new URLSearchParams(filtros).toString()}`),
+  pago: (id: string) => llamar('GET', `/v1/payments/${encodeURIComponent(id)}`),
 };
+
+/**
+ * ¿LA ORDEN ESTÁ PAGA? `processed` es lo que documenta Mercado Pago para un QR
+ * pagado; además se acepta `status_detail: accredited` o pagos acreditados que
+ * cubran el monto (por si el estado de arriba tarda o cambia de nombre).
+ * Devuelve el id del pago, o null si no está paga.
+ */
+export function pagoDeOrden(orden: any, monto: number): { pagado: boolean; paymentId: string } {
+  const estado = String(orden?.status ?? '').toLowerCase();
+  const detalle = String(orden?.status_detail ?? '').toLowerCase();
+  const pagos: any[] = Array.isArray(orden?.transactions?.payments) ? orden.transactions.payments : [];
+  const acreditados = pagos.filter((p) => /processed|approved|accredited/i.test(`${p?.status ?? ''} ${p?.status_detail ?? ''}`)
+    && !/refund/i.test(`${p?.status ?? ''} ${p?.status_detail ?? ''}`));
+  const sumaAcreditada = acreditados.reduce((a, p) => a + (Number(p?.paid_amount ?? p?.amount) || 0), 0);
+  const pago = acreditados[0] ?? pagos[0];
+  const pagado = !/refund|cancel|expired|failed/.test(estado)
+    && (estado === 'processed' || detalle === 'accredited' || (acreditados.length > 0 && sumaAcreditada + 0.01 >= monto));
+  return { pagado, paymentId: String(pago?.id ?? '') };
+}
+
+/** Un pago de la búsqueda, ¿sirve para un cobro de `monto`? Aprobado, por ese monto y sin devolver. */
+export function pagoSirve(p: any, monto: number): boolean {
+  return String(p?.status ?? '') === 'approved'
+    && Math.abs((Number(p?.transaction_amount) || 0) - monto) <= 0.01
+    && !(Number(p?.transaction_amount_refunded) > 0);
+}
 
 /** Importe como lo pide la API de Orders: texto con dos decimales ("1234.50"). */
 export const importeMp = (n: number) => (Math.round(Number(n) * 100) / 100).toFixed(2);
