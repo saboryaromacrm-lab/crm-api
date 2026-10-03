@@ -25,11 +25,11 @@ import {
   IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
-import { clientes, presupuestoItems, presupuestos, productos, stock } from '../db/schema';
+import { clientes, fraccionOperadores, presupuestoItems, presupuestos, productos, stock } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService, stockSinControl } from '../inventario/inventario.service';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -108,6 +108,11 @@ class AceptarOrdenDto {
 class CancelarDto {
   @IsOptional() @IsInt() usuarioId?: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+/** Confirmar: quién fracciona, si el pedido tiene paquetes que hay que armar (3/10/2026). */
+class ConfirmarDto {
+  @IsOptional() @IsInt() usuarioId?: number;
+  @IsOptional() @IsInt() operadorId?: number;
 }
 class DelegarDto {
   @IsOptional() @IsInt() vendedorId?: number | null;
@@ -339,7 +344,7 @@ export class PresupuestosService {
    * stock (disponible → comprometido) para que la caja no venda la mercadería
    * que el vendedor está apartando. Vencido no se confirma: se re-cotiza.
    */
-  async confirmar(id: number, usuarioId?: number, opciones: OpcionesPresupuesto = {}) {
+  async confirmar(id: number, usuarioId?: number, opciones: OpcionesPresupuesto = {}, operadorId?: number | null) {
     return this.db.transaction(async (tx) => {
       const [p] = await tx.select().from(presupuestos).where(eq(presupuestos.id, id)).limit(1);
       if (!p) throw new NotFoundException('Presupuesto inexistente.');
@@ -357,15 +362,23 @@ export class PresupuestosService {
         .where(and(eq(presupuestos.id, id), eq(presupuestos.estado, 'enviado')))
         .returning({ id: presupuestos.id });
       if (!gano.length) throw new BadRequestException('El presupuesto cambió de estado — actualizá la pantalla.');
+      let armados: string[] = [];
       if (reservar) {
         const items = await tx.select().from(presupuestoItems).where(eq(presupuestoItems.presupuestoId, id));
+        /* LOS PAQUETES QUE FALTAN SE ARMAN SOLOS (3/10/2026, decisión del dueño):
+         * si el pedido lleva paquetes de un granel y no están todos armados, se
+         * fraccionan con el granel ANTES de reservar, en esta misma transacción
+         * — si la reserva falla, el fraccionado se deshace con ella. */
+        armados = await this.inv.armarPaquetesParaPedido(tx, {
+          sucursalId: p.sucursalId, codigo: p.codigo, operadorId: operadorId ?? null, usuarioId: usuarioId ?? null, items,
+        });
         await this.inv.reservarItems(tx, {
           sucursalId: p.sucursalId, usuarioId: usuarioId ?? null,
           descripcion: `${p.codigo}: reserva por presupuesto confirmado`,
           items,
         });
       }
-      return { ok: true, reservado: reservar };
+      return { ok: true, reservado: reservar, armados };
     });
   }
 
@@ -434,12 +447,37 @@ export class PresupuestosService {
     const disponibleDe = (it: any) => st
       .filter((s) => s.productoId === it.productoId && (s.presentacionId ?? null) === (it.presentacionId ?? null))
       .reduce((a, s) => a + s.cantidad, 0);
+    /* LO QUE SE VA A FRACCIONAR AL CONFIRMAR (3/10/2026): los paquetes que no
+     * están armados y salen del granel. Un paquete «alcanza» si lo que falta se
+     * cubre armándolo; el granel que se usa para eso ya no está para un renglón
+     * del mismo producto a granel (la bolsa cerrada). */
+    const plan = await this.inv.planPaquetes(p.sucursalId, items);
+    const planDe = new Map<string, any>(plan.renglones.map((r: any) => [`${r.productoId}:${r.presentacionId}`, r]));
+    const kgUsadoDe = new Map<number, number>();
+    for (const r of plan.renglones) kgUsadoDe.set(r.productoId, (kgUsadoDe.get(r.productoId) ?? 0) + r.kg);
     return {
       ...p,
       items: items.map((it) => {
-        const disponible = money(disponibleDe(it));
-        return { ...it, disponible, alcanza: libresIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad };
+        let disponible = money(disponibleDe(it));
+        if (it.presentacionId == null) disponible = money(disponible - (kgUsadoDe.get(it.productoId) ?? 0));
+        const r = it.presentacionId != null ? planDe.get(`${it.productoId}:${it.presentacionId}`) : null;
+        const cubreArmando = !!r && r.sinCubrir <= 0;
+        return {
+          ...it, disponible, seArman: r?.armar ?? 0,
+          alcanza: libresIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad || cubreArmando,
+        };
       }),
+      /** Lo que «Confirmar» va a fraccionar (vacío = nada). */
+      fraccionar: plan.renglones.filter((r: any) => r.armar > 0)
+        .map((r: any) => ({ nombre: r.nombre, tam: r.tam, paquetes: r.armar, kg: r.kg })),
+      /* Quién puede fraccionar en esa sucursal, solo si hay algo para armar:
+       * el que confirma elige ahí mismo, aunque no tenga la pantalla de
+       * Fraccionamiento (la lista de operadores pide otro permiso). */
+      operadores: plan.renglones.some((r: any) => r.armar > 0)
+        ? await this.db.select({ id: fraccionOperadores.id, nombre: fraccionOperadores.nombre }).from(fraccionOperadores)
+          .where(and(eq(fraccionOperadores.activo, true), or(isNull(fraccionOperadores.sucursalId), eq(fraccionOperadores.sucursalId, p.sucursalId))))
+          .orderBy(asc(fraccionOperadores.nombre))
+        : [],
     };
   }
 
@@ -610,8 +648,8 @@ export class PresupuestosController {
   }
 
   @Post(':id/confirmar')
-  confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: CancelarDto, @Auth() sesion: Sesion) {
-    return this.svc.confirmar(id, dto?.usuarioId, this.opciones(sesion));
+  confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarDto, @Auth() sesion: Sesion) {
+    return this.svc.confirmar(id, dto?.usuarioId, this.opciones(sesion), dto?.operadorId ?? null);
   }
 
   @Post(':id/armar')

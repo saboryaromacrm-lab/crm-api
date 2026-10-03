@@ -108,7 +108,7 @@ const netoDe = (precioFinal: number, iva: number) => (Number(precioFinal) || 0) 
  * propia `presentacion`, y las de la madre solo si la oferta lo dice
  * (`incluyeFraccionados`).
  */
-function ofertaAlcanza(
+export function ofertaAlcanza(
   o: { alcances?: { tipo: string; refId: number }[]; incluyeFraccionados?: boolean; tipo?: string;
     componentes?: { productoId: number }[] },
   r: { productoId: number; presentacionId: number | null; marcaId: number | null;

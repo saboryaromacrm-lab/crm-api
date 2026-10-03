@@ -28,10 +28,11 @@ import type { Response } from 'express';
 import { and, eq, gte, isNull, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, subcategorias, clientes, etiquetas, marcas, movimientos, productoEtiquetas, productoListas,
+  categorias, subcategorias, clientes, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
-import { costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
+import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
+import { ofertaAlcanza } from '../ventas/ventas.module';
 import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -41,6 +42,10 @@ import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+/** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
+const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
+/** «500 g», «1 kg», «2,5 kg»: como se lee en la etiqueta. */
+const textoKg = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${String(r3(kg)).replace('.', ',')} kg`);
 
 /** Últimos N días para considerar un producto "recién reingresado" (stock de nuevo > 0). */
 const DIAS_REINGRESO = 14;
@@ -133,10 +138,20 @@ export class TiendaService {
     return cualquiera;
   }
 
+  /** El catálogo PÚBLICO del sitio: sin los datos internos de stock. */
   async catalogo() {
+    return (await this.armarCatalogo()).catalogo;
+  }
+
+  /**
+   * El catálogo y, aparte, el POZO de cada granel (granel suelto utilizable y
+   * paquetes armados), que solo usa el pedido para validar el stock entre
+   * opciones del mismo producto. El pozo no se publica.
+   */
+  private async armarCatalogo(): Promise<{ catalogo: any; pozos: Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number> }> }> {
     const suc = await this.sucursalTienda();
     const desdeReingreso = new Date(Date.now() - DIAS_REINGRESO * 86400000);
-    const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web, subs] = await Promise.all([
+    const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web, subs, press] = await Promise.all([
       /* El sitio no publica ARCHIVADOS, tengan precio mayorista o no: el estado
        * corta antes que el criterio de publicación. El discontinuado se sigue
        * ofreciendo mientras tenga stock — el `webStockMin` ya lo saca de la web
@@ -149,8 +164,11 @@ export class TiendaService {
       this.db.select({ id: marcas.id, nombre: marcas.nombre }).from(marcas),
       this.db.select({ id: categorias.id, nombre: categorias.nombre }).from(categorias),
       this.db.select({ id: etiquetas.id, nombre: etiquetas.nombre }).from(etiquetas),
+      /* TODO el disponible de la sucursal: el del producto (granel en kg,
+       * entero en unidades) y el de cada paquete fraccionado (3/10/2026: el
+       * sitio vende los paquetes del granel). */
       suc
-        ? this.db.select().from(stock).where(and(eq(stock.sucursalId, suc.id), eq(stock.estado, 'disponible'), isNull(stock.presentacionId)))
+        ? this.db.select().from(stock).where(and(eq(stock.sucursalId, suc.id), eq(stock.estado, 'disponible')))
         : Promise.resolve([] as any[]),
       this.listas.catalogo(),
       this.cfg.get('ventas'),
@@ -168,6 +186,8 @@ export class TiendaService {
       this.cfg.get('web'),
       // Las subcategorías (2/10/2026): el menú de Categorías del sitio las muestra debajo de cada una.
       this.db.select({ id: subcategorias.id, nombre: subcategorias.nombre, categoriaId: subcategorias.categoriaId }).from(subcategorias),
+      // Los paquetes fraccionados: el granel se vende por ellos (3/10/2026).
+      this.db.select({ id: presentaciones.id, productoId: presentaciones.productoId, tamKg: presentaciones.tamKg }).from(presentaciones),
     ]);
 
     /** URL de una imagen subida en el módulo Web ('' si no hay). `?v=` rompe el caché al re-subir. */
@@ -200,8 +220,18 @@ export class TiendaService {
       const arr = etiquetasDe.get(e.productoId);
       if (arr) arr.push(e.etiquetaId); else etiquetasDe.set(e.productoId, [e.etiquetaId]);
     }
-    const stockPorProd = new Map<number, number>();
-    for (const s of existencias) stockPorProd.set(s.productoId, (stockPorProd.get(s.productoId) ?? 0) + s.cantidad);
+    /** Disponible por (producto, paquete); paquete null = el producto (granel en kg, entero en unidades). */
+    const stockPorClave = new Map<string, number>();
+    for (const s of existencias) {
+      const k = `${s.productoId}:${s.presentacionId ?? ''}`;
+      stockPorClave.set(k, (stockPorClave.get(k) ?? 0) + s.cantidad);
+    }
+    const stockDe = (productoId: number, presentacionId: number | null) => stockPorClave.get(`${productoId}:${presentacionId ?? ''}`) ?? 0;
+    const presPorProducto = new Map<number, any[]>();
+    for (const pr of press) {
+      const arr = presPorProducto.get(pr.productoId);
+      if (arr) arr.push(pr); else presPorProducto.set(pr.productoId, [pr]);
+    }
 
     const activas = (cat.listas ?? []).filter((l: any) => l.activa);
     const listaTienda = activas.find((l: any) => l.modalidadId === cfg.modalidadMontoId)
@@ -240,7 +270,7 @@ export class TiendaService {
       categorias: [], marcas: [], etiquetas: [], reglasMarca: [], items: [],
       sitio,
     };
-    if (!listaTienda) return vacio;
+    if (!listaTienda) return { catalogo: vacio, pozos: new Map() };
 
     /*
      * PRE-ÍNDICE de las tablas hijas, un solo pase cada una. Sin esto, adentro
@@ -252,9 +282,14 @@ export class TiendaService {
      * producto en la lista de la tienda, pero por las dudas).
      */
     const filaTiendaPorProducto = new Map<number, any>();
+    /** La fila de la lista de la tienda de cada PAQUETE (3/10/2026): el granel se vende por ellos. */
+    const filaTiendaPorPres = new Map<number, any>();
     for (const f of filas) {
-      if (f.presentacionId == null && f.listaId === listaTienda.id && !filaTiendaPorProducto.has(f.productoId)) {
-        filaTiendaPorProducto.set(f.productoId, f);
+      if (f.listaId !== listaTienda.id) continue;
+      if (f.presentacionId == null) {
+        if (!filaTiendaPorProducto.has(f.productoId)) filaTiendaPorProducto.set(f.productoId, f);
+      } else if (!filaTiendaPorPres.has(f.presentacionId)) {
+        filaTiendaPorPres.set(f.presentacionId, f);
       }
     }
     const provsPorProducto = new Map<number, any[]>();
@@ -264,78 +299,50 @@ export class TiendaService {
     }
 
     const items: any[] = [];
+    /**
+     * EL POZO DE CADA GRANEL (uso interno del pedido, no viaja al sitio): el
+     * granel suelto que el sitio puede usar y los paquetes ya armados de cada
+     * tamaño. El pedido lo usa para que dos opciones del mismo producto (la
+     * bolsa y los paquetes) no se vendan dos veces los mismos kilos.
+     */
+    const pozos = new Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number> }>();
     for (const p of prods) {
-      /*
-       * REGLA DE PUBLICACIÓN (módulo Web): está en el sitio el producto que
-       * tiene precio cargado en la lista Mayorista — ni flag manual ni
-       * fallback a otra lista. Publicar = cargarle el precio mayorista;
-       * sacarlo del sitio = quitárselo.
-       */
-      /* La fila del producto SUELTO: el sitio todavía publica la madre, no sus
-       * paquetes (el stock que mira ya es el del granel). Sin el filtro de
-       * presentación podría tomar la fila de un paquete de 250 g y publicar ESE
-       * precio como si fuera el del kilo. */
-      const filaTienda = filaTiendaPorProducto.get(p.id);
-      if (!filaTienda) continue;
-
       // La BASE del precio (0072): el sitio publica el mismo precio que el POS.
       const costoNeto = costoPrecioEntry(formatoDeCosto(p, provsPorProducto.get(p.id) ?? []) as any, p.iva);
-      const pv = precioVentaFila(costoNeto, filaTienda, { iva: p.iva, redondeo: p.redondeo ?? cfg.redondeoPrecio });
+      const opts = { iva: p.iva, redondeo: p.redondeo ?? cfg.redondeoPrecio };
       /*
-       * Sin precio real no hay publicación: una fila mayorista con el costo a
-       * medio cargar daría $0 — y el pedido se recotizaría a $0. Mejor que el
-       * producto no aparezca hasta que el precio esté bien.
+       * Sin control de stock (el propio del producto, 0129, o la llave de su
+       * tipo): se ofrece siempre y sin tope (`disponible: null`), como en la caja.
        */
-      if (!(pv.finalUnitario > 0)) continue;
-
-      const stockDisp = stockPorProd.get(p.id) ?? 0;
-      /*
-       * Piso de stock online (`webStockMin`): al llegar a ese número, lo que
-       * queda se prioriza para fraccionar / venta minorista y el sitio pasa a
-       * "Sin stock". 0 = se vende online hasta la última unidad.
-       */
-      /*
-       * Lo que el sitio PUEDE vender de este producto: el disponible menos el
-       * piso reservado para el mostrador. Viaja como número (no solo el sí/no)
-       * para que el carrito pueda topear la cantidad y avisar "es todo lo que
-       * hay" en vez de dejar pedir 50 kg de algo que tiene 3.
-       *
-       * Es el único dato de stock que el sitio conoce, y solo se muestra al
-       * llegar al tope: no es un cartel de "quedan pocos".
-       */
-      /*
-       * GRANEL SIN CONTROL DE STOCK (1/10/2026, pedido del dueño: "que la web
-       * siga la misma regla"). Con `controlStockGranel` apagado el granel se
-       * ofrece siempre y sin tope (`disponible: null`), igual que en la caja.
-       */
-      const sinTope = stockSinControl(cfg, p);   // el control propio del producto (0129) o la llave de su tipo
-      const disponibleParaWeb = sinTope ? null : Math.max(0, Math.round((stockDisp - (p.webStockMin || 0)) * 1000) / 1000);
-      const disponibleWeb = sinTope || (disponibleParaWeb ?? 0) > 1e-9;
+      const sinTope = stockSinControl(cfg, p);
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];
-
-      /* Una promo por producto: la de mayor beneficio entre las que alcanzan
-       * (misma regla que el POS). El alcance `presentacion` no entra: el sitio
-       * publica el producto SUELTO, no sus paquetes — una oferta apuntada a un
-       * paquete de 250 g no puede bajarle el precio al kilo. */
-      const matches = ofertasWeb.filter((o: any) => (o.alcances ?? []).some((a: any) => {
-        if (a.tipo === 'producto') return a.refId === p.id;
-        if (a.tipo === 'marca') return a.refId === p.marcaId;
-        if (a.tipo === 'categoria') return a.refId === p.categoriaId;
-        if (a.tipo === 'etiqueta') return etiquetasIds.includes(a.refId);
-        return false;
-      }));
-      let mejorOferta: any = null;
-      let mejorPrecio: number | null = null;
-      for (const o of matches) {
-        const pOferta = precioConOferta(o, pv.finalUnitario);
-        if (pOferta != null && (mejorPrecio == null || pOferta < mejorPrecio)) {
-          mejorOferta = o; mejorPrecio = pOferta;
-        } else if (pOferta == null && !mejorOferta) {
-          mejorOferta = o; // nxm / segunda_unidad / pack: sin precio unitario, pero se avisa igual.
+      /**
+       * Una promo por opción: la de mayor beneficio entre las que alcanzan, con
+       * la MISMA regla de alcance que la caja (`ofertaAlcanza`): a un paquete
+       * lo alcanza una oferta de ESE paquete, y las de su producto, marca,
+       * categoría o etiqueta solo si la oferta incluye los fraccionados.
+       * `precioUnidad` es el precio de UNA unidad del producto (el kilo de la
+       * bolsa, un paquete) y `por` cuántas lleva la opción: el precio con la
+       * promo es el de la unidad × `por`, igual que lo cobraría la caja.
+       */
+      const ofertaDe = (presentacionId: number | null, precioUnidad: number, por: number) => {
+        const r = { productoId: p.id, presentacionId, marcaId: p.marcaId, categoriaId: p.categoriaId, etiquetas: etiquetasIds };
+        let mejor: any = null;
+        let mejorPrecio: number | null = null;
+        for (const o of ofertasWeb) {
+          if (!ofertaAlcanza(o, r)) continue;
+          const pOferta = precioConOferta(o, precioUnidad);
+          if (pOferta != null && (mejorPrecio == null || pOferta < mejorPrecio)) {
+            mejor = o; mejorPrecio = pOferta;
+          } else if (pOferta == null && !mejor) {
+            mejor = o; // nxm / segunda_unidad / pack: sin precio unitario, pero se avisa igual.
+          }
         }
-      }
-
-      items.push({
+        return mejor
+          ? { id: mejor.id, nombre: mejor.nombre, tipo: mejor.tipo, badge: describirOferta(mejor), precioOferta: mejorPrecio != null ? money(mejorPrecio * por) : null }
+          : null;
+      };
+      const base = {
         id: p.id,
         nombre: p.nombre,
         marcaId: p.marcaId,
@@ -353,21 +360,115 @@ export class TiendaService {
           .map((id) => ({ id, nombre: nombreEtiqueta.get(id) ?? '' }))
           .filter((e) => e.nombre),
         tipo: p.tipo,
-        unidad: p.tipo === 'granel' ? 'kg' : 'u',
         iva: p.iva,
-        precio: pv.finalUnitario,
-        /** Mínimo de compra PROPIO del producto (0 = sin mínimo). */
-        unidadesMinimas: filaTienda.unidadesMinimas || 0,
-        enStock: disponibleWeb,
-        /** Cuánto puede vender el sitio (ya descontado el piso del mostrador). `null` = sin tope (granel sin control). */
-        disponible: disponibleParaWeb,
         // La imagen subida en el módulo Web manda; la URL externa es el plan B.
         imagenUrl: urlImagen('producto', p.id) || p.imagenUrl || '',
         destacado: !!p.destacado,
-        oferta: mejorOferta
-          ? { id: mejorOferta.id, nombre: mejorOferta.nombre, tipo: mejorOferta.tipo, badge: describirOferta(mejorOferta), precioOferta: mejorPrecio }
-          : null,
-        reingreso: disponibleWeb && reingresados.has(p.id),
+      };
+
+      if (p.tipo !== 'granel') {
+        /*
+         * REGLA DE PUBLICACIÓN DEL ENTERO (módulo Web): está en el sitio si
+         * tiene precio cargado en la lista Mayorista — ni flag manual ni
+         * fallback a otra lista. Publicar = cargarle el precio mayorista.
+         */
+        const filaTienda = filaTiendaPorProducto.get(p.id);
+        if (!filaTienda) continue;
+        const pv = precioVentaFila(costoNeto, filaTienda, opts);
+        // Sin precio real no hay publicación: el pedido se recotizaría a $0.
+        if (!(pv.finalUnitario > 0)) continue;
+        /* Lo que el sitio PUEDE vender: el disponible menos el piso reservado
+         * para el mostrador (`webStockMin`). Es el tope del carrito. */
+        const disponibleParaWeb = sinTope ? null : Math.max(0, r3(stockDe(p.id, null) - (p.webStockMin || 0)));
+        const disponibleWeb = sinTope || (disponibleParaWeb ?? 0) > 1e-9;
+        items.push({
+          ...base,
+          unidad: 'u',
+          precio: pv.finalUnitario,
+          /** Mínimo de compra PROPIO del producto (0 = sin mínimo). */
+          unidadesMinimas: filaTienda.unidadesMinimas || 0,
+          enStock: disponibleWeb,
+          disponible: disponibleParaWeb,
+          oferta: ofertaDe(null, pv.finalUnitario, 1),
+          reingreso: disponibleWeb && reingresados.has(p.id),
+        });
+        continue;
+      }
+
+      /*
+       * EL GRANEL SE VENDE POR OPCIONES (3/10/2026, pedido del dueño). Ningún
+       * granel se vende suelto: el sitio ofrece, en un selector,
+       *   · cada PAQUETE fraccionado que tenga su fila en la lista Mayorista;
+       *   · la BOLSA CERRADA del producto madre, si el madre tiene su fila en
+       *     la lista Mayorista: «Bolsa de N kg», con N = las unidades de ese
+       *     formato, y se compra de a bolsas enteras. No la del que es «solo
+       *     para fraccionar» (la caja no lo vende y el pedido no se podría cerrar).
+       * Sin ninguna opción con precio, el producto no se publica.
+       *
+       * STOCK: un paquete está disponible si hay paquetes armados O granel para
+       * armarlo (al confirmar el pedido el ERP fracciona lo que falte). La
+       * bolsa sale del granel. El piso del mostrador (`webStockMin`) se
+       * descuenta del granel.
+       */
+      const granelKg = Math.max(0, r3(stockDe(p.id, null) - (p.webStockMin || 0)));
+      const armados = new Map<number, number>();
+      const variantes: any[] = [];
+      const filaMadre = filaTiendaPorProducto.get(p.id);
+      if (filaMadre && !p.soloFraccionar) {
+        const pv = precioVentaFila(costoNeto, filaMadre, opts);
+        const kgBolsa = r3(Number(filaMadre.unidades) || 1);
+        if (pv.finalUnitario > 0 && kgBolsa > 0) {
+          const disponible = sinTope ? null : Math.floor(granelKg / kgBolsa + 1e-9);
+          variantes.push({
+            clave: 'p', presentacionId: null, etiqueta: `Bolsa de ${textoKg(kgBolsa)}`, kgPorUnidad: kgBolsa,
+            /** Lo que se cobra por bolsa, y el kilo de referencia. */
+            precio: pv.finalFormato, precioKg: pv.finalUnitario,
+            /** El mínimo del formato viene en kilos: en bolsas, redondeado para arriba. */
+            unidadesMinimas: (Number(filaMadre.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(filaMadre.unidadesMinimas) / kgBolsa - 1e-9) : 0,
+            enStock: sinTope || (disponible ?? 0) >= 1,
+            disponible,
+            oferta: ofertaDe(null, pv.finalUnitario, kgBolsa),
+          });
+        }
+      }
+      for (const pres of presPorProducto.get(p.id) ?? []) {
+        const fila = filaTiendaPorPres.get(pres.id);
+        if (!fila || !(pres.tamKg > 0)) continue;
+        const pv = precioVentaFila(costoNetoPresentacion(costoNeto, pres.tamKg, p.merma), fila, opts);
+        if (!(pv.finalUnitario > 0)) continue;
+        const porCaja = Math.max(1, Math.round(Number(fila.unidades) || 1));
+        const hay = Math.max(0, stockDe(p.id, pres.id));
+        armados.set(pres.id, hay);
+        const paquetes = hay + Math.floor(granelKg / pres.tamKg + 1e-9);
+        const disponible = sinTope ? null : Math.floor(paquetes / porCaja + 1e-9);
+        const tam = textoKg(pres.tamKg);
+        variantes.push({
+          clave: `s${pres.id}`, presentacionId: pres.id, etiqueta: porCaja > 1 ? `Caja de ${porCaja} × ${tam}` : tam,
+          kgPorUnidad: r3(pres.tamKg * porCaja), paquetesPorUnidad: porCaja,
+          precio: pv.finalFormato, precioKg: money(pv.finalFormato / (pres.tamKg * porCaja)),
+          unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0,
+          enStock: sinTope || (disponible ?? 0) >= 1,
+          disponible,
+          oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja),
+        });
+      }
+      if (!variantes.length) continue;
+      variantes.sort((a, b) => a.kgPorUnidad - b.kgPorUnidad);
+      pozos.set(p.id, { sinTope, granelKg, armados });
+      // Lo de la tarjeta, por defecto: la primera opción CON stock (o la primera).
+      const v0 = variantes.find((v) => v.enStock) ?? variantes[0];
+      const enStock = variantes.some((v) => v.enStock);
+      items.push({
+        ...base,
+        unidad: 'u',
+        precio: v0.precio,
+        unidadesMinimas: v0.unidadesMinimas,
+        enStock,
+        disponible: v0.disponible,
+        oferta: v0.oferta,
+        reingreso: enStock && reingresados.has(p.id),
+        /** Las opciones del selector (3/10/2026): bolsa del madre y paquetes con lista mayorista. */
+        variantes,
       });
     }
 
@@ -387,7 +488,7 @@ export class TiendaService {
     }
     const porNombre = (a: any, b: any) => a.nombre.localeCompare(b.nombre, 'es');
 
-    return {
+    const publico = {
       sucursalId: suc?.id ?? null,
       listaId: listaTienda.id,
       listaNombre: listaTienda.nombre,
@@ -410,6 +511,7 @@ export class TiendaService {
       items,
       sitio,
     };
+    return { catalogo: publico, pozos };
   }
 
   /**
@@ -481,61 +583,112 @@ export class TiendaService {
       throw new BadRequestException(`Un pedido no puede tener más de ${MAX_RENGLONES_PEDIDO} renglones.`);
     }
 
-    const cat = await this.catalogo();
+    const { catalogo: cat, pozos } = await this.armarCatalogo();
     const porId = new Map<number, any>(cat.items.map((i: any): [number, any] => [i.id, i]));
 
     /*
-     * Se AGRUPA por producto: el mismo producto repetido en dos renglones es un
-     * solo renglón con la suma. Sin esto, el tope de stock de más abajo se
-     * esquiva partiendo el pedido en pedacitos que por separado entran.
+     * Se AGRUPA por producto Y OPCIÓN: el mismo artículo repetido en dos
+     * renglones es un solo renglón con la suma. Sin esto, el tope de stock de
+     * más abajo se esquiva partiendo el pedido en pedacitos que por separado
+     * entran.
+     *
+     * UN GRANEL SE PIDE POR OPCIÓN (3/10/2026): `variante` dice cuál —la bolsa
+     * del madre o un paquete—. Un renglón de granel sin opción válida es un
+     * carrito viejo (de cuando el granel se pedía en kilos): se rechaza con el
+     * nombre, para no interpretar kilos como bolsas.
      *
      * `Number.isFinite` y no `|| 0`: `Number('1e999')` es Infinity, es truthy,
-     * pasa `cantidad > 0` y Postgres lo GUARDA en `double precision` — desde
-     * ahí contamina el total del pedido y el ranking de las estadísticas.
+     * pasa `cantidad > 0` y Postgres lo GUARDA en `double precision`.
      */
-    const porProducto = new Map<number, { prod: any; cantidad: number }>();
+    type Renglon = { prod: any; v: any | null; cantidad: number };
+    const porClave = new Map<string, Renglon>();
+    const viejos: string[] = [];
     for (const linea of carritoIn) {
       const prod = porId.get(Number(linea?.productoId));
       const cantidad = Number(linea?.cantidad);
       if (!prod || !Number.isFinite(cantidad) || cantidad <= 0) continue;
-      const acc = porProducto.get(prod.id);
+      let v: any = null;
+      if (prod.variantes) {
+        v = prod.variantes.find((x: any) => x.clave === String(linea?.variante ?? ''));
+        if (!v) { viejos.push(prod.nombre); continue; }
+      }
+      const k = `${prod.id}:${v?.clave ?? ''}`;
+      const acc = porClave.get(k);
       if (acc) acc.cantidad += cantidad;
-      else porProducto.set(prod.id, { prod, cantidad });
+      else porClave.set(k, { prod, v, cantidad });
     }
-    const resueltos = [...porProducto.values()];
-    if (!resueltos.length) throw new BadRequestException('Ningún producto del pedido está disponible.');
-
-    /*
-     * EL STOCK LO DECIDE EL SERVIDOR. El carrito del sitio ya topea la cantidad
-     * (`cart.tsx`), pero eso es una comodidad del navegador: acá se vuelve a
-     * mirar contra el mismo `disponible` que publica el catálogo (el stock de
-     * la Distribuidora menos el piso reservado para el mostrador). También
-     * cubre el caso honesto: el pedido que quedó abierto media hora mientras
-     * otro se llevaba lo último.
-     */
-    const agotados = resueltos.filter((r) => !r.prod.enStock);
-    if (agotados.length) {
+    if (viejos.length) {
       throw new BadRequestException(
-        `Se quedó sin stock: ${agotados.map((r) => r.prod.nombre).join(', ')}. `
-        + 'Sacalo del carrito y volvé a intentar.',
+        `Cambió la forma de vender ${[...new Set(viejos)].join(', ')}: ahora se elige el tamaño. `
+        + 'Sacalo del carrito y volvé a agregarlo.',
       );
     }
-    const excedidos = resueltos.filter((r) => r.prod.disponible != null && r.cantidad > r.prod.disponible);
+    const resueltos = [...porClave.values()];
+    if (!resueltos.length) throw new BadRequestException('Ningún producto del pedido está disponible.');
+    const nombreDe = (r: Renglon) => (r.v ? `${r.prod.nombre} (${r.v.etiqueta})` : r.prod.nombre);
+    /** Lo que vale una unidad de compra (la bolsa, el paquete o la caja, o la unidad del entero). */
+    const de = (r: Renglon) => r.v ?? r.prod;
+
+    // Bolsas, paquetes y unidades se piden ENTEROS: media bolsa cerrada no existe.
+    const fraccionados = resueltos.filter((r) => Math.abs(r.cantidad - Math.round(r.cantidad)) > 1e-9);
+    if (fraccionados.length) {
+      throw new BadRequestException(`Se piden unidades enteras: ${fraccionados.map(nombreDe).join(', ')}.`);
+    }
+
+    /*
+     * EL STOCK LO DECIDE EL SERVIDOR. El carrito ya topea la cantidad, pero
+     * eso es una comodidad del navegador: acá se vuelve a mirar contra el mismo
+     * `disponible` que publica el catálogo. También cubre el caso honesto: el
+     * pedido que quedó abierto media hora mientras otro se llevaba lo último.
+     */
+    const agotados = resueltos.filter((r) => !de(r).enStock);
+    if (agotados.length) {
+      throw new BadRequestException(`Se quedó sin stock: ${agotados.map(nombreDe).join(', ')}. Sacalo del carrito y volvé a intentar.`);
+    }
+    const excedidos = resueltos.filter((r) => de(r).disponible != null && r.cantidad > de(r).disponible + 1e-9);
     if (excedidos.length) {
       throw new BadRequestException(
         'No tenemos esa cantidad: '
-        + excedidos.map((r) => `${r.prod.nombre} (quedan ${r.prod.disponible} ${r.prod.unidad})`).join(', ')
+        + excedidos.map((r) => `${nombreDe(r)} (quedan ${de(r).disponible})`).join(', ')
         + '. Ajustá el carrito y volvé a intentar.',
       );
     }
+    /*
+     * LAS OPCIONES DE UN GRANEL COMPARTEN EL GRANEL: la bolsa sale del granel y
+     * los paquetes que no están armados también. Cada opción por separado ya
+     * se topeó; acá se suma lo que el pedido entero le saca al granel.
+     */
+    const porProducto = new Map<number, Renglon[]>();
+    for (const r of resueltos) {
+      if (!r.v) continue;
+      const arr = porProducto.get(r.prod.id);
+      if (arr) arr.push(r); else porProducto.set(r.prod.id, [r]);
+    }
+    for (const [productoId, rs] of porProducto) {
+      const pozo = pozos.get(productoId);
+      if (!pozo || pozo.sinTope) continue;
+      let kg = 0;
+      for (const r of rs) {
+        if (r.v.presentacionId == null) { kg += r.cantidad * r.v.kgPorUnidad; continue; }
+        const paquetes = r.cantidad * (r.v.paquetesPorUnidad || 1);
+        const faltan = Math.max(0, paquetes - (pozo.armados.get(r.v.presentacionId) ?? 0));
+        kg += faltan * (r.v.kgPorUnidad / (r.v.paquetesPorUnidad || 1));
+      }
+      if (r3(kg) > pozo.granelKg + 1e-9) {
+        throw new BadRequestException(
+          `No tenemos tanto de ${rs[0].prod.nombre} entre todos los tamaños que elegiste. Bajá alguna cantidad y volvé a intentar.`,
+        );
+      }
+    }
 
-    // Precio EFECTIVO: si hay una promo con precio unitario propio (porcentaje / precio_fijo),
+    // Precio EFECTIVO: si hay una promo con precio propio (porcentaje / precio_fijo),
     // el pedido se cotiza con ese precio — el cliente vio ese número, se le cobra ese número.
-    const precioEfectivo = (prod: any) => prod.oferta?.precioOferta ?? prod.precio;
-    const total = resueltos.reduce((a, r) => a + r.cantidad * precioEfectivo(r.prod), 0);
+    const precioEfectivo = (r: Renglon) => de(r).oferta?.precioOferta ?? de(r).precio;
+    const total = resueltos.reduce((a, r) => a + r.cantidad * precioEfectivo(r), 0);
 
     // Gate de compra mínima: por MONTO o por CANTIDAD (marca / producto) — no
     // cambia el precio, solo habilita finalizar el pedido (igual que el sitio real).
+    // Las cantidades se cuentan en unidades de compra: bolsas, paquetes, cajas o unidades.
     const montoOk = cat.montoMinimo > 0 ? total >= cat.montoMinimo : true;
     const porMarca = new Map<number, number>();
     for (const r of resueltos) {
@@ -546,14 +699,14 @@ export class TiendaService {
       const enCarrito = porMarca.get(rm.marcaId);
       return enCarrito != null && enCarrito < rm.unidadesMinimas;
     });
-    const productosIncumplidos = resueltos.filter((r) => r.prod.unidadesMinimas > 0 && r.cantidad < r.prod.unidadesMinimas);
+    const productosIncumplidos = resueltos.filter((r) => de(r).unidadesMinimas > 0 && r.cantidad < de(r).unidadesMinimas);
     const cantidadOk = marcasIncumplidas.length === 0 && productosIncumplidos.length === 0;
 
     if (!montoOk && !cantidadOk) {
       const partes: string[] = [];
       if (cat.montoMinimo > 0) partes.push(`llegar a $${cat.montoMinimo} en total`);
       for (const rm of marcasIncumplidas) partes.push(`${rm.unidadesMinimas} unidades surtidas de ${rm.marca}`);
-      for (const r of productosIncumplidos) partes.push(`${r.prod.unidadesMinimas} unidades de ${r.prod.nombre}`);
+      for (const r of productosIncumplidos) partes.push(`${de(r).unidadesMinimas} de ${nombreDe(r)}`);
       throw new BadRequestException(`Para completar el pedido, alcanzá alguna de estas condiciones: ${partes.join(' — o — ')}.`);
     }
 
@@ -578,20 +731,28 @@ export class TiendaService {
     const [existente] = await this.db.select().from(clientes)
       .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni))).limit(1);
 
+    /*
+     * EL RENGLÓN DEL PEDIDO, EN LA UNIDAD DEL STOCK: la bolsa viaja en KILOS
+     * (2 bolsas de 10 kg = 20 kg del producto, a precio por kilo) y el paquete
+     * en PAQUETES (una caja de 6 = 6 paquetes, a precio por paquete). Así la
+     * reserva, el fraccionado al confirmar y el cierre en la caja trabajan con
+     * lo que ya conocen. El presupuesto guarda el NETO por unidad y el
+     * descuento como PORCENTAJE (una oferta 'porcentaje' queda auditada como tal).
+     */
     const items = resueltos.map((r) => {
       const iva = r.prod.iva ?? 21;
-      // El presupuesto guarda el NETO unitario (misma convención que el resto del sistema)
-      // y el descuento como PORCENTAJE — así una oferta 'porcentaje' queda auditada como
-      // tal en vez de disfrazada de precio de lista distinto.
-      const esPorcentaje = r.prod.oferta?.tipo === 'porcentaje' && r.prod.oferta.precioOferta != null;
-      const precioBase = esPorcentaje ? r.prod.precio : precioEfectivo(r.prod);
-      const descuento = esPorcentaje ? money(100 * (1 - r.prod.oferta.precioOferta / r.prod.precio)) : 0;
+      const x = de(r);
+      const unidadesStock = r.v ? (r.v.presentacionId == null ? r.v.kgPorUnidad : (r.v.paquetesPorUnidad || 1)) : 1;
+      const esPorcentaje = x.oferta?.tipo === 'porcentaje' && x.oferta.precioOferta != null;
+      const precioCompra = esPorcentaje ? x.precio : precioEfectivo(r);
+      const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio)) : 0;
       return {
-        productoId: r.prod.id, presentacionId: null,
-        nombre: r.prod.nombre, detalle: r.prod.unidad === 'kg' ? 'Suelto (por kg)' : 'Unidad',
-        cantidad: r.cantidad,
-        precioLista: money(precioBase / (1 + iva / 100)),
-        descuento, iva, lista: cat.listaNombre, ofertaNombre: r.prod.oferta?.nombre ?? '',
+        productoId: r.prod.id, presentacionId: r.v?.presentacionId ?? null,
+        nombre: r.prod.nombre,
+        detalle: r.v ? r.v.etiqueta : 'Unidad',
+        cantidad: r3(r.cantidad * unidadesStock),
+        precioLista: money(precioCompra / unidadesStock / (1 + iva / 100)),
+        descuento, iva, lista: cat.listaNombre, listaId: cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
       };
     });
 
