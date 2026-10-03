@@ -300,6 +300,23 @@ export class TiendaService {
       .sort((a: any, b: any) => (a.id === listaTienda.id ? -1 : b.id === listaTienda.id ? 1 : 0)
         || (a.orden ?? 0) - (b.orden ?? 0) || (a.numero ?? 0) - (b.numero ?? 0) || a.id - b.id);
     const rangoLista = new Map<number, number>(listasGranel.map((l: any, i: number): [number, number] => [l.id, i]));
+    /*
+     * EL PRECIO MINORISTA, PARA DECIR CUÁNTO SE AHORRA (3/10/2026, pedido del
+     * dueño): la lista base de la caja —el precio de mostrador—, la misma regla
+     * que el catálogo del POS. Solo si es de otra modalidad que la tienda (si la
+     * base fuera la mayorista, no hay contra qué comparar).
+     */
+    const listaMinorista = activas.find((l: any) => l.id === cfg.listaBaseId) ?? activas[0] ?? null;
+    const comparaMinorista = !!listaMinorista && listaMinorista.modalidadId !== listaTienda.modalidadId;
+    const filaMinoristaProducto = new Map<number, any>();
+    const filaMinoristaPres = new Map<number, any>();
+    if (comparaMinorista) {
+      for (const f of filas) {
+        if (f.listaId !== listaMinorista.id) continue;
+        if (f.presentacionId == null) filaMinoristaProducto.set(f.productoId, f);
+        else filaMinoristaPres.set(f.presentacionId, f);
+      }
+    }
     type FilaLista = { fila: any; lista: { id: number; nombre: string } };
     const filasGranelProducto = new Map<number, FilaLista[]>();
     /** Las filas de cada PAQUETE (3/10/2026): el granel se vende por ellos. */
@@ -517,6 +534,33 @@ export class TiendaService {
         variantes.push(...delTamano);
       }
       if (!variantes.length) continue;
+      /*
+       * CUÁNTO SE AHORRA FRENTE AL MINORISTA: el kilo MÁS BARATO al que se
+       * puede comprar al por menor este producto (el madre o cualquiera de sus
+       * paquetes en la lista minorista) contra el kilo de cada opción, con la
+       * promo si tiene. El más barato a propósito: el ahorro que se anuncia
+       * nunca está inflado.
+       */
+      let kgMinorista = Infinity;
+      if (comparaMinorista) {
+        const fm = filaMinoristaProducto.get(p.id);
+        if (fm) {
+          const pv = precioVentaFila(costoNeto, fm, opts);
+          if (pv.finalUnitario > 0) kgMinorista = Math.min(kgMinorista, pv.finalUnitario);
+        }
+        for (const pres of presPorProducto.get(p.id) ?? []) {
+          const fp = filaMinoristaPres.get(pres.id);
+          if (!fp || !(pres.tamKg > 0)) continue;
+          const pv = precioVentaFila(costoNetoPresentacion(costoNeto, pres.tamKg, p.merma), fp, opts);
+          if (pv.finalUnitario > 0) kgMinorista = Math.min(kgMinorista, pv.finalUnitario / pres.tamKg);
+        }
+      }
+      for (const v of variantes) {
+        const kg = (v.oferta?.precioOferta ?? v.precio) / v.kgPorUnidad;
+        v.ahorroMinorista = Number.isFinite(kgMinorista) && kgMinorista > kg * 1.005
+          ? { pct: Math.round(100 * (1 - kg / kgMinorista)), precioKg: money(kgMinorista), pesos: money((kgMinorista - kg) * v.kgPorUnidad) }
+          : null;
+      }
       /* Por tamaño (el kilo de su forma más chica) y, adentro, de la forma más chica a la caja más grande. */
       const kgGrupo = new Map<string, number>();
       for (const v of variantes) {
