@@ -48,6 +48,12 @@ class AbrirCajaDto {
 /** El cierre del cajero (0111): el cajón contado billete por billete, confirmado dos veces. */
 class EnviarCierreDto {
   @IsObject() billetes!: Record<string, number>;
+  /**
+   * Los billetes que van en el SOBRE (0130). Salen de los contados; lo que
+   * queda en la caja es la resta. Sin esto (una pantalla vieja), el servidor
+   * separa solo con `proponerSeparacion`.
+   */
+  @IsOptional() @IsObject() billetesEnvio?: Record<string, number>;
   /** La segunda confirmación de la pantalla, también exigida acá. */
   @IsBoolean() confirmado!: boolean;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -81,6 +87,62 @@ export function totalDeBilletes(billetes: Record<string, unknown> | null | undef
   }
   return { billetes: limpio, total };
 }
+
+/**
+ * QUÉ BILLETES QUEDAN EN LA CAJA Y CUÁLES VAN AL SOBRE (0130, pedido del dueño).
+ *
+ * De lo contado, se apartan billetes que sumen EXACTO lo que tiene que quedar
+ * (el fondo); si con esos billetes no se puede exacto, lo más cerca POR ARRIBA
+ * (queda un poco más, nunca menos). Entre las formas de llegar, la que deja
+ * los billetes MÁS CHICOS en la caja: son los del cambio del turno siguiente.
+ * El resto va al sobre. Contó menos que el fondo: queda todo, sobre vacío.
+ *
+ * Cuenta en unidades de $10 (todos los billetes son múltiplos). Es la misma
+ * regla que la pantalla (`separarEnvio` del POS), duplicada porque son
+ * proyectos separados.
+ */
+export function proponerSeparacion(billetes: Record<string, number>, objetivoQueda: number) {
+  const den = [...DENOMINACIONES].sort((a, b) => b - a);
+  const cant = den.map((d) => Math.max(0, Math.floor(Number(billetes[String(d)]) || 0)));
+  const total = den.reduce((a, d, i) => a + d * cant[i], 0);
+  const objetivo = Math.max(0, Math.min(total, objetivoQueda));
+  const todos = () => ({ queda: { ...soloPositivos(den, cant) }, envio: {} as Record<string, number> });
+  if (objetivo >= total - 0.009) return todos();
+  const U = 10;
+  const meta = Math.ceil(objetivo / U - 1e-9);
+  const tope = Math.min(Math.round(total / U), meta + 2000);
+  /* alcanza[i][v]: se puede armar v con los billetes de i en adelante (los más chicos). */
+  const alcanza: Uint8Array[] = new Array(den.length + 1);
+  alcanza[den.length] = new Uint8Array(tope + 1); alcanza[den.length][0] = 1;
+  for (let i = den.length - 1; i >= 0; i--) {
+    const paso = den[i] / U; const c = cant[i]; const prev = alcanza[i + 1]; const cur = new Uint8Array(tope + 1);
+    for (let r = 0; r < paso; r++) {
+      let ultimo = -Infinity; // la última posición (en pasos) donde `prev` era verdadero
+      for (let k = 0, v = r; v <= tope; k++, v += paso) {
+        if (prev[v]) ultimo = k;
+        if (k - ultimo <= c) cur[v] = 1;
+      }
+    }
+    alcanza[i] = cur;
+  }
+  let v = -1;
+  for (let x = meta; x <= tope; x++) if (alcanza[0][x]) { v = x; break; }
+  if (v < 0) return todos();
+  const quedaCant = den.map(() => 0);
+  for (let i = 0; i < den.length; i++) {
+    const paso = den[i] / U;
+    for (let k = 0; k <= cant[i]; k++) {
+      if (v - k * paso < 0) break;
+      if (alcanza[i + 1][v - k * paso]) { quedaCant[i] = k; v -= k * paso; break; }
+    }
+  }
+  return { queda: soloPositivos(den, quedaCant), envio: soloPositivos(den, cant.map((c, i) => c - quedaCant[i])) };
+}
+const soloPositivos = (den: number[], cant: number[]) => {
+  const o: Record<string, number> = {};
+  den.forEach((d, i) => { if (cant[i] > 0) o[String(d)] = cant[i]; });
+  return o;
+};
 
 /**
  * EL TURNO SIN LOS NÚMEROS DEL SISTEMA, para el que no es jefe (0111).
@@ -600,9 +662,28 @@ export class CajaService {
       const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
         .where(eq(sucursales.id, sesion.sucursalId)).limit(1);
       const fondo = money(suc?.fondo ?? sesion.montoInicial);
-      const queda = money(Math.min(contado, fondo));
-      const envio = money(contado - queda);
-      const faltaFondo = money(fondo - queda);
+      /*
+       * EL SOBRE, BILLETE POR BILLETE (0130): los que manda la pantalla, que
+       * tienen que salir de los contados y dejar en la caja por lo menos el
+       * fondo; o, sin ellos, la separación que propone el sistema.
+       */
+      let billetesEnvio: Record<string, number>;
+      if (dto.billetesEnvio) {
+        billetesEnvio = totalDeBilletes(dto.billetesEnvio).billetes;
+        for (const [d, n] of Object.entries(billetesEnvio)) {
+          if (n > (billetes[d] ?? 0)) {
+            throw new BadRequestException(`En el envío pusiste ${n} billetes de $${Number(d).toLocaleString('es-AR')} y contaste ${billetes[d] ?? 0}.`);
+          }
+        }
+      } else {
+        billetesEnvio = proponerSeparacion(billetes, Math.min(contado, fondo)).envio;
+      }
+      const envio = money(totalDeBilletes(billetesEnvio).total);
+      const queda = money(contado - envio);
+      if (queda + 0.009 < Math.min(contado, fondo)) {
+        throw new BadRequestException(`Así quedarían $${queda.toLocaleString('es-AR')} en la caja y el fondo es $${fondo.toLocaleString('es-AR')}: dejá por lo menos el fondo y mandá el resto.`);
+      }
+      const faltaFondo = money(Math.max(0, fondo - queda));
 
       const a = await this.arqueo(id);
       const diferencia = money(contado - a.esperadoEfectivo);
@@ -618,6 +699,7 @@ export class CajaService {
         totales: { medios: a.medios, ingresos: a.ingresos, egresos: a.egresos, ctaCte: a.ctaCte },
         estado: 'cerrada',
         billetes,
+        billetesEnvio,
         envioEfectivo: envio,
         fondoQueda: queda,
         observaciones: sesion.observaciones ? `${sesion.observaciones} · ${nota}` : nota,
@@ -636,7 +718,7 @@ export class CajaService {
        * cierra cuenta a ciegas (`cajaVeEsperado` apagado y no es jefe). */
       return {
         sesion: c,
-        contado, envio, fondo, fondoQueda: queda, faltaFondo, billetes,
+        contado, envio, fondo, fondoQueda: queda, faltaFondo, billetes, billetesEnvio,
         esperadoEfectivo: a.esperadoEfectivo, diferencia,
       };
     });

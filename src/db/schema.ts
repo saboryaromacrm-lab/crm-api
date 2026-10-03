@@ -1834,6 +1834,8 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   billetes: jsonb('billetes'),
   envioEfectivo: doublePrecision('envio_efectivo'),
   fondoQueda: doublePrecision('fondo_queda'),
+  /** Los billetes que van en el SOBRE (0130); lo que queda en la caja es `billetes` menos estos. */
+  billetesEnvio: jsonb('billetes_envio'),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
   /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el

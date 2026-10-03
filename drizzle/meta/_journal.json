@@ -911,6 +911,13 @@
       "when": 1790550000000,
       "tag": "0129_control_stock_producto",
       "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1790560000000,
+      "tag": "0130_caja_billetes_envio",
+      "breakpoints": true
     }
   ]
 }
