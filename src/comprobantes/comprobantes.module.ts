@@ -72,6 +72,8 @@ class PercepcionDto {
   @IsOptional() @IsIn(['neto', 'total']) base?: 'neto' | 'total';
   /** El del papel. Si no viene, se calcula con la alícuota. */
   @IsOptional() @IsNumber() importe?: number;
+  /** De qué impuesto es (0132): iva | iibb | otro (viene de la del proveedor); '' = por el nombre. */
+  @IsOptional() @IsString() tipo?: string;
 }
 
 /*
@@ -867,7 +869,8 @@ export class ComprobantesService {
         const calculado = (base === 'total' ? conIva : subtotalNeto) * alicuota / 100;
         // El importe del papel gana: el proveedor puede redondear distinto.
         const importe = p.importe != null ? Number(p.importe) || 0 : r2(calculado);
-        return { nombre: String(p.nombre).trim(), alicuota, base: base as 'neto' | 'total', importe };
+        const tipo = ['iva', 'iibb', 'otro'].includes(String((p as any).tipo ?? '')) ? String((p as any).tipo) : '';
+        return { nombre: String(p.nombre).trim(), alicuota, base: base as 'neto' | 'total', importe, tipo };
       })
       .filter((p) => p.importe > 0.009);
     /*

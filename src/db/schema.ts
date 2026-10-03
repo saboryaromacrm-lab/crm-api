@@ -1622,6 +1622,8 @@ export const proveedorPercepciones = pgTable('proveedor_percepciones', {
   /** Sobre qué se calcula: el neto gravado (lo habitual) o el total con IVA. */
   base: basePercepcionEnum('base').notNull().default('neto'),
   activa: boolean('activa').notNull().default(true),
+  /** De qué impuesto es (0132): iva | iibb | otro; '' = se deduce del nombre (`tipoPercepcion`). */
+  tipo: text('tipo').notNull().default(''),
 }, (t) => ({
   ixProveedor: index('ix_proveedor_percepciones').on(t.proveedorId),
 }));
@@ -1638,6 +1640,8 @@ export const comprobantePercepciones = pgTable('comprobante_percepciones', {
   alicuota: doublePrecision('alicuota').notNull().default(0),
   base: basePercepcionEnum('base').notNull().default('neto'),
   importe: doublePrecision('importe').notNull().default(0),
+  /** De qué impuesto es (0132), copiado de la del proveedor; '' = se deduce del nombre. */
+  tipo: text('tipo').notNull().default(''),
 }, (t) => ({
   /** Se consulta por comprobante en cada listado y en cada detalle (0058). */
   ixComprobante: index('ix_comprobante_percepciones_comprobante').on(t.comprobanteId),

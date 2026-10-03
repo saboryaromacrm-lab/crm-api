@@ -41,6 +41,7 @@ import {
   LENTES, PASOS, TIPOS, periodoAnterior, reporteComparar, reporteGranel, reporteMargenes, reporteVentas,
   type Filtro, type Lente, type Paso, type TipoVenta,
 } from './consultas';
+import { reporteIva } from './iva';
 import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
 import { reporteProductos } from './productos';
 import { reporteStock } from './stock';
@@ -126,6 +127,16 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   private paso(v?: string): Paso { return (v && v in PASOS ? v : 'dia') as Paso; }
 
   ventas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteVentas(c, f, this.paso(q.paso))); }
+
+  /** Resultados IVA (3/10/2026): facturado contra sin factura y la posición de IVA mes a mes. */
+  iva(q: any) {
+    const f = this.filtro(q);
+    return this.leer(async (c) => {
+      const r = await c.query(`select valor from configuracion where clave = 'empresa'`);
+      const v: any = r.rows[0]?.valor ?? {};
+      return reporteIva(c, f, { importe: Number(v.ivaSaldoInicial) || 0, mes: String(v.ivaSaldoMes ?? '') });
+    });
+  }
 
   margenes(q: any) {
     const f = this.filtro(q);
@@ -300,6 +311,7 @@ export class MetricasController {
   @Get('productos') productos(@Query() q: any) { return this.svc.productos(q); }
   @Get('comparar') comparar(@Query() q: any) { return this.svc.comparar(q); }
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
+  @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
 
   /** El botón «Sincronizar»: por defecto, hoy y ayer (un instante). */
   @Post('sincronizar')

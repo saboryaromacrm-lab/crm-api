@@ -205,6 +205,14 @@ export const EMPRESA_DEFAULTS = {
   /* Datos que la factura electrónica tiene que llevar impresos (28/9/2026). */
   ingresosBrutos: '' as string,      // N° de inscripción (o "Convenio Multilateral …")
   inicioActividades: '' as string,   // AAAA-MM-DD
+  /*
+   * RESULTADOS IVA (3/10/2026): el saldo a favor de IVA con el que se arranca
+   * (el de la última declaración de la contadora) y el MES desde el que corre
+   * ('AAAA-MM': «al comienzo de ese mes tenía este saldo a favor»). Desde ahí
+   * Gerencia › Métricas › Resultados IVA lo arrastra mes a mes. '' = sin saldo inicial.
+   */
+  ivaSaldoInicial: 0 as number,
+  ivaSaldoMes: '' as string,
 };
 
 /**
@@ -488,6 +496,9 @@ const REGLAS: Record<string, {
   'empresa.colorMarca': { texto: colorNormalizado },
   'empresa.inicioActividades': { texto: fechaIsoONada },
   'empresa.ingresosBrutos': { texto: (v: string) => String(v ?? '').trim().slice(0, 60) },
+  /* Resultados IVA: el saldo a favor inicial y el mes 'AAAA-MM' desde el que corre. */
+  'empresa.ivaSaldoInicial': { min: 0, max: 100_000_000_000 },
+  'empresa.ivaSaldoMes': { texto: (v: string) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(String(v ?? '').trim()) ? String(v).trim() : '') },
   /* El cartel de bienvenida de la tienda: con tope, para que no desborde el cartel en el celular. */
   'web.popupEtiqueta': { texto: (v: string) => String(v ?? '').trim().slice(0, 40) },
   'web.popupTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 90) },

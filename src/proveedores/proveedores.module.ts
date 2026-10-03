@@ -349,6 +349,8 @@ export class ProveedoresService {
         alicuota: Number(f.alicuota) || 0,
         base: (f.base === 'total' ? 'total' : 'neto') as 'neto' | 'total',
         activa: f.activa !== false,
+        /* De qué impuesto es (0132): iva | iibb | otro; '' = se deduce del nombre. */
+        tipo: ['iva', 'iibb', 'otro'].includes(String(f.tipo ?? '')) ? String(f.tipo) : '',
       }));
     for (const f of validas) {
       if (f.alicuota < 0 || f.alicuota > 100) {
@@ -359,7 +361,7 @@ export class ProveedoresService {
     /* AUDITORÍA (0086): el full-replace se traduce a cambios legibles POR
      * PERCEPCIÓN (comparando por nombre): agregada, quitada o modificada. */
     const anteriores = await this.percepciones(proveedorId);
-    const legible = (f: any) => `${Number(f.alicuota) || 0}% sobre ${f.base === 'total' ? 'el total' : 'el neto'}${f.activa === false ? ' (inactiva)' : ''}`;
+    const legible = (f: any) => `${Number(f.alicuota) || 0}% sobre ${f.base === 'total' ? 'el total' : 'el neto'}${f.tipo ? ` · ${String(f.tipo).toUpperCase()}` : ''}${f.activa === false ? ' (inactiva)' : ''}`;
     const viejas = new Map(anteriores.map((f: any) => [f.nombre, legible(f)]));
     const nuevas = new Map(validas.map((f) => [f.nombre, legible(f)]));
     const cambios = [] as { campo: string; antes: string; despues: string }[];
