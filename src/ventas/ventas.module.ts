@@ -5070,7 +5070,7 @@ export class VentasController {
    */
   @Get('listado')
   @Permiso('ventas.listado')
-  listado(
+  async listado(
     @Auth() sesion: Sesion,
     @Query('desde') desde?: string,
     @Query('hasta') hasta?: string,
@@ -5096,7 +5096,10 @@ export class VentasController {
       if (!validos.includes(v)) throw new BadRequestException(`${campo} inválido: ${v}`);
       return v;
     };
-    return this.svc.listado({
+    /* Las ESTADÍSTICAS (tickets, vendido, medios, facturado, por lista) son de
+     * administración (3/10/2026, pedido del dueño): al que no es jefe le llega
+     * la lista de sus ventas, sin el bloque de totales. */
+    const r = await this.svc.listado({
       desde, hasta, q,
       estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
       medioPago: uno(medioPago, MEDIOS, 'Medio de pago'),
@@ -5109,6 +5112,7 @@ export class VentasController {
       offset: num(offset), limit: num(limit),
       verRentabilidad: tienePermiso(sesion.permisos, ['precios', 'compras.productos']),
     });
+    return esJefe(sesion) ? r : { ...r, totales: null };
   }
 
   @Get()
