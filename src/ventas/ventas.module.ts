@@ -835,7 +835,7 @@ export class VentasService {
      * (F10): tickets internos y sus devoluciones. Las NC restan en su lado.
      */
     const FACTURADO = sql`(${ventas.tipo}::text like 'factura%' or (${ventas.tipo}::text like 'nota_credito_%' and ${ventas.tipo}::text <> 'nota_credito_ticket') or ${ventas.facturarPendiente})`;
-    const [filas, [tot], porMedio, [fac], porLista, [ren]] = await Promise.all([
+    const [filas, [tot], porMedio, [fac], porLista, [ren], mpTipos] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -924,10 +924,28 @@ export class VentasService {
           .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
           .where(vivas)
         : Promise.resolve([null]),
+
+      /* LO COBRADO POR EL QR DE MERCADO PAGO, POR CÓMO PAGÓ EL CLIENTE (0131,
+       * 3/10/2026, pedido del dueño): dinero en cuenta / débito / crédito, con
+       * lo que descontó Mercado Pago y lo que quedó. `sinDatos` = cobros cuyo
+       * detalle todavía no se pudo leer (se completan solos). */
+      this.db.select({
+        tipo: sql<string>`coalesce(nullif(${mpCobros.pagoInfo}->>'tipo', ''), 'sin_datos')`,
+        cobros: sql<number>`count(*)::int`,
+        importe: sql<number>`coalesce(sum(${mpCobros.monto}), 0)`,
+        enCuotas: sql<number>`count(*) filter (where coalesce((${mpCobros.pagoInfo}->>'cuotas')::int, 1) > 1)::int`,
+        comision: sql<number>`coalesce(sum((${mpCobros.pagoInfo}->>'comision')::numeric), 0)`,
+        neto: sql<number>`coalesce(sum((${mpCobros.pagoInfo}->>'neto')::numeric), 0)`,
+        sinComision: sql<number>`count(*) filter (where ${mpCobros.pagoInfo}->>'comision' is null)::int`,
+      }).from(mpCobros)
+        .innerJoin(ventas, eq(ventas.id, mpCobros.ventaId))
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .where(and(vivas, eq(mpCobros.estado, 'pagado')))
+        .groupBy(sql`1`),
     ]);
 
     const ids = filas.map((f) => f.v.id);
-    const [pagos, agg, imput, notas] = ids.length
+    const [pagos, agg, imput, notas, cobrosMp] = ids.length
       ? await Promise.all([
         this.db.select().from(ventaPagos).where(inArray(ventaPagos.ventaId, ids)),
         this.db.select({
@@ -951,8 +969,11 @@ export class VentasService {
         }).from(ventas)
           .where(and(inArray(ventas.refVentaId, ids), ne(ventas.estado, 'anulada')))
           .groupBy(ventas.refVentaId),
+        this.db.select({ ventaId: mpCobros.ventaId, pagoInfo: mpCobros.pagoInfo }).from(mpCobros)
+          .where(and(inArray(mpCobros.ventaId, ids), eq(mpCobros.estado, 'pagado'))),
       ])
-      : [[], [], new Map<number, number>(), []];
+      : [[], [], new Map<number, number>(), [], []];
+    const infoMpDe = new Map<number, any>((cobrosMp as any[]).map((x) => [x.ventaId, x.pagoInfo]));
 
     const registros = Number(tot?.registros) || 0;
     const tickets = Number(tot?.tickets) || 0;
@@ -977,7 +998,16 @@ export class VentasService {
            * contrario de lo que dice el comprobante. */
           saldo: esNotaCredito(v.tipo) ? 0 : money(v.total - cobrado - acreditado),
           medios: pagos.filter((p: any) => p.ventaId === v.id)
-            .map((p: any) => ({ medio: p.medio === 'qr' && /^MP /.test(String(p.referencia ?? '')) ? 'qr_mp' : p.medio, importe: p.importe })),
+            .map((p: any) => {
+              const esMp = p.medio === 'qr' && /^MP /.test(String(p.referencia ?? ''));
+              const i = esMp ? infoMpDe.get(v.id) : null;
+              /* Con qué pagó por el QR (0131). La comisión y el neto viajan; el
+               * controlador los saca para el que no es jefe. */
+              return {
+                medio: esMp ? 'qr_mp' : p.medio, importe: p.importe,
+                ...(i ? { mp: { tipo: i.tipo ?? '', cuotas: i.cuotas ?? 1, comision: i.comision ?? null, interesCliente: i.interesCliente ?? 0, neto: i.neto ?? null } } : {}),
+              };
+            }),
           renglones: Number(a?.renglones) || 0,
           unidades: money(Number(a?.unidades)),
           ofertaDescuento: money(Number(a?.ofertaDescuento)),
@@ -1004,6 +1034,16 @@ export class VentasService {
         plataAcreditada: money(Number(tot?.plataAcreditada)),
         promedio: tickets ? money(plata / tickets) : 0,
         sinFacturar: Number(tot?.sinFacturar) || 0,
+        /* El QR de Mercado Pago por cómo pagó el cliente (0131). */
+        mercadoPago: (() => {
+          const filasT = (mpTipos as any[]).map((t) => ({
+            tipo: t.tipo, cobros: Number(t.cobros) || 0, importe: money(Number(t.importe)), enCuotas: Number(t.enCuotas) || 0,
+            comision: money(Number(t.comision)), neto: money(Number(t.neto)), sinComision: Number(t.sinComision) || 0,
+          })).sort((a, b) => b.importe - a.importe);
+          if (!filasT.length) return null;
+          const suma = (k: 'cobros' | 'importe' | 'comision' | 'neto' | 'sinComision') => filasT.reduce((a, x) => a + x[k], 0);
+          return { cobros: suma('cobros'), importe: money(suma('importe')), comision: money(suma('comision')), neto: money(suma('neto')), sinComision: suma('sinComision'), porTipo: filasT };
+        })(),
         /* Con el % de cada medio sobre lo cobrado (1/10/2026), de mayor a menor. */
         porMedio: (() => {
           const filasM = porMedio.map((m) => ({ medio: m.medio, importe: money(Number(m.importe)) }));
@@ -5124,7 +5164,13 @@ export class VentasController {
       offset: num(offset), limit: num(limit),
       verRentabilidad: tienePermiso(sesion.permisos, ['precios', 'compras.productos']),
     });
-    return esJefe(sesion) ? r : { ...r, totales: null };
+    if (esJefe(sesion)) return r;
+    /* Al que no es jefe: sin totales, y del QR de Mercado Pago solo con qué pagó (sin comisión ni neto). */
+    const filas = (r.filas ?? []).map((f: any) => ({
+      ...f,
+      medios: (f.medios ?? []).map((m: any) => (m.mp ? { ...m, mp: { tipo: m.mp.tipo, cuotas: m.mp.cuotas } } : m)),
+    }));
+    return { ...r, filas, totales: null };
   }
 
   @Get()

@@ -107,6 +107,56 @@ export function pagoDeOrden(orden: any, monto: number): { pagado: boolean; payme
   return { pagado, paymentId: String(pago?.id ?? '') };
 }
 
+/**
+ * CON QUÉ PAGÓ EL CLIENTE (3/10/2026, pedido del dueño): el resumen de un
+ * cobro para el listado de ventas. Sale del pago "clásico" (`GET
+ * /v1/payments/{id}`, el que trae comisiones y neto) y, si no se pudo leer,
+ * de lo que dice el pago dentro de la orden (tipo y cuotas, sin comisiones).
+ *
+ *   tipo            account_money | debit_card | credit_card | prepaid_card | …
+ *   cuotas          1 = un pago
+ *   comision        lo que Mercado Pago le descontó AL COMERCIO (fee_payer
+ *                   collector): comisión y, si hay, el costo de las cuotas sin interés
+ *   interesCliente  lo que pagó de más el cliente por las cuotas (fee_payer payer)
+ *   neto            lo que le quedó al comercio
+ */
+export function resumenPago(clasico: any, deOrden: any, monto: number) {
+  const n = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+  const r2 = (x: number) => Math.round(x * 100) / 100;
+  if (clasico) {
+    const fees: any[] = Array.isArray(clasico.fee_details) ? clasico.fee_details : [];
+    const del = (quien: string) => fees.filter((f) => String(f?.fee_payer ?? 'collector') === quien).reduce((a, f) => a + n(f?.amount), 0);
+    const comision = r2(del('collector'));
+    const td = clasico.transaction_details ?? {};
+    const total = r2(n(td.total_paid_amount) || n(clasico.transaction_amount) || monto);
+    const interes = r2(Math.max(del('payer'), total - (n(clasico.transaction_amount) || monto)));
+    return {
+      tipo: String(clasico.payment_type_id ?? ''),
+      metodo: String(clasico.payment_method_id ?? ''),
+      cuotas: Math.max(1, Math.round(n(clasico.installments) || 1)),
+      comision,
+      interesCliente: interes > 0.009 ? interes : 0,
+      neto: r2(n(td.net_received_amount) || ((n(clasico.transaction_amount) || monto) - comision)),
+      total,
+      completo: true,
+    };
+  }
+  if (deOrden) {
+    const pm = deOrden.payment_method ?? {};
+    return {
+      tipo: String(pm.type ?? ''),
+      metodo: String(pm.id ?? ''),
+      cuotas: Math.max(1, Math.round(n(pm.installments) || 1)),
+      comision: null as number | null,
+      interesCliente: 0,
+      neto: null as number | null,
+      total: r2(n(deOrden.paid_amount) || n(deOrden.amount) || monto),
+      completo: false,
+    };
+  }
+  return null;
+}
+
 /** Un pago de la búsqueda, ¿sirve para un cobro de `monto`? Aprobado, por ese monto y sin devolver. */
 export function pagoSirve(p: any, monto: number): boolean {
   return String(p?.status ?? '') === 'approved'

@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { firmaValida, importeMp, pagoDeOrden, pagoSirve } from './api';
+import { firmaValida, importeMp, pagoDeOrden, pagoSirve, resumenPago } from './api';
 
 const SECRETO = 'clave-de-prueba';
 const firmar = (manifiesto: string, ts = '1742505638683') => `ts=${ts},v1=${createHmac('sha256', SECRETO).update(manifiesto).digest('hex')}`;
@@ -55,4 +55,25 @@ test('un pago de la búsqueda sirve si está aprobado, por el monto y sin devolv
   assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20919 }, 20920), false, 'otro monto');
   assert.equal(pagoSirve({ status: 'pending', transaction_amount: 20920 }, 20920), false, 'pendiente');
   assert.equal(pagoSirve({ status: 'approved', transaction_amount: 20920, transaction_amount_refunded: 20920 }, 20920), false, 'devuelto');
+});
+
+test('con qué pagó el cliente: dinero en cuenta, crédito en cuotas, y sin el pago clásico', () => {
+  const cuenta = resumenPago({ payment_type_id: 'account_money', payment_method_id: 'account_money', installments: 1, transaction_amount: 20920,
+    fee_details: [{ type: 'mercadopago_fee', amount: 167.36, fee_payer: 'collector' }], transaction_details: { net_received_amount: 20752.64, total_paid_amount: 20920 } }, null, 20920);
+  assert.deepEqual(cuenta, { tipo: 'account_money', metodo: 'account_money', cuotas: 1, comision: 167.36, interesCliente: 0, neto: 20752.64, total: 20920, completo: true });
+  const credito = resumenPago({ payment_type_id: 'credit_card', payment_method_id: 'visa', installments: 3, transaction_amount: 20920,
+    fee_details: [{ type: 'mercadopago_fee', amount: 836.8, fee_payer: 'collector' }, { type: 'financing_fee', amount: 3100, fee_payer: 'payer' }],
+    transaction_details: { net_received_amount: 20083.2, total_paid_amount: 24020 } }, null, 20920);
+  assert.equal(credito!.cuotas, 3);
+  assert.equal(credito!.comision, 836.8, 'al comercio: solo la comisión');
+  assert.equal(credito!.interesCliente, 3100, 'el interés lo pagó el cliente');
+  assert.equal(credito!.neto, 20083.2);
+  const sinInteres = resumenPago({ payment_type_id: 'credit_card', installments: 6, transaction_amount: 10000,
+    fee_details: [{ type: 'mercadopago_fee', amount: 400, fee_payer: 'collector' }, { type: 'financing_fee', amount: 1500, fee_payer: 'collector' }],
+    transaction_details: { net_received_amount: 8100, total_paid_amount: 10000 } }, null, 10000);
+  assert.equal(sinInteres!.comision, 1900, 'cuotas sin interés: el costo lo paga el comercio');
+  assert.equal(sinInteres!.interesCliente, 0);
+  const deOrden = resumenPago(null, { payment_method: { id: 'master', type: 'debit_card', installments: 1 }, paid_amount: '500.00' }, 500);
+  assert.deepEqual(deOrden, { tipo: 'debit_card', metodo: 'master', cuotas: 1, comision: null, interesCliente: 0, neto: null, total: 500, completo: false });
+  assert.equal(resumenPago(null, null, 1), null);
 });

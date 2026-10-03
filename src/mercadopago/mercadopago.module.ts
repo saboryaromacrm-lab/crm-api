@@ -44,7 +44,7 @@ import { esJefe } from '../auth/auth.guard';
 import { mpCajas, mpCobros, mpSucursales, sucursales, terminales } from '../db/schema';
 import { terminalPorToken } from '../sucursales/sucursales.module';
 import { VentasModule, VentasService } from '../ventas/ventas.module';
-import { MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve } from './api';
+import { MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve, resumenPago } from './api';
 
 /* ------------------------------- DTOs ------------------------------- */
 
@@ -562,6 +562,7 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
       await this.ventas.confirmar(c.ventaId, dto, { desdeMercadoPago: true });
       await this.db.update(mpCobros).set({ estado: 'pagado', detalle: '', actualizadoEn: new Date() }).where(eq(mpCobros.id, c.id));
       this.log.log(`Cobro ${c.id}: pagado (${ref}) y venta ${c.ventaId} cerrada.`);
+      void this.completarInfoPago(c.id).catch((e) => this.log.warn(`detalle del pago del cobro ${c.id}: ${(e as Error).message}`));
     } catch (e) {
       const msg = String((e as any)?.response?.message ?? (e as Error).message ?? e);
       // ¿Ya estaba cerrada (otro camino llegó primero)? Entonces está bien.
@@ -577,6 +578,46 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
       }).where(eq(mpCobros.id, c.id));
       this.log.error(`Cobro ${c.id}: pagado pero la venta ${c.ventaId} no cerró: ${msg}`);
     }
+  }
+
+  /* ------------------------ con qué pagó el cliente ------------------------ */
+
+  /**
+   * CON QUÉ PAGÓ EL CLIENTE (0131, 3/10/2026, pedido del dueño): dinero en
+   * cuenta, débito o crédito y en cuántas cuotas, cuánto descontó Mercado Pago
+   * y cuánto quedó. Se pregunta al cerrar el cobro y queda en `pago_info`.
+   * El pago "clásico" (`/v1/payments/{id}`) trae las comisiones; si no se
+   * puede leer, queda lo que dice la orden (tipo y cuotas) y se reintenta
+   * después, hasta 5 veces. Nunca toca la venta: es solo para mirar.
+   */
+  async completarInfoPago(cobroId: number) {
+    const [c] = await this.db.select().from(mpCobros).where(eq(mpCobros.id, cobroId)).limit(1);
+    if (!c || c.estado !== 'pagado') return;
+    const previo: any = c.pagoInfo ?? null;
+    if (previo?.completo || (previo?.intentos ?? 0) >= 5) return;
+    let deOrden: any = null;
+    if (c.orderId) {
+      const orden: any = await mp.orden(c.orderId).catch(() => null);
+      const pagos: any[] = orden?.transactions?.payments ?? [];
+      deOrden = pagos.find((x) => /processed|approved|accredited/i.test(`${x?.status ?? ''} ${x?.status_detail ?? ''}`)) ?? pagos[0] ?? null;
+    }
+    const candidatos = [...new Set([c.paymentId, deOrden?.reference_id, deOrden?.id].map((x) => String(x ?? '').trim()).filter((x) => /^\d{1,20}$/.test(x)))];
+    let clasico: any = null;
+    for (const id of candidatos) {
+      clasico = await mp.pago(id).catch(() => null);
+      if (clasico) break;
+    }
+    const r = resumenPago(clasico, deOrden, c.monto);
+    const info = { ...(r ?? { completo: false }), consultado: new Date().toISOString(), intentos: (previo?.intentos ?? 0) + 1 };
+    await this.db.update(mpCobros).set({ pagoInfo: info, actualizadoEn: new Date() }).where(eq(mpCobros.id, c.id));
+  }
+
+  /** Los cobros pagados sin el detalle (los de antes de la 0131, o los que no se pudieron leer): de a 5. */
+  private async rellenarInfoPagos() {
+    const faltan = await this.db.select({ id: mpCobros.id }).from(mpCobros)
+      .where(and(eq(mpCobros.estado, 'pagado'), sql`(${mpCobros.pagoInfo} is null or (coalesce((${mpCobros.pagoInfo}->>'completo')::boolean, false) = false and coalesce((${mpCobros.pagoInfo}->>'intentos')::int, 0) < 5 and ${mpCobros.actualizadoEn} < now() - interval '1 minute'))`))
+      .orderBy(desc(mpCobros.id)).limit(5);
+    for (const f of faltan) await this.completarInfoPago(f.id).catch((e) => this.log.warn(`detalle del cobro ${f.id}: ${(e as Error).message}`));
   }
 
   /* ------------------------------- el aviso ------------------------------- */
@@ -621,6 +662,7 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
             .where(and(eq(mpCobros.id, c.id), eq(mpCobros.estado, 'esperando')));
         }
       }
+      await this.rellenarInfoPagos();
     } catch (e) {
       this.log.warn(`reloj: ${(e as Error).message}`);
     }

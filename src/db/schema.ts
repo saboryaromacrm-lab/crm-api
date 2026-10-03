@@ -3102,6 +3102,12 @@ export const mpCobros = pgTable('mp_cobros', {
   confirmar: jsonb('confirmar').notNull(),
   paymentId: text('payment_id').notNull().default(''),
   detalle: text('detalle').notNull().default(''),
+  /**
+   * Con qué pagó el cliente (0131): { tipo, metodo, cuotas, comision,
+   * interesCliente, neto, total, consultado, intentos }. Lo trae Mercado Pago
+   * al cerrar el cobro; NULL = todavía no se consultó.
+   */
+  pagoInfo: jsonb('pago_info'),
   usuarioId: integer('usuario_id'),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
