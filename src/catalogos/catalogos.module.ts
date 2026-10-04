@@ -19,12 +19,15 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post,
 } from '@nestjs/common';
 import { IsBoolean, IsInt, IsOptional, IsString } from 'class-validator';
-import { and, asc, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { Permiso } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, etiquetas, marcas, productoEtiquetas, productos, reglasMarca, subcategorias,
 } from '../db/schema';
+
+/** La mercadería que todavía se puede vender o mover (la misma regla que frena archivar un producto). */
+const STOCK_VIVO = ['disponible', 'comprometido', 'retenido', 'en_transito'];
 
 /** Texto comparable: sin acentos, sin caja, sin espacios de más. */
 export function norm(v: string) {
@@ -97,6 +100,8 @@ class UpsertCatalogoDto {
   /** Solo etiquetas. */
   @IsOptional() @IsString() color?: string;
   @IsOptional() @IsBoolean() activa?: boolean;
+  /** Inhabilitar o habilitar una MARCA cambia el estado de sus productos: se confirma (0135). */
+  @IsOptional() @IsBoolean() confirmado?: boolean;
 }
 
 class FusionarDto {
@@ -166,6 +171,51 @@ export class CatalogosService {
     return filas[0];
   }
 
+  /**
+   * QUÉ PASA SI SE INHABILITA (O HABILITA) UNA MARCA (0135, pedido del dueño).
+   * Inhabilitar: sus productos ACTIVOS salen — los que tienen stock vivo pasan
+   * a discontinuado (no se compran más, se venden hasta agotar) y los que no,
+   * a archivado. Los que ya estaban discontinuados o archivados no se tocan.
+   * Habilitar: vuelven a activo SOLO los que dio de baja la marca.
+   */
+  async impactoMarca(id: number, db: any = this.db) {
+    const [m] = await db.select().from(marcas).where(eq(marcas.id, id)).limit(1);
+    if (!m) throw new NotFoundException('La marca no existe.');
+    const r = await db.execute(sql`
+      select
+        count(*) filter (where p.estado = 'activo' and exists (
+          select 1 from stock st where st.producto_id = p.id and st.cantidad > 1e-9 and st.estado::text in (${sql.join(STOCK_VIVO.map((e) => sql`${e}`), sql`, `)})
+        ))::int as "conStock",
+        count(*) filter (where p.estado = 'activo')::int as activos,
+        count(*) filter (where p.baja_por_marca)::int as "porMarca",
+        count(*) filter (where p.estado <> 'activo' and not p.baja_por_marca)::int as "yaDeBaja",
+        count(*)::int as total
+      from productos p where p.marca_id = ${id}`);
+    const x: any = r.rows[0] ?? {};
+    const activos = Number(x.activos) || 0; const conStock = Number(x.conStock) || 0;
+    return {
+      marca: m.nombre, activa: m.activa, total: Number(x.total) || 0,
+      aDiscontinuar: conStock, aArchivar: activos - conStock,
+      aReactivar: Number(x.porMarca) || 0, yaDeBaja: Number(x.yaDeBaja) || 0,
+    };
+  }
+
+  /** La cascada sobre los productos, dentro de la transacción de la marca. */
+  private async cascadaMarca(tx: any, id: number, nombre: string, activa: boolean) {
+    const ahora = new Date();
+    if (!activa) {
+      const motivo = `Marca «${nombre}» inhabilitada el ${ahora.toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`;
+      const conStock = sql`exists (select 1 from stock st where st.producto_id = ${productos.id} and st.cantidad > 1e-9 and st.estado::text in (${sql.join(STOCK_VIVO.map((e) => sql`${e}`), sql`, `)}))`;
+      await tx.update(productos).set({ estado: 'discontinuado', estadoDesde: ahora, motivoBaja: motivo, bajaPorMarca: true })
+        .where(and(eq(productos.marcaId, id), eq(productos.estado, 'activo'), conStock));
+      await tx.update(productos).set({ estado: 'archivado', estadoDesde: ahora, motivoBaja: motivo, bajaPorMarca: true })
+        .where(and(eq(productos.marcaId, id), eq(productos.estado, 'activo')));
+    } else {
+      await tx.update(productos).set({ estado: 'activo', estadoDesde: ahora, motivoBaja: '', bajaPorMarca: false })
+        .where(and(eq(productos.marcaId, id), eq(productos.bajaPorMarca, true)));
+    }
+  }
+
   async editar(tipo: TipoCatalogo, id: number, dto: UpsertCatalogoDto) {
     const d = this.def(tipo);
     const nombre = (dto.nombre || '').trim();
@@ -181,6 +231,30 @@ export class CatalogosService {
     const values: any = { nombre, activa: dto.activa ?? true };
     if (tipo === 'subcategorias') values.categoriaId = catId;
     if (tipo === 'etiquetas') values.color = (dto.color ?? '').trim();
+
+    /* MARCA QUE SE INHABILITA O SE HABILITA: sus productos acompañan, en la
+     * misma transacción y con la fila de la marca candada (dos clics no la
+     * procesan dos veces). Si cambia algún producto, se exige `confirmado`. */
+    if (tipo === 'marcas' && values.activa !== (actual as any).activa) {
+      return this.db.transaction(async (tx) => {
+        const [fresca] = await tx.select().from(marcas).where(eq(marcas.id, id)).limit(1).for('update');
+        if (!fresca) throw new NotFoundException('La marca no existe.');
+        if (fresca.activa === values.activa) {
+          const [f] = await tx.update(marcas).set({ nombre }).where(eq(marcas.id, id)).returning();
+          return f;
+        }
+        const imp = await this.impactoMarca(id, tx);
+        const toca = values.activa ? imp.aReactivar : imp.aDiscontinuar + imp.aArchivar;
+        if (toca > 0 && dto.confirmado !== true) {
+          throw new BadRequestException(values.activa
+            ? `Habilitar «${nombre}» vuelve a activo ${toca} producto(s): confirmalo.`
+            : `Inhabilitar «${nombre}» da de baja ${toca} producto(s): confirmalo.`);
+        }
+        const [f] = await tx.update(marcas).set({ nombre, activa: values.activa }).where(eq(marcas.id, id)).returning();
+        await this.cascadaMarca(tx, id, nombre, values.activa);
+        return { ...f, productos: values.activa ? { reactivados: imp.aReactivar } : { discontinuados: imp.aDiscontinuar, archivados: imp.aArchivar } };
+      });
+    }
 
     const filas = await this.db.update(d.tabla).set(values).where(eq(d.tabla.id, id)).returning() as any[];
     return filas[0];
@@ -203,6 +277,11 @@ export class CatalogosService {
   async borrar(tipo: TipoCatalogo, id: number) {
     const d = this.def(tipo);
     const usos = await this.contarUsos(tipo, id);
+    if (tipo === 'marcas' && usos.length) {
+      throw new BadRequestException(
+        `La marca está en uso (${usos.map((u) => `${u.n} ${u.que}`).join(', ')}): no se borra. Para sacarla de circulación usá «Inhabilitar», que también da de baja sus productos.`,
+      );
+    }
     if (usos.length) {
       const filas = await this.db.update(d.tabla).set({ activa: false } as any)
         .where(eq(d.tabla.id, id)).returning() as any[];
@@ -276,6 +355,12 @@ export class CatalogosController {
   @Permiso('compras.catalogos')
   @Post(':tipo') crear(@Param('tipo') tipo: TipoCatalogo, @Body() dto: UpsertCatalogoDto) {
     return this.svc.crear(tipo, dto);
+  }
+
+  /** Antes de inhabilitar/habilitar una marca: cuántos productos cambian (para la confirmación). */
+  @Permiso('compras.catalogos')
+  @Get('marcas/:id/impacto') impacto(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.impactoMarca(id);
   }
 
   @Permiso('compras.catalogos')

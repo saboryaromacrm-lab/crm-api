@@ -1861,6 +1861,8 @@ export class ProductosService {
       estado,
       estadoDesde: new Date(),
       motivoBaja: estado === 'activo' ? '' : (dto.motivo ?? '').trim(),
+      /* Cambiado a mano: ya no lo maneja la marca (al habilitarla no se toca). */
+      bajaPorMarca: false,
     }).where(eq(productos.id, id)).returning();
     return { ...(await this.get(out.id)) };
   }

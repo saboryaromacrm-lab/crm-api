@@ -477,6 +477,8 @@ export const productos = pgTable('productos', {
    * acumula. Eliminar de verdad queda solo para el que no tiene NINGUNA
    * huella (un duplicado del importador, un alta con el dedo). */
   estado: estadoProductoEnum('estado').notNull().default('activo'),
+  /** Lo dio de baja su MARCA al inhabilitarse (0135): al habilitarla, vuelve a activo. */
+  bajaPorMarca: boolean('baja_por_marca').notNull().default(false),
   /** Cuándo pasó al estado actual: da el "discontinuado hace 8 meses". */
   estadoDesde: timestamp('estado_desde', { withTimezone: true }),
   /**
