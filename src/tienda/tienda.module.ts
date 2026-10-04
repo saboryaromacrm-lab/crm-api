@@ -284,6 +284,7 @@ export class TiendaService {
     const vacio = {
       sucursalId: suc?.id ?? null, listaId: null, listaNombre: '', montoMinimo: 0,
       montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
+      envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [], marcas: [], etiquetas: [], reglasMarca: [], items: [],
       sitio,
@@ -677,8 +678,10 @@ export class TiendaService {
       listaNombre: listaTienda.nombre,
       /** 0 = sin mínimo por monto configurado (solo rigen los de marca/producto, si hay). */
       montoMinimo: Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0,
-      /** Piso EXTRA si la entrega es con la camioneta de la empresa (0 = sin piso). */
+      /** Piso EXTRA si la entrega es el envío sin costo (la camioneta; 0 = sin piso). */
       montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
+      /** El envío sin costo se ofrece (Ventas › Configuración › Tienda online). */
+      envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [...catMap.values()].sort(porNombre)
         .map((c) => ({ ...c, imagenUrl: urlImagen('categoria', c.id) })),
@@ -906,13 +909,18 @@ export class TiendaService {
     }
 
     /*
-     * La camioneta tiene su PROPIO piso, y es duro (sin el camino alternativo
-     * por cantidades): mover el vehículo cuesta lo mismo lleve lo que lleve,
-     * así que el pedido tiene que valer el viaje.
+     * El ENVÍO SIN COSTO (la camioneta de la empresa) se puede apagar, y tiene
+     * su PROPIO piso, duro (sin el camino alternativo por cantidades): mover el
+     * vehículo cuesta lo mismo lleve lo que lleve, así que el pedido tiene que
+     * valer el viaje. El cliente nunca lee «camioneta»: lee «envío sin costo».
      */
+    if (entrega === 'camioneta' && !cat.envioCamionetaActivo) {
+      throw new BadRequestException('El envío sin costo no está disponible por ahora. Elegí retiro en el local o envío por cadete.');
+    }
     if (entrega === 'camioneta' && cat.montoMinimoCamioneta > 0 && total < cat.montoMinimoCamioneta) {
+      const pesos = cat.montoMinimoCamioneta.toLocaleString('es-AR', { maximumFractionDigits: 2 });
       throw new BadRequestException(
-        `El envío con la camioneta necesita un pedido de al menos $${cat.montoMinimoCamioneta}. `
+        `El envío sin costo necesita un pedido de al menos $${pesos}. `
         + 'Sumá productos, o elegí retiro en el local o envío por cadete.',
       );
     }

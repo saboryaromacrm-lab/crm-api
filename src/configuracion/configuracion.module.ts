@@ -78,6 +78,13 @@ export const VENTAS_DEFAULTS = {
    */
   montoMinimoCamioneta: 80000 as number,
   /**
+   * ENVÍO SIN COSTO EN LA TIENDA (4/10/2026, pedido del dueño). Es la entrega
+   * con la camioneta de la empresa —por dentro sigue llamándose `camioneta`—,
+   * pero el cliente la ve como «Envío sin costo». Apagado, la tienda no la
+   * ofrece y el servidor rechaza el pedido que la pida. Retiro y cadete siguen.
+   */
+  envioCamionetaActivo: true as boolean,
+  /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
    * precio se armó antes.
