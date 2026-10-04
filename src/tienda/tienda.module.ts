@@ -345,6 +345,7 @@ export class TiendaService {
       sucursalId: suc?.id ?? null, listaId: null, listaNombre: '', montoMinimo: 0,
       montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
       envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
+      vistaLista: cfg.tiendaVistaLista === true,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [], marcas: [], etiquetas: [], reglasMarca: [], items: [],
       sitio,
@@ -742,6 +743,8 @@ export class TiendaService {
       montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
       /** El envío sin costo se ofrece (Ventas › Configuración › Tienda online). */
       envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
+      /** Catálogo sin fotos: la tienda lista los productos en vez de mostrar tarjetas. */
+      vistaLista: cfg.tiendaVistaLista === true,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [...catMap.values()].sort(porNombre)
         .map((c) => ({ ...c, imagenUrl: urlImagen('categoria', c.id) })),

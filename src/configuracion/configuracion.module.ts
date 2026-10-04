@@ -85,6 +85,13 @@ export const VENTAS_DEFAULTS = {
    */
   envioCamionetaActivo: true as boolean,
   /**
+   * CATÁLOGO SIN FOTOS (4/10/2026, pedido del dueño): la tienda muestra los
+   * productos en una lista compacta (sin imagen, con todos los datos en un
+   * renglón) en vez de las tarjetas con foto. Apagado = tarjetas, como siempre;
+   * la vista de lista ni se descarga.
+   */
+  tiendaVistaLista: false as boolean,
+  /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
    * precio se armó antes.
