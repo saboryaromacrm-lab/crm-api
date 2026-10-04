@@ -26,13 +26,17 @@ import {
   BadRequestException, Body, ConflictException, Controller, Get, Inject, Injectable, Module, NotFoundException,
   Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  cajaSesiones, cashflowCaja, cashflowConceptos, cashflowMovimientos, cashflowSobres, gastoCategorias, sucursales,
+  cajaSesiones, cashflowCaja, cashflowConceptos, cashflowMovimientos, cashflowSobres, gastoCategorias, proveedorImputaciones,
+  proveedorPagos, proveedores, sucursales,
 } from '../db/schema';
+import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { GastosModule, GastosService } from '../gastos/gastos.module';
 
 /** La llave: fuera del catálogo, solo la tiene el superadmin (`*`). */
 export const PERMISO_CASHFLOW = 'gerencia.cashflow';
@@ -75,6 +79,23 @@ class ConceptoDto {
   @IsOptional() @IsBoolean() activo?: boolean;
   @IsOptional() @IsInt() @Min(0) @Max(100000) orden?: number;
 }
+/** Una imputación del pago a proveedor: a qué factura (o gasto cargado) y cuánto. */
+class ImputacionCfDto {
+  @IsOptional() @IsInt() comprobanteId?: number;
+  @IsOptional() @IsInt() gastoId?: number;
+  @IsNumber() @Min(0.01) @Max(MAX_IMPORTE) importe!: number;
+}
+class PagoProveedorDto {
+  @IsInt() proveedorId!: number;
+  @IsIn(['mercaderia', 'gastos']) destino!: 'mercaderia' | 'gastos';
+  @IsIn(['efectivo', 'deposito']) medio!: 'efectivo' | 'deposito';
+  @IsNumber() @Min(0.01) @Max(MAX_IMPORTE) importe!: number;
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionCfDto) imputaciones?: ImputacionCfDto[];
+  @IsOptional() @IsString() @MaxLength(200) referencia?: string;
+  @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  @IsOptional() @IsString() fecha?: string;
+  @IsBoolean() confirmado!: boolean;
+}
 class MovimientoDto {
   @IsIn(TIPOS as unknown as string[]) tipo!: 'ingreso' | 'egreso';
   @IsInt() conceptoId!: number;
@@ -86,7 +107,11 @@ class MovimientoDto {
 
 @Injectable()
 export class CashflowService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly pagos: PagosProveedorService,
+    private readonly gastos: GastosService,
+  ) {}
 
   /** La caja (una sola fila) o null si todavía no arrancó. */
   private async caja(db: any = this.db) {
@@ -335,9 +360,9 @@ export class CashflowService {
     if (!actual) throw new NotFoundException('Ese concepto no existe.');
     const v = await this.validarConcepto(dto, actual);
     /* Con movimientos registrados el tipo no cambia: un egreso no se vuelve ingreso por detrás. */
-    if (v.tipo !== actual.tipo) {
+    if (v.tipo !== actual.tipo || v.clase !== actual.clase) {
       const [n] = await this.db.select({ n: sql<number>`count(*)::int` }).from(cashflowMovimientos).where(eq(cashflowMovimientos.conceptoId, id));
-      if (Number(n?.n) > 0) throw new BadRequestException('Ese concepto ya tiene movimientos: no se le cambia el tipo. Desactivalo y creá otro.');
+      if (Number(n?.n) > 0) throw new BadRequestException('Ese concepto ya tiene movimientos: no se le cambia el tipo ni la clase. Desactivalo y creá otro.');
     }
     try {
       const [c] = await this.db.update(cashflowConceptos).set(v).where(eq(cashflowConceptos.id, id)).returning();
@@ -364,9 +389,14 @@ export class CashflowService {
       select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto,
         m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia",
         m.pago_id as "pagoId", m.gasto_id as "gastoId", u.nombre as usuario,
+        pr.nombre as proveedor, pp.medio, pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
         m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo", ua.nombre as "anuladoPor"
       from cashflow_movimientos m
       left join cashflow_conceptos c on c.id = m.concepto_id
+      left join proveedor_pagos pp on pp.id = m.pago_id
+      left join proveedores pr on pr.id = pp.proveedor_id
+      left join gastos g on g.id = m.gasto_id
+      left join gasto_categorias gc on gc.id = g.categoria_id
       left join cashflow_sobres s on s.id = m.sobre_id
       left join caja_sesiones cs on cs.id = s.caja_sesion_id
       left join sucursales su on su.id = cs.sucursal_id
@@ -378,7 +408,8 @@ export class CashflowService {
     return r.rows.map((x: any) => ({ ...x, importe: money(x.importe), sobreDiferencia: x.sobreDiferencia == null ? null : money(x.sobreDiferencia) }));
   }
 
-  async crearMovimiento(dto: MovimientoDto, usuarioId: number | null) {
+  async crearMovimiento(dto: MovimientoDto, sesion: Sesion) {
+    const usuarioId = sesion?.usuarioId ?? null;
     if (dto.confirmado !== true) throw new BadRequestException('Confirmá el movimiento.');
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe tiene que ser mayor a cero.');
@@ -396,7 +427,8 @@ export class CashflowService {
       if (!c) throw new NotFoundException('Ese concepto no existe.');
       if (!c.activo) throw new BadRequestException('Ese concepto está desactivado.');
       if (c.tipo !== dto.tipo) throw new BadRequestException(`«${c.nombre}» es un concepto de ${c.tipo}.`);
-      if (c.clase === 'gasto') throw new BadRequestException('Los conceptos de gasto (los que crean el gasto en Gastos) llegan en la parte 2. Por ahora usá un concepto de movimiento.');
+      const esGasto = c.clase === 'gasto';
+      if (esGasto && !c.gastoCategoriaId) throw new BadRequestException(`«${c.nombre}» es un concepto de gasto pero no tiene rubro: asignale uno en la pestaña Conceptos.`);
       if (dto.tipo === 'egreso') {
         const saldo = await this.saldo(tx);
         if (importe > saldo + 0.009) {
@@ -406,10 +438,106 @@ export class CashflowService {
       const esHoy = fecha === hoyAr();
       const [m] = await tx.insert(cashflowMovimientos).values({
         fecha: esHoy ? new Date() : new Date(`${fecha}T12:00:00`),
-        tipo: dto.tipo, origen: 'concepto', importe, conceptoId: c.id, detalle, usuarioId,
+        tipo: dto.tipo, origen: esGasto ? 'gasto' : 'concepto', importe, conceptoId: c.id, detalle, usuarioId,
       }).returning();
+      /*
+       * EL CONCEPTO DE GASTO CREA EL GASTO EN GASTOS (decisión del dueño): sin
+       * factura (recibo, letra X, sin IVA), con su rubro, pagado en el acto en
+       * efectivo. Así aparece en rentabilidad y no se carga dos veces. Si el
+       * alta del gasto falla, esta transacción se deshace y el egreso no queda.
+       */
+      if (esGasto) {
+        const g: any = await this.gastos.crear({
+          fecha, tipoDoc: 'recibo', letra: 'X', categoriaId: c.gastoCategoriaId!, descripcion: detalle || c.nombre,
+          condicionPago: 'contado', neto: importe, iva: 0, observaciones: 'Registrado desde Cash Flow (efectivo del dueño)',
+          usuarioId: usuarioId ?? undefined, pagoInmediato: { importe, medio: 'efectivo', fecha },
+        } as any, sesion);
+        const [imp] = await tx.select({ pagoId: proveedorImputaciones.pagoId }).from(proveedorImputaciones)
+          .where(eq(proveedorImputaciones.gastoId, g.id)).limit(1);
+        await tx.update(cashflowMovimientos).set({ gastoId: g.id, pagoId: imp?.pagoId ?? null }).where(eq(cashflowMovimientos.id, m.id));
+      }
       return { ok: true, id: m.id, saldo: await this.saldo(tx) };
     });
+  }
+
+  /* ------------------------------ Pago a proveedor ------------------------------ */
+
+  /** Los proveedores (no hay baja lógica en la tabla), para elegir a quién se le paga. */
+  proveedoresActivos() {
+    return this.db.select({ id: proveedores.id, nombre: proveedores.nombre, proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos })
+      .from(proveedores).orderBy(asc(proveedores.nombre));
+  }
+
+  /** Las facturas (o los gastos cargados) de ese proveedor que todavía deben plata: lo que se tilda al pagar. */
+  pendientesDe(proveedorId: number, destino?: string) {
+    return this.pagos.documentosPendientes(proveedorId, destino === 'gastos' ? 'gastos' : 'mercaderia');
+  }
+
+  gastoCategorias() {
+    return this.db.select({ id: gastoCategorias.id, nombre: gastoCategorias.nombre, tipo: gastoCategorias.tipo })
+      .from(gastoCategorias).where(eq(gastoCategorias.activa, true)).orderBy(asc(gastoCategorias.orden), asc(gastoCategorias.nombre));
+  }
+
+  /**
+   * EL PAGO A PROVEEDOR SALE DE LA CAJA CENTRAL. Es el MISMO pago de siempre
+   * (`pagos.crear`: queda en la cuenta del proveedor, aplicado a las facturas
+   * tildadas, con su medio efectivo o depósito), más el egreso en el libro.
+   * No lleva turno de caja: la plata sale de la mano del dueño, no del cajón
+   * de un local. Un depósito también resta: es efectivo que se lleva al banco.
+   */
+  async pagarProveedor(dto: PagoProveedorDto, sesion: Sesion) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá el pago.');
+    const importe = money(dto.importe);
+    if (importe <= 0) throw new BadRequestException('El importe tiene que ser mayor a cero.');
+    const fecha = dto.fecha ?? hoyAr();
+    if (!esDia(fecha)) throw new BadRequestException('La fecha tiene que ser un día válido.');
+    if (fecha > hoyAr()) throw new BadRequestException('La fecha no puede ser futura.');
+    const imputaciones = (dto.imputaciones ?? []).map((i) => ({
+      comprobanteId: dto.destino === 'mercaderia' ? i.comprobanteId : undefined,
+      gastoId: dto.destino === 'gastos' ? i.gastoId : undefined,
+      importe: money(i.importe),
+    })).filter((i) => (i.comprobanteId || i.gastoId) && i.importe > 0);
+    const aplicado = money(imputaciones.reduce((a, i) => a + i.importe, 0));
+    if (aplicado > importe + 0.009) throw new BadRequestException(`Lo aplicado a documentos (${aplicado.toLocaleString('es-AR')}) supera el importe del pago (${importe.toLocaleString('es-AR')}).`);
+    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
+    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    const usuarioId = sesion?.usuarioId ?? null;
+    const detalle = String(dto.detalle ?? '').trim();
+    return this.db.transaction(async (tx) => {
+      const [caja] = await tx.select().from(cashflowCaja).limit(1).for('update');
+      if (!caja) throw new BadRequestException('Primero arrancá el Cash Flow con la fecha y el saldo inicial.');
+      if (fecha < caja.fechaInicio) throw new BadRequestException(`La fecha es anterior al arranque del Cash Flow (${caja.fechaInicio}).`);
+      const saldo = await this.saldo(tx);
+      if (importe > saldo + 0.009) {
+        throw new BadRequestException(`No hay tanto efectivo en mano: el saldo es $${saldo.toLocaleString('es-AR')} y el pago es de $${importe.toLocaleString('es-AR')}.`);
+      }
+      const esHoy = fecha === hoyAr();
+      const [m] = await tx.insert(cashflowMovimientos).values({
+        fecha: esHoy ? new Date() : new Date(`${fecha}T12:00:00`),
+        tipo: 'egreso', origen: 'pago_proveedor', importe, usuarioId,
+        detalle: `Pago a ${prov.nombre} (${dto.medio === 'deposito' ? 'depósito' : 'efectivo'})${detalle ? ` · ${detalle}` : ''}`,
+      }).returning();
+      /* El pago de siempre. Si falla, esta transacción se deshace y el egreso no queda. */
+      const pago: any = await this.pagos.crear({
+        proveedorId: prov.id, destino: dto.destino, importe, medio: dto.medio, fecha,
+        referencia: String(dto.referencia ?? '').trim() || undefined,
+        concepto: `Cash Flow${detalle ? `: ${detalle}` : ''}`,
+        usuarioId: usuarioId ?? undefined,
+        imputaciones: imputaciones.length ? imputaciones : undefined,
+      } as any, sesion.sucursalId, true);
+      await tx.update(cashflowMovimientos).set({ pagoId: pago.id }).where(eq(cashflowMovimientos.id, m.id));
+      return { ok: true, id: m.id, pagoId: pago.id, saldo: await this.saldo(tx) };
+    });
+  }
+
+  /** Deshace un pago de proveedor: desaplica sus imputaciones y lo anula (el camino de siempre, en orden). */
+  private async anularPago(pagoId: number, motivo: string) {
+    const imps = await this.db.select({ id: proveedorImputaciones.id }).from(proveedorImputaciones).where(eq(proveedorImputaciones.pagoId, pagoId));
+    for (const i of imps) await this.pagos.desimputar(i.id);
+    /* Un pago SIN proveedor (el de un gasto suelto) no puede quedar a cuenta
+     * de nadie: desaplicarlo ya lo anula. Solo se anula acá si sigue vivo. */
+    const [p] = await this.db.select({ estado: proveedorPagos.estado }).from(proveedorPagos).where(eq(proveedorPagos.id, pagoId)).limit(1);
+    if (p && p.estado !== 'anulado') await this.pagos.anular(pagoId, `Cash Flow: ${motivo}`);
   }
 
   async anularMovimiento(id: number, dto: AnularDto, usuarioId: number | null) {
@@ -420,8 +548,15 @@ export class CashflowService {
       if (!m) throw new NotFoundException('Ese movimiento no existe.');
       if (m.anuladoEn) throw new BadRequestException('Ese movimiento ya estaba anulado.');
       /* Cada origen se anula por su camino: el sobre desde su control, el
-       * saldo inicial desde el arranque; los pagos y gastos (parte 2) desde su pago. */
-      if (m.origen !== 'concepto') throw new BadRequestException('Ese movimiento no se anula desde acá: es el saldo inicial, un sobre o un pago.');
+       * saldo inicial desde el arranque. El pago a proveedor y el gasto se
+       * deshacen PRIMERO por su circuito (desaplicar + anular el pago, anular
+       * el gasto); si eso falla, el egreso sigue vigente y el saldo no miente. */
+      if (!['concepto', 'pago_proveedor', 'gasto'].includes(m.origen)) throw new BadRequestException('Ese movimiento no se anula desde acá: es el saldo inicial o un sobre.');
+      if (m.origen === 'pago_proveedor' && m.pagoId) await this.anularPago(m.pagoId, motivo);
+      if (m.origen === 'gasto') {
+        if (m.pagoId) await this.anularPago(m.pagoId, motivo);
+        if (m.gastoId) await this.gastos.anular(m.gastoId, `Cash Flow: ${motivo}`);
+      }
       await tx.update(cashflowMovimientos).set({ anuladoEn: new Date(), anuladoPor: usuarioId, anuladoMotivo: motivo }).where(eq(cashflowMovimientos.id, id));
       return { ok: true, saldo: await this.saldo(tx) };
     });
@@ -451,7 +586,12 @@ export class CashflowController {
   @Patch('conceptos/:id') editarConcepto(@Param('id', ParseIntPipe) id: number, @Body() dto: ConceptoDto) { return this.svc.editarConcepto(id, dto); }
 
   @Get('movimientos') movimientos(@Query() q: any) { return this.svc.movimientos(q ?? {}); }
-  @Post('movimientos') crearMovimiento(@Body() dto: MovimientoDto, @Auth() s: Sesion) { return this.svc.crearMovimiento(dto, s?.usuarioId ?? null); }
+  @Post('movimientos') crearMovimiento(@Body() dto: MovimientoDto, @Auth() s: Sesion) { return this.svc.crearMovimiento(dto, s); }
+
+  @Get('proveedores') proveedores() { return this.svc.proveedoresActivos(); }
+  @Get('proveedores/:id/pendientes') pendientes(@Param('id', ParseIntPipe) id: number, @Query('destino') destino?: string) { return this.svc.pendientesDe(id, destino); }
+  @Get('gasto-categorias') gastoCategorias() { return this.svc.gastoCategorias(); }
+  @Post('pagos') pagar(@Body() dto: PagoProveedorDto, @Auth() s: Sesion) { return this.svc.pagarProveedor(dto, s); }
   @Post('movimientos/:id/anular')
   anularMovimiento(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularDto, @Auth() s: Sesion) {
     return this.svc.anularMovimiento(id, dto, s?.usuarioId ?? null);
@@ -459,6 +599,7 @@ export class CashflowController {
 }
 
 @Module({
+  imports: [PagosModule, GastosModule],
   controllers: [CashflowController],
   providers: [CashflowService],
   exports: [CashflowService],
