@@ -20,7 +20,7 @@ import {
   categorias, coffitMovimientos, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
   modalidadesVenta, movimientos, pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
   productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
-  transferenciaItems, vencimientos, ventaItems,
+  transferenciaItems, vencimientos, ventaItems, webImagenes,
 } from '../db/schema';
 import {
   costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, formatoDeCosto,
@@ -315,7 +315,7 @@ export class ProductosService {
     // entera y cruzar en memoria sale más barato que N consultas filtradas.
     const filtro = (col: any) => (solo != null ? eq(col, solo) : undefined);
 
-    const [pres, provs, formato, etqs, cfg, cat, cats] = await Promise.all([
+    const [pres, provs, formato, etqs, cfg, cat, cats, fotos] = await Promise.all([
       this.db.select().from(presentaciones).where(filtro(presentaciones.productoId)),
       this.db.select().from(productoProveedores).where(filtro(productoProveedores.productoId)),
       solo != null ? this.listas.formatoDe(solo) : this.listas.formatoTodos(),
@@ -323,7 +323,12 @@ export class ProductosService {
       this.cfg.get('ventas'),
       this.listas.catalogo(),
       this.catalogoPlano(),
+      /* QUÉ PRODUCTOS TIENEN FOTO (4/10/2026, filtro «con / sin imagen» del
+       * catálogo). Solo el id: la foto en sí (base64) NO se lee acá — pesa. */
+      this.db.select({ refId: webImagenes.refId }).from(webImagenes)
+        .where(and(eq(webImagenes.tipo, 'producto'), filtro(webImagenes.refId))),
     ]);
+    const conFoto = new Set(fotos.map((f) => f.refId));
 
     const activas = cat.listas.filter((l: any) => l.activa);
     const porListaId = new Map(activas.map((l: any) => [l.id, l]));
@@ -410,6 +415,7 @@ export class ProductosService {
         subcategoria: cats.subcategoria.get(prod.subcategoriaId) ?? '',
         etiquetas: misEtq,
         etiquetasNombres: misEtq.map((id: number) => cats.etiqueta.get(id)).filter(Boolean),
+        tieneImagen: conFoto.has(prod.id),
         costoNeto,
         /*
          * Cada paquete con SU formato de venta y su costo derivado. `precio` es
