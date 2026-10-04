@@ -2388,6 +2388,62 @@ export const webImagenes = pgTable('web_imagenes', {
   uqRef: uniqueIndex('uq_web_imagen').on(t.tipo, t.refId),
 }));
 
+/* ---------------- Cash Flow: la caja central de efectivo del dueño (0133) ---------------- */
+/** Una sola fila: desde qué día arranca el control y con cuánto efectivo en mano. */
+export const cashflowCaja = pgTable('cashflow_caja', {
+  id: serial('id').primaryKey(),
+  fechaInicio: date('fecha_inicio').notNull(),
+  saldoInicial: doublePrecision('saldo_inicial').notNull().default(0),
+  abiertaEn: timestamp('abierta_en', { withTimezone: true }).notNull().defaultNow(),
+  abiertaPor: integer('abierta_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  observaciones: text('observaciones').notNull().default(''),
+});
+/** Los motivos de ingreso/egreso que configura el dueño. `clase` gasto = crea el gasto en Gastos. */
+export const cashflowConceptos = pgTable('cashflow_conceptos', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  tipo: text('tipo').notNull(),
+  clase: text('clase').notNull().default('movimiento'),
+  gastoCategoriaId: integer('gasto_categoria_id').references(() => gastoCategorias.id, { onDelete: 'set null' }),
+  activo: boolean('activo').notNull().default(true),
+  orden: integer('orden').notNull().default(0),
+});
+/** El control de un sobre: lo que mandó el cajero contra lo que contó el dueño. Uno vigente por sobre. */
+export const cashflowSobres = pgTable('cashflow_sobres', {
+  id: serial('id').primaryKey(),
+  cajaSesionId: integer('caja_sesion_id').notNull().references(() => cajaSesiones.id, { onDelete: 'restrict' }),
+  enviado: doublePrecision('enviado').notNull(),
+  contado: doublePrecision('contado').notNull(),
+  diferencia: doublePrecision('diferencia').notNull(),
+  motivo: text('motivo').notNull().default(''),
+  controladoEn: timestamp('controlado_en', { withTimezone: true }).notNull().defaultNow(),
+  controladoPor: integer('controlado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
+}, (t) => ({
+  ixSesion: index('ix_cashflow_sobres_sesion').on(t.cajaSesionId),
+}));
+/** El libro: cada ingreso y egreso con su origen. No se borra: se anula con motivo. */
+export const cashflowMovimientos = pgTable('cashflow_movimientos', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  tipo: text('tipo').notNull(),
+  origen: text('origen').notNull(),
+  importe: doublePrecision('importe').notNull(),
+  conceptoId: integer('concepto_id').references(() => cashflowConceptos.id, { onDelete: 'restrict' }),
+  sobreId: integer('sobre_id').references(() => cashflowSobres.id, { onDelete: 'restrict' }),
+  pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'restrict' }),
+  gastoId: integer('gasto_id').references(() => gastos.id, { onDelete: 'restrict' }),
+  detalle: text('detalle').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
+}, (t) => ({
+  ixFecha: index('ix_cashflow_mov_fecha').on(t.fecha),
+}));
+
 /**
  * Telemetría ANÓNIMA del sitio web: qué se mira y cuánto tiempo. La sesión es
  * un UUID que vive en el navegador del visitante — sin nombre, sin IP, sin

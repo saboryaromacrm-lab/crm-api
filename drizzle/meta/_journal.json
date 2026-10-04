@@ -932,6 +932,13 @@
       "when": 1790580000000,
       "tag": "0132_percepcion_tipo",
       "breakpoints": true
+    },
+    {
+      "idx": 133,
+      "version": "7",
+      "when": 1790590000000,
+      "tag": "0133_cashflow",
+      "breakpoints": true
     }
   ]
 }

@@ -34,6 +34,7 @@ import { AuditoriaModule } from './auditoria/auditoria.module';
 import { RespaldosModule } from './respaldos/respaldos.module';
 import { RespaldoDriveModule } from './respaldos/drive.service';
 import { MetricasModule } from './metricas/metricas.module';
+import { CashflowModule } from './cashflow/cashflow.module';
 import { MercadoPagoModule } from './mercadopago/mercadopago.module';
 
 @Module({
@@ -47,6 +48,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     RespaldosModule,
     RespaldoDriveModule,
     MetricasModule,
+    CashflowModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,
