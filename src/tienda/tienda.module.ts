@@ -26,10 +26,10 @@ import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
 import type { Response } from 'express';
-import { and, eq, gte, isNull, ne } from 'drizzle-orm';
+import { and, desc, eq, gte, isNull, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, subcategorias, clientes, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
+  categorias, subcategorias, clientes, presupuestos, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
@@ -38,6 +38,7 @@ import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { PresupuestosModule } from '../presupuestos/presupuestos.module';
+import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
@@ -129,7 +130,66 @@ export class TiendaService {
     private readonly cfg: ConfiguracionService,
     private readonly presupuestos: PresupuestosService,
     private readonly ofertasSvc: OfertasService,
+    private readonly clientesSvc: ClientesService,
   ) {}
+
+  /**
+   * EL CHECKOUT RECONOCE AL CLIENTE POR SU DNI (4/10/2026, pedido del dueño:
+   * «si ya está registrado, que se completen solos sus datos»). Devuelve SOLO
+   * lo que el formulario usa —nombre, apellido, WhatsApp y dirección—, nunca
+   * crédito, saldo ni correo. Con cupo estricto por IP (regla `cliente`).
+   *
+   * El nombre y el apellido salen del último pedido web con ese DNI (ahí
+   * vinieron separados); si no hay, se parte el de la ficha en el último
+   * espacio («Juan Pablo Pérez» → «Juan Pablo» / «Pérez»). La dirección, de la
+   * ficha; si está vacía, la del último pedido con envío.
+   */
+  async clientePorDni(dto: any) {
+    const dni = String(dto?.dni ?? '').replace(/\D/g, '');
+    if (dni.length < 7 || dni.length > 8) return { encontrado: false };
+    const [cli] = await this.db.select().from(clientes)
+      .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni), eq(clientes.activo, true), eq(clientes.esConsumidorFinal, false)))
+      .limit(1);
+    if (!cli) return { encontrado: false };
+    const [ultimo] = await this.db.select({ wc: presupuestos.webCliente }).from(presupuestos)
+      .where(sql`${presupuestos.webCliente}->>'dni' = ${dni}`)
+      .orderBy(desc(presupuestos.id)).limit(1);
+    const wc: any = ultimo?.wc ?? {};
+    const completo = String(cli.nombre ?? '').trim().replace(/\s+/g, ' ');
+    const corte = completo.lastIndexOf(' ');
+    const nombre = String(wc.nombre ?? '').trim() || (corte > 0 ? completo.slice(0, corte) : completo);
+    const apellido = String(wc.apellido ?? '').trim() || (corte > 0 ? completo.slice(corte + 1) : '');
+    return {
+      encontrado: true,
+      nombre: nombre.slice(0, 60),
+      apellido: apellido.slice(0, 60),
+      telefono: String(cli.telefono || wc.telefono || '').trim(),
+      direccion: String(cli.direccion || wc.direccion || '').trim().slice(0, MAX_CALLE),
+      localidad: String(cli.localidad || wc.localidad || '').trim().slice(0, MAX_LOCALIDAD),
+    };
+  }
+
+  /**
+   * PRIMERA COMPRA = CLIENTE NUEVO EN EL MOMENTO (4/10/2026, pedido del dueño:
+   * «si es un DNI que no se encuentra, que le guarde ya los datos»). Antes el
+   * alta esperaba a que alguien aceptara la orden en el ERP. Se da de alta con
+   * lo que escribió (consumidor final, sin crédito) y una nota de origen. Si dos
+   * pedidos con el mismo DNI llegan juntos, el segundo encuentra al primero.
+   */
+  private async altaClienteWeb(d: { nombre: string; dni: string; telefono: string; direccion: string; localidad: string }) {
+    try {
+      const c = await this.clientesSvc.create({
+        nombre: d.nombre, tipoDoc: 'dni', numeroDoc: d.dni, telefono: d.telefono,
+        direccion: d.direccion, localidad: d.localidad, condicionIva: 'consumidor_final',
+        observaciones: 'Alta automática desde la tienda online (primer pedido).',
+      } as any, false);
+      return c.id as number;
+    } catch {
+      const [ya] = await this.db.select({ id: clientes.id }).from(clientes)
+        .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, d.dni))).limit(1);
+      return ya?.id ?? null;
+    }
+  }
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
   private async sucursalTienda() {
@@ -927,9 +987,9 @@ export class TiendaService {
 
     /*
      * Cliente: se busca por DNI. Si ya existe, el pedido queda adjudicado a ESE
-     * cliente. Si no, NO se da de alta acá: los datos del formulario viajan en
-     * `webCliente` y el alta se decide al ACEPTAR la orden en el ERP — así una
-     * prueba o un spam no ensucian la base de clientes.
+     * cliente y su ficha NO se toca (pedido del dueño): el WhatsApp y la
+     * dirección que escribió viajan en `webCliente` y son los que muestra la
+     * orden. Si no existe, se da de alta más abajo, ya validado el pedido.
      */
     const [existente] = await this.db.select().from(clientes)
       .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni))).limit(1);
@@ -963,8 +1023,14 @@ export class TiendaService {
       };
     });
 
+    /* Último paso antes de grabar: todo lo de arriba (stock, mínimos, envío) ya pasó. */
+    const clienteId = existente?.id ?? await this.altaClienteWeb({
+      nombre: nombreCompleto.slice(0, 121), dni, telefono,
+      direccion: domicilio?.direccion ?? '', localidad: domicilio?.localidad ?? '',
+    });
+
     return this.presupuestos.crearDesdeWeb({
-      clienteId: existente?.id ?? null, sucursalId: cat.sucursalId,
+      clienteId, sucursalId: cat.sucursalId,
       // Topes de largo del lado del servidor: el `maxLength` del checkout vive
       // en el navegador y no protege al `POST` directo. Un pedido con 3 MB de
       // texto en observaciones vuelve inusable la bandeja de Órdenes al pintarla.
@@ -1000,6 +1066,11 @@ export class TiendaController {
   @Post('pedidos')
   @RateLimit('pedidos')
   pedido(@Body() body: any) { return this.svc.pedido(body ?? {}); }
+
+  /** POST y no GET: el DNI no queda escrito en la dirección (ni en los registros del servidor). */
+  @Post('cliente')
+  @RateLimit('cliente')
+  cliente(@Body() body: any) { return this.svc.clientePorDni(body ?? {}); }
 
   @Post('eventos')
   @RateLimit('eventos')
@@ -1052,7 +1123,7 @@ export class TiendaController {
 }
 
 @Module({
-  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule],
+  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule],
   controllers: [TiendaController],
   providers: [TiendaService, TiendaRateLimitGuard],
 })

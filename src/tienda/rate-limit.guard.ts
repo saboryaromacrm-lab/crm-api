@@ -39,6 +39,12 @@ export const RateLimit = (regla: keyof typeof REGLAS) => SetMetadata(RATE_LIMIT_
 export const REGLAS = {
   /** Alta de pedidos: lo único que de verdad duele si lo spamean. */
   pedidos: { max: 5, ventanaMs: 10 * 60_000, aviso: 'Demasiados pedidos seguidos: esperá unos minutos y probá de nuevo.' },
+  /**
+   * Buscar cliente por DNI en el checkout (4/10/2026). Devuelve nombre, WhatsApp
+   * y dirección: ESTRICTO para que no sirva para recorrer DNIs ajenos. Un cliente
+   * real busca su DNI una o dos veces.
+   */
+  cliente: { max: 8, ventanaMs: 10 * 60_000, aviso: 'Demasiadas búsquedas seguidas: completá tus datos a mano o esperá unos minutos.' },
   /** Telemetría: el navegador manda un lote cada 15 s como máximo — 40 sobra. */
   eventos: { max: 40, ventanaMs: 10 * 60_000, aviso: 'Demasiadas peticiones.' },
   /** Navegación normal + freno al scraping grosero. */
