@@ -21,7 +21,8 @@
  *   sin factura  liquidaciones (la mitad sin factura; letra X)
  *   remitos    todavía sin facturar: se muestran aparte (pueden pasar a factura)
  *   Para los % se compara lo que costó la mercadería: neto en A, total en B/C
- *   y liquidaciones (para la casa ese IVA es costo).
+ *   y liquidaciones (para la casa ese IVA es costo). En B, C y X el ERP guarda
+ *   IVA 0 y el neto ES el total del papel (comprobantes.armarPie).
  *
  * GASTOS: crédito fiscal = IVA de los de letra A (las NC de gasto ya vienen en
  *   negativo); percepción de IVA = `perc_dgi`.
@@ -39,7 +40,10 @@ import type { PoolClient } from 'pg';
 import { N, r2, pct, type Filtro } from './consultas';
 
 const ZONA = 'America/Argentina/Buenos_Aires';
-const DIA = (col: string) => `(${col} at time zone '${ZONA}')::date`;
+/* El día argentino $1..$2 como RANGO sobre la columna (no `(col at time zone)::date
+ * between`): así Postgres usa el índice de la fecha en vez de recorrer la tabla. */
+const EN_DIAS = (col: string) =>
+  `${col} >= ($1::date::timestamp at time zone '${ZONA}') and ${col} < (($2::date + 1)::timestamp at time zone '${ZONA}')`;
 const MES = (col: string) => `to_char(date_trunc('month', ${col} at time zone '${ZONA}'), 'YYYY-MM')`;
 
 /** La regla de `tipoPercepcion` (common/iva.ts), en SQL. */
@@ -82,21 +86,23 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
         count(*) filter (where v.tipo::text not like 'nota_credito%')::int as comprobantes,
         count(*) filter (where v.tipo::text like 'nota_credito%')::int as notas
       from ventas v
-      where v.estado in ('confirmada','pendiente_cae') and ${DIA('v.fecha')} between $1::date and $2::date and ${sucV}
+      where v.estado in ('confirmada','pendiente_cae') and ${EN_DIAS('v.fecha')} and ${sucV}
       group by 1, 2`, p),
     /* El débito por alícuota (y el IVA absorbido) de lo facturado y lo pendiente: renglones y cargos extra. */
     c.query(`
-      select ${grupoV} as mes, x.alicuota,
-        coalesce(sum(x.neto * ${SIGNO_VENTA}), 0) as neto,
-        coalesce(sum(x.absorbido * ${SIGNO_VENTA}), 0) as absorbido
+      with vv as (
+        select v.id, ${grupoV} as mes, ${SIGNO_VENTA} as signo from ventas v
+        where v.estado in ('confirmada','pendiente_cae') and ${EN_DIAS('v.fecha')} and ${sucV}
+          and (${CLASE_VENTA}) in ('facturado','pendiente')
+      )
+      select x.mes, x.alicuota, coalesce(sum(x.neto * x.signo), 0) as neto, coalesce(sum(x.absorbido * x.signo), 0) as absorbido
       from (
-        select vi.venta_id, vi.iva as alicuota, vi.subtotal as neto, coalesce(vi.cantidad * vi.iva_absorbido_unitario, 0) as absorbido from venta_items vi
+        select vv.mes, vv.signo, vi.iva as alicuota, vi.subtotal as neto, coalesce(vi.cantidad * vi.iva_absorbido_unitario, 0) as absorbido
+        from venta_items vi join vv on vv.id = vi.venta_id
         union all
-        select ve.venta_id, ve.iva as alicuota, ve.importe as neto, 0 as absorbido from venta_extras ve
+        select vv.mes, vv.signo, ve.iva, ve.importe, 0
+        from venta_extras ve join vv on vv.id = ve.venta_id
       ) x
-      join ventas v on v.id = x.venta_id
-      where v.estado in ('confirmada','pendiente_cae') and ${DIA('v.fecha')} between $1::date and $2::date and ${sucV}
-        and (${CLASE_VENTA}) in ('facturado','pendiente')
       group by 1, 2`, p),
     c.query(`
       select ${grupoC} as mes, ${CLASE_COMPRA} as clase,
@@ -107,15 +113,15 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
         count(*) filter (where c.tipo = 'nota_credito')::int as notas
       from comprobantes c
       where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito','remito')
-        and ${DIA('c.fecha')} between $1::date and $2::date and ${sucC}
+        and ${EN_DIAS('c.fecha')} and ${sucC}
       group by 1, 2`, p),
     c.query(`
       select ${grupoC} as mes, ${TIPO_PERCEPCION_SQL('cp.tipo', 'cp.nombre')} as tipo,
         coalesce(sum(cp.importe * ${SIGNO_COMPRA}), 0) as importe, count(*)::int as cantidad,
         count(*) filter (where cp.tipo = '')::int as sin_marcar
       from comprobante_percepciones cp join comprobantes c on c.id = cp.comprobante_id
-      where c.estado = 'confirmado' and c.tipo in ('factura','nota_credito','nota_debito')
-        and ${DIA('c.fecha')} between $1::date and $2::date and ${sucC}
+      where c.estado = 'confirmado' and c.tipo in ('factura','nota_credito','nota_debito') and c.letra <> 'X'
+        and ${EN_DIAS('c.fecha')} and ${sucC}
       group by 1, 2`, p),
     c.query(`
       select ${grupoG} as mes,
@@ -126,17 +132,21 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
         count(*)::int as cantidad,
         count(*) filter (where g.letra <> 'A' and g.iva <> 0)::int as iva_sin_credito
       from gastos g
-      where g.estado <> 'anulado' and ${DIA('g.fecha')} between $1::date and $2::date and ${sucG}
+      where g.estado <> 'anulado' and ${EN_DIAS('g.fecha')} and ${sucG}
       group by 1`, p),
   ]);
-  return { ventas: ventas.rows, alicuotas: alic.rows, compras: compras.rows, percepciones: percs.rows, gastos: gastos.rows };
+  const porClave = (rows: any[]) => new Map<string, any>(rows.map((x) => [`${x.mes}|${x.clase ?? ''}`, x]));
+  return {
+    ventas: porClave(ventas.rows), compras: porClave(compras.rows), gastos: porClave(gastos.rows),
+    alicuotas: alic.rows, percepciones: percs.rows,
+  };
 }
 
 /** Lo de un mes (o del total), con nombres. */
 function armar(d: Awaited<ReturnType<typeof cifras>>, mes: string) {
-  const v = (cl: string) => d.ventas.find((x: any) => x.mes === mes && x.clase === cl);
-  const c = (cl: string) => d.compras.find((x: any) => x.mes === mes && x.clase === cl);
-  const g = d.gastos.find((x: any) => x.mes === mes);
+  const v = (cl: string) => d.ventas.get(`${mes}|${cl}`);
+  const c = (cl: string) => d.compras.get(`${mes}|${cl}`);
+  const g = d.gastos.get(`${mes}|`);
   const percIvaCompras = r2(d.percepciones.filter((x: any) => x.mes === mes && x.tipo === 'iva').reduce((a: number, x: any) => a + N(x.importe), 0));
   const ventas = {
     facturado: { total: r2(N(v('facturado')?.total)), iva: r2(N(v('facturado')?.iva)), comprobantes: N(v('facturado')?.comprobantes), notas: N(v('facturado')?.notas) },
@@ -185,10 +195,7 @@ const mesesEntre = (a: string, b: string) => {
   while (y < yb || (y === yb && m <= mb)) { out.push(`${y}-${String(m).padStart(2, '0')}`); m++; if (m > 12) { m = 1; y++; } }
   return out;
 };
-const finDeMes = (mes: string) => {
-  const [y, m] = mes.split('-').map(Number);
-  return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
-};
+const pesos = (n: number) => `$${N(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 /**
  * La posición mes a mes con el saldo a favor arrastrado. `saldo` = el saldo a
@@ -216,12 +223,15 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
   if (tope.length > 36) inicio = tope[tope.length - 36];
   const [periodo, porMes] = await Promise.all([
     cifras(c, f, false),
-    cifras(c, { desde: `${inicio}-01`, hasta: finDeMes(mesHasta) < f.hasta ? finDeMes(mesHasta) : f.hasta, sucursalId: f.sucursalId }, true),
+    /* El IVA se liquida por MES COMPLETO: la serie arranca el día 1 aunque el período no. */
+    cifras(c, { desde: `${inicio}-01`, hasta: f.hasta, sucursalId: f.sucursalId }, true),
   ]);
   const total = armar(periodo, 'total');
 
+  let ultimoMes: ReturnType<typeof armar>['iva'] | null = null;
   const lista = mesesEntre(inicio, mesHasta).map((mes) => {
     const a = armar(porMes, mes);
+    if (mes === mesHasta) ultimoMes = a.iva;
     return {
       mes,
       debito: a.iva.debito, credito: a.iva.credito, percepciones: a.iva.percepciones,
@@ -231,8 +241,10 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
       pctComprasFacturadas: a.compras.pct.facturado,
     };
   });
-  /* El saldo inicial vale desde SU mes; antes de ese mes se arranca en cero. */
+  /* El saldo inicial vale desde SU mes; antes de ese mes se arranca en cero.
+   * Si quedó afuera de los 36 meses, se ignora (y se avisa). */
   const desdeSaldo = mesInicioSaldo ? lista.findIndex((m) => m.mes === mesInicioSaldo) : -1;
+  const saldoViejo = !!mesInicioSaldo && mesInicioSaldo < lista[0].mes;
   const conArrastre = desdeSaldo >= 0
     ? [...arrastrar(lista.slice(0, desdeSaldo), 0), ...arrastrar(lista.slice(desdeSaldo), saldoInicial.importe)]
     : arrastrar(lista, 0);
@@ -252,7 +264,7 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
       coalesce(sum(case when c.tipo = 'liquidacion' or c.letra = 'X' then c.subtotal_neto else 0 end * ${SIGNO_COMPRA}), 0) as sin_factura
     from comprobantes c join proveedores p on p.id = c.proveedor_id
     where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito')
-      and ${DIA('c.fecha')} between $1::date and $2::date and ($3::int is null or c.sucursal_id = $3)
+      and ${EN_DIAS('c.fecha')} and ($3::int is null or c.sucursal_id = $3)
     group by 1, 2`, [f.desde, f.hasta, f.sucursalId]);
   const porProveedor = prov.rows
     .map((x: any) => {
@@ -264,17 +276,21 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
     .slice(0, 20);
 
   const ult = meses[meses.length - 1];
+  const comprasConIva = total.compras.facturaA.neto + total.compras.facturaA.iva + total.compras.facturaBC.total;
   const percSinMarcar = periodo.percepciones.reduce((a: number, x: any) => a + N(x.sin_marcar), 0);
   const percOtras = periodo.percepciones.filter((x: any) => x.tipo === 'otro').reduce((a: number, x: any) => a + N(x.cantidad), 0);
   const avisos: string[] = [];
   if (total.ventas.pendiente.comprobantes > 0) {
-    avisos.push(`${total.ventas.pendiente.comprobantes} venta(s) cobradas como factura con ARCA caída todavía sin CAE: su IVA (${total.iva.debitoPendiente}) está sumado al débito. Facturalas en Ventas › Caídas por ARCA.`);
+    avisos.push(`${total.ventas.pendiente.comprobantes} venta(s) cobradas como factura con ARCA caída todavía sin CAE: su IVA (${pesos(total.iva.debitoPendiente)}) está sumado al débito. Facturalas en Ventas › Caídas por ARCA.`);
   }
   if (total.compras.remitos.comprobantes > 0) {
     avisos.push(`${total.compras.remitos.comprobantes} remito(s) de compra sin facturar: no entran en los % hasta que se sepa si llegan con factura o sin factura.`);
   }
   if (percOtras > 0) avisos.push(`${percOtras} percepción(es) de compra no se reconocen como IVA ni IIBB por su nombre: marcales el tipo en la ficha del proveedor.`);
   if (total.gastos.ivaSinCredito > 0) avisos.push(`${total.gastos.ivaSinCredito} gasto(s) de letra B/C/ticket tienen IVA cargado: no es crédito fiscal y no se suma.`);
+  if (!mesInicioSaldo) avisos.push(`No hay saldo a favor inicial cargado: la cuenta arranca en cero en ${mesDesde}. Cargá el de la última declaración (abajo, «Saldo a favor inicial») para que el arrastre sea exacto.`);
+  else if (saldoViejo) avisos.push(`El saldo a favor inicial es de ${mesInicioSaldo}, de hace más de 3 años: no se usa. Cargá el de una declaración más reciente.`);
+  if (f.desde.slice(8) !== '01') avisos.push(`El IVA se liquida por mes completo: «Cómo se llega al resultado» y «Mes a mes» toman ${mesDesde} desde el día 1; los totales de arriba son solo del período elegido.`);
   if (f.sucursalId != null) avisos.push('El IVA se declara por CUIT, con todas las sucursales juntas: este resultado es solo de la sucursal elegida.');
 
   return {
@@ -289,11 +305,11 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
       aPagar: ult?.aPagar ?? 0,
       saldoAFavor: ult?.saldoAFavor ?? 0,
       aPagarPeriodo: r2(meses.reduce((a, m) => a + m.aPagar, 0)),
+      /* La cuenta COMPLETA del último mes (del 1 al «hasta»), la que cierra con el arrastre. */
+      cuentaMes: ultimoMes ? { mes: mesHasta, ...(ultimoMes as object) } : null,
     },
     /* Cuánto se vende facturado por cada $100 que se compra facturado (con IVA en los dos lados). */
-    cobertura: total.compras.facturaA.total + total.compras.facturaBC.total > 0
-      ? r2(((total.ventas.facturado.total + total.ventas.pendiente.total) / (total.compras.facturaA.total + total.compras.facturaBC.total)) * 100)
-      : null,
+    cobertura: comprasConIva > 0 ? r2(((total.ventas.facturado.total + total.ventas.pendiente.total) / comprasConIva) * 100) : null,
     porProveedor,
     meses,
     saldoInicial: { importe: N(saldoInicial.importe), mes: mesInicioSaldo },
