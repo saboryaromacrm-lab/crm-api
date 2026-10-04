@@ -32,9 +32,10 @@ import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  cajaSesiones, cashflowCaja, cashflowConceptos, cashflowMovimientos, cashflowSobres, gastoCategorias, proveedorImputaciones,
-  proveedorPagos, proveedores, sucursales,
+  cajaSesiones, cashflowCaja, cashflowConceptos, cashflowConteos, cashflowMovimientos, cashflowSobres, gastoCategorias,
+  proveedorImputaciones, proveedorPagos, proveedores, sucursales,
 } from '../db/schema';
+import { DENOMINACIONES } from '../caja/caja.module';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 
@@ -94,6 +95,14 @@ class PagoProveedorDto {
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
   @IsOptional() @IsString() fecha?: string;
+  @IsBoolean() confirmado!: boolean;
+}
+/** «Contar mi caja»: los billetes por denominación (+ monedas y otros) y si la diferencia se ajusta en el libro. */
+class ConteoDto {
+  @IsOptional() billetes?: Record<string, number>;
+  @IsOptional() @IsNumber() @Min(0) @Max(MAX_IMPORTE) otros?: number;
+  @IsOptional() @IsBoolean() ajustar?: boolean;
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
   @IsBoolean() confirmado!: boolean;
 }
 class MovimientoDto {
@@ -165,15 +174,26 @@ export class CashflowService {
 
   /* ------------------------------ Resumen ------------------------------ */
 
-  async resumen() {
-    const caja = await this.caja();
-    const abiertas = await this.db.execute(sql`
+  /** Las cajas de los locales abiertas hace más de 24 h (un cierre olvidado: el sobre no llega). */
+  private async cajasAbiertas() {
+    const r = await this.db.execute(sql`
       select cs.id, cs.sucursal_id as "sucursalId", su.nombre as sucursal, cs.apertura, u.nombre as usuario,
         round(extract(epoch from (now() - cs.apertura)) / 3600)::int as horas
       from caja_sesiones cs join sucursales su on su.id = cs.sucursal_id left join usuarios u on u.id = cs.usuario_id
       where cs.estado = 'abierta' and cs.apertura < now() - (${HORAS_CAJA_ABIERTA} || ' hours')::interval
       order by cs.apertura`);
-    if (!caja) return { caja: null, cajasAbiertas: abiertas.rows };
+    return r.rows;
+  }
+
+  /** Lo que sondea el banner del ERP cada tanto: liviano a propósito (una consulta chica). */
+  async alertas() {
+    return { cajasAbiertas: await this.cajasAbiertas() };
+  }
+
+  async resumen() {
+    const caja = await this.caja();
+    const abiertas = await this.cajasAbiertas();
+    if (!caja) return { caja: null, cajasAbiertas: abiertas };
 
     const mes = hoyAr().slice(0, 7);
     const [[saldoRow], [mesRow], pend] = await Promise.all([
@@ -200,8 +220,133 @@ export class CashflowService {
       saldo: money(saldoRow?.s),
       enTransito: { sobres: Number(p.n) || 0, total: money(p.total) },
       mes: { periodo: mes, ingresos: money(mesRow?.ingresos), egresos: money(mesRow?.egresos) },
-      cajasAbiertas: abiertas.rows,
+      cajasAbiertas: abiertas,
       ultimos: await this.movimientos({ limite: 8 }),
+      conteos: await this.conteos(5),
+    };
+  }
+
+  /* ------------------------------ Contar mi caja ------------------------------ */
+
+  conteos(limite = 50) {
+    return this.db.execute(sql`
+      select c.id, c.fecha, c.billetes, c.otros, c.contado, c.esperado, c.diferencia, c.ajustado, c.motivo, u.nombre as usuario
+      from cashflow_conteos c left join usuarios u on u.id = c.usuario_id
+      order by c.id desc limit ${Math.min(Math.max(Number(limite) || 50, 1), 500)}`).then((r) => r.rows.map((x: any) => ({
+      ...x, otros: money(x.otros), contado: money(x.contado), esperado: money(x.esperado), diferencia: money(x.diferencia),
+    })));
+  }
+
+  /**
+   * «CONTAR MI CAJA»: lo contado (billetes + monedas/otros) contra el saldo del
+   * libro. El conteo queda siempre; si hay diferencia y se pide ajustar, el
+   * ajuste es un movimiento del libro (ingreso si sobró, egreso si faltó) con
+   * su motivo, para que el saldo vuelva a ser lo que hay en la mano.
+   */
+  async contar(dto: ConteoDto, usuarioId: number | null) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá el conteo.');
+    const billetes: Record<string, number> = {};
+    let suma = 0;
+    for (const [d, n] of Object.entries(dto.billetes ?? {})) {
+      const den = Number(d); const cant = Number(n);
+      if (!(DENOMINACIONES as readonly number[]).includes(den)) throw new BadRequestException(`No existe el billete de $${d}.`);
+      if (!Number.isInteger(cant) || cant < 0 || cant > 100000) throw new BadRequestException(`La cantidad de billetes de $${den.toLocaleString('es-AR')} no es válida.`);
+      if (cant > 0) { billetes[String(den)] = cant; suma += den * cant; }
+    }
+    const otros = money(dto.otros ?? 0);
+    const contado = money(suma + otros);
+    const motivo = String(dto.motivo ?? '').trim();
+    return this.db.transaction(async (tx) => {
+      const [caja] = await tx.select().from(cashflowCaja).limit(1).for('update');
+      if (!caja) throw new BadRequestException('Primero arrancá el Cash Flow con la fecha y el saldo inicial.');
+      const esperado = await this.saldo(tx);
+      const diferencia = money(contado - esperado);
+      const hayDif = Math.abs(diferencia) > 0.009;
+      const ajustar = hayDif && dto.ajustar === true;
+      if (ajustar && !motivo) throw new BadRequestException(`Contaste $${contado.toLocaleString('es-AR')} y el libro dice $${esperado.toLocaleString('es-AR')}: para ajustar, escribí el motivo de la diferencia.`);
+      const [c] = await tx.insert(cashflowConteos).values({
+        billetes, otros, contado, esperado, diferencia, ajustado: ajustar, motivo, usuarioId,
+      }).returning();
+      if (ajustar) {
+        await tx.insert(cashflowMovimientos).values({
+          tipo: diferencia > 0 ? 'ingreso' : 'egreso', origen: 'conteo', importe: money(Math.abs(diferencia)), conteoId: c.id, usuarioId,
+          detalle: `Ajuste por conteo: contado $${contado.toLocaleString('es-AR')}, el libro decía $${esperado.toLocaleString('es-AR')} · ${motivo}`,
+        });
+      }
+      return { ok: true, conteoId: c.id, contado, esperado, diferencia, ajustado: ajustar, saldo: await this.saldo(tx) };
+    });
+  }
+
+  /* ------------------------------ Reporte ------------------------------ */
+
+  /**
+   * El período en números: saldo al inicio y al fin, ingresos/egresos por
+   * concepto, los sobres por sucursal, las diferencias por cajero y la serie
+   * por día / semana / mes. Todo sale del libro y de los sobres: no hay
+   * tablas resumen que puedan quedar viejas.
+   */
+  async reporte(q: { desde?: string; hasta?: string }) {
+    const caja = await this.caja();
+    const hoy = hoyAr();
+    const desde = esDia(q.desde) ? q.desde : `${hoy.slice(0, 7)}-01`;
+    const hasta = esDia(q.hasta) ? q.hasta : hoy;
+    if (hasta < desde) throw new BadRequestException('«Hasta» es anterior a «desde».');
+    const dias = Math.round((Date.parse(`${hasta}T12:00:00Z`) - Date.parse(`${desde}T12:00:00Z`)) / 86_400_000) + 1;
+    if (dias > 1100) throw new BadRequestException('El período puede ser de hasta 3 años.');
+    const paso = dias <= 45 ? 'day' : dias <= 200 ? 'week' : 'month';
+    if (!caja) return { caja: null, desde, hasta };
+    const vivo = sql`m.anulado_en is null`;
+    const [antes, periodo, porConcepto, serie, sobresSuc, cajeros] = await Promise.all([
+      this.db.execute(sql`select coalesce(sum(case when m.tipo = 'ingreso' then m.importe else -m.importe end), 0) as s
+        from cashflow_movimientos m where ${vivo} and m.fecha < ('${sql.raw(desde)}'::date::timestamp at time zone '${sql.raw(ZONA)}')`),
+      this.db.execute(sql`select
+          coalesce(sum(m.importe) filter (where m.tipo = 'ingreso' and m.origen <> 'saldo_inicial'), 0) as ingresos,
+          coalesce(sum(m.importe) filter (where m.tipo = 'ingreso' and m.origen = 'saldo_inicial'), 0) as "saldoInicial",
+          coalesce(sum(m.importe) filter (where m.tipo = 'egreso'), 0) as egresos,
+          count(*) filter (where m.origen <> 'saldo_inicial')::int as movimientos
+        from cashflow_movimientos m where ${vivo} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}`),
+      this.db.execute(sql`select m.tipo, m.origen, coalesce(c.nombre, '') as concepto,
+          coalesce(sum(m.importe), 0) as importe, count(*)::int as cantidad
+        from cashflow_movimientos m left join cashflow_conceptos c on c.id = m.concepto_id
+        where ${vivo} and m.origen <> 'saldo_inicial' and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
+        group by 1, 2, 3 order by 1, 4 desc`),
+      this.db.execute(sql`select to_char(date_trunc('${sql.raw(paso)}', m.fecha at time zone '${sql.raw(ZONA)}'), 'YYYY-MM-DD') as periodo,
+          coalesce(sum(m.importe) filter (where m.tipo = 'ingreso' and m.origen <> 'saldo_inicial'), 0) as ingresos,
+          coalesce(sum(m.importe) filter (where m.tipo = 'egreso'), 0) as egresos
+        from cashflow_movimientos m
+        where ${vivo} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
+        group by 1 order by 1`),
+      this.db.execute(sql`select su.id as "sucursalId", su.nombre as sucursal,
+          count(*)::int as sobres, count(s.id)::int as controlados,
+          coalesce(sum(cs.envio_efectivo), 0) as enviado, coalesce(sum(s.contado), 0) as contado, coalesce(sum(s.diferencia), 0) as diferencia
+        from caja_sesiones cs join sucursales su on su.id = cs.sucursal_id
+        left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
+        where cs.estado = 'cerrada' and cs.envio_efectivo > 0 and ${desdeDia('cs.cierre', caja.fechaInicio)}
+          and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)}
+        group by 1, 2 order by 2`),
+      this.db.execute(sql`select coalesce(uc.id, ua.id) as "usuarioId", coalesce(uc.nombre, ua.nombre, 'Sin cajero') as cajero,
+          count(*)::int as sobres, count(*) filter (where abs(s.diferencia) > 0.009)::int as "conDiferencia",
+          coalesce(sum(s.diferencia), 0) as diferencia,
+          coalesce(sum(s.diferencia) filter (where s.diferencia < 0), 0) as faltantes,
+          coalesce(sum(s.diferencia) filter (where s.diferencia > 0), 0) as sobrantes
+        from cashflow_sobres s join caja_sesiones cs on cs.id = s.caja_sesion_id
+        left join usuarios ua on ua.id = cs.usuario_id
+        left join lateral (select cc.usuario_id from caja_controles cc where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1) cx on true
+        left join usuarios uc on uc.id = cx.usuario_id
+        where s.anulado_en is null and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)}
+        group by 1, 2 order by 5 asc`),
+    ]);
+    const p: any = periodo.rows[0] ?? {};
+    const saldoInicio = money((antes.rows[0] as any)?.s);
+    const ingresos = money(p.ingresos); const egresos = money(p.egresos); const saldoInicial = money(p.saldoInicial);
+    return {
+      caja, desde, hasta, paso: paso === 'day' ? 'dia' : paso === 'week' ? 'semana' : 'mes',
+      saldoInicio, saldoInicial, ingresos, egresos, movimientos: Number(p.movimientos) || 0,
+      saldoFin: money(saldoInicio + saldoInicial + ingresos - egresos),
+      porConcepto: porConcepto.rows.map((x: any) => ({ ...x, importe: money(x.importe) })),
+      serie: serie.rows.map((x: any) => ({ periodo: x.periodo, ingresos: money(x.ingresos), egresos: money(x.egresos) })),
+      sobresPorSucursal: sobresSuc.rows.map((x: any) => ({ ...x, enviado: money(x.enviado), contado: money(x.contado), diferencia: money(x.diferencia) })),
+      porCajero: cajeros.rows.map((x: any) => ({ ...x, diferencia: money(x.diferencia), faltantes: money(x.faltantes), sobrantes: money(x.sobrantes) })),
     };
   }
 
@@ -551,7 +696,7 @@ export class CashflowService {
        * saldo inicial desde el arranque. El pago a proveedor y el gasto se
        * deshacen PRIMERO por su circuito (desaplicar + anular el pago, anular
        * el gasto); si eso falla, el egreso sigue vigente y el saldo no miente. */
-      if (!['concepto', 'pago_proveedor', 'gasto'].includes(m.origen)) throw new BadRequestException('Ese movimiento no se anula desde acá: es el saldo inicial o un sobre.');
+      if (!['concepto', 'pago_proveedor', 'gasto', 'conteo'].includes(m.origen)) throw new BadRequestException('Ese movimiento no se anula desde acá: es el saldo inicial o un sobre.');
       if (m.origen === 'pago_proveedor' && m.pagoId) await this.anularPago(m.pagoId, motivo);
       if (m.origen === 'gasto') {
         if (m.pagoId) await this.anularPago(m.pagoId, motivo);
@@ -569,6 +714,10 @@ export class CashflowController {
   constructor(private readonly svc: CashflowService) {}
 
   @Get('resumen') resumen() { return this.svc.resumen(); }
+  @Get('alertas') alertas() { return this.svc.alertas(); }
+  @Get('reporte') reporte(@Query() q: any) { return this.svc.reporte(q ?? {}); }
+  @Get('conteos') conteos(@Query('limite') limite?: string) { return this.svc.conteos(Number(limite) || 50); }
+  @Post('conteos') contar(@Body() dto: ConteoDto, @Auth() s: Sesion) { return this.svc.contar(dto, s?.usuarioId ?? null); }
   @Put('inicio') inicio(@Body() dto: InicioDto, @Auth() s: Sesion) { return this.svc.inicio(dto, s?.usuarioId ?? null); }
 
   @Get('sobres') sobres(@Query() q: any) { return this.svc.sobres(q ?? {}); }

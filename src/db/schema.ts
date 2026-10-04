@@ -2424,6 +2424,19 @@ export const cashflowSobres = pgTable('cashflow_sobres', {
 }, (t) => ({
   ixSesion: index('ix_cashflow_sobres_sesion').on(t.cajaSesionId),
 }));
+/** «Contar mi caja» (0134): lo contado billete por billete contra lo que debía haber. */
+export const cashflowConteos = pgTable('cashflow_conteos', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  billetes: jsonb('billetes').notNull().default({}),
+  otros: doublePrecision('otros').notNull().default(0),
+  contado: doublePrecision('contado').notNull(),
+  esperado: doublePrecision('esperado').notNull(),
+  diferencia: doublePrecision('diferencia').notNull(),
+  ajustado: boolean('ajustado').notNull().default(false),
+  motivo: text('motivo').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
 /** El libro: cada ingreso y egreso con su origen. No se borra: se anula con motivo. */
 export const cashflowMovimientos = pgTable('cashflow_movimientos', {
   id: serial('id').primaryKey(),
@@ -2435,6 +2448,8 @@ export const cashflowMovimientos = pgTable('cashflow_movimientos', {
   sobreId: integer('sobre_id').references(() => cashflowSobres.id, { onDelete: 'restrict' }),
   pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'restrict' }),
   gastoId: integer('gasto_id').references(() => gastos.id, { onDelete: 'restrict' }),
+  /** El ajuste de un conteo (0134). */
+  conteoId: integer('conteo_id').references(() => cashflowConteos.id, { onDelete: 'restrict' }),
   detalle: text('detalle').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   anuladoEn: timestamp('anulado_en', { withTimezone: true }),
