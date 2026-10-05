@@ -2423,6 +2423,11 @@ export const cashflowSobres = pgTable('cashflow_sobres', {
   anuladoEn: timestamp('anulado_en', { withTimezone: true }),
   anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   anuladoMotivo: text('anulado_motivo').notNull().default(''),
+  /** 0136: sobre que NO corresponde (ya en el saldo inicial, extraviado): sin ingreso y sin faltante al cajero. */
+  descartado: boolean('descartado').notNull().default(false),
+  /** 0136: el conteo a ciegas del dueño, billete por billete (+ monedas y otros). */
+  billetes: jsonb('billetes').notNull().default({}),
+  otros: doublePrecision('otros').notNull().default(0),
 }, (t) => ({
   ixSesion: index('ix_cashflow_sobres_sesion').on(t.cajaSesionId),
 }));
@@ -2438,6 +2443,8 @@ export const cashflowConteos = pgTable('cashflow_conteos', {
   ajustado: boolean('ajustado').notNull().default(false),
   motivo: text('motivo').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** 0136: lo que había en sobres sin controlar al contar (explica un «sobrante» que era un sobre). */
+  enTransito: doublePrecision('en_transito').notNull().default(0),
 });
 /** El libro: cada ingreso y egreso con su origen. No se borra: se anula con motivo. */
 export const cashflowMovimientos = pgTable('cashflow_movimientos', {

@@ -45,6 +45,7 @@ const paraCuentaCoffit = (g: { total: number; iva: number; percDgi: number; perc
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { PagosModule, PagosProveedorService, esAdminPagos, exigirFechaPago } from '../pagos/pagos.module';
+import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 
 /**
  * LAS FECHAS DEL GASTO (27/9/2026). Se aceptaba un gasto fechado en 2035 y un
@@ -1114,10 +1115,12 @@ export class GastosService {
     return this.get(id);
   }
 
-  async anular(id: number, motivo?: string) {
+  async anular(id: number, motivo?: string, opts?: OpcionesCashflow) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('Ya está anulado.');
+    /* Cargado desde la caja del dueño: se anula desde el Cash Flow (auditoría 5/10). */
+    await exigirFueraDeCashflow(this.db, { gastoId: id }, 'Este gasto', opts);
     await exigirFueraDeConciliado(this.db, g.proveedorId, g.fecha, 'anular un gasto');
     if (g.pagado > 0.009) {
       const [nc] = await this.db.select({ id: gastos.id }).from(gastos).where(and(

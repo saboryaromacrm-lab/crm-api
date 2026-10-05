@@ -96,6 +96,11 @@ const TABLAS_PRACTICA = [
   'metricas_venta_pago_dia', 'metricas_compra_prov_dia', 'metricas_venta_mezcla_dia', 'metricas_estado',
   // cobros por QR de Mercado Pago (0126): cuelgan de las ventas de práctica
   'mp_cobros',
+  // cash flow (0133/0134): el arranque, los sobres controlados, los conteos y el
+  // libro cuelgan de cajas, pagos y gastos de práctica. Vacía la caja central
+  // también: sin su libro el saldo no cerraría, así que se vuelve a arrancar.
+  // Los CONCEPTOS quedan: son la configuración del dueño.
+  'cashflow_caja', 'cashflow_sobres', 'cashflow_conteos', 'cashflow_movimientos',
   // tienda: eventos (las fotos quedan)
   'web_eventos',
   // el rastro de la práctica; el primer registro de la era nueva es la limpieza

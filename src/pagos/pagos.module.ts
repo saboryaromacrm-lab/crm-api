@@ -41,6 +41,7 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import {
   cajaMovimientos, cajaSesiones, comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
   proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores, sucursales, usuarios,
@@ -1363,7 +1364,7 @@ export class PagosProveedorService {
    * a ese documento y sin él no puede aplicarse a nada. Desaplicarlo equivale
    * a anularlo, así que se anula entero (y ahí sí manda la regla de la caja).
    */
-  async desimputar(imputacionId: number) {
+  async desimputar(imputacionId: number, opts?: OpcionesCashflow) {
     const pagoId = await this.db.transaction(async (tx) => {
       const [imp] = await tx.select().from(proveedorImputaciones)
         .where(eq(proveedorImputaciones.id, imputacionId)).limit(1);
@@ -1375,6 +1376,9 @@ export class PagosProveedorService {
         .where(eq(proveedorPagos.id, imp.pagoId)).limit(1).for('update');
 
       if (pago && !pago.proveedorId) {
+        /* Desaplicar el pago de un gasto suelto lo ANULA: si el gasto se cargó
+         * desde el Cash Flow, eso se hace desde ahí (el egreso va junto). */
+        await exigirFueraDeCashflow(tx, { pagoId: pago.id }, 'El pago de este gasto', opts);
         if (pago.cajaMovimientoId) {
           // Con candado, igual que al crear: el cierre no puede colarse entre el
           // chequeo de "sigue abierta" y el borrado del movimiento.
@@ -1480,7 +1484,10 @@ export class PagosProveedorService {
    *     ese egreso adentro. La corrección va como ingreso de caja del turno
    *     actual, dejando rastro de las dos operaciones.
    */
-  async anular(id: number, motivo?: string) {
+  async anular(id: number, motivo?: string, opts?: OpcionesCashflow) {
+    /* Si salió de la caja del dueño (Cash Flow), se anula desde ahí: si no, el
+     * egreso del libro seguía vivo con el pago ya anulado (auditoría 5/10). */
+    await exigirFueraDeCashflow(this.db, { pagoId: id }, 'Este pago', opts);
     await this.db.transaction(async (tx) => {
       /* El chequeo de `aplicado` va DENTRO de la transacción y con candado.
        * Leído afuera, una imputación que entraba en el medio dejaba el pago
