@@ -240,6 +240,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'proveedores.edoc', nombre: 'Estados de cuenta' },
       { clave: 'proveedores.cuentas', nombre: 'Cuentas disponibles (transferencias de clientes a proveedores)' },
       { clave: 'proveedores.padron', nombre: 'Ficha de proveedores' },
+      { clave: 'proveedores.stock_provisorio', nombre: 'Stock provisorio de granel (planilla temporal, bolsas a ojo)' },
     ],
     acciones: [],
   },

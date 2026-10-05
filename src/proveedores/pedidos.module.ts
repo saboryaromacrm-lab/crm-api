@@ -93,6 +93,55 @@ export class PedidosProveedorService {
     };
   }
 
+  /**
+   * «VER STOCK» desde la tarjeta (5/10/2026): los productos que trae este
+   * proveedor (su lista de productos) con lo disponible en total y por
+   * sucursal (también la que quedó en negativo: si no, el detalle no suma el
+   * total), y lo que viene en camino. Los que menos tienen, primero: es lo
+   * que se mira para armar el pedido. Una consulta.
+   */
+  async stockDe(proveedorId: number) {
+    const r = await this.db.execute(sql`
+      select p.id, p.nombre, p.codigo_propio as codigo, p.tipo, p.estado,
+        coalesce(sum(st.cantidad) filter (where st.estado = 'disponible'), 0)::float as disponible,
+        coalesce(sum(st.cantidad) filter (where st.estado = 'en_transito'), 0)::float as "enCamino",
+        coalesce((
+          select json_agg(json_build_object('sucursal', x.nombre, 'cantidad', x.c) order by x.nombre)
+          from (
+            select su.nombre, sum(s2.cantidad)::float as c from stock s2 join sucursales su on su.id = s2.sucursal_id
+            where s2.producto_id = p.id and s2.estado = 'disponible' group by su.nombre
+            having abs(sum(s2.cantidad)) > 1e-9
+          ) x
+        ), '[]'::json) as "porSucursal"
+      from producto_proveedores pp
+      join productos p on p.id = pp.producto_id
+      left join stock st on st.producto_id = p.id
+      where pp.proveedor_id = ${proveedorId} and p.estado <> 'archivado'
+      group by p.id
+      order by disponible asc, p.nombre`);
+    return r.rows;
+  }
+
+  /**
+   * «SUS ÚLTIMOS INGRESOS» (5/10/2026): las últimas facturas, remitos y
+   * liquidaciones confirmadas de este proveedor, con qué trajo cada una.
+   * Sin costos por renglón: el total del comprobante alcanza para ubicarlo.
+   */
+  async ingresosDe(proveedorId: number) {
+    const r = await this.db.execute(sql`
+      select c.id, c.tipo, c.letra, c.punto_venta as "puntoVenta", c.numero, c.fecha, c.total::float as total,
+        c.recepcion, coalesce(su.nombre, '') as sucursal,
+        coalesce((
+          select json_agg(json_build_object('nombre', p.nombre, 'cantidad', ci.cantidad, 'tipo', p.tipo) order by ci.id)
+          from comprobante_items ci join productos p on p.id = ci.producto_id where ci.comprobante_id = c.id
+        ), '[]'::json) as items
+      from comprobantes c left join sucursales su on su.id = c.sucursal_id
+      where c.proveedor_id = ${proveedorId} and c.estado = 'confirmado' and c.tipo in ('factura', 'remito', 'liquidacion')
+      order by c.fecha desc, c.id desc
+      limit 15`);
+    return r.rows;
+  }
+
   /** El kanban: todo lo que NO está recibido (los recibidos son historial). */
   async kanban() {
     const filas = await this.db.select(this.baseSelect())
@@ -276,6 +325,9 @@ export class PedidosProveedorController {
   constructor(private readonly svc: PedidosProveedorService) {}
 
   @Get() kanban() { return this.svc.kanban(); }
+  /* El menú del nombre en la tarjeta (5/10/2026): su stock y sus últimos ingresos. */
+  @Get('proveedor/:id/stock') stockDe(@Param('id', ParseIntPipe) id: number) { return this.svc.stockDe(id); }
+  @Get('proveedor/:id/ingresos') ingresosDe(@Param('id', ParseIntPipe) id: number) { return this.svc.ingresosDe(id); }
   @Get('stats') stats() { return this.svc.stats(); }
   @Get('recibidos') recibidos(
     @Query('filtro') filtro?: string,

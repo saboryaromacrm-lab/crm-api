@@ -1860,6 +1860,12 @@ export const cajaMovimientos = pgTable('caja_movimientos', {
   motivo: text('motivo').notNull().default(''),
   importe: doublePrecision('importe').notNull().default(0),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** 0137: asentado por el superadmin DESPUÉS del cierre (el cajero se olvidó): recalcula el cierre. */
+  posterior: boolean('posterior').notNull().default(false),
+  /** 0137: solo el posterior se anula — tachado a la vista, deja de sumar. */
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
 }, (t) => ({
   ixSesion: index('ix_caja_mov_sesion').on(t.cajaSesionId),
 }));
@@ -3477,3 +3483,19 @@ export const respaldoDrive = pgTable('respaldo_drive', {
   ultimoError: text('ultimo_error').notNull().default(''),
   ultimoOrigen: text('ultimo_origen').notNull().default(''),
 });
+
+/**
+ * STOCK PROVISORIO DE GRANEL (0138) — TEMPORAL. Bolsas cerradas contadas a ojo
+ * de cada producto a granel madre, en una planilla aparte que NO toca `stock`.
+ * Se elimina entera cuando el stock real del sistema esté bien.
+ */
+export const stockProvisorioConteos = pgTable('stock_provisorio_conteos', {
+  id: serial('id').primaryKey(),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  bolsas: integer('bolsas').notNull(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  observacion: text('observacion').notNull().default(''),
+}, (t) => ({
+  ixProducto: index('ix_stock_provisorio_producto').on(t.productoId, t.id),
+}));

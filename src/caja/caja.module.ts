@@ -13,15 +13,16 @@
  *    contra el resumen del banco/posnet, así que se guardan como foto.
  */
 import {
-  Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
+  Body, ConflictException, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString } from 'class-validator';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, mpCobros, sucursales, ventaPagos, ventas,
 } from '../db/schema';
@@ -191,6 +192,20 @@ class MovimientoCajaDto {
   @IsOptional() @IsInt() operadorId?: number;
 }
 
+/** Un movimiento que el cajero se olvidó de asentar, cargado por el superadmin en un turno YA CERRADO (0137). */
+class MovimientoPosteriorDto {
+  @IsIn(['ingreso', 'egreso']) tipo!: 'ingreso' | 'egreso';
+  @IsNumber() @Min(0.01) @Max(100_000_000_000) importe!: number;
+  @IsString() @MaxLength(300) motivo!: string;
+  @IsBoolean() confirmado!: boolean;
+}
+class AnularPosteriorDto {
+  @IsString() @MaxLength(300) motivo!: string;
+}
+
+/** La llave de los movimientos después del cierre: fuera del catálogo, solo el superadmin (`*`). */
+export const PERMISO_CAJA_POSTERIOR = 'caja.posterior';
+
 /**
  * EL ARQUEO SIN EL EFECTIVO ESPERADO, para el turno abierto de quien cuenta.
  *
@@ -230,7 +245,10 @@ async function sinCobrosQrVivos(tx: any, sucursalId: number) {
 
 @Injectable()
 export class CajaService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly audit: AuditoriaService,
+  ) {}
 
   /**
    * ¿El cajero ve lo que tiene que haber en caja? (`ventas.cajaVeEsperado`,
@@ -334,8 +352,10 @@ export class CajaService {
      */
     const recargos = money(Object.values(medios).reduce((a, m) => a + (m.recargo || 0), 0));
 
-    const ingresos = money(movs.filter((m) => m.tipo === 'ingreso').reduce((a, m) => a + m.importe, 0));
-    const egresos = money(movs.filter((m) => m.tipo === 'egreso').reduce((a, m) => a + m.importe, 0));
+    /* Los anulados (0137: solo los asentados después del cierre) se muestran tachados pero no suman. */
+    const vivos = movs.filter((m) => !m.anuladoEn);
+    const ingresos = money(vivos.filter((m) => m.tipo === 'ingreso').reduce((a, m) => a + m.importe, 0));
+    const egresos = money(vivos.filter((m) => m.tipo === 'egreso').reduce((a, m) => a + m.importe, 0));
 
     const efectivo = medios.efectivo ?? { ventas: 0, cobranzas: 0, total: 0 };
     const esperadoEfectivo = money(sesion.montoInicial + efectivo.total + ingresos - egresos);
@@ -777,6 +797,94 @@ export class CajaService {
   }
 
   /**
+   * MOVIMIENTO DESPUÉS DEL CIERRE (0137, pedido del dueño). El cajero se olvidó
+   * de asentar un egreso (o un ingreso) y avisa cuando el turno ya cerró: sin
+   * esto, ese cierre queda con una diferencia que no es real para siempre. Solo
+   * el superadmin; queda marcado `posterior`, firmado por él, y el cierre se
+   * recalcula: el efectivo esperado y la diferencia cambian, lo CONTADO y lo
+   * ENVIADO no (son plata física que ya se contó). Con el turno candado: dos
+   * clics no lo cargan dos veces.
+   */
+  async movimientoPosterior(id: number, dto: MovimientoPosteriorDto, usuarioId: number | null) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá el movimiento.');
+    const importe = money(dto.importe);
+    if (importe <= 0) throw new BadRequestException('El importe tiene que ser mayor a 0.');
+    const motivo = String(dto.motivo ?? '').trim();
+    if (motivo.length < 5) throw new BadRequestException('Escribí el motivo: qué fue y quién avisó (queda en el turno).');
+    return this.db.transaction(async (tx) => {
+      const sesion = await this.turnoCerrado(tx, id);
+      /* El mismo movimiento recién asentado (doble clic, o reintento de una red
+       * lenta): con el turno candado, el segundo lo encuentra y no lo repite. */
+      const [gemelo] = await tx.select({ id: cajaMovimientos.id }).from(cajaMovimientos).where(and(
+        eq(cajaMovimientos.cajaSesionId, id), eq(cajaMovimientos.posterior, true), eq(cajaMovimientos.tipo, dto.tipo),
+        eq(cajaMovimientos.importe, importe), eq(cajaMovimientos.motivo, motivo), isNull(cajaMovimientos.anuladoEn),
+        sql`${cajaMovimientos.fecha} > now() - interval '30 seconds'`,
+      )).limit(1);
+      if (gemelo) throw new ConflictException('Ese movimiento ya se asentó recién: revisá los movimientos del turno.');
+      const [m] = await tx.insert(cajaMovimientos).values({
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo, usuarioId, posterior: true,
+      }).returning();
+      const turno = await this.recalcularCierre(tx, sesion, dto.tipo, importe, false, usuarioId,
+        `${dto.tipo === 'egreso' ? 'Egreso' : 'Ingreso'} asentado después del cierre: $${importe.toLocaleString('es-AR')} · ${motivo}`);
+      return { movimiento: m, sesion: turno };
+    });
+  }
+
+  /** Anula un movimiento asentado después del cierre (solo esos): tachado, deja de sumar y el cierre vuelve. */
+  async anularPosterior(id: number, movId: number, dto: AnularPosteriorDto, usuarioId: number | null) {
+    const motivo = String(dto.motivo ?? '').trim();
+    if (motivo.length < 3) throw new BadRequestException('Escribí por qué se anula.');
+    return this.db.transaction(async (tx) => {
+      const sesion = await this.turnoCerrado(tx, id);
+      const [m] = await tx.select().from(cajaMovimientos).where(eq(cajaMovimientos.id, movId)).limit(1).for('update');
+      if (!m || m.cajaSesionId !== id) throw new NotFoundException('Ese movimiento no es de este turno.');
+      if (!m.posterior) throw new BadRequestException('Solo se anulan los movimientos asentados después del cierre: los del turno los firmó el cajero.');
+      if (m.anuladoEn) throw new BadRequestException('Ese movimiento ya estaba anulado.');
+      await tx.update(cajaMovimientos).set({ anuladoEn: new Date(), anuladoPor: usuarioId, anuladoMotivo: motivo })
+        .where(eq(cajaMovimientos.id, movId));
+      /* Deshacerlo saca ese movimiento del cierre. */
+      const turno = await this.recalcularCierre(tx, sesion, m.tipo, m.importe, true, usuarioId,
+        `Anulado el ${m.tipo} posterior de $${money(m.importe).toLocaleString('es-AR')} («${m.motivo}») · ${motivo}`);
+      return { ok: true, sesion: turno };
+    });
+  }
+
+  /** El turno, candado y CERRADO: lo abierto se mueve por el camino de siempre (Ingreso / egreso). */
+  private async turnoCerrado(tx: any, id: number) {
+    const [sesion] = await tx.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1).for('update');
+    if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+    if (sesion.estado !== 'cerrada') throw new BadRequestException('El turno está abierto: el movimiento se carga con «Ingreso / egreso».');
+    return sesion;
+  }
+
+  /**
+   * El cierre después de un movimiento posterior: lo esperado se corre en el
+   * importe (egreso resta, ingreso suma), la diferencia es lo contado menos
+   * eso, y los totales del turno acompañan. Sobre la foto del cierre y no
+   * recalculando el arqueo entero: dentro de la transacción es exacto, y lo
+   * contado y lo enviado no se tocan. Queda en la auditoría del turno.
+   */
+  private async recalcularCierre(
+    tx: any, sesion: any, tipo: 'ingreso' | 'egreso', importe: number, quitar: boolean, usuarioId: number | null, detalle: string,
+  ) {
+    /* Sumar un egreso baja lo esperado; quitarlo (anular) lo devuelve. */
+    const signo = (tipo === 'ingreso' ? 1 : -1) * (quitar ? -1 : 1);
+    const sistema = money((Number(sesion.sistemaEfectivo) || 0) + signo * importe);
+    const diferencia = money((Number(sesion.declaradoEfectivo) || 0) - sistema);
+    const tot: any = { ...(sesion.totales ?? {}) };
+    const campo = tipo === 'ingreso' ? 'ingresos' : 'egresos';
+    tot[campo] = money((Number(tot[campo]) || 0) + (quitar ? -importe : importe));
+    const [c] = await tx.update(cajaSesiones).set({ sistemaEfectivo: sistema, diferencia, totales: tot })
+      .where(eq(cajaSesiones.id, sesion.id)).returning();
+    const $ = (n: number) => `${n > 0 ? '+' : n < 0 ? '−' : ''}$${Math.abs(n).toLocaleString('es-AR')}`;
+    await this.audit.registrar([{
+      entidad: 'caja', entidadId: sesion.id, ambito: 'Caja', campo: 'Movimiento después del cierre', usuarioId,
+      detalle, antes: `Diferencia ${$(money(sesion.diferencia ?? 0))}`, despues: `Diferencia ${$(diferencia)}`,
+    }], tx);
+    return c;
+  }
+
+  /**
    * Turno válido para operar en una sucursal. Lo usa la venta: si la caja es
    * obligatoria y no hay turno, la venta se rechaza acá y no a mitad de camino.
    */
@@ -950,9 +1058,26 @@ export class CajaController {
   mov(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoCajaDto, @Auth() sesion: Sesion) {
     return this.svc.movimiento(id, dto, soloSuSucursal(sesion));
   }
+
+  /* Después del cierre (0137): solo el superadmin — la llave no está en el catálogo, pasa el comodín. */
+  @Post(':id/movimiento-posterior')
+  @Permiso(PERMISO_CAJA_POSTERIOR)
+  movPosterior(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoPosteriorDto, @Auth() sesion: Sesion) {
+    return this.svc.movimientoPosterior(id, dto, sesion?.usuarioId ?? null);
+  }
+
+  @Post(':id/movimiento-posterior/:movId/anular')
+  @Permiso(PERMISO_CAJA_POSTERIOR)
+  anularPosterior(
+    @Param('id', ParseIntPipe) id: number, @Param('movId', ParseIntPipe) movId: number,
+    @Body() dto: AnularPosteriorDto, @Auth() sesion: Sesion,
+  ) {
+    return this.svc.anularPosterior(id, movId, dto, sesion?.usuarioId ?? null);
+  }
 }
 
 @Module({
+  imports: [AuditoriaModule],
   controllers: [CajaController],
   providers: [CajaService],
   exports: [CajaService],

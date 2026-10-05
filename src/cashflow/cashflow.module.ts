@@ -501,7 +501,7 @@ export class CashflowService {
       left join lateral (
         select sum(cm.importe) as total,
           json_agg(json_build_object('motivo', cm.motivo, 'importe', cm.importe) order by cm.id) as detalle
-        from caja_movimientos cm where cm.caja_sesion_id = cs.id and cm.tipo = 'egreso'
+        from caja_movimientos cm where cm.caja_sesion_id = cs.id and cm.tipo = 'egreso' and cm.anulado_en is null
       ) pl on true
       where ${sql.join(cond, sql` and `)}
       order by cs.cierre desc
