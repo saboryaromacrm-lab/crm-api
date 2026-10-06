@@ -287,10 +287,15 @@ export class CajaService {
     return c ?? null;
   }
 
-  async list(q: { sucursalId?: number; estado?: string; limit?: number }) {
+  async list(q: { sucursalId?: number; estado?: string; limit?: number; desde?: string; hasta?: string }) {
     const conds: any[] = [];
     if (q.sucursalId) conds.push(eq(cajaSesiones.sucursalId, Number(q.sucursalId)));
     if (q.estado) conds.push(eq(cajaSesiones.estado, q.estado as any));
+    /* POR FECHA DE APERTURA, día argentino (6/10/2026, pedido del dueño: anteayer,
+     * ayer o un rango a mano). La fecha se valida antes de entrar al SQL. */
+    const esDia = (v?: string) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && (() => { const d = new Date(`${v}T12:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v; })();
+    if (esDia(q.desde)) conds.push(sql`${cajaSesiones.apertura} >= (${q.desde}::date::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
+    if (esDia(q.hasta)) conds.push(sql`${cajaSesiones.apertura} < ((${q.hasta}::date + 1)::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
     const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 200);
     return this.db.select().from(cajaSesiones)
       .where(conds.length ? and(...conds) : undefined)
@@ -942,11 +947,13 @@ export class CajaController {
     @Query('sucursalId') sucursalId?: string,
     @Query('estado') estado?: string,
     @Query('limit') limit?: string,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
   ) {
     const mia = soloSuSucursal(sesion);
     const filas = await this.svc.list({
       sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
-      estado, limit: limit ? Number(limit) : undefined,
+      estado, limit: limit ? Number(limit) : undefined, desde, hasta,
     });
     // El historial también a ciegas para el que cuenta a ciegas (0111).
     return (await this.ciego(sesion)) ? filas.map((f) => sesionCiega(f)) : filas;

@@ -245,6 +245,10 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
      * entre ellos, se rechaza ACÁ — después de que el cliente pagó, la venta no
      * cerraría y la plata quedaría cobrada. */
     await this.ventas.validarMediosMayorista(venta.items as any[], 'contado', [...otros, { medio: 'qr', importe: montoQr }]);
+    /* Los medios que exigen factura, también ANTES de mandar el monto (5/10/2026):
+     * si el QR de Mercado Pago (u otro medio del cobro) obliga a facturar y se
+     * pidió ticket, la venta no cerraría después de que el cliente pagó. */
+    await this.ventas.exigirFacturaSegunMedios(dto.confirmar.tipo, [...otros, { medio: 'qr', importe: montoQr, referencia: 'MP cobro' }] as any);
 
     const confirmar = {
       tipo: dto.confirmar.tipo, condicionPago: 'contado',

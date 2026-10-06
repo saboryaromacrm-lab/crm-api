@@ -974,6 +974,13 @@
       "when": 1790720000000,
       "tag": "0138_stock_provisorio",
       "breakpoints": true
+    },
+    {
+      "idx": 139,
+      "version": "7",
+      "when": 1790730000000,
+      "tag": "0139_qr_mp_exige_factura",
+      "breakpoints": true
     }
   ]
 }

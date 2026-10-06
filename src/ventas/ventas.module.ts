@@ -2989,17 +2989,27 @@ export class VentasService {
    * El POS bloquea "Liquidar" con el motivo a la vista; esto es el candado del
    * lado que manda, para el ticket armado por API o un POS desactualizado.
    */
-  private validarMediosFacturar(tipo: string, pagos: VentaPagoDto[], config: any) {
+  validarMediosFacturar(tipo: string, pagos: VentaPagoDto[], config: any) {
     if (tipo !== 'ticket') return;                                   // factura/NC/ND: nada que exigir
     const exigen: string[] = config.mediosFacturar ?? [];
     if (!exigen.length) return;
-    const usado = (pagos ?? []).find((p) => Number(p.importe) > 0 && exigen.includes(p.medio));
+    /* El QR de Mercado Pago viaja como «qr» con la referencia «MP …», pero en
+     * la configuración es su propio medio (`qr_mp`, 5/10/2026): se puede exigir
+     * factura para él sin exigirla para el QR del posnet, y al revés. */
+    const medioDe = (p: any) => (p.medio === 'qr' && /^MP /.test(String(p.referencia ?? '')) ? 'qr_mp' : p.medio);
+    const usado = (pagos ?? []).find((p) => Number(p.importe) > 0 && exigen.includes(medioDe(p)));
     if (usado) {
+      const nombre = medioDe(usado) === 'qr_mp' ? 'QR de Mercado Pago' : usado.medio.replace(/_/g, ' ');
       throw new BadRequestException(
-        `El medio "${usado.medio.replace(/_/g, ' ')}" exige factura: esta venta no puede salir como ticket. `
+        `El medio "${nombre}" exige factura: esta venta no puede salir como ticket. `
         + 'Facturala (F8) o cobrala con otro medio.',
       );
     }
+  }
+
+  /** La misma regla, para quien no tiene la configuración a mano (el cobro por QR la mira ANTES de mandar el monto). */
+  async exigirFacturaSegunMedios(tipo: string, pagos: VentaPagoDto[]) {
+    this.validarMediosFacturar(tipo, pagos, await this.cfg.get('ventas'));
   }
 
   /**
