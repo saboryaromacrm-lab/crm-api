@@ -3499,3 +3499,39 @@ export const stockProvisorioConteos = pgTable('stock_provisorio_conteos', {
 }, (t) => ({
   ixProducto: index('ix_stock_provisorio_producto').on(t.productoId, t.id),
 }));
+
+/**
+ * COFFIT · INGREDIENTES (0140): los productos que Coffit usa como ingrediente,
+ * con el contenido del envase y la unidad en que se quiere el costo. El costo
+ * se calcula siempre del último comprobante con precio real (ver
+ * `cafeteria/ingredientes.module.ts`): acá solo vive la configuración.
+ */
+export const coffitIngredientes = pgTable('coffit_ingredientes', {
+  id: serial('id').primaryKey(),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  contenido: doublePrecision('contenido'),
+  contenidoUnidad: text('contenido_unidad').notNull().default('g'),
+  unidadCosto: text('unidad_costo').notNull().default('kg'),
+  nota: text('nota').notNull().default(''),
+  /** 0141: el nombre del ingrediente EN CoffitCost (tiene que coincidir); vacío = el del producto. */
+  nombreCoffit: text('nombre_coffit').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  uqProducto: uniqueIndex('uq_coffit_ingrediente_producto').on(t.productoId),
+}));
+
+/** Cada envío de costos a CoffitCost (0141): qué se mandó, cuándo y qué contestó. */
+export const coffitcostEnvios = pgTable('coffitcost_envios', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  referencia: text('referencia').notNull().default(''),
+  origen: text('origen').notNull().default('manual'),
+  cantidad: integer('cantidad').notNull().default(0),
+  ok: boolean('ok').notNull().default(false),
+  estadoHttp: integer('estado_http'),
+  respuesta: text('respuesta').notNull().default(''),
+  firma: text('firma').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});

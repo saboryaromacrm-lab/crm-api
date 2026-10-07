@@ -981,6 +981,20 @@
       "when": 1790730000000,
       "tag": "0139_qr_mp_exige_factura",
       "breakpoints": true
+    },
+    {
+      "idx": 140,
+      "version": "7",
+      "when": 1790740000000,
+      "tag": "0140_coffit_ingredientes",
+      "breakpoints": true
+    },
+    {
+      "idx": 141,
+      "version": "7",
+      "when": 1790750000000,
+      "tag": "0141_coffitcost_envios",
+      "breakpoints": true
     }
   ]
 }

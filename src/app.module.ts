@@ -35,6 +35,7 @@ import { RespaldosModule } from './respaldos/respaldos.module';
 import { RespaldoDriveModule } from './respaldos/drive.service';
 import { MetricasModule } from './metricas/metricas.module';
 import { CashflowModule } from './cashflow/cashflow.module';
+import { IngredientesModule } from './cafeteria/ingredientes.module';
 // TEMPORAL (0138): se borra junto con su panel cuando el stock real esté bien.
 import { StockProvisorioModule } from './stock-provisorio/stock-provisorio.module';
 import { MercadoPagoModule } from './mercadopago/mercadopago.module';
@@ -51,6 +52,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     RespaldoDriveModule,
     MetricasModule,
     CashflowModule,
+    IngredientesModule,
     StockProvisorioModule,
     InventarioModule,
     ComprobantesModule,
