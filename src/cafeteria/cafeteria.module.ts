@@ -46,14 +46,15 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, ClaveServicio, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { PERMISO_METRICAS_CAFE, soloSuSucursal, tienePermiso, veMetricasDelCafe } from '../auth/auth.guard';
 import {
-  comprobanteItems, comprobantes, enviosCafeteria, envioCafeteriaItems, gastoCategorias, gastoItems, gastos, incidencias, listasVenta, pedidoCafeteriaItems,
+  comprobanteItems, comprobantes, enviosCafeteria, envioCafeteriaItems, gastoCategorias, gastoItems, gastos, incidencias, listasVenta, marcas, pedidoCafeteriaItems,
   pedidosCafeteria, precioHistorial, presentaciones, productoListas, productoProveedores, productos,
   coffitCierres, coffitMovimientos, proveedores, stock, sucursales, usuarios,
 } from '../db/schema';
 import { ProductosModule, ProductosService } from '../productos/productos.module';
+import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
+import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import {
   costoUltimaFactura, cupoCafe, exigirCuentaAbierta, finDia, hoyAr, inicioDia, lineasCuenta, saldoAl, sumaTotales, sumarDias, totalesCuenta,
   totalesDeLineas, ultimoCierre,
@@ -224,11 +225,10 @@ class ProductoCafeDto {
   @IsString() @MaxLength(120) nombre!: string;
   /** Se pesa (kg) en vez de contarse. Por defecto se cuenta: la medialuna. */
   @IsOptional() @IsBoolean() esGranel?: boolean;
-  /** Lo que paga el cliente en el mostrador, con IVA. */
-  @IsNumber() @Min(0.01) @Max(100_000_000) precio!: number;
   /**
-   * Cuánto le cuesta a la cafetería hacerlo. Opcional: se puede cargar el
-   * producto hoy y poner el costo cuando lo sepa. 0 = todavía no lo sé.
+   * Cuánto le cuesta a Coffit hacerlo, sin IVA. Opcional: se puede cargar el
+   * producto hoy y poner el costo cuando lo sepa. El PRECIO no lo pone Coffit
+   * (8/10/2026): lo fija Sabor y Aroma (`PrecioCafeDto`).
    */
   @IsOptional() @IsNumber() @Min(0) @Max(100_000_000) costo?: number;
   /**
@@ -237,23 +237,26 @@ class ProductoCafeDto {
    * contador; acá solo se ofrecen las dos que aplican a lo que hace un café.
    */
   @IsOptional() @IsIn(ALICUOTAS_CAFE, { message: 'El IVA del mostrador va al 21 %, al 10,5 % o sin IVA.' }) iva?: number;
-  /** «Sí, lo vendo por debajo del costo a propósito»: lo manda la pantalla después de preguntar. */
-  @IsOptional() @IsBoolean() confirmarPerdida?: boolean;
+}
+
+/** La edición de Coffit: nombre, costo e IVA (cómo se vende no cambia; el precio es de Sabor y Aroma). */
+class EditarProductoCafeDto {
+  @IsString() @MaxLength(120) nombre!: string;
+  @IsOptional() @IsNumber() @Min(0) @Max(100_000_000) costo?: number;
+  @IsOptional() @IsIn(ALICUOTAS_CAFE, { message: 'El IVA del mostrador va al 21 %, al 10,5 % o sin IVA.' }) iva?: number;
 }
 
 /**
- * LA EDICIÓN: lo mismo que el alta, pero el PRECIO ES OPCIONAL (26/9/2026).
- *
- * Si la distribuidora le puso el precio por MARGEN, la cafetería no lo toca
- * desde acá: la pantalla no lo manda y la API rechaza si llega. Obligarla a
- * tipear un precio para poder corregir solo el costo convertía la regla de
- * margen en un precio fijo, en silencio.
+ * EL PRECIO EN EL MOSTRADOR DE LO QUE ELABORA COFFIT (8/10/2026): lo pone
+ * Sabor y Aroma, de una de dos formas — un precio fijo (y ve el markup que le
+ * da sobre el costo de Coffit) o un markup sobre ese costo (y el precio lo
+ * sigue solo cuando Coffit cambia el costo).
  */
-class EditarProductoCafeDto {
-  @IsString() @MaxLength(120) nombre!: string;
-  @IsOptional() @IsNumber() @Min(0.01) @Max(100_000_000) precio?: number;
-  @IsOptional() @IsNumber() @Min(0) @Max(100_000_000) costo?: number;
-  @IsOptional() @IsIn(ALICUOTAS_CAFE, { message: 'El IVA del mostrador va al 21 %, al 10,5 % o sin IVA.' }) iva?: number;
+class PrecioCafeDto {
+  @IsIn(['precio', 'markup']) modo!: 'precio' | 'markup';
+  /** El precio final con IVA, o el markup en %. */
+  @IsNumber() @Min(0) @Max(100_000_000) valor!: number;
+  /** «Sí, lo vendo por debajo del costo a propósito». */
   @IsOptional() @IsBoolean() confirmarPerdida?: boolean;
 }
 
@@ -268,6 +271,7 @@ export class CafeteriaService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly inv: InventarioService,
     private readonly prods: ProductosService,
+    private readonly cfg: ConfiguracionService,
   ) {}
 
   /**
@@ -493,10 +497,20 @@ export class CafeteriaService {
    */
 
   /** La lista de precios del mostrador: la primera activa, por orden. */
+  /**
+   * LA LISTA DEL MOSTRADOR: la BASE con la misma regla que el POS, la góndola y
+   * el catálogo — la configurada en Ventas (`listaBaseId`) o, si no hay, la
+   * primera activa (8/10/2026: antes ignoraba la configurada, y el precio de lo
+   * de Coffit podía caer en otra lista que la que cobra la caja).
+   */
   private async listaMostrador() {
-    const [l] = await this.db.select({ id: listasVenta.id, nombre: listasVenta.nombre })
-      .from(listasVenta).where(eq(listasVenta.activa, true))
-      .orderBy(asc(listasVenta.orden), asc(listasVenta.id)).limit(1);
+    const [activas, cfg] = await Promise.all([
+      this.db.select({ id: listasVenta.id, nombre: listasVenta.nombre })
+        .from(listasVenta).where(eq(listasVenta.activa, true))
+        .orderBy(asc(listasVenta.orden), asc(listasVenta.id)),
+      this.cfg.get('ventas'),
+    ]);
+    const l = activas.find((x) => x.id === Number(cfg.listaBaseId)) ?? activas[0];
     if (!l) throw new BadRequestException('No hay ninguna lista de precios activa. Configurala en Ventas › Listas.');
     return l;
   }
@@ -535,17 +549,20 @@ export class CafeteriaService {
         .groupBy(precioHistorial.productoId),
     );
 
-    const filas = await this.db.with(ultimoPrecio).select({
+    const [filas, config] = await Promise.all([this.db.with(ultimoPrecio).select({
       id: productos.id,
       nombre: productos.nombre,
       codigoPropio: productos.codigoPropio,
       tipo: productos.tipo,
       estado: productos.estado,
       iva: productos.iva,
+      redondeo: productos.redondeo,
       costo: productos.costoCafeteria,
       costoActualizado: productos.costoCafeteriaActualizado,
       modoPrecio: productoListas.modoPrecio,
       precioFijo: productoListas.precioFijo,
+      markup: productoListas.markup,
+      unidades: productoListas.unidades,
       precioActualizado: ultimoPrecio.fecha,
     }).from(productos)
       .leftJoin(productoListas, and(
@@ -555,40 +572,44 @@ export class CafeteriaService {
       ))
       .leftJoin(ultimoPrecio, eq(ultimoPrecio.productoId, productos.id))
       .where(eq(productos.origenCafeteria, true))
-      .orderBy(asc(productos.nombre));
+      .orderBy(asc(productos.nombre)), this.cfg.get('ventas')]);
 
     return {
       lista: lista.nombre,
+      redondeo: Number(config.redondeoPrecio) || 0,
       productos: filas.map((f) => {
-        /* `precio` solo cuando es un número fijo. Si la distribuidora se lo
-         * definió por MARGEN desde Compras, acá no se toca: convertirlo a un
-         * fijo en silencio le cambiaría la regla de precio sin avisar. */
-        const precio = f.modoPrecio === 'precio' ? Number(f.precioFijo) : null;
         /* NULO = nunca se declaró, distinto de "cuesta cero": uno es un dato
          * que falta y el otro es una decisión, y la pantalla los muestra
          * distinto porque significan cosas distintas. */
         const costo = f.costoActualizado ? Number(f.costo) : null;
+        const iva = Number(f.iva) || 0;
+        /* EL PRECIO DE LA CAJA, en los dos modos (8/10/2026): el mismo cálculo
+         * que cobra el POS (`precioVentaFila`, con el redondeo de góndola). Por
+         * markup sin costo no hay precio: saldría de cero. Sin fila, «sin
+         * precio»: todavía no se puede vender. */
+        const modo = f.modoPrecio === 'markup' ? 'markup' : f.modoPrecio === 'precio' ? 'precio' : null;
+        const precio = modo === 'precio' ? Number(f.precioFijo)
+          : modo === 'markup' && costo != null
+            ? precioVentaFila(costo, { modoPrecio: 'markup', markup: Number(f.markup) || 0, unidades: Number(f.unidades) || 1 } as any,
+              { iva, redondeo: f.redondeo ?? (Number(config.redondeoPrecio) || 0) }).finalUnitario
+            : null;
+        const neto = precio != null ? precio / (1 + iva / 100) : null;
         return {
           id: f.id, nombre: f.nombre, codigoPropio: f.codigoPropio,
           esGranel: f.tipo === 'granel', estado: f.estado,
-          precio,
-          porMargen: f.modoPrecio === 'markup',
+          modo, precio,
+          /** El markup que se cargó (modo markup) o el que da el precio fijo sobre el costo de Coffit. */
+          markup: modo === 'markup' ? Number(f.markup) || 0
+            : neto != null && costo ? r2((neto / costo - 1) * 100) : null,
+          redondeo: f.redondeo,
           costo,
           costoDias: this.diasDesde(f.costoActualizado),
           precioDias: this.diasDesde(f.precioActualizado as any),
-          iva: Number(f.iva) || 0,
-          /* El margen sale de los dos números de esta misma fila, y es la razón
-           * por la que importa que ninguno de los dos esté viejo. Sin costo no
-           * hay margen — y esa ausencia también dice algo.
-           *
-           * SOBRE EL PRECIO SIN IVA (26/9/2026). El precio del mostrador trae el
-           * IVA adentro y ese IVA es de ARCA, no del café; el costo es neto. Se
-           * comparaban $1.500 contra $700 y salía 53 %, cuando la venta guarda
-           * $1.239,67 contra $700: 43,5 %. Ahora es el mismo número que va a
-           * dar la rentabilidad de Gerencia. */
-          margen: precio != null && costo != null && precio > 0
-            ? r2(((precio / (1 + (Number(f.iva) || 0) / 100) - costo) / (precio / (1 + (Number(f.iva) || 0) / 100))) * 100)
-            : null,
+          iva,
+          /* El margen, SOBRE EL PRECIO SIN IVA (26/9/2026): el mismo número que da
+           * la rentabilidad de Gerencia. Sin costo no hay margen — y esa
+           * ausencia también dice algo. */
+          margen: neto != null && costo != null && neto > 0 ? r2(((neto - costo) / neto) * 100) : null,
         };
       }),
     };
@@ -665,84 +686,100 @@ export class CafeteriaService {
     });
   }
 
+  /**
+   * LA MARCA «COFFIT» (0148): todo lo que elabora Coffit la lleva, para verlo
+   * aparte de lo propio en Métricas, Rentabilidad y Sin movimiento. Si alguien
+   * la borró o le cambió el nombre, se vuelve a crear.
+   */
+  private async marcaCoffit(): Promise<number> {
+    const buscar = async () => (await this.db.select({ id: marcas.id }).from(marcas)
+      .where(sql`lower(${marcas.nombre}) = 'coffit'`).orderBy(asc(marcas.id)).limit(1))[0]?.id;
+    const id = await buscar();
+    if (id) return id;
+    await this.db.insert(marcas).values({ nombre: 'Coffit' }).onConflictDoNothing();
+    return (await buscar())!;
+  }
+
+  /**
+   * EL ALTA DE COFFIT (8/10/2026): nombre, cómo se vende, IVA y costo. El
+   * precio NO: lo pone Sabor y Aroma (`precioDelCafe`). Hasta entonces queda
+   * «sin precio» y la caja no lo puede cobrar — mejor que venderlo a un
+   * precio que nadie decidió.
+   */
   async crearProductoDelCafe(dto: ProductoCafeDto) {
     const nombre = this.nombreDelProducto(dto);
     await this.exigirNombreLibre(nombre);
-    const iva = dto.iva ?? 21;
-    this.exigirPrecioSobreCosto(nombre, Number(dto.precio), dto.costo ?? null, iva, dto.confirmarPerdida);
-    const lista = await this.listaMostrador();
     const p: any = await this.prods.create({
       nombre,
-      iva,
+      iva: dto.iva ?? 21,
       esGranel: !!dto.esGranel,
+      marcaId: await this.marcaCoffit(),
       /* Las dos marcas, explícitas y en el alta: `origenCafeteria` es lo que
        * lo habilita en el envío, y `soloCafeteria` en false porque es
        * justamente lo contrario — esto SÍ se vende en el mostrador. */
       origenCafeteria: true,
       soloCafeteria: false,
     } as any);
-    await this.prods.setListas(p.id, [
-      { listaId: lista.id, modoPrecio: 'precio', precioFijo: Number(dto.precio), unidades: 1 },
-    ]);
     await this.guardarCostoDelCafe(p, dto.costo);
     return this.productosDelCafe();
   }
 
-  async editarProductoDelCafe(id: number, dto: EditarProductoCafeDto, usuarioId?: number | null) {
+  /**
+   * LA EDICIÓN DE COFFIT: nombre, IVA y costo. El tipo NO se cambia después
+   * del alta (pasar de contar a pesar le cambia el significado a todo el
+   * stock y a los envíos que ya existen: eso es un producto nuevo).
+   *
+   * La ficha se reescribe entera, así que la marca, la categoría y la
+   * subcategoría van explícitas (8/10/2026): sin eso, cada edición de Coffit
+   * las dejaba vacías.
+   */
+  async editarProductoDelCafe(id: number, dto: EditarProductoCafeDto) {
     const nombre = this.nombreDelProducto(dto as any);
     const p = await this.productoDelCafe(id);
     await this.exigirNombreLibre(nombre, id);
-    const lista = await this.listaMostrador();
+    await this.prods.update(id, {
+      nombre, iva: dto.iva ?? Number(p.iva), esGranel: p.tipo === 'granel',
+      marcaId: p.marcaId ?? await this.marcaCoffit(), categoriaId: p.categoriaId, subcategoriaId: p.subcategoriaId,
+    } as any);
+    await this.guardarCostoDelCafe(p, dto.costo);
+    return this.productosDelCafe();
+  }
 
-    /*
-     * EL CAFÉ TOCA SOLO SU FILA: la del mostrador (26/9/2026).
-     *
-     * Antes se reemplazaba el formato de venta ENTERO por esa sola fila, así que
-     * si la distribuidora le había cargado un precio mayorista, cambiarle el
-     * nombre a la medialuna lo borraba. Ahora se leen las filas que hay, se
-     * cambia únicamente la del mostrador, y las demás vuelven tal cual (con su
-     * código de caja, sus unidades y su mínimo).
-     *
-     * Y si esa fila va POR MARGEN, el precio es de la distribuidora: no se toca,
-     * y si la pantalla lo manda igual se rechaza con un mensaje.
-     */
+  /**
+   * EL PRECIO DE LO QUE ELABORA COFFIT (8/10/2026): lo pone Sabor y Aroma en
+   * la lista del mostrador, fijo o por markup sobre el costo de Coffit. Se
+   * toca SOLO esa fila: las de otras listas vuelven tal cual (con su código de
+   * caja, unidades y mínimo). Pasa por `setListas`, así queda en la evolución
+   * de precios y en «Cambios de precio» para la etiqueta de góndola.
+   */
+  async precioDelCafe(id: number, dto: PrecioCafeDto, usuarioId: number | null) {
+    const p = await this.productoDelCafe(id);
+    const lista = await this.listaMostrador();
+    const costo = p.costoCafeteriaActualizado ? Number(p.costoCafeteria) : null;
+    const iva = Number(p.iva) || 0;
+    const valor = r2(Number(dto.valor));
+    if (dto.modo === 'precio' && !(valor > 0)) throw new BadRequestException('Poné a cuánto se vende en el mostrador.');
+    if (dto.modo === 'markup' && costo == null) {
+      throw new BadRequestException(`Coffit todavía no cargó el costo de ${p.nombre}: por markup el precio saldría de cero. Poné un precio fijo o esperá el costo.`);
+    }
+    const config = await this.cfg.get('ventas');
+    const fila = dto.modo === 'precio'
+      ? { modoPrecio: 'precio', precioFijo: valor }
+      : { modoPrecio: 'markup', markup: valor };
+    const precio = precioVentaFila(costo ?? 0, { ...fila, unidades: 1 } as any, { iva, redondeo: p.redondeo ?? (Number(config.redondeoPrecio) || 0) }).finalUnitario;
+    this.exigirPrecioSobreCosto(p.nombre, precio, costo, iva, dto.confirmarPerdida);
+
     const filas = await this.db.select().from(productoListas)
       .where(and(eq(productoListas.productoId, id), isNull(productoListas.presentacionId)));
+    const comoItem = (f: any) => ({
+      listaId: f.listaId, modoPrecio: f.modoPrecio, markup: f.markup, precioFijo: f.precioFijo,
+      unidades: f.unidades, codigoBarras: f.codigoBarras, unidadesMinimas: f.unidadesMinimas,
+    });
     const mostrador = filas.find((f) => f.listaId === lista.id);
-    if (dto.precio != null && mostrador?.modoPrecio === 'markup') {
-      throw new BadRequestException(
-        `El precio de ${p.nombre} lo fija Sabor y Aroma por margen: desde acá no se cambia. Si tiene que ser otro, pedíselo a ellos.`,
-      );
-    }
-    /* El precio y el costo con los que va a quedar: lo que se manda, o lo que
-     * ya tenía. Por margen no hay precio fijo que comparar. */
-    const iva = dto.iva ?? Number(p.iva);
-    const precioFinal = dto.precio != null ? Number(dto.precio)
-      : (mostrador?.modoPrecio === 'precio' ? Number(mostrador.precioFijo) : null);
-    const costoFinal = dto.costo != null ? Number(dto.costo)
-      : (p.costoCafeteriaActualizado ? Number(p.costoCafeteria) : null);
-    this.exigirPrecioSobreCosto(nombre, precioFinal, costoFinal, iva, dto.confirmarPerdida);
-
-    /* Solo el nombre (y el IVA): el tipo NO se cambia después del alta. Pasar
-     * de contar a pesar (o al revés) le cambia el significado a todo el stock
-     * y a todos los envíos que ya existen — eso es un producto nuevo. */
-    await this.prods.update(id, { nombre, iva, esGranel: p.tipo === 'granel' } as any);
-
-    const nuevo = dto.precio != null ? Number(dto.precio) : null;
-    const cambiaPrecio = nuevo != null
-      && !(mostrador?.modoPrecio === 'precio' && Math.abs(Number(mostrador.precioFijo) - nuevo) < 0.005);
-    if (cambiaPrecio) {
-      const comoItem = (f: any) => ({
-        listaId: f.listaId, modoPrecio: f.modoPrecio, markup: f.markup, precioFijo: f.precioFijo,
-        unidades: f.unidades, codigoBarras: f.codigoBarras, unidadesMinimas: f.unidadesMinimas,
-      });
-      const items: any[] = filas.filter((f) => f.listaId !== lista.id).map(comoItem);
-      items.push(mostrador
-        ? { ...comoItem(mostrador), modoPrecio: 'precio', precioFijo: nuevo }
-        : { listaId: lista.id, modoPrecio: 'precio', precioFijo: nuevo, unidades: 1 });
-      await this.prods.setListas(id, items, usuarioId ?? null);
-    }
-    await this.guardarCostoDelCafe(p, dto.costo);
+    await this.prods.setListas(id, [
+      ...filas.filter((f) => f.listaId !== lista.id).map(comoItem),
+      { ...(mostrador ? comoItem(mostrador) : { listaId: lista.id, unidades: 1 }), markup: null, precioFijo: null, ...fila },
+    ], usuarioId);
     return this.productosDelCafe();
   }
 
@@ -2556,9 +2593,18 @@ export class CafeteriaController {
   @Patch('productos/:id') editarProductoCafe(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: EditarProductoCafeDto,
+  ) {
+    return this.svc.editarProductoDelCafe(id, dto);
+  }
+
+  /* El precio lo pone Sabor y Aroma (8/10/2026): la misma llave que cambia precios en Compras. */
+  @Permiso('precios', 'ventas.listas')
+  @Patch('productos/:id/precio') precioProductoCafe(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PrecioCafeDto,
     @Auth() sesion: Sesion,
   ) {
-    return this.svc.editarProductoDelCafe(id, dto, sesion?.usuarioId ?? null);
+    return this.svc.precioDelCafe(id, dto, sesion?.usuarioId ?? null);
   }
 
   @Permiso('almacen.cafeteria-entradas')
@@ -2712,7 +2758,7 @@ export class CafeteriaController {
 @Module({
   /* `ProductosModule` para poder dar de alta lo que la cafetería elabora sin
    * duplicar acá el alta de un producto (códigos, validaciones, precios). */
-  imports: [InventarioModule, ProductosModule],
+  imports: [InventarioModule, ProductosModule, ConfiguracionModule],
   controllers: [CafeteriaController],
   providers: [CafeteriaService],
   exports: [CafeteriaService],

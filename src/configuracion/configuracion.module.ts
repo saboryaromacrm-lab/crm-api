@@ -134,7 +134,6 @@ export const VENTAS_DEFAULTS = {
    * y no una decisión.
    */
   overrideListaRequiereAdmin: true as boolean,
-  descuentoMaxVendedor: 10 as number,   // % que un no-admin puede aplicar
   redondeoEfectivo: 0 as number,        // 0 = sin redondeo; 10/50/100 = a esa unidad
   /**
    * Redondeo del PRECIO DE GÓNDOLA. 0 = sin redondeo; 1 = al entero; 10/50/100
@@ -493,7 +492,6 @@ const REGLAS: Record<string, {
    * cada envío de presupuesto. Un negativo era peor porque no rompe nada
    * visible: TODA orden web nacía vencida y el canal del sitio quedaba muerto. */
   'ventas.presupuestoValidezDias': { min: 1, max: 365, entero: true },
-  'ventas.descuentoMaxVendedor': { min: 0, max: 100 },
   'ventas.ctaCteDiasPlazo': { min: 0, max: 365, entero: true },
   'ventas.ctaCteLimiteDefault': { min: 0, max: 100_000_000 },
   'ventas.montoMinimoMayorista': { min: 0, max: 100_000_000 },

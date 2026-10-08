@@ -133,12 +133,8 @@ export const CATALOGO_PERMISOS = [
       /*
        * EL PERMISO DE PISAR EL PRECIO. Sin esto, el precio del renglón sale de la
        * lista y nada más; con esto, se puede escribir un precio a mano, elegir
-       * una lista que el volumen no habilitó y pasar el tope de descuento.
-       *
-       * Es la llave que le da sentido del lado del servidor a las dos
-       * preferencias que ya existían en Ventas › Configuración
-       * (`descuentoMaxVendedor` y `overrideListaRequiereAdmin`) y que hasta ahora
-       * solo se evaluaban en el navegador.
+       * una lista que el volumen no habilitó y pasar el tope de descuento a
+       * mano de cada usuario (0147, `usuarios.descuentoManualMax`).
        */
       { clave: 'precio_manual', nombre: 'Pisar el precio y pasar el tope de descuento' },
     ],
@@ -301,6 +297,20 @@ const CLAVES_LEGADAS = new Set(['ver', 'config', 'usuarios']);
  */
 const COMODIN = '*';
 
+/** Fijar el descuento a mano de un usuario (0147): llave fuera del catálogo, solo el superadmin. */
+const PERMISO_DESCUENTO_MANUAL = 'usuarios.descuento_manual';
+const textoDescuento = (n: number) => (n > 0 ? `Hasta ${n.toLocaleString('es-AR')} %` : 'No puede');
+/** 0..100 con medio punto; ausente = no se toca. */
+function topeDescuento(v: unknown, sesion?: Sesion): number | undefined {
+  if (v == null || v === '') return undefined;
+  const n = Math.round(Number(v) * 2) / 2;
+  if (!Number.isFinite(n) || n < 0 || n > 100) throw new BadRequestException('El tope de descuento a mano va de 0 a 100 %.');
+  if (!(sesion?.permisos ?? []).some((p) => p === COMODIN || p === PERMISO_DESCUENTO_MANUAL)) {
+    throw new ForbiddenException('El descuento a mano de un usuario lo fija el dueño.');
+  }
+  return n;
+}
+
 /**
  * Largo mínimo de contraseña: CUATRO, o sea que puede ser un PIN.
  *
@@ -363,6 +373,8 @@ function publico(u: any, r: any) {
     tienePin: !!u.pinHash,
     /** Sucursales en las que puede entrar (0105). Vacía = todas. */
     sucursales: Array.isArray(u.sucursales) ? u.sucursales : [],
+    /** Descuento a mano (0147): hasta cuánto %. 0 = no puede. */
+    descuentoManualMax: Number(u.descuentoManualMax) || 0,
   };
 }
 
@@ -613,14 +625,16 @@ export class UsuariosService {
     }
     const suc = o?.sucursales != null ? await this.sucursalesValidas(o.sucursales) : [];
     const locales = await this.nombresDeSucursales(suc);
+    /* Por defecto 0: sin descuento a mano (0147). Darle uno es del dueño. */
+    const descuentoManualMax = Number(o?.descuentoManualMax) > 0 ? topeDescuento(o.descuentoManualMax, sesion)! : 0;
     const u = await this.db.transaction(async (tx) => {
       const [nuevo] = await tx.insert(usuarios).values({
         nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
-        relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc,
+        relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc, descuentoManualMax,
       }).returning();
       await this.audit.registrar([{
         entidad: 'usuario', entidadId: nuevo.id, ambito: 'Usuarios', detalle: nombre, campo: 'Usuario creado',
-        despues: `Rol ${r.nombre} · ${locales}${relevoCaja ? ' · relevo de caja' : ''}${nuevo.activo ? '' : ' · inactivo'}`,
+        despues: `Rol ${r.nombre} · ${locales}${relevoCaja ? ' · relevo de caja' : ''}${descuentoManualMax ? ` · descuento a mano ${textoDescuento(descuentoManualMax).toLowerCase()}` : ''}${nuevo.activo ? '' : ' · inactivo'}`,
         usuarioId: sesion?.usuarioId ?? null,
       }], tx);
       return nuevo;
@@ -1009,6 +1023,8 @@ export class UsuariosService {
       }
       patch.relevoCaja = !!o.relevoCaja;
     }
+    const tope = topeDescuento(o?.descuentoManualMax, sesion);
+    if (tope !== undefined && tope !== (Number(u.descuentoManualMax) || 0)) patch.descuentoManualMax = tope;
     let sucursalesCambiaron = false;
     if (o?.sucursales != null) {
       const nuevas = await this.sucursalesValidas(o.sucursales);
@@ -1026,6 +1042,7 @@ export class UsuariosService {
         ...(patch.passwordHash ? [{ ...base, campo: 'Contraseña', despues: 'Cambiada' }] : []),
         ...(patch.pinHash ? [{ ...base, campo: 'PIN de relevo', despues: u.pinHash ? 'Cambiado' : 'Definido' }] : []),
         ...(patch.relevoCaja != null ? [{ ...base, campo: 'Relevo de caja', antes: siNo(u.relevoCaja), despues: siNo(patch.relevoCaja) }] : []),
+        ...(patch.descuentoManualMax != null ? [{ ...base, campo: 'Descuento a mano', antes: textoDescuento(Number(u.descuentoManualMax) || 0), despues: textoDescuento(patch.descuentoManualMax) }] : []),
         ...(sucursalesCambiaron ? [{
           ...base, campo: 'Sucursales',
           antes: await this.nombresDeSucursales(Array.isArray(u.sucursales) ? u.sucursales : []), despues: await this.nombresDeSucursales(patch.sucursales),

@@ -279,6 +279,12 @@ export const usuarios = pgTable('usuarios', {
    * TRAZABILIDAD, no permiso: los permisos siguen siendo los de la sesión.
    */
   relevoCaja: boolean('relevo_caja').notNull().default(false),
+  /**
+   * DESCUENTO A MANO (0147): hasta cuánto % puede poner a mano en el POS.
+   * 0 = no puede (lo de todos al arrancar). Lo del cliente, las ofertas, las
+   * listas ganadas y los descuentos con nombre no cuentan. Lo fija el dueño.
+   */
+  descuentoManualMax: doublePrecision('descuento_manual_max').notNull().default(0),
   /** PIN del relevo, mismo formato que passwordHash. Vacío = sin PIN. */
   pinHash: text('pin_hash').notNull().default(''),
   /**
@@ -1990,7 +1996,7 @@ export const medioPagoEnum = pgEnum('medio_pago', [
  * propia:
  *   · el descuento del CLIENTE es un atributo de con quién se vende;
  *   · el descuento MANUAL del renglón es una decisión del vendedor, acotada por
- *     `ventas.descuentoMaxVendedor`;
+ *     el tope de descuento a mano de cada usuario (0147);
  *   · la OFERTA es una promoción del catálogo, con su propia mecánica (3×2,
  *     precio fijo) y su propio alcance por producto.
  * Esto es otra cosa: una autorización con nombre ("Empleados", "Atención por
@@ -2012,7 +2018,7 @@ export const medioPagoEnum = pgEnum('medio_pago', [
  * 3. `requiereAdmin` existe porque el porcentaje de acá **saltea el tope del
  *    vendedor**: lo autorizó el dueño al crearlo, no la cajera al tipearlo. Sin
  *    esta bandera, publicar un descuento del 25% equivaldría a subirle el tope
- *    a todo el mundo, y `descuentoMaxVendedor` dejaría de significar algo.
+ *    a todo el mundo, y el tope de descuento a mano del usuario dejaría de significar algo.
  */
 export const descuentos = pgTable('descuentos', {
   id: serial('id').primaryKey(),
@@ -2208,7 +2214,7 @@ export const ventaItems = pgTable('venta_items', {
    * Sin esto, reabrir un borrador es una trampa: el 25% de "Atención por
    * tardanza" volvería al POS como si lo hubiera tipeado el vendedor, y el
    * autoguardado siguiente lo mandaría de vuelta como descuento manual — que el
-   * servidor rebota contra `descuentoMaxVendedor` antes de llegar a aplicar el
+   * servidor rebota contra el tope de descuento a mano del usuario antes de llegar a aplicar el
    * nombrado. El ticket quedaría sin poder guardarse, con un error sobre un
    * número que nadie escribió. Y quitar el nombrado en pantalla dejaría el
    * renglón en 0 en vez de volver al 10% que el cliente tiene por contrato.

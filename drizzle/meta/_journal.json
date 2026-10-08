@@ -1030,6 +1030,20 @@
       "when": 1791490000000,
       "tag": "0146_retiros_sin_costo",
       "breakpoints": true
+    },
+    {
+      "idx": 147,
+      "version": "7",
+      "when": 1791500000000,
+      "tag": "0147_descuento_manual_usuario",
+      "breakpoints": true
+    },
+    {
+      "idx": 148,
+      "version": "7",
+      "when": 1791510000000,
+      "tag": "0148_marca_coffit",
+      "breakpoints": true
     }
   ]
 }

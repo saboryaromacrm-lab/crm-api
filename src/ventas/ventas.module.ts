@@ -2000,14 +2000,30 @@ export class VentasService {
     return porLista;
   }
 
+  /**
+   * EL TOPE DE DESCUENTO A MANO de quien está en la caja (0147). 0 = no puede.
+   * Lo fija el dueño por usuario en Gerencia › Usuarios.
+   */
+  private async topeDescuentoManual(usuarioId: number | null | undefined) {
+    if (!usuarioId) return 0;
+    const [u] = await this.db.select({ tope: usuarios.descuentoManualMax }).from(usuarios).where(eq(usuarios.id, usuarioId)).limit(1);
+    return Number(u?.tope) || 0;
+  }
+
   private async resolverRenglones(
     itemsDto: VentaItemDto[],
-    cliente: { id: number },
+    cliente: { id: number; descuento?: number | null },
     config: any,
     puedePisarPrecio: boolean,
     congelados: Map<string, { precioLista: number; listaId: number | null }> = new Map(),
     descuentosPorLista: Map<number, DescuentoResuelto> = new Map(),
     sucursalId: number | null = null,
+    /**
+     * El descuento A MANO (0147): el tope de quien está en la caja y lo que el
+     * ticket guardado ya traía por renglón (lo autorizó quien podía: seguir
+     * trabajando sobre el ticket no lo vuelve a pedir). Sin pasarlo, 0.
+     */
+    descuentoManual: { tope: number; yaAutorizados?: Map<string, number> } = { tope: 0 },
   ): Promise<RenglonResuelto[]> {
     const ahora = new Date();
     const items = itemsDto ?? [];
@@ -2291,13 +2307,20 @@ export class VentasService {
       }
       if (pisado && pedido < 0) throw new BadRequestException(`${etiqueta}: el precio no puede ser negativo.`);
 
-      /* -- El descuento: 0..100 por DTO, y el tope de la configuración acá -- */
+      /*
+       * -- El descuento: 0..100 por DTO, y el tope A MANO del usuario (0147) --
+       * Lo del cliente (su ficha) no es «a mano»: entra siempre. Las ofertas y
+       * los descuentos con nombre van aparte y no pasan por acá.
+       */
       let desc = Number(it.descuento) || 0;
-      const tope = Number(config.descuentoMaxVendedor) || 0;
-      if (desc > tope + 1e-9 && !puedePisarPrecio) {
-        throw new BadRequestException(
-          `${etiqueta}: el descuento de ${desc}% supera el tope de ${tope}%. Hace falta el permiso para pisar precios.`,
-        );
+      const permitido = Math.max(
+        descuentoManual.tope, Number(cliente.descuento) || 0,
+        descuentoManual.yaAutorizados?.get(`${prod.id}|${presId ?? ''}`) ?? 0,
+      );
+      if (desc > permitido + 1e-9 && !puedePisarPrecio) {
+        throw new BadRequestException(descuentoManual.tope > 0
+          ? `${etiqueta}: el descuento de ${desc}% supera tu tope de ${descuentoManual.tope}% para descuentos a mano.`
+          : `${etiqueta}: no tenés habilitado poner descuentos a mano. Las ofertas, el descuento del cliente y los descuentos con nombre sí se aplican.`);
       }
 
       /*
@@ -2386,7 +2409,7 @@ export class VentasService {
        *
        * DESPUÉS DEL TOPE: el porcentaje de acá lo autorizó el dueño al crear el
        * descuento, no la cajera al tipearlo, así que no pasa por
-       * `descuentoMaxVendedor`. Si se evaluara antes, "Atención por tardanza 25%"
+       * el tope de descuento a mano del usuario. Si se evaluara antes, "Atención por tardanza 25%"
        * sería rechazado por el tope del 10% y el descuento no serviría para nada.
        * El tope sigue vivo para lo que el vendedor pone a mano, que es lo que
        * esa configuración existe para acotar.
@@ -3458,6 +3481,7 @@ export class VentasService {
     );
     const items = await this.resolverRenglones(
       dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista, sucursalId,
+      { tope: await this.topeDescuentoManual(autor) },
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
@@ -3662,8 +3686,12 @@ export class VentasService {
     if (v.estado !== 'borrador') {
       throw new BadRequestException('La venta ya está emitida: no se puede modificar.');
     }
-    const items = await this.db.select({ descuentoId: ventaItems.descuentoId })
-      .from(ventaItems).where(eq(ventaItems.ventaId, id));
+    /* Lo que el ticket guardado ya trae por renglón: el descuento con nombre y el
+     * puesto a mano (0147), que se respetan al seguir editándolo. */
+    const items = await this.db.select({
+      descuentoId: ventaItems.descuentoId, productoId: ventaItems.productoId, presentacionId: ventaItems.presentacionId,
+      descuento: ventaItems.descuento, descuentoBase: ventaItems.descuentoBase,
+    }).from(ventaItems).where(eq(ventaItems.ventaId, id));
     return { ...v, items };
   }
 
@@ -3727,6 +3755,10 @@ export class VentasService {
     );
     const items = await this.resolverRenglones(
       dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista, actual.sucursalId,
+      {
+        tope: await this.topeDescuentoManual(autor),
+        yaAutorizados: new Map((actual.items ?? []).map((it: any) => [`${it.productoId}|${it.presentacionId ?? ''}`, Number(it.descuentoBase ?? it.descuento) || 0])),
+      },
     );
     const tot = this.calcularTotales(items, dto.extras ?? []);
 
@@ -5061,6 +5093,8 @@ export class VentasService {
         id: u.id, nombre: u.nombre, activo: u.activo, rolId: u.rolId,
         rolClave: r?.clave ?? '', rolNombre: r?.nombre ?? '',
         permisos: esYo ? conPermisosBase(r?.permisos, r?.clave ?? '') : [],
+        /* El tope de descuento a mano (0147): de todos, porque el relevo de caja firma con el suyo. */
+        descuentoManualMax: Number(u.descuentoManualMax) || 0,
       };
     });
     // Las listas predeterminadas de cada cliente en UNA consulta, no una por
@@ -5110,8 +5144,8 @@ export class VentasController {
       // El jefe cruza sucursales (corrige la carga de otro mostrador); el cajero
       // solo toca lo suyo. `undefined` = sin restricción.
       soloSuSucursal: jefe ? undefined : sesion.sucursalId,
-      // La llave que le da sentido del lado del servidor a `descuentoMaxVendedor`
-      // y `overrideListaRequiereAdmin`, que hasta ahora solo vivían en el navegador.
+      // La llave que pasa el tope de descuento a mano del usuario (0147)
+      // y `overrideListaRequiereAdmin`, validados acá del lado del servidor.
       puedePisarPrecio: tienePermiso(sesion.permisos, ['precio_manual']),
       esJefe: jefe,
     };

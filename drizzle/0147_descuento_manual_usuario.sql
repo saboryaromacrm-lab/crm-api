@@ -1,0 +1,14 @@
+-- ===========================================================================
+-- 0147 · DESCUENTO A MANO POR USUARIO (8/10/2026, pedido del dueño)
+-- ===========================================================================
+-- Hasta hoy había UN tope de descuento para todos los vendedores
+-- (`ventas.descuentoMaxVendedor`, 10 %). Ahora es de cada usuario y lo fija el
+-- dueño en Gerencia › Usuarios: 0 = no puede poner descuentos a mano (el
+-- valor de todos al arrancar); N = hasta N %.
+--
+-- Solo cuenta lo puesto A MANO: el descuento del cliente (su ficha), las
+-- ofertas, las listas ganadas por cantidad/marca/monto/bulto y los
+-- descuentos con nombre siguen funcionando para todos. El permiso
+-- `precio_manual` sigue pasando cualquier tope.
+-- ===========================================================================
+ALTER TABLE "usuarios" ADD COLUMN IF NOT EXISTS "descuento_manual_max" double precision NOT NULL DEFAULT 0;
