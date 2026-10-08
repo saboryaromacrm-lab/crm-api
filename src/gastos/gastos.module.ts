@@ -1121,7 +1121,7 @@ export class GastosService {
     return this.get(id);
   }
 
-  async anular(id: number, motivo?: string, opts?: OpcionesCashflow) {
+  async anular(id: number, motivo?: string, opts?: OpcionesCashflow & { usuarioId?: number | null }) {
     const [g] = await this.db.select().from(gastos).where(eq(gastos.id, id)).limit(1);
     if (!g) throw new NotFoundException('Gasto inexistente.');
     if (g.estado === 'anulado') throw new BadRequestException('Ya está anulado.');
@@ -1142,6 +1142,12 @@ export class GastosService {
         estado: 'anulado',
         observaciones: nota ? `${g.observaciones ? `${g.observaciones}\n` : ''}Anulado: ${nota}` : g.observaciones,
       }).where(eq(gastos.id, id));
+      /* El gasto no guarda quién lo anuló: queda en la auditoría (Gerencia › Auditoría, 0144). */
+      await tx.insert(auditoria).values({
+        usuarioId: opts?.usuarioId ?? null, entidad: 'gasto', entidadId: id, ambito: 'Anulación',
+        detalle: `#${id}${g.numero ? ` ${g.numero}` : ''}${g.proveedorTexto ? ` · ${g.proveedorTexto}` : ''}${g.descripcion ? ` · ${g.descripcion}` : ''}`.slice(0, 200),
+        campo: 'Gasto anulado', antes: `$${Number(g.total).toLocaleString('es-AR')}`, despues: nota,
+      });
       /* De Coffit y en un mes cerrado de su cuenta: el ajuste contrario (0120). */
       if (g.negocio === 'cafeteria') {
         await ajustePorAnulacion(tx, {
@@ -1608,9 +1614,9 @@ export class GastosController {
     return this.svc.editar(id, dto, auth);
   }
   @Post(':id/anular') @Permiso('gastos_anular') anular(
-    @Param('id', ParseIntPipe) id: number, @Body() dto: AnularGastoDto,
+    @Param('id', ParseIntPipe) id: number, @Body() dto: AnularGastoDto, @Auth() sesion: Sesion,
   ) {
-    return this.svc.anular(id, dto?.motivo);
+    return this.svc.anular(id, dto?.motivo, { usuarioId: sesion?.usuarioId });
   }
   /** Sale plata del cajón: mismas claves que `PagosProveedorController`. */
   @Post(':id/pagos') @Permiso(...PERMISOS_PAGO) pagar(

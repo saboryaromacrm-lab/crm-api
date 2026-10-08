@@ -43,12 +43,13 @@ import { DENOMINACIONES } from '../caja/caja.module';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
+import {
+  MarcaDto, PERMISO_CASHFLOW, cambiarUmbral, cuantasPendientes, listarCajas, marcarCaja, marcarDesdePantalla, resolverCaja, umbralControlar,
+} from './a-controlar';
 
 /** La puerta autorizada: el Cash Flow deshace en Pagos y Gastos lo que nació acá. */
 const DESDE_CF: OpcionesCashflow = { desdeCashflow: true };
 
-/** La llave: fuera del catálogo, solo la tiene el superadmin (`*`). */
-export const PERMISO_CASHFLOW = 'gerencia.cashflow';
 
 const ZONA = 'America/Argentina/Buenos_Aires';
 const money = (n: unknown) => Math.round((Number(n) || 0) * 100) / 100;
@@ -112,6 +113,19 @@ class ControlarSobreDto {
   @IsOptional() @IsNumber() @Min(0) @Max(MAX_IMPORTE) otros?: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
   @IsBoolean() confirmado!: boolean;
+  /** Con el tilde «Mandar a Cajas a controlar» (0145): el turno queda marcado en la misma transacción. */
+  @IsOptional() @ValidateNested() @Type(() => MarcaDto) aControlar?: MarcaDto;
+}
+/** Marcar un turno desde una pantalla que ya registró su control (el control a mitad de turno). */
+class MarcarCajaDto {
+  @IsInt() cajaSesionId!: number;
+  @IsOptional() @IsString() @MaxLength(300) nota?: string;
+}
+class ResolverCajaDto {
+  @IsString() @MaxLength(500) resolucion!: string;
+}
+class UmbralDto {
+  @IsNumber() @Min(0) @Max(100_000_000) umbral!: number;
 }
 class AnularDto {
   @IsString() @MaxLength(300) motivo!: string;
@@ -327,6 +341,8 @@ export class CashflowService {
       cajasAbiertas: abiertas,
       ultimos: await this.movimientos({ limite: 8 }),
       conteos: await this.conteos(5),
+      /** Turnos marcados para controlar, sin resolver (0145): el número de la pestaña. */
+      aControlar: await cuantasPendientes(this.db),
     };
   }
 
@@ -560,6 +576,7 @@ export class CashflowService {
           tipo: 'ingreso', origen: 'sobre', importe: contado, sobreId: s.id, usuarioId,
           detalle: `Sobre ${sucursal} · cierre ${diaVisible(diaAr(cs.cierre!))}`,
         });
+        if (dto.aControlar) await marcarCaja(tx, { cajaSesionId, origen: 'sobre', nota: dto.aControlar.nota, usuarioId });
         return { ok: true, sobreId: s.id, enviado, contado, diferencia, saldo: await this.saldo(tx) };
       });
     } catch (e) {
@@ -874,7 +891,7 @@ export class CashflowService {
 @Controller('cashflow')
 @Permiso(PERMISO_CASHFLOW)
 export class CashflowController {
-  constructor(private readonly svc: CashflowService) {}
+  constructor(private readonly svc: CashflowService, @Inject(DRIZZLE) private readonly db: Database) {}
 
   @Get('resumen') resumen() { return this.svc.resumen(); }
   @Get('alertas') alertas() { return this.svc.alertas(); }
@@ -895,6 +912,16 @@ export class CashflowController {
   @Post('sobres/:id/anular')
   anularSobre(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularDto, @Auth() s: Sesion) {
     return this.svc.anularSobre(id, dto, s?.usuarioId ?? null);
+  }
+
+  /* Cajas a controlar (0145). Las rutas fijas antes que `:id`. */
+  @Get('a-controlar') aControlar(@Query('resueltas') resueltas?: string) { return listarCajas(this.db, resueltas === '1'); }
+  @Get('a-controlar/umbral') async umbral() { return { umbral: await umbralControlar(this.db) }; }
+  @Patch('a-controlar/umbral') cambiarUmbral(@Body() dto: UmbralDto) { return cambiarUmbral(this.db, dto.umbral); }
+  @Post('a-controlar') marcar(@Body() dto: MarcarCajaDto, @Auth() s: Sesion) { return marcarDesdePantalla(this.db, dto, s?.usuarioId ?? null); }
+  @Post('a-controlar/:id/resolver')
+  resolver(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverCajaDto, @Auth() s: Sesion) {
+    return resolverCaja(this.db, id, dto.resolucion, s?.usuarioId ?? null);
   }
 
   @Get('conceptos') conceptos() { return this.svc.conceptos(); }

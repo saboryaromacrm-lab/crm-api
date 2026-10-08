@@ -251,11 +251,8 @@ export const CATALOGO_PERMISOS = [
     modulo: 'gerencia',
     secciones: [
       { clave: 'gerencia.usuarios', nombre: 'Usuarios y roles' },
-      { clave: 'gerencia.reportes', nombre: 'Reportes de ventas' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
-      { clave: 'gerencia.valorizacion', nombre: 'Valorización de stock' },
-      { clave: 'gerencia.auditoria', nombre: 'Auditoría' },
-      { clave: 'gerencia.configuracion', nombre: 'Configuración' },
+      /* Métricas, Cash Flow y Auditoría (0144) no están acá a propósito: solo el superadmin. */
     ],
     acciones: [],
   },
@@ -278,6 +275,12 @@ export const CATALOGO_PERMISOS = [
 const CLAVES_VALIDAS = new Set(
   CATALOGO_PERMISOS.flatMap((g) => [...g.secciones, ...g.acciones].map((p) => p.clave)),
 );
+
+/** «Ventas › Caja», para que la auditoría de un rol se lea sin conocer las claves. */
+const NOMBRE_PERMISO = new Map<string, string>(
+  CATALOGO_PERMISOS.flatMap((g) => [...g.secciones, ...g.acciones].map((p) => [p.clave, `${g.grupo} › ${p.nombre}`] as [string, string])),
+);
+const nombrePermiso = (clave: string) => NOMBRE_PERMISO.get(clave) ?? clave;
 
 /**
  * Claves del catálogo viejo que ya no se muestran pero se siguen aceptando:
@@ -511,9 +514,17 @@ export class UsuariosService {
     const [ya] = await this.db.select().from(roles).where(eq(roles.clave, clave)).limit(1);
     if (ya) throw new BadRequestException(`Ya existe un rol con la clave "${clave}".`);
     const permisos = this.validarPermisos(o?.permisos ?? ['ver'], sesion);
-    const [r] = await this.db.insert(roles).values({
-      clave, nombre, descripcion: (o?.descripcion ?? '').trim(), permisos, esSistema: false,
-    }).returning();
+    const r = await this.db.transaction(async (tx) => {
+      const [nuevo] = await tx.insert(roles).values({
+        clave, nombre, descripcion: (o?.descripcion ?? '').trim(), permisos, esSistema: false,
+      }).returning();
+      const base = { entidad: 'rol', entidadId: nuevo.id, ambito: 'Roles y permisos', detalle: nombre, usuarioId: sesion?.usuarioId ?? null };
+      await this.audit.registrar([
+        { ...base, campo: 'Rol creado', despues: nombre },
+        ...permisos.map((p) => ({ ...base, campo: 'Permiso dado', despues: nombrePermiso(p) })),
+      ], tx);
+      return nuevo;
+    });
     return { ok: true, id: r.id };
   }
 
@@ -530,17 +541,36 @@ export class UsuariosService {
     }
     if (o?.descripcion != null) patch.descripcion = String(o.descripcion).trim();
     if (o?.permisos != null) patch.permisos = this.validarPermisos(o.permisos, sesion);
-    if (Object.keys(patch).length) await this.db.update(roles).set(patch).where(eq(roles.id, id));
+    if (!Object.keys(patch).length) return { ok: true };
+    /* Repartir permisos es la llave de todas las demás: cada uno que entra o sale queda firmado. */
+    const base = { entidad: 'rol', entidadId: id, ambito: 'Roles y permisos', detalle: patch.nombre ?? r.nombre, usuarioId: sesion?.usuarioId ?? null };
+    const cambios = this.audit.diferencias(base, { nombre: r.nombre, descripcion: r.descripcion ?? '' },
+      { nombre: patch.nombre ?? r.nombre, descripcion: patch.descripcion ?? r.descripcion ?? '' }, { nombre: 'Nombre', descripcion: 'Descripción' });
+    if (patch.permisos) {
+      const antes = new Set<string>(r.permisos ?? []);
+      const despues = new Set<string>(patch.permisos);
+      for (const p of despues) if (!antes.has(p)) cambios.push({ ...base, campo: 'Permiso dado', despues: nombrePermiso(p) });
+      for (const p of antes) if (!despues.has(p)) cambios.push({ ...base, campo: 'Permiso quitado', antes: nombrePermiso(p) });
+    }
+    await this.db.transaction(async (tx) => {
+      await tx.update(roles).set(patch).where(eq(roles.id, id));
+      await this.audit.registrar(cambios, tx);
+    });
     return { ok: true };
   }
 
-  async borrarRol(id: number) {
+  async borrarRol(id: number, sesion?: Sesion) {
     const [r] = await this.db.select().from(roles).where(eq(roles.id, id)).limit(1);
     if (!r) throw new NotFoundException('Rol inexistente.');
     if (r.esSistema) throw new BadRequestException('Los roles del sistema no se borran.');
     const usados = await this.db.select().from(usuarios).where(eq(usuarios.rolId, id)).limit(1);
     if (usados.length) throw new BadRequestException('Hay usuarios con ese rol: reasignalos primero.');
-    await this.db.delete(roles).where(eq(roles.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.delete(roles).where(eq(roles.id, id));
+      await this.audit.registrar([{
+        entidad: 'rol', entidadId: id, ambito: 'Roles y permisos', detalle: r.nombre, campo: 'Rol borrado', antes: r.nombre, usuarioId: sesion?.usuarioId ?? null,
+      }], tx);
+    });
     return { ok: true };
   }
 
@@ -582,10 +612,19 @@ export class UsuariosService {
       throw new BadRequestException('Para habilitarlo como relevo de caja definile un PIN.');
     }
     const suc = o?.sucursales != null ? await this.sucursalesValidas(o.sucursales) : [];
-    const [u] = await this.db.insert(usuarios).values({
-      nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
-      relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc,
-    }).returning();
+    const locales = await this.nombresDeSucursales(suc);
+    const u = await this.db.transaction(async (tx) => {
+      const [nuevo] = await tx.insert(usuarios).values({
+        nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
+        relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc,
+      }).returning();
+      await this.audit.registrar([{
+        entidad: 'usuario', entidadId: nuevo.id, ambito: 'Usuarios', detalle: nombre, campo: 'Usuario creado',
+        despues: `Rol ${r.nombre} · ${locales}${relevoCaja ? ' · relevo de caja' : ''}${nuevo.activo ? '' : ' · inactivo'}`,
+        usuarioId: sesion?.usuarioId ?? null,
+      }], tx);
+      return nuevo;
+    });
     return { ok: true, id: u.id };
   }
 
@@ -976,7 +1015,27 @@ export class UsuariosService {
       const antes = (Array.isArray(u.sucursales) ? u.sucursales : []).slice().sort((a: number, b: number) => a - b);
       if (JSON.stringify(nuevas) !== JSON.stringify(antes)) { patch.sucursales = nuevas; sucursalesCambiaron = true; }
     }
-    if (Object.keys(patch).length) await this.db.update(usuarios).set(patch).where(eq(usuarios.id, id));
+    if (Object.keys(patch).length) {
+      /* Lo que cambió, firmado. Las claves y el PIN nunca: solo que se cambiaron. */
+      const base = { entidad: 'usuario', entidadId: id, ambito: 'Usuarios', detalle: patch.nombre ?? u.nombre, usuarioId: sesion?.usuarioId ?? null };
+      const siNo = (v: boolean) => (v ? 'Sí' : 'No');
+      const cambios = [
+        ...(patch.nombre && patch.nombre !== u.nombre ? [{ ...base, campo: 'Nombre', antes: u.nombre, despues: patch.nombre }] : []),
+        ...(patch.rolId ? [{ ...base, campo: 'Rol', antes: rolActual?.nombre ?? '', despues: (await this.db.select({ n: roles.nombre }).from(roles).where(eq(roles.id, patch.rolId)))[0]?.n ?? '' }] : []),
+        ...(patch.activo != null ? [{ ...base, campo: 'Activo', antes: siNo(u.activo), despues: siNo(patch.activo) }] : []),
+        ...(patch.passwordHash ? [{ ...base, campo: 'Contraseña', despues: 'Cambiada' }] : []),
+        ...(patch.pinHash ? [{ ...base, campo: 'PIN de relevo', despues: u.pinHash ? 'Cambiado' : 'Definido' }] : []),
+        ...(patch.relevoCaja != null ? [{ ...base, campo: 'Relevo de caja', antes: siNo(u.relevoCaja), despues: siNo(patch.relevoCaja) }] : []),
+        ...(sucursalesCambiaron ? [{
+          ...base, campo: 'Sucursales',
+          antes: await this.nombresDeSucursales(Array.isArray(u.sucursales) ? u.sucursales : []), despues: await this.nombresDeSucursales(patch.sucursales),
+        }] : []),
+      ];
+      await this.db.transaction(async (tx) => {
+        await tx.update(usuarios).set(patch).where(eq(usuarios.id, id));
+        await this.audit.registrar(cambios, tx);
+      });
+    }
 
     /*
      * Cambiar la contraseña o desactivar a alguien tiene que ECHARLO de donde
@@ -990,6 +1049,13 @@ export class UsuariosService {
       await this.sesiones.cerrarTodasDe(id);
     }
     return { ok: true };
+  }
+
+  /** «Fontana, Centro» para la auditoría; la lista vacía es «todas». */
+  private async nombresDeSucursales(ids: number[]) {
+    if (!ids.length) return 'Todas las sucursales';
+    const filas = await this.db.select({ nombre: sucursales.nombre }).from(sucursales).where(inArray(sucursales.id, ids)).orderBy(sucursales.id);
+    return filas.map((x) => x.nombre).join(', ');
   }
 
   /** Ids de sucursales existentes, sin repetir y en orden. Vacío = todas. */
@@ -1020,7 +1086,7 @@ export class RolesController {
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() body: any, @Auth() sesion: Sesion) {
     return this.svc.editarRol(id, body ?? {}, sesion);
   }
-  @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarRol(id); }
+  @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.borrarRol(id, sesion); }
 }
 
 @Controller('usuarios')

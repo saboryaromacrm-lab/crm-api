@@ -14,7 +14,7 @@ import { sumarDias } from '../cafeteria/cuenta';
 
 export const PASOS = { dia: 'day', semana: 'week', mes: 'month' } as const;
 export type Paso = keyof typeof PASOS;
-export const LENTES = ['producto', 'categoria', 'marca', 'proveedor', 'lista', 'sucursal'] as const;
+export const LENTES = ['producto', 'categoria', 'marca', 'proveedor', 'lista', 'modalidad', 'sucursal'] as const;
 export type Lente = (typeof LENTES)[number];
 
 /** Granel (fraccionado o suelto) o enteros: el tipo que tenía el producto al sincronizar (0123). */
@@ -193,6 +193,12 @@ const DEF_LENTE: Record<Lente, { porProducto: boolean; sel: string; join: string
     group: `coalesce(pa.proveedor_id, 0), coalesce(prov.nombre, 'Sin proveedor')`,
   },
   lista: { porProducto: false, sel: `f.lista_id AS clave, coalesce(lv.nombre, 'Sin lista') AS nombre`, join: 'LEFT JOIN listas_venta lv ON lv.id = f.lista_id', group: `f.lista_id, coalesce(lv.nombre, 'Sin lista')` },
+  /* 8/10/2026: la modalidad (Minorista, Mayorista…) es la de la lista con la que se vendió cada renglón. */
+  modalidad: {
+    porProducto: false, sel: `coalesce(lv.modalidad_id, 0) AS clave, coalesce(mv.nombre, 'Sin modalidad') AS nombre`,
+    join: 'LEFT JOIN listas_venta lv ON lv.id = f.lista_id LEFT JOIN modalidades_venta mv ON mv.id = lv.modalidad_id',
+    group: `coalesce(lv.modalidad_id, 0), coalesce(mv.nombre, 'Sin modalidad')`,
+  },
   sucursal: { porProducto: false, sel: `f.sucursal_id AS clave, coalesce(s.nombre, 'Sin sucursal') AS nombre`, join: 'LEFT JOIN sucursales s ON s.id = f.sucursal_id', group: `f.sucursal_id, coalesce(s.nombre, 'Sin sucursal')` },
 };
 

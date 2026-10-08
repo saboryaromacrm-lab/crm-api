@@ -1009,6 +1009,27 @@
       "when": 1791453880104,
       "tag": "0143_sucursal_activa",
       "breakpoints": true
+    },
+    {
+      "idx": 144,
+      "version": "7",
+      "when": 1791470000000,
+      "tag": "0144_auditoria_gerencia",
+      "breakpoints": true
+    },
+    {
+      "idx": 145,
+      "version": "7",
+      "when": 1791480000000,
+      "tag": "0145_cajas_a_controlar",
+      "breakpoints": true
+    },
+    {
+      "idx": 146,
+      "version": "7",
+      "when": 1791490000000,
+      "tag": "0146_retiros_sin_costo",
+      "breakpoints": true
     }
   ]
 }

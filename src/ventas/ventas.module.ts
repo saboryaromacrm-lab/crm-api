@@ -54,6 +54,7 @@ import { faltaIdentificar } from '../arca/comprobante';
 import { consultarCuit, cuitValido, ErrorPadron, soloDigitos } from '../arca/padron';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
+import { esNotaCredito, etiquetaVenta, letraDe } from './etiqueta';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -359,15 +360,6 @@ export function letraFacturaPara(cliente: { condicionIva: string }, config: Reco
 
 /* ------------------------------- DTOs ------------------------------- */
 
-/** ¿Este comprobante RESTA en vez de sumar? Las notas de crédito, y solo ellas. */
-export const esNotaCredito = (tipo: string) => String(tipo ?? '').startsWith('nota_credito');
-
-/** La letra de un comprobante del sistema: 'factura_b' → 'B'. */
-const letraDe = (tipo: string) => {
-  const m = /_([abc])$/.exec(String(tipo ?? ''));
-  return m ? (m[1].toUpperCase() as 'A' | 'B' | 'C') : null;
-};
-
 /**
  * Lo mismo que `esNotaCredito` pero del lado de Postgres, para las sumas: una
  * nota de crédito entra con signo negativo. Se compara sobre `::text` porque
@@ -375,13 +367,16 @@ const letraDe = (tipo: string) => {
  */
 const SIGNO_NC = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)`;
 
-/** "Factura B 0003-00000042", para mensajes y rastros. */
-const etiquetaVenta = (v: { tipo: string; puntoVenta: string; numero: number | null }) => {
-  const nombre = v.tipo === 'ticket' ? 'Ticket'
-    : v.tipo === 'nota_credito_ticket' ? 'Devolución'
-      : `${esNotaCredito(v.tipo) ? 'Nota de crédito' : 'Factura'} ${letraDe(v.tipo) ?? ''}`.trim();
-  return `${nombre} ${v.puntoVenta}-${String(v.numero ?? 0).padStart(8, '0')}`;
-};
+/**
+ * UN CLIENTE DE «RETIROS SIN COSTO» NO COMPRA (0146): lo que se lleva es un
+ * retiro (`retiros`), que no toca caja, ventas, ARCA ni IVA. Si un ticket suyo
+ * llegara a cobrarse por acá, entraría a todo eso en $0 o con plata.
+ */
+function exigirNoEsRetiro(cliente: { retiroSinCosto?: boolean; nombre?: string }) {
+  if (cliente?.retiroSinCosto) {
+    throw new BadRequestException(`${cliente.nombre ?? 'Este cliente'} es de «Retiros sin costo»: no se le cobra. Registralo como retiro (F2).`);
+  }
+}
 
 const ORIGENES_LISTA = ['base', 'cliente', 'auto', 'manual', 'marca', 'monto', 'presupuesto', 'bulto'] as const;
 
@@ -3336,6 +3331,17 @@ export class VentasService {
    * de verdad, porque lo que se acepta no puede depender de lo que se ofrece.
    * Sus presentaciones se venden normal (llevan presentacionId).
    */
+  /**
+   * LAS REGLAS DEL RENGLÓN DE MOSTRADOR, juntas: solo-para-fraccionar,
+   * vendible (no archivado ni de Coffit) y entero lo que va por unidad. Las usa
+   * también el RETIRO sin costo (0146), que sale del mismo mostrador.
+   */
+  async validarRenglonesMostrador(items: Array<{ productoId: number; presentacionId?: number | null; cantidad: number | string }>) {
+    await this.validarSoloFraccionar(items);
+    await this.validarEstadoVendible(items);
+    await this.validarCantidadesEnteras(items);
+  }
+
   private async validarSoloFraccionar(items: Array<{ productoId: number; presentacionId?: number | null }>) {
     const sueltos = [...new Set((items ?? []).filter((it) => !it.presentacionId).map((it) => it.productoId))];
     if (!sueltos.length) return;
@@ -3424,13 +3430,12 @@ export class VentasService {
     const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     const esBorrador = dto.estado === 'borrador';
+    if (!esBorrador) exigirNoEsRetiro(cliente);
     if (!esBorrador && !dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
 
     // También en el borrador: un ticket que nunca va a poder confirmarse no
     // tiene por qué poder armarse.
-    await this.validarSoloFraccionar(dto.items ?? []);
-    await this.validarEstadoVendible(dto.items ?? []);
-    await this.validarCantidadesEnteras(dto.items ?? []);
+    await this.validarRenglonesMostrador(dto.items ?? []);
 
     // La sucursal se resuelve ANTES del portero: el presupuesto que el ticket
     // dice cerrar se valida contra ella.
@@ -3806,12 +3811,11 @@ export class VentasService {
     if (!borrador.items.length) throw new BadRequestException('El ticket está vacío.');
     // El borrador pudo nacer antes de que el producto se marcara "solo para
     // fraccionar" o se archivara: se re-valida acá, que es donde el stock sale.
-    await this.validarSoloFraccionar(borrador.items);
-    await this.validarEstadoVendible(borrador.items);
-    await this.validarCantidadesEnteras(borrador.items);
+    await this.validarRenglonesMostrador(borrador.items);
 
     const config = await this.cfg.get('ventas');
     let cliente: any = await this.cli.get(borrador.clienteId);
+    exigirNoEsRetiro(cliente);
     const condicionPago = dto.condicionPago ?? borrador.condicionPago;
     const sucursalId = borrador.sucursalId!;
     // ARCA visto desde ESTA sucursal (0124).

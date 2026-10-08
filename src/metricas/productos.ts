@@ -175,7 +175,61 @@ export async function reporteProductos(c: PoolClient, f: Filtro, paso: Paso, nod
   };
 
   if (nivel === 'detalle') return { ...base, ...(await detalleProducto(c, f, ant, prod, catId ?? 0, subId ?? 0, N(prod.marca_id), total.ventaNeta)) };
-  return { ...base, ...(await nivelArbol(c, f, ant, nivel, condNodo, total.ventaNeta)) };
+  const [arbol, modalidades] = await Promise.all([
+    nivelArbol(c, f, ant, nivel, condNodo, total.ventaNeta),
+    porMarca ? modalidadesPorMarca(c, f, condNodo) : Promise.resolve(null),
+  ]);
+  if (!modalidades) return { ...base, ...arbol };
+  /* Por marca (8/10/2026, pedido del dueño): qué parte de lo vendido fue en cada modalidad, del nodo y de cada marca. */
+  return {
+    ...base, ...arbol,
+    modalidades: { lista: modalidades.lista, nodo: modalidades.nodo },
+    filas: nivel === 'marca' ? arbol.filas.map((x: any) => ({ ...x, modalidades: modalidades.porMarca.get(x.clave) ?? [] })) : arbol.filas,
+  };
+}
+
+/**
+ * QUÉ PARTE DE LA VENTA FUE EN CADA MODALIDAD (Minorista, Mayorista…), por
+ * marca. La modalidad es la de la lista con la que se vendió cada renglón; una
+ * sola lectura de la tabla resumen, del mismo período y filtro que el resto.
+ * Las modalidades van en el mismo orden en todas las filas (el de la venta del
+ * nodo), para poder compararlas de un vistazo.
+ */
+async function modalidadesPorMarca(c: PoolClient, f: Filtro, condNodo: (p: (v: unknown) => string) => string) {
+  const we = donde(f, 'f', true);
+  const q = parametros();
+  for (const v of we.params) q.lista.push(v);
+  const r = await c.query(
+    `SELECT ${CLAVE_MARCA} AS marca, coalesce(lv.modalidad_id, 0) AS modalidad, coalesce(mv.nombre, 'Sin modalidad') AS nombre,
+       sum(f.venta_neta) AS venta
+     FROM metricas_venta_prod_dia f
+     LEFT JOIN productos p ON p.id = f.producto_id
+     LEFT JOIN listas_venta lv ON lv.id = f.lista_id
+     LEFT JOIN modalidades_venta mv ON mv.id = lv.modalidad_id
+     WHERE ${we.sql} AND ${condNodo(q.p)}
+     GROUP BY 1, 2, 3`, q.lista);
+  const nombreDe = new Map<number, string>();
+  const totalMod = new Map<number, number>();
+  const porMarcaMod = new Map<number, Map<number, number>>();
+  for (const x of r.rows as any[]) {
+    const mod = N(x.modalidad); const marca = N(x.marca); const v = N(x.venta);
+    nombreDe.set(mod, x.nombre);
+    totalMod.set(mod, (totalMod.get(mod) ?? 0) + v);
+    const m = porMarcaMod.get(marca) ?? new Map<number, number>();
+    m.set(mod, (m.get(mod) ?? 0) + v);
+    porMarcaMod.set(marca, m);
+  }
+  const orden = [...totalMod.keys()].sort((a, b) => (totalMod.get(b) ?? 0) - (totalMod.get(a) ?? 0));
+  const reparto = (m: Map<number, number>) => {
+    const total = [...m.values()].reduce((s, v) => s + v, 0);
+    return orden.filter((id) => Math.abs(m.get(id) ?? 0) > 0.005)
+      .map((id) => ({ id, ventaNeta: r2(m.get(id) ?? 0), participacion: pct(m.get(id) ?? 0, total) }));
+  };
+  return {
+    lista: orden.map((id) => ({ id, nombre: nombreDe.get(id) ?? 'Sin modalidad' })),
+    nodo: reparto(totalMod),
+    porMarca: new Map([...porMarcaMod].map(([marca, m]) => [marca, reparto(m)])),
+  };
 }
 
 /* ============================== UN NIVEL DEL ÁRBOL ============================== */

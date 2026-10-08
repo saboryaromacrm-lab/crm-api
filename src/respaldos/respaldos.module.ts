@@ -101,6 +101,10 @@ const TABLAS_PRACTICA = [
   // también: sin su libro el saldo no cerraría, así que se vuelve a arrancar.
   // Los CONCEPTOS quedan: son la configuración del dueño.
   'cashflow_caja', 'cashflow_sobres', 'cashflow_conteos', 'cashflow_movimientos',
+  // las cajas marcadas para controlar (0145) cuelgan de los turnos de práctica
+  'cajas_a_controlar',
+  // los retiros sin costo de práctica (0146); la marca del cliente queda
+  'retiro_items', 'retiros',
   // tienda: eventos (las fotos quedan)
   'web_eventos',
   // el rastro de la práctica; el primer registro de la era nueva es la limpieza

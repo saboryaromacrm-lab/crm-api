@@ -7,10 +7,10 @@
  * A MANO de condiciones que arrastran costos y precios sin que nadie firme.
  *
  * EL MECANISMO ES UNO Y GENERAL (entidad + entidadId), no "de proveedores":
- * hoy escriben las condiciones comerciales del proveedor (formato de compra,
- * percepciones, ficha comercial) y lo lee la pestaña Auditoría de su modal;
- * el día que Gerencia › Auditoría se construya, lee ESTA misma tabla sin
- * migrar nada.
+ * la escriben las condiciones comerciales del proveedor, las fichas, los
+ * relevos de caja, los respaldos, los usuarios, roles y sucursales (0144)… La
+ * lee la pestaña Auditoría del modal del proveedor y Gerencia › Auditoría
+ * (`gerencia.ts`), que la junta con lo que cada operación firma en su tabla.
  *
  * Reglas de escritura:
  *   - una fila por CAMPO cambiado — nunca "se guardó el formulario";
@@ -25,6 +25,7 @@ import { desc, eq, and, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
 import { auditoria, usuarios } from '../db/schema';
+import { auditoriaGerencia, validarFiltro } from './gerencia';
 
 /** Un cambio puntual: el campo y sus dos valores. Todo texto: es para leer. */
 export interface CambioAuditado {
@@ -81,6 +82,11 @@ export class AuditoriaService {
     return out;
   }
 
+  /** Gerencia › Auditoría: todo lo firmado del período, por tipo y por persona. */
+  gerencia(q: Record<string, string | undefined>) {
+    return auditoriaGerencia(this.db, validarFiltro(q));
+  }
+
   async list(q: { entidad: string; entidadId: number; limit?: number }) {
     const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 500);
     return this.db
@@ -118,6 +124,12 @@ export class AuditoriaController {
     const id = parseInt(entidadId ?? '', 10);
     if (!id) throw new BadRequestException('Falta entidadId.');
     return this.svc.list({ entidad, entidadId: id, limit: Number(limit) || undefined });
+  }
+
+  /* `gerencia.auditoria` no está en el catálogo de permisos: solo el superadmin (0144). */
+  @Get('gerencia') @Permiso('gerencia.auditoria')
+  gerencia(@Query() q: Record<string, string | undefined>) {
+    return this.svc.gerencia(q);
   }
 }
 

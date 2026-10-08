@@ -6,6 +6,7 @@ import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength,
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import {
   cajaSesiones, conteos, enviosCafeteria, gastosRecurrentes, incidencias, pedidosCafeteria, presupuestos, productos, sesiones, stock,
@@ -38,9 +39,27 @@ export const normalizarPuntoVentaFiscal = (v: unknown) => {
   return d ? d.padStart(5, '0') : '';
 };
 
+/** Lo que se audita de una sucursal (0144): el fondo de caja y la distribuidora mueven plata y mercadería. */
+const CAMPOS_SUCURSAL = {
+  nombre: 'Nombre', tipo: 'Tipo', puntoVenta: 'Punto de venta ARCA', direccion: 'Domicilio',
+  facturaElectronica: 'Factura electrónica', fondoCaja: 'Fondo de caja',
+} as const;
+const textoSucursal = (s: Record<string, any>) => Object.fromEntries(Object.keys(CAMPOS_SUCURSAL).map((k) => {
+  const v = s[k];
+  return [k, typeof v === 'boolean' ? (v ? 'Sí' : 'No') : k === 'fondoCaja' ? `$${(Number(v) || 0).toLocaleString('es-AR')}` : String(v ?? '')];
+}));
+
 @Injectable()
 export class SucursalesService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly audit: AuditoriaService,
+  ) {}
+
+  /** Una fila de auditoría de la sucursal, con quién la hizo. */
+  private firma(s: { id: number; nombre: string }, sesion: Sesion | undefined, campo: string, antes = '', despues = '') {
+    return { entidad: 'sucursal', entidadId: s.id, ambito: 'Sucursales', detalle: s.nombre, campo, antes, despues, usuarioId: sesion?.usuarioId ?? null };
+  }
 
   /**
    * Las sucursales para ELEGIR: solo las activas (0143). `todas` (la pantalla
@@ -110,16 +129,26 @@ export class SucursalesService {
     };
   }
 
-  async create(dto: UpsertSucursalDto) {
-    const [s] = await this.db.insert(sucursales).values(await this.normalizar(dto)).returning();
-    return s;
+  async create(dto: UpsertSucursalDto, sesion?: Sesion) {
+    const valores = await this.normalizar(dto);
+    return this.db.transaction(async (tx) => {
+      const [s] = await tx.insert(sucursales).values(valores).returning();
+      await this.audit.registrar([this.firma(s, sesion, 'Sucursal creada', '', s.nombre)], tx);
+      return s;
+    });
   }
 
-  async update(id: number, dto: UpsertSucursalDto) {
+  async update(id: number, dto: UpsertSucursalDto, sesion?: Sesion) {
     const actual = await this.get(id);
-    const [s] = await this.db.update(sucursales)
-      .set(await this.normalizar(dto, id, actual)).where(eq(sucursales.id, id)).returning();
-    return s;
+    const valores = await this.normalizar(dto, id, actual);
+    return this.db.transaction(async (tx) => {
+      const [s] = await tx.update(sucursales).set(valores).where(eq(sucursales.id, id)).returning();
+      await this.audit.registrar(this.audit.diferencias(
+        { entidad: 'sucursal', entidadId: id, ambito: 'Sucursales', detalle: s.nombre, usuarioId: sesion?.usuarioId ?? null },
+        textoSucursal(actual), textoSucursal(s), CAMPOS_SUCURSAL,
+      ), tx);
+      return s;
+    });
   }
 
   /**
@@ -136,7 +165,7 @@ export class SucursalesService {
    * incidencia abierta, no se borra. Lo que hay que hacer con un local que
    * cierra es vaciarlo por transferencia, que deja los movimientos.
    */
-  async remove(id: number) {
+  async remove(id: number, sesion?: Sesion) {
     const s = await this.get(id);
     const [conStock] = await this.db.select({ n: sql<number>`count(*)` })
       .from(stock).where(and(eq(stock.sucursalId, id), gt(stock.cantidad, 0.000001)));
@@ -151,7 +180,10 @@ export class SucursalesService {
     if (Number(conInc?.n) > 0) {
       throw new BadRequestException(`${s.nombre} tiene incidencias sin resolver: cerralas antes de borrarla.`);
     }
-    await this.db.delete(sucursales).where(eq(sucursales.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.delete(sucursales).where(eq(sucursales.id, id));
+      await this.audit.registrar([this.firma(s, sesion, 'Sucursal borrada', s.nombre)], tx);
+    });
     return { ok: true };
   }
 
@@ -230,6 +262,7 @@ export class SucursalesService {
           .where(and(eq(sesiones.id, sesion.sesionId), eq(sesiones.sucursalId, id)));
       }
       const cerradas = await tx.delete(sesiones).where(eq(sesiones.sucursalId, id)).returning({ id: sesiones.id });
+      await this.audit.registrar([this.firma(s, sesion, 'Estado', 'Activa', 'Desactivada')], tx);
       return { equipos: eqs.length, sesiones: cerradas.length };
     });
     /* Quien trabajaba SOLO ahí ya no tiene dónde entrar: se avisa (no se le
@@ -244,10 +277,13 @@ export class SucursalesService {
     return { ok: true, sucursal: s.nombre, ...r, usuariosSinLocal: soloAhi.map((u) => u.nombre), gastosFijos: fijos.map((g) => g.nombre) };
   }
 
-  async reactivar(id: number) {
+  async reactivar(id: number, sesion?: Sesion) {
     const s = await this.get(id);
     if (s.activa) return { ok: true, yaEstaba: true };
-    await this.db.update(sucursales).set({ activa: true, desactivadaEn: null }).where(eq(sucursales.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.update(sucursales).set({ activa: true, desactivadaEn: null }).where(eq(sucursales.id, id));
+      await this.audit.registrar([this.firma(s, sesion, 'Estado', 'Desactivada', 'Activa')], tx);
+    });
     return { ok: true, sucursal: s.nombre };
   }
 }
@@ -270,20 +306,20 @@ export class SucursalesController {
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
   @Post() @Permiso('gerencia.usuarios')
-  create(@Body() dto: UpsertSucursalDto) { return this.svc.create(dto); }
+  create(@Body() dto: UpsertSucursalDto, @Auth() sesion: Sesion) { return this.svc.create(dto, sesion); }
 
   @Patch(':id') @Permiso('gerencia.usuarios')
-  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertSucursalDto) { return this.svc.update(id, dto); }
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertSucursalDto, @Auth() sesion: Sesion) { return this.svc.update(id, dto, sesion); }
 
   @Delete(':id') @Permiso('gerencia.usuarios')
-  remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
+  remove(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.remove(id, sesion); }
 
   /** Un local que cerró (0143): sale de todas las listas para elegir; el historial queda. */
   @Post(':id/desactivar') @Permiso('gerencia.usuarios')
   desactivar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.desactivar(id, sesion); }
 
   @Post(':id/reactivar') @Permiso('gerencia.usuarios')
-  reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }
+  reactivar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.reactivar(id, sesion); }
 }
 
 /* ==================================================================== *
@@ -476,6 +512,7 @@ export class TerminalesController {
 }
 
 @Module({
+  imports: [AuditoriaModule],
   controllers: [SucursalesController, TerminalesController],
   providers: [SucursalesService, TerminalesService],
 })

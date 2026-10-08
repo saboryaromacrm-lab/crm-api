@@ -16,11 +16,13 @@ import {
   Body, ConflictException, Controller, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
+import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
+import { MarcaDto, PERMISO_CASHFLOW, marcarCaja } from '../cashflow/a-controlar';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import {
@@ -59,6 +61,8 @@ class EnviarCierreDto {
   @IsBoolean() confirmado!: boolean;
   @IsOptional() @IsInt() usuarioId?: number;
   @IsOptional() @IsInt() operadorId?: number;
+  /** El tilde «Mandar a Cajas a controlar» (0145): solo el dueño, en la misma transacción del cierre. */
+  @IsOptional() @ValidateNested() @Type(() => MarcaDto) aControlar?: MarcaDto;
 }
 
 /**
@@ -669,7 +673,7 @@ export class CajaService {
    * Misma transacción y mismo candado que `cerrar`: nada entra al turno
    * mientras se cierra.
    */
-  async enviarYCerrar(id: number, dto: EnviarCierreDto, sucursalSesion: number | null) {
+  async enviarYCerrar(id: number, dto: EnviarCierreDto, sucursalSesion: number | null, marcadaPor: number | null = null) {
     if (dto.confirmado !== true) {
       throw new BadRequestException('Confirmá el envío: el turno se cierra y no se puede reabrir.');
     }
@@ -739,6 +743,7 @@ export class CajaService {
         observaciones: `Cierre por envío (conteo por billetes): envió ${$(envio)}, quedan ${$(queda)} de fondo`,
         usuarioId: cerrador ?? null,
       });
+      if (dto.aControlar) await marcarCaja(tx, { cajaSesionId: id, origen: 'cierre', nota: dto.aControlar.nota, usuarioId: marcadaPor });
       /* El esperado y la diferencia viajan: el controlador los saca si el que
        * cierra cuenta a ciegas (`cajaVeEsperado` apagado y no es jefe). */
       return {
@@ -1023,7 +1028,10 @@ export class CajaController {
   /** El cierre: contar billetes, dejar el fondo y enviar el resto (0111). Para todos. */
   @Post(':id/enviar')
   async enviar(@Param('id', ParseIntPipe) id: number, @Body() dto: EnviarCierreDto, @Auth() sesion: Sesion) {
-    const r = await this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion));
+    if (dto.aControlar && !tienePermiso(sesion?.permisos ?? [], [PERMISO_CASHFLOW])) {
+      throw new ForbiddenException('Mandar una caja a «Cajas a controlar» es solo del dueño.');
+    }
+    const r = await this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion), sesion?.usuarioId ?? null);
     return (await this.ciego(sesion))
       ? { ...r, sesion: sesionCiega(r.sesion), esperadoEfectivo: null, diferencia: null, ciego: true }
       : { ...r, ciego: false };

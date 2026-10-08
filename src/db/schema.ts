@@ -69,6 +69,10 @@ export const tipoMovEnum = pgEnum('tipo_movimiento', [
   // sucursal para venderse en el mostrador. Tipo propio y no 'compra',
   // porque no hay factura ni proveedor: es el otro negocio del mismo dueño.
   'ingreso_cafeteria',
+  // 0146 · la mercadería que se llevan los socios (Retiros sin costo): sale del
+  // stock sin venta. Tipo propio para que ninguna suma de ventas ni de pérdidas
+  // la cuente.
+  'retiro',
 ]);
 /**
  * Condición frente al IVA. La usan las DOS puntas: en el cliente define la
@@ -1220,6 +1224,9 @@ export const movimientos = pgTable('movimientos', {
    */
   ixProdSucFecha: index('ix_mov_prod_suc_fecha').on(t.productoId, t.sucursalId, t.fecha.desc()),
   ixPases: index('ix_mov_pases').on(t.productoId, t.sucursalId, t.fecha.desc()).where(sql`${t.tipo} = 'transferencia' AND ${t.signo} <> 0`),
+  /* Gerencia › Auditoría (0144): ajustes y bajas del período. */
+  ixAjustes: index('ix_mov_ajustes').on(t.fecha.desc())
+    .where(sql`${t.tipo} IN ('ajuste', 'merma', 'vencido', 'defectuoso') AND ${t.signo} <> 0`),
 }));
 
 /* ---------------- Historial de fraccionamiento (0102) ---------------- */
@@ -1816,10 +1823,46 @@ export const clientes = pgTable('clientes', {
   activo: boolean('activo').notNull().default(true),
   // El "Consumidor Final" genérico del sistema: único, no editable en lo fiscal ni borrable.
   esConsumidorFinal: boolean('es_consumidor_final').notNull().default(false),
+  /** 0146: lo que se le «vende» en el POS es un RETIRO sin costo (ver `retiros`), nunca una venta. Lo marca el superadmin. */
+  retiroSinCosto: boolean('retiro_sin_costo').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixNombre: index('ix_clientes_nombre').on(t.nombre),
   ixDoc: index('ix_clientes_doc').on(t.tipoDoc, t.numeroDoc),
+}));
+
+/**
+ * RETIROS SIN COSTO (0146): la mercadería que se llevan los socios. Documento
+ * APARTE de las ventas: no toca caja, ventas, ARCA, IVA ni métricas de ventas.
+ * Baja el stock (movimiento 'retiro') y congela el costo real de cada renglón.
+ * Ver `retiros/retiros.module.ts`.
+ */
+export const retiros = pgTable('retiros', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  clienteId: integer('cliente_id').notNull().references(() => clientes.id, { onDelete: 'restrict' }),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  costoTotal: doublePrecision('costo_total').notNull().default(0),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
+}, (t) => ({
+  ixCliente: index('ix_retiros_cliente').on(t.clienteId, t.fecha.desc()),
+  ixFecha: index('ix_retiros_fecha').on(t.fecha),
+}));
+export const retiroItems = pgTable('retiro_items', {
+  id: serial('id').primaryKey(),
+  retiroId: integer('retiro_id').notNull().references(() => retiros.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
+  /** El nombre CONGELADO ("Aceite x500"), como en el ticket. */
+  nombre: text('nombre').notNull().default(''),
+  cantidad: doublePrecision('cantidad').notNull(),
+  /** El costo REAL por unidad del día (neto + la parte sin factura entera), igual que el de una venta (0072). */
+  costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
+}, (t) => ({
+  ixRetiro: index('ix_retiro_items_retiro').on(t.retiroId),
 }));
 
 /* ---------------- Caja (turnos del punto de venta) ---------------- */
@@ -2105,6 +2148,8 @@ export const ventas = pgTable('ventas', {
   ixAbiertas: index('ix_ventas_abiertas').on(t.sucursalId, t.estado),
   /* El arqueo suma las ventas del turno en cada cierre y en cada control. */
   ixCajaSesion: index('ix_ventas_caja_sesion').on(t.cajaSesionId),
+  /* Gerencia › Auditoría (0144): las anuladas del período, sin recorrer las ventas. */
+  ixAnuladas: index('ix_ventas_anuladas').on(t.anuladoEn).where(sql`${t.estado} = 'anulada'`),
 }));
 
 export const ventaItems = pgTable('venta_items', {
@@ -2190,6 +2235,9 @@ export const ventaItems = pgTable('venta_items', {
   refItemId: integer('ref_item_id'),                      // NC parcial → ítem original
 }, (t) => ({
   ixVenta: index('ix_venta_items_venta').on(t.ventaId),
+  /* Gerencia › Auditoría (0144): solo los renglones con precio o descuento puesto a mano. */
+  ixAMano: index('ix_venta_items_a_mano').on(t.ventaId)
+    .where(sql`${t.listaOrigen} = 'manual' OR (${t.descuento} > 0 AND ${t.descuentoId} IS NULL AND ${t.ofertaDescuento} = 0)`),
 }));
 
 /**
@@ -2419,7 +2467,28 @@ export const cashflowCaja = pgTable('cashflow_caja', {
   abiertaEn: timestamp('abierta_en', { withTimezone: true }).notNull().defaultNow(),
   abiertaPor: integer('abierta_por').references(() => usuarios.id, { onDelete: 'set null' }),
   observaciones: text('observaciones').notNull().default(''),
+  /** 0145: desde qué diferencia se propone mandar una caja a «Cajas a controlar». */
+  umbralControlar: doublePrecision('umbral_controlar').notNull().default(5000),
 });
+/**
+ * CAJAS A CONTROLAR (0145): el turno que el dueño marcó al ver una diferencia
+ * grande (en el sobre, el cierre o un control), hasta que la resuelva. Una
+ * sola pendiente por turno. Ver `cashflow/a-controlar.ts`.
+ */
+export const cajasAControlar = pgTable('cajas_a_controlar', {
+  id: serial('id').primaryKey(),
+  cajaSesionId: integer('caja_sesion_id').notNull().references(() => cajaSesiones.id, { onDelete: 'cascade' }),
+  /** Dónde se marcó: 'sobre' | 'cierre' | 'control'. */
+  origen: text('origen').notNull(),
+  nota: text('nota').notNull().default(''),
+  marcadaEn: timestamp('marcada_en', { withTimezone: true }).notNull().defaultNow(),
+  marcadaPor: integer('marcada_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  resueltaEn: timestamp('resuelta_en', { withTimezone: true }),
+  resueltaPor: integer('resuelta_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  resolucion: text('resolucion').notNull().default(''),
+}, (t) => ({
+  uqPendiente: uniqueIndex('uq_caja_a_controlar_pendiente').on(t.cajaSesionId).where(sql`${t.resueltaEn} IS NULL`),
+}));
 /** Los motivos de ingreso/egreso que configura el dueño. `clase` gasto = crea el gasto en Gastos. */
 export const cashflowConceptos = pgTable('cashflow_conceptos', {
   id: serial('id').primaryKey(),
@@ -3457,6 +3526,7 @@ export const auditoria = pgTable('auditoria', {
   despues: text('despues').notNull().default(''),
 }, (t) => ({
   ixEntidad: index('ix_auditoria_entidad').on(t.entidad, t.entidadId),
+  ixFecha: index('ix_auditoria_fecha').on(t.fecha.desc()),
 }));
 
 /** Todas las tablas para pasar al cliente de Drizzle. */
