@@ -1515,6 +1515,7 @@ export class InventarioService {
       const [origen] = await tx.select().from(sucursales).where(eq(sucursales.id, o.origenId)).limit(1);
       const [destino] = await tx.select().from(sucursales).where(eq(sucursales.id, o.destinoId)).limit(1);
       if (!origen || !destino || origen.id === destino.id) throw new BadRequestException('Elegí origen y destino distintos.');
+      if (!origen.activa || !destino.activa) throw new BadRequestException(`${(!origen.activa ? origen : destino).nombre} está desactivada: el local cerró. Elegí otro.`);
       const items = (o.items || []).filter((it: any) => Number(it.cantidad) > 0);
       if (!items.length) throw new BadRequestException('Agregá al menos un ítem con cantidad.');
 
@@ -1721,6 +1722,7 @@ export class InventarioService {
       const [origen] = await tx.select().from(sucursales).where(eq(sucursales.id, o.origenId)).limit(1);
       const [destino] = await tx.select().from(sucursales).where(eq(sucursales.id, o.destinoId)).limit(1);
       if (!origen || !destino || origen.id === destino.id) throw new BadRequestException('Elegí origen y destino distintos.');
+      if (!origen.activa || !destino.activa) throw new BadRequestException(`${(!origen.activa ? origen : destino).nombre} está desactivada: el local cerró. Elegí otro.`);
 
       const buscar = async () => {
         const [t] = await tx.select().from(transferencias).where(and(
@@ -3285,7 +3287,11 @@ export class InventarioService {
       // Los catálogos del producto: chicos y estables, viajan enteros para que
       // los desplegables del modal no cuesten una llamada cada uno.
       catalogos: { marcas: ms, categorias: cs, subcategorias: ss, etiquetas: es },
-      sucursales: suc, proveedores: prov, usuarios: this.usuariosPublicos(usr, rolesCat),
+      /* Para elegir, solo las activas (0143); las desactivadas viajan aparte con su
+       * nombre, para que el historial (pases viejos, movimientos) las siga nombrando. */
+      sucursales: suc.filter((x: any) => x.activa !== false),
+      sucursalesInactivas: suc.filter((x: any) => x.activa === false).map((x: any) => ({ id: x.id, nombre: x.nombre })),
+      proveedores: prov, usuarios: this.usuariosPublicos(usr, rolesCat),
       transferencias: transfs, incidencias: incs,
       /*
        * Cuántas facturas de papel están esperando que alguien las cargue. Viaja

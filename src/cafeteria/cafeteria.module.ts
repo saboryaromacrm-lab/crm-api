@@ -951,11 +951,12 @@ export class CafeteriaService {
       }
       /* Un id que no existe llegaba hasta la clave foránea y salía un 500
        * crudo: el que lo veía no tenía forma de saber qué le faltaba. */
-      const [suc] = await tx.select({ id: sucursales.id })
+      const [suc] = await tx.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa })
         .from(sucursales).where(eq(sucursales.id, sucId)).limit(1);
       if (!suc) {
         throw new BadRequestException('Esa sucursal ya no existe. Actualizá la pantalla y elegila de nuevo.');
       }
+      if (!suc.activa) throw new BadRequestException(`${suc.nombre} está desactivada: el local cerró. Elegí otra sucursal.`);
 
       /*
        * Si viene a cumplir un pedido, el pedido se CIERRA acá, con reclamo
@@ -1502,9 +1503,10 @@ export class CafeteriaService {
     if (!items.length) throw new BadRequestException('Agregá al menos un renglón con cantidad.');
 
     const id = await this.db.transaction(async (tx) => {
-      const [suc] = await tx.select({ id: sucursales.id })
+      const [suc] = await tx.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa })
         .from(sucursales).where(eq(sucursales.id, Number(o.sucursalId) || 0)).limit(1);
       if (!suc) throw new BadRequestException('Elegí a qué sucursal le pedís la mercadería.');
+      if (!suc.activa) throw new BadRequestException(`${suc.nombre} está desactivada: el local cerró. Pedile a otra sucursal.`);
       // valuarItems valida producto/presentación y da los nombres; el costo
       // que calcula acá NO se guarda — el pedido es demanda, no plata.
       const val = await this.valuarItems(tx, items);

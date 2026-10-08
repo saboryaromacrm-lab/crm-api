@@ -1,13 +1,16 @@
 import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
-  Param, ParseIntPipe, Patch, Post,
+  Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
-import { and, eq, gt, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
-import { incidencias, stock, sucursales, terminales } from '../db/schema';
+import {
+  cajaSesiones, conteos, enviosCafeteria, gastosRecurrentes, incidencias, pedidosCafeteria, presupuestos, productos, sesiones, stock,
+  sucursales, terminales, transferencias, usuarios, vencimientos, ventas,
+} from '../db/schema';
 
 class UpsertSucursalDto {
   @IsString() @MaxLength(80) nombre!: string;
@@ -39,7 +42,16 @@ export const normalizarPuntoVentaFiscal = (v: unknown) => {
 export class SucursalesService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  list() { return this.db.select().from(sucursales).orderBy(sucursales.id); }
+  /**
+   * Las sucursales para ELEGIR: solo las activas (0143). `todas` (la pantalla
+   * de Sucursales de Gerencia) trae también las desactivadas, para poder
+   * reactivarlas. Lo que solo muestra un nombre en el historial no pasa por
+   * acá: lo lee con un join y sigue viendo el nombre de un local cerrado.
+   */
+  list(todas = false) {
+    const q = this.db.select().from(sucursales);
+    return (todas ? q : q.where(eq(sucursales.activa, true))).orderBy(sucursales.id);
+  }
 
   async get(id: number) {
     const [s] = await this.db.select().from(sucursales).where(eq(sucursales.id, id)).limit(1);
@@ -142,7 +154,104 @@ export class SucursalesService {
     await this.db.delete(sucursales).where(eq(sucursales.id, id));
     return { ok: true };
   }
+
+  /**
+   * DESACTIVAR UN LOCAL QUE CERRÓ (0143, 8/10/2026).
+   *
+   * Antes de apagarlo se revisa que no quede nada vivo atado a él: si quedara,
+   * desaparecería de las pantallas con plata, mercadería o un pedido adentro.
+   * Se juntan TODOS los motivos en un solo mensaje, así se resuelven de una vez
+   * y no de a uno por intento.
+   *
+   * Al apagarlo: los equipos registrados en ese local dejan de abrir el ERP
+   * (si no, el login lo seguiría eligiendo solo) y se cierran las sesiones
+   * paradas ahí. La del que lo apaga, si estaba parado ahí, se muda a otra.
+   */
+  async desactivar(id: number, sesion?: Sesion) {
+    const s = await this.get(id);
+    if (!s.activa) return { ok: true, yaEstaba: true };
+    const motivos: string[] = [];
+    if (s.tipo === 'distribuidora') {
+      motivos.push('es la Distribuidora: de ahí salen las compras, los envíos a Coffit y el stock de la tienda online');
+    }
+    const n = async (q: Promise<any[]>) => Number((await q)[0]?.n) || 0;
+    /* Stock DISTINTO de cero, también el negativo: un faltante sin explicar no puede quedar escondido en un local cerrado. */
+    const conCantidad = sql`abs(${stock.cantidad}) > 0.000001`;
+    const [activas, cajas, conStock, pases, incs, abiertas, pedidosCafe, controles, presus, enviosCafe, vencs, sinCae] = await Promise.all([
+      n(this.db.select({ n: sql<number>`count(*)` }).from(sucursales).where(and(eq(sucursales.activa, true), ne(sucursales.id, id)))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(cajaSesiones).where(and(eq(cajaSesiones.sucursalId, id), eq(cajaSesiones.estado, 'abierta')))),
+      n(this.db.select({ n: sql<number>`count(distinct ${stock.productoId})` }).from(stock).where(and(eq(stock.sucursalId, id), conCantidad))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(transferencias).where(and(
+        or(eq(transferencias.origenId, id), eq(transferencias.destinoId, id)),
+        inArray(transferencias.estado, ['borrador', 'pendiente', 'preparada', 'transito'] as any)))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(incidencias).where(and(eq(incidencias.sucursalId, id), ne(incidencias.estado, 'resuelta')))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(ventas).where(and(eq(ventas.sucursalId, id), eq(ventas.estado, 'borrador')))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(pedidosCafeteria).where(and(
+        eq(pedidosCafeteria.sucursalId, id), inArray(pedidosCafeteria.estado, ['pendiente', 'armando'] as any)))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(conteos).where(and(eq(conteos.sucursalId, id), eq(conteos.estado, 'en_curso')))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(presupuestos).where(and(
+        eq(presupuestos.sucursalId, id), inArray(presupuestos.estado, ['borrador', 'enviado', 'confirmado', 'pendiente'] as any)))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(enviosCafeteria).where(and(
+        eq(enviosCafeteria.sucursalId, id), eq(enviosCafeteria.estado, 'enviado'), eq(enviosCafeteria.recepcion, 'pendiente')))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(vencimientos).where(and(eq(vencimientos.sucursalId, id), eq(vencimientos.procesado, false)))),
+      n(this.db.select({ n: sql<number>`count(*)` }).from(ventas).where(and(
+        eq(ventas.sucursalId, id), or(eq(ventas.estado, 'pendiente_cae'), and(eq(ventas.estado, 'confirmada'), eq(ventas.facturarPendiente, true)))))),
+    ]);
+    if (!activas) motivos.push('es la única sucursal activa');
+    if (cajas) motivos.push('tiene la caja abierta: cerrala primero (el sobre tiene que llegar)');
+    if (conStock) {
+      const ej = await this.db.select({ nombre: productos.nombre }).from(stock)
+        .innerJoin(productos, eq(productos.id, stock.productoId))
+        .where(and(eq(stock.sucursalId, id), conCantidad)).orderBy(asc(productos.nombre)).limit(3);
+      motivos.push(`todavía tiene stock cargado distinto de cero (${conStock} producto${conStock === 1 ? '' : 's'}, por ejemplo ${ej.map((x) => x.nombre).join(', ')}): transferilo a otro local, dalo de baja o, si está en negativo, corregilo con un control de stock`);
+    }
+    if (pases) motivos.push(`tiene ${pases} pase${pases === 1 ? '' : 's'} entre locales sin terminar (en borrador, preparándose o en viaje)`);
+    if (incs) motivos.push(`tiene ${incs} incidencia${incs === 1 ? '' : 's'} sin resolver`);
+    if (abiertas) motivos.push(`tiene ${abiertas} ticket${abiertas === 1 ? '' : 's'} abierto${abiertas === 1 ? '' : 's'} en la caja sin cobrar: cobralos o descartalos`);
+    if (pedidosCafe) motivos.push(`tiene ${pedidosCafe} pedido${pedidosCafe === 1 ? '' : 's'} de Coffit sin enviar`);
+    if (controles) motivos.push(`tiene ${controles} control${controles === 1 ? '' : 'es'} de stock en curso: cerralo o descartalo`);
+    if (presus) motivos.push(`tiene ${presus} presupuesto${presus === 1 ? '' : 's'} o pedido${presus === 1 ? '' : 's'} abierto${presus === 1 ? '' : 's'}: concretalos o cancelalos`);
+    if (enviosCafe) motivos.push(`tiene ${enviosCafe} envío${enviosCafe === 1 ? '' : 's'} de Coffit sin recibir`);
+    if (vencs) motivos.push(`tiene ${vencs} fecha${vencs === 1 ? '' : 's'} de vencimiento sin procesar en Almacén › Vencimientos: procesalas o borralas (si no, el aviso de vencimientos queda prendido para siempre)`);
+    if (sinCae) motivos.push(`tiene ${sinCae} venta${sinCae === 1 ? '' : 's'} esperando el CAE de ARCA: facturalas desde Ventas › Caídas por ARCA`);
+    if (motivos.length) {
+      throw new BadRequestException(`No se puede desactivar ${s.nombre} porque ${motivos.join('; ')}.`);
+    }
+
+    const otra = (await this.db.select({ id: sucursales.id }).from(sucursales)
+      .where(and(eq(sucursales.activa, true), ne(sucursales.id, id))).orderBy(sucursales.id).limit(1))[0];
+    const r = await this.db.transaction(async (tx) => {
+      await tx.update(sucursales).set({ activa: false, desactivadaEn: new Date() }).where(eq(sucursales.id, id));
+      const eqs = await tx.update(terminales).set({ activa: false })
+        .where(and(eq(terminales.sucursalId, id), eq(terminales.activa, true))).returning({ id: terminales.id });
+      // El que la apaga no queda afuera: si estaba parado ahí, se muda a otra activa.
+      if (sesion?.sesionId && otra) {
+        await tx.update(sesiones).set({ sucursalId: otra.id })
+          .where(and(eq(sesiones.id, sesion.sesionId), eq(sesiones.sucursalId, id)));
+      }
+      const cerradas = await tx.delete(sesiones).where(eq(sesiones.sucursalId, id)).returning({ id: sesiones.id });
+      return { equipos: eqs.length, sesiones: cerradas.length };
+    });
+    /* Quien trabajaba SOLO ahí ya no tiene dónde entrar: se avisa (no se le
+     * cambia nada solo; vaciarle la lista sería abrirle TODAS las sucursales). */
+    const soloAhi = await this.db.select({ nombre: usuarios.nombre }).from(usuarios)
+      .where(and(eq(usuarios.activo, true), sql`${usuarios.sucursales} @> ${JSON.stringify([id])}::jsonb`,
+        sql`NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(${usuarios.sucursales}) e
+              JOIN sucursales x ON x.id = e::int WHERE x.activa AND x.id <> ${id})`));
+    /* Los gastos fijos del local se siguen generando si nadie los da de baja: se avisa (no se tocan solos). */
+    const fijos = await this.db.select({ nombre: gastosRecurrentes.nombre }).from(gastosRecurrentes)
+      .where(and(eq(gastosRecurrentes.sucursalId, id), eq(gastosRecurrentes.activo, true)));
+    return { ok: true, sucursal: s.nombre, ...r, usuariosSinLocal: soloAhi.map((u) => u.nombre), gastosFijos: fijos.map((g) => g.nombre) };
+  }
+
+  async reactivar(id: number) {
+    const s = await this.get(id);
+    if (s.activa) return { ok: true, yaEstaba: true };
+    await this.db.update(sucursales).set({ activa: true, desactivadaEn: null }).where(eq(sucursales.id, id));
+    return { ok: true, sucursal: s.nombre };
+  }
 }
+
 
 /**
  * Las sucursales son estructura de la empresa: crearlas, renombrarlas y —sobre
@@ -157,7 +266,7 @@ export class SucursalesService {
 @Controller('sucursales')
 export class SucursalesController {
   constructor(private readonly svc: SucursalesService) {}
-  @Get() list() { return this.svc.list(); }
+  @Get() list(@Query('todas') todas?: string) { return this.svc.list(todas === '1' || todas === 'true'); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
   @Post() @Permiso('gerencia.usuarios')
@@ -168,6 +277,13 @@ export class SucursalesController {
 
   @Delete(':id') @Permiso('gerencia.usuarios')
   remove(@Param('id', ParseIntPipe) id: number) { return this.svc.remove(id); }
+
+  /** Un local que cerró (0143): sale de todas las listas para elegir; el historial queda. */
+  @Post(':id/desactivar') @Permiso('gerencia.usuarios')
+  desactivar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.desactivar(id, sesion); }
+
+  @Post(':id/reactivar') @Permiso('gerencia.usuarios')
+  reactivar(@Param('id', ParseIntPipe) id: number) { return this.svc.reactivar(id); }
 }
 
 /* ==================================================================== *
@@ -244,6 +360,7 @@ export class TerminalesService {
       ultimoAgente: terminales.ultimoAgente,
       sucursalId: terminales.sucursalId,
       sucursalNombre: sucursales.nombre,
+      sucursalActiva: sucursales.activa,
     })
       .from(terminales)
       .innerJoin(sucursales, eq(sucursales.id, terminales.sucursalId))
@@ -259,6 +376,7 @@ export class TerminalesService {
     if (!nombre) throw new BadRequestException('Ponele un nombre al equipo: es como lo vas a reconocer en la lista.');
     const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, dto.sucursalId)).limit(1);
     if (!suc) throw new BadRequestException('Elegí una sucursal válida.');
+    if (!suc.activa) throw new BadRequestException(`${suc.nombre} está desactivada (el local cerró): registrá el equipo en otra sucursal.`);
 
     const token = randomBytes(32).toString('base64url');
     const [t] = await this.db.insert(terminales).values({
@@ -282,9 +400,15 @@ export class TerminalesService {
     if (dto.sucursalId != null && dto.sucursalId !== t.sucursalId) {
       const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, dto.sucursalId)).limit(1);
       if (!suc) throw new BadRequestException('Elegí una sucursal válida.');
+      if (!suc.activa) throw new BadRequestException(`${suc.nombre} está desactivada (el local cerró): elegí otra sucursal.`);
       patch.sucursalId = suc.id;
     }
     if (dto.activa != null) patch.activa = !!dto.activa;
+    /* Un equipo de un local que cerró (0143) no se reactiva ahí: primero se lo pasa a otra sucursal. */
+    if (patch.activa === true && !patch.sucursalId) {
+      const [suya] = await this.db.select({ nombre: sucursales.nombre, activa: sucursales.activa }).from(sucursales).where(eq(sucursales.id, t.sucursalId)).limit(1);
+      if (suya && !suya.activa) throw new BadRequestException(`"${t.nombre}" es de ${suya.nombre}, que está desactivada: pasalo a otra sucursal antes de reactivarlo.`);
+    }
     if (!Object.keys(patch).length) return t;
     const [nuevo] = await this.db.update(terminales).set(patch).where(eq(terminales.id, id)).returning();
     return nuevo;

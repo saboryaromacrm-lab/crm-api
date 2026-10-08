@@ -359,7 +359,7 @@ export class ArcaService implements OnApplicationBootstrap {
   private async puntosDeVenta() {
     const filas = await this.db.select({
       id: sucursales.id, nombre: sucursales.nombre, pv: sucursales.puntoVenta, fe: sucursales.facturaElectronica,
-    }).from(sucursales).orderBy(sucursales.id);
+    }).from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id);
 
     const salida: Array<{
       sucursalId: number | null; sucursal: string; puntoVenta: string;
@@ -587,7 +587,7 @@ export class ArcaController {
         puntoVenta: sucursales.puntoVenta,
         direccion: sucursales.direccion,
         facturaElectronica: sucursales.facturaElectronica,
-      }).from(sucursales).orderBy(sucursales.id),
+      }).from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id),
     ]);
     return {
       ...base,

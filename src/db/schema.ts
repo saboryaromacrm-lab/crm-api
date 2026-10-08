@@ -118,6 +118,13 @@ export const sucursales = pgTable('sucursales', {
    * todavía no se fijó (la primera apertura lo fija).
    */
   fondoCaja: doublePrecision('fondo_caja'),
+  /*
+   * DESACTIVADA (0143): un local que cerró. No se borra (su historial queda y
+   * lo sigue nombrando) pero desaparece de todo lo que ofrece elegir un local y
+   * nadie puede entrar ni operar en él. Ver `SucursalesService.desactivar`.
+   */
+  activa: boolean('activa').notNull().default(true),
+  desactivadaEn: timestamp('desactivada_en', { withTimezone: true }),
 }, (t) => ({
   /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
    * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
@@ -1206,6 +1213,13 @@ export const movimientos = pgTable('movimientos', {
    */
   ixProdFecha: index('ix_mov_prod_fecha').on(t.productoId, t.fecha.desc()),
   ixSucTipoFecha: index('ix_mov_suc_tipo_fecha').on(t.sucursalId, t.tipo, t.fecha.desc()),
+  /*
+   * PRODUCTOS SIN MOVIMIENTO (0142): «la última venta de este producto EN
+   * ESTE local» y «el último pase que entró o salió» son una sola lectura.
+   * Sin ellos, cada pregunta recorría el producto en todos los locales.
+   */
+  ixProdSucFecha: index('ix_mov_prod_suc_fecha').on(t.productoId, t.sucursalId, t.fecha.desc()),
+  ixPases: index('ix_mov_pases').on(t.productoId, t.sucursalId, t.fecha.desc()).where(sql`${t.tipo} = 'transferencia' AND ${t.signo} <> 0`),
 }));
 
 /* ---------------- Historial de fraccionamiento (0102) ---------------- */

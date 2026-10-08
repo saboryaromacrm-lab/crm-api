@@ -33,7 +33,7 @@
  * dueño es el de la Cafetería, y ese va por otro circuito (`cafeteria/`).
  */
 import {
-  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Param,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Param,
   ParseIntPipe, Patch, Post, Put, Query, Req, Res,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -47,6 +47,8 @@ import { esJefe, ocultaCostoUnitario, soloSuSucursal, sucursalDeOperacion, tiene
 /** Quién ve el detalle de compra en la carga inicial (ver `bootstrapCatalogo`). */
 const verCostos = (sesion: Sesion) => tienePermiso(sesion?.permisos ?? [], ['precios', 'compras.productos']);
 import { InventarioService } from './inventario.service';
+import { DRIZZLE, Database } from '../db/drizzle';
+import { productosSinMovimiento } from './sin-movimiento';
 
 /*
  * TOPES. Cien mil unidades es más de lo que entra en cualquier depósito de este
@@ -772,6 +774,28 @@ export class ConteosController {
     return this.inv.descartarConteo(id, {
       puedeAplicar: this.puedeAplicar(sesion),
       soloSuc: soloSuSucursal(sesion),
+    });
+  }
+}
+
+/**
+ * ALMACÉN › PRODUCTOS SIN MOVIMIENTO (7/10/2026). Solo lectura (ver
+ * `sin-movimiento.ts`). El que no es jefe ve solo su local; la plata parada
+ * va solo a quien puede ver costos.
+ */
+@Controller('sin-movimiento')
+@Permiso('almacen.sin-movimiento')
+export class SinMovimientoController {
+  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+
+  @Get()
+  listar(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string, @Query('dias') dias?: string, @Query('pases') pases?: string) {
+    const pedida = Number(sucursalId);
+    return productosSinMovimiento(this.db, {
+      sucursalId: soloSuSucursal(sesion) ?? (Number.isInteger(pedida) && pedida > 0 ? pedida : null),
+      dias: Number(dias) || 7,
+      pases: pases === '1' || pases === 'true',
+      verCosto: !ocultaCostoUnitario(sesion?.permisos ?? []),
     });
   }
 }

@@ -293,10 +293,12 @@ export class FraccionamientosService {
     }
   }
 
-  private async sucursalValida(id: number | null | undefined) {
+  /* `actual`: la que ya tiene el operador. Editar a uno de un local que cerró (0143) no se traba. */
+  private async sucursalValida(id: number | null | undefined, actual: number | null = null) {
     if (id == null) return;
-    const [s] = await this.db.select({ id: sucursales.id }).from(sucursales).where(eq(sucursales.id, id)).limit(1);
+    const [s] = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa }).from(sucursales).where(eq(sucursales.id, id)).limit(1);
     if (!s) throw new BadRequestException('Esa sucursal no existe.');
+    if (!s.activa && s.id !== actual) throw new BadRequestException(`${s.nombre} está desactivada: el local cerró.`);
   }
 
   async crearOperador(dto: OperadorDto) {
@@ -310,7 +312,11 @@ export class FraccionamientosService {
   async editarOperador(id: number, dto: EditarOperadorDto) {
     const patch: Record<string, unknown> = {};
     if (dto.nombre !== undefined) { await this.nombreLibre(dto.nombre, id); patch.nombre = dto.nombre; }
-    if (dto.sucursalId !== undefined) { await this.sucursalValida(dto.sucursalId); patch.sucursalId = dto.sucursalId; }
+    if (dto.sucursalId !== undefined) {
+      const [ya] = await this.db.select({ s: fraccionOperadores.sucursalId }).from(fraccionOperadores).where(eq(fraccionOperadores.id, id)).limit(1);
+      await this.sucursalValida(dto.sucursalId, ya?.s ?? null);
+      patch.sucursalId = dto.sucursalId;
+    }
     if (dto.activo !== undefined) patch.activo = dto.activo;
     if (!Object.keys(patch).length) throw new BadRequestException('No hay nada para cambiar.');
     const [op] = await this.db.update(fraccionOperadores).set(patch).where(eq(fraccionOperadores.id, id)).returning();

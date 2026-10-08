@@ -159,6 +159,8 @@ export const CATALOGO_PERMISOS = [
        * vencidos (pérdida real + baja de stock), ofertas por vencer y mermas.
        */
       { clave: 'almacen.vencimientos', nombre: 'Vencimientos (control de fechas)' },
+      /* Qué mercadería está quieta hace 7/14/21/30 días, por local (7/10/2026). */
+      { clave: 'almacen.sin-movimiento', nombre: 'Productos sin movimiento' },
       { clave: 'almacen.cafeteria', nombre: 'Coffit (envíos)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
@@ -696,19 +698,21 @@ export class UsuariosService {
      */
     const sinSucursal = !!r?.sinSucursal;
     if (sinSucursal) {
-      const [primera] = await this.db.select().from(sucursales).orderBy(sucursales.id).limit(1);
+      const [primera] = await this.db.select().from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id).limit(1);
       if (!primera) throw new UnauthorizedException('No hay sucursales cargadas.');
       sucursalId = primera.id;
     } else if (!Number.isInteger(sucursalId) || sucursalId <= 0) {
       const esSuper = r?.clave === 'superadmin' || (Array.isArray(r?.permisos) && (r.permisos as string[]).includes('*'));
       if (!esSuper) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
-      const [central] = await this.db.select().from(sucursales).orderBy(sucursales.id).limit(1);
+      const [central] = await this.db.select().from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id).limit(1);
       if (!central) throw new UnauthorizedException('No hay sucursales cargadas.');
       sucursalId = central.id;
     }
 
     const [suc] = await this.db.select().from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     if (!suc) throw new UnauthorizedException('Elegí la sucursal con la que vas a operar.');
+    /* Un local que cerró (0143) no abre: ni elegido ni por un equipo registrado. */
+    if (!suc.activa) throw new UnauthorizedException(`${suc.nombre} está desactivada (el local cerró): entrá en otra sucursal.`);
 
     /*
      * CADA UNO ENTRA EN LAS SUYAS (0105). La sucursal se elegía libre: el
@@ -721,7 +725,10 @@ export class UsuariosService {
     const permitidas: number[] = Array.isArray(u.sucursales) ? u.sucursales : [];
     if (!sinSucursal && permitidas.length && !rolQueCruza(r) && !permitidas.includes(suc.id)) {
       const nombres = await this.db.select({ nombre: sucursales.nombre }).from(sucursales)
-        .where(inArray(sucursales.id, permitidas)).orderBy(sucursales.id);
+        .where(and(inArray(sucursales.id, permitidas), eq(sucursales.activa, true))).orderBy(sucursales.id);
+      if (!nombres.length) {
+        throw new UnauthorizedException(`${u.nombre} trabajaba solo en sucursales que ya están desactivadas: pedile a gerencia que le asigne otra.`);
+      }
       throw new UnauthorizedException(
         `${u.nombre} no trabaja en ${suc.nombre}: entrá en ${nombres.map((x) => x.nombre).join(' o ')}.`,
       );
@@ -773,7 +780,7 @@ export class UsuariosService {
   /** Una sucursal por id, para validar el cambio de sucursal de la sesión. */
   async sucursalPorId(id: number) {
     const [s] = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
-      .from(sucursales).where(eq(sucursales.id, id)).limit(1);
+      .from(sucursales).where(and(eq(sucursales.id, id), eq(sucursales.activa, true))).limit(1);
     return s ?? null;
   }
 
@@ -799,7 +806,8 @@ export class UsuariosService {
         .from(usuarios)
         .innerJoin(roles, eq(roles.id, usuarios.rolId))
         .where(eq(usuarios.activo, true)).orderBy(usuarios.nombre),
-      this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).orderBy(sucursales.id),
+      // Solo las activas (0143): un local cerrado no se ofrece para entrar.
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id),
     ]);
     return { usuarios: us, sucursales: ss };
   }

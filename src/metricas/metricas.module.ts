@@ -153,6 +153,7 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
    * `subcategoriaId` dicen dónde se está parado en el árbol (`0` = sin
    * clasificar), `productoId` abre el detalle de uno y `plano=1` lista todos
    * los productos del nivel. `tipo`: solo granel o solo enteros.
+   * `porMarca=1` recorre por marca (7/10/2026) y `marcaId` abre una.
    */
   productos(q: any) {
     const f = this.filtro(q);
@@ -161,6 +162,7 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
     const productoId = id(q.productoId);
     return this.leer((c) => reporteProductos(c, { ...f, tipo }, this.paso(q.paso), {
       categoriaId: id(q.categoriaId), subcategoriaId: id(q.subcategoriaId), productoId: productoId || null, plano: q.plano === '1' || q.plano === 'true',
+      porMarca: q.porMarca === '1' || q.porMarca === 'true', marcaId: id(q.marcaId),
     }));
   }
 
@@ -182,7 +184,8 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   }
 
   async sucursales() {
-    const r = await this.pool.query('SELECT id, nombre FROM sucursales ORDER BY id');
+    // Para el filtro: solo las activas (0143). Los totales siguen incluyendo lo que vendió un local cerrado.
+    const r = await this.pool.query('SELECT id, nombre FROM sucursales WHERE activa ORDER BY id');
     return r.rows;
   }
 

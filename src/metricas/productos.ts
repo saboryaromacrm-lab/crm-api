@@ -19,6 +19,11 @@
  *
  * La clasificación es la de HOY: si un producto se pasó de categoría, su
  * historia viaja con él (igual que «Por categoría» en Rentabilidad).
+ *
+ * POR MARCA (7/10/2026, pedido del dueño): el mismo reporte agrupado por la
+ * marca de cada producto (`porMarca`): todas las marcas → los productos de
+ * una marca → la ficha del producto. `0` = «Sin marca». Igual que con las
+ * categorías, cuenta la marca que el producto tiene HOY.
  */
 import type { PoolClient } from 'pg';
 import {
@@ -31,7 +36,11 @@ import {
  * un producto sin clasificar también se vende y tiene que poder encontrarse.
  * `plano`: todos los productos del nodo de una vez, sin bajar por subcategoría.
  */
-export interface NodoProductos { categoriaId: number | null; subcategoriaId: number | null; productoId: number | null; plano: boolean }
+export interface NodoProductos {
+  categoriaId: number | null; subcategoriaId: number | null; productoId: number | null; plano: boolean;
+  /** Recorrer por marca en vez de por categoría; `marcaId` = la marca abierta. */
+  porMarca?: boolean; marcaId?: number | null;
+}
 
 /** Arma los parámetros posicionales sin contarlos a mano: `p(valor)` devuelve `$n`. */
 const parametros = () => {
@@ -93,10 +102,11 @@ function armarGrupo(x: any) {
 
 const CLAVE_CAT = 'coalesce(p.categoria_id, 0)';
 const CLAVE_SUB = 'coalesce(p.subcategoria_id, 0)';
+const CLAVE_MARCA = 'coalesce(p.marca_id, 0)';
 const JOINS = `LEFT JOIN productos p ON p.id = x.producto_id LEFT JOIN categorias cat ON cat.id = p.categoria_id
   LEFT JOIN subcategorias sc ON sc.id = p.subcategoria_id LEFT JOIN marcas m ON m.id = p.marca_id`;
 
-type Nivel = 'categoria' | 'subcategoria' | 'producto' | 'detalle';
+type Nivel = 'categoria' | 'subcategoria' | 'marca' | 'producto' | 'detalle';
 
 export async function reporteProductos(c: PoolClient, f: Filtro, paso: Paso, nodo: NodoProductos) {
   const ant = periodoAnterior(f);
@@ -108,32 +118,39 @@ export async function reporteProductos(c: PoolClient, f: Filtro, paso: Paso, nod
     prod = (await c.query(
       `SELECT p.id, p.nombre, p.tipo::text AS tipo, p.codigo_propio, p.codigo_barras, p.estado::text AS estado,
          coalesce(p.categoria_id, 0) AS categoria_id, coalesce(p.subcategoria_id, 0) AS subcategoria_id,
-         coalesce(m.nombre, '') AS marca
+         coalesce(p.marca_id, 0) AS marca_id, coalesce(m.nombre, '') AS marca
        FROM productos p LEFT JOIN marcas m ON m.id = p.marca_id WHERE p.id = $1`, [nodo.productoId])).rows[0] ?? null;
   }
-  // El producto manda: su categoría y subcategoría son las de HOY, las arma el detalle.
-  const catId = prod ? N(prod.categoria_id) : nodo.categoriaId;
-  const subId = prod ? N(prod.subcategoria_id) : (catId != null ? nodo.subcategoriaId : null);
-  const [catRow, subRow] = await Promise.all([
+  const porMarca = !!nodo.porMarca;
+  // El producto manda: su categoría, subcategoría y marca son las de HOY, las arma el detalle.
+  const catId = prod ? N(prod.categoria_id) : porMarca ? null : nodo.categoriaId;
+  const subId = prod ? N(prod.subcategoria_id) : porMarca ? null : (catId != null ? nodo.subcategoriaId : null);
+  const marcaId = prod ? (porMarca ? N(prod.marca_id) : null) : porMarca ? (nodo.marcaId ?? null) : null;
+  const [catRow, subRow, marcaRow] = await Promise.all([
     catId ? c.query('SELECT nombre FROM categorias WHERE id = $1', [catId]) : Promise.resolve({ rows: [] as any[] }),
     subId ? c.query('SELECT nombre FROM subcategorias WHERE id = $1', [subId]) : Promise.resolve({ rows: [] as any[] }),
+    marcaId ? c.query('SELECT nombre FROM marcas WHERE id = $1', [marcaId]) : Promise.resolve({ rows: [] as any[] }),
   ]);
   const ruta = {
     categoria: catId == null ? null : { id: catId, nombre: catId === 0 ? 'Sin categoría' : catRow.rows[0]?.nombre ?? 'Categoría eliminada' },
     subcategoria: subId == null ? null : { id: subId, nombre: subId === 0 ? 'Sin subcategoría' : subRow.rows[0]?.nombre ?? 'Subcategoría eliminada' },
+    marca: marcaId == null ? null : { id: marcaId, nombre: marcaId === 0 ? 'Sin marca' : marcaRow.rows[0]?.nombre ?? 'Marca eliminada' },
     producto: prod ? { id: N(prod.id), nombre: prod.nombre as string } : null,
   };
 
   /* Sin categoría elegida se listan las categorías; con categoría, sus
-   * subcategorías; con las dos (o «todos los productos»), los productos. */
+   * subcategorías; con las dos (o «todos los productos»), los productos.
+   * Por marca: las marcas, y con una marca elegida, sus productos. */
   const nivel: Nivel = prod ? 'detalle'
-    : nodo.plano || (catId != null && subId != null) ? 'producto'
-      : catId != null ? 'subcategoria' : 'categoria';
+    : porMarca ? (marcaId != null ? 'producto' : 'marca')
+      : nodo.plano || (catId != null && subId != null) ? 'producto'
+        : catId != null ? 'subcategoria' : 'categoria';
 
   /** El filtro del nodo sobre `productos p`. */
   const condNodo = (p: (v: unknown) => string) => [
     catId != null ? `${CLAVE_CAT} = ${p(catId)}` : '',
     subId != null ? `${CLAVE_SUB} = ${p(subId)}` : '',
+    marcaId != null ? `${CLAVE_MARCA} = ${p(marcaId)}` : '',
   ].filter(Boolean).join(' AND ') || 'true';
 
   /* La serie del nodo (o del producto), período por período. */
@@ -148,7 +165,7 @@ export async function reporteProductos(c: PoolClient, f: Filtro, paso: Paso, nod
   const [serieR, total] = await Promise.all([c.query(serieSql, qe.lista), sumaMargen(c, f)]);
   const porPeriodo = new Map(serieR.rows.map((x: any) => [x.periodo, x]));
   const base = {
-    desde: f.desde, hasta: f.hasta, paso, tipo: f.tipo ?? null, nivel, plano: nivel === 'producto' && nodo.plano, ruta,
+    desde: f.desde, hasta: f.hasta, paso, tipo: f.tipo ?? null, nivel, plano: nivel === 'producto' && !porMarca && nodo.plano, porMarca, ruta,
     anterior: { desde: ant.desde, hasta: ant.hasta },
     totalGeneral: { ventaNeta: total.ventaNeta, margen: total.margen },
     serie: periodos(f.desde, f.hasta, paso).map((per) => {
@@ -157,7 +174,7 @@ export async function reporteProductos(c: PoolClient, f: Filtro, paso: Paso, nod
     }),
   };
 
-  if (nivel === 'detalle') return { ...base, ...(await detalleProducto(c, f, ant, prod, catId ?? 0, subId ?? 0, total.ventaNeta)) };
+  if (nivel === 'detalle') return { ...base, ...(await detalleProducto(c, f, ant, prod, catId ?? 0, subId ?? 0, N(prod.marca_id), total.ventaNeta)) };
   return { ...base, ...(await nivelArbol(c, f, ant, nivel, condNodo, total.ventaNeta)) };
 }
 
@@ -169,6 +186,7 @@ async function nivelArbol(
   const DEF = {
     categoria: { sel: `${CLAVE_CAT} AS clave, coalesce(cat.nombre, 'Sin categoría') AS nombre`, grupo: `${CLAVE_CAT}, coalesce(cat.nombre, 'Sin categoría')` },
     subcategoria: { sel: `${CLAVE_SUB} AS clave, coalesce(sc.nombre, 'Sin subcategoría') AS nombre`, grupo: `${CLAVE_SUB}, coalesce(sc.nombre, 'Sin subcategoría')` },
+    marca: { sel: `${CLAVE_MARCA} AS clave, coalesce(m.nombre, 'Sin marca') AS nombre`, grupo: `${CLAVE_MARCA}, coalesce(m.nombre, 'Sin marca')` },
     producto: {
       sel: `x.producto_id AS clave, coalesce(p.nombre, 'Producto eliminado') AS nombre, bool_or(x.granel) AS granel,
         max(coalesce(m.nombre, '')) AS marca, max(coalesce(cat.nombre, 'Sin categoría')) AS categoria,
@@ -192,7 +210,7 @@ async function nivelArbol(
   const tipoProd = f.tipo ? ` AND p.tipo::text ${f.tipo === 'granel' ? '=' : '<>'} 'granel'` : '';
   const esProd = nivel === 'producto';
   const sinVentaSql = `WITH ${cteS}
-    SELECT ${nivel === 'categoria' ? CLAVE_CAT : nivel === 'subcategoria' ? CLAVE_SUB : 'p.id'} AS clave,
+    SELECT ${nivel === 'categoria' ? CLAVE_CAT : nivel === 'subcategoria' ? CLAVE_SUB : nivel === 'marca' ? CLAVE_MARCA : 'p.id'} AS clave,
       ${esProd ? 'p.nombre AS nombre, p.tipo::text AS tipo,' : ''} count(*)::float8 AS n
     FROM productos p
     WHERE p.estado::text = 'activo' AND NOT p.solo_cafeteria AND ${condNodo(qs.p)}${tipoProd}
@@ -221,17 +239,18 @@ async function nivelArbol(
     sinVenta: esProd ? 0 : sinVentaDe.get(N(x.clave)) ?? 0,
   }));
 
-  // Una categoría o subcategoría que no vendió nada pero tiene productos activos también va, en cero: si no, «desaparece».
+  // Una categoría, subcategoría o marca que no vendió nada pero tiene productos activos también va, en cero: si no, «desaparece».
   if (!esProd) {
     const vistos = new Set(filas.map((x) => x.clave));
     const faltan = [...sinVentaDe.keys()].filter((k) => !vistos.has(k));
     if (faltan.length) {
-      const nombres = await c.query(
-        `SELECT id, nombre FROM ${nivel === 'categoria' ? 'categorias' : 'subcategorias'} WHERE id = ANY($1::int[])`, [faltan]);
+      const tabla = { categoria: 'categorias', subcategoria: 'subcategorias', marca: 'marcas' }[nivel];
+      const sinNombre = { categoria: 'Sin categoría', subcategoria: 'Sin subcategoría', marca: 'Sin marca' }[nivel];
+      const nombres = await c.query(`SELECT id, nombre FROM ${tabla} WHERE id = ANY($1::int[])`, [faltan]);
       const nom = new Map(nombres.rows.map((x: any) => [N(x.id), x.nombre as string]));
       for (const k of faltan) {
         filas.push({
-          clave: k, nombre: k === 0 ? (nivel === 'categoria' ? 'Sin categoría' : 'Sin subcategoría') : nom.get(k) ?? '—',
+          clave: k, nombre: k === 0 ? sinNombre : nom.get(k) ?? '—',
           ...armarGrupo(null), participacion: null, participacionTotal: null, participacionMargen: null, sinVenta: sinVentaDe.get(k) ?? 0,
         });
       }
@@ -255,7 +274,7 @@ async function nivelArbol(
 }
 
 /* ============================== EL DETALLE DE UN PRODUCTO ============================== */
-async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any, catId: number, subId: number, totalGeneral: number) {
+async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any, catId: number, subId: number, marcaId: number, totalGeneral: number) {
   const wd = donde(f, 'f', true);
   const desglose = (sel: string, join: string, grupo: string) => {
     const q = parametros();
@@ -269,7 +288,7 @@ async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any,
   // El puesto dentro de su subcategoría, su categoría y todo: «el 3.º más vendido de 45».
   const qr = parametros();
   const cteR = cteProductos(f, ant, qr.p);
-  const pcat = qr.p(catId); const psub = qr.p(subId); const pprod = qr.p(prod.id);
+  const pcat = qr.p(catId); const psub = qr.p(subId); const pprod = qr.p(prod.id); const pmarca = qr.p(marcaId);
   const qm = parametros();
   const cteM = cteProductos(f, ant, qm.p);
 
@@ -280,7 +299,7 @@ async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any,
     desglose(`f.lista_id AS clave, coalesce(lv.nombre, 'Sin lista') AS nombre`, 'LEFT JOIN listas_venta lv ON lv.id = f.lista_id', `f.lista_id, coalesce(lv.nombre, 'Sin lista')`),
     c.query(
       `WITH ${cteR},
-       t AS (SELECT x.producto_id, x.va, ${CLAVE_CAT} AS cat, ${CLAVE_SUB} AS sub
+       t AS (SELECT x.producto_id, x.va, ${CLAVE_CAT} AS cat, ${CLAVE_SUB} AS sub, ${CLAVE_MARCA} AS marca
              FROM x LEFT JOIN productos p ON p.id = x.producto_id WHERE ${VENDIO}),
        yo AS (SELECT coalesce(max(t.va), 0) AS va FROM t WHERE t.producto_id = ${pprod})
        SELECT
@@ -290,6 +309,9 @@ async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any,
          count(*) FILTER (WHERE t.cat = ${pcat} AND t.sub = ${psub})::float8 AS en_sub,
          count(*) FILTER (WHERE t.cat = ${pcat} AND t.sub = ${psub} AND t.va > yo.va)::float8 AS antes_sub,
          coalesce(sum(t.va) FILTER (WHERE t.cat = ${pcat} AND t.sub = ${psub}), 0) AS venta_sub,
+         count(*) FILTER (WHERE t.marca = ${pmarca})::float8 AS en_marca,
+         count(*) FILTER (WHERE t.marca = ${pmarca} AND t.va > yo.va)::float8 AS antes_marca,
+         coalesce(sum(t.va) FILTER (WHERE t.marca = ${pmarca}), 0) AS venta_marca,
          count(*)::float8 AS en_total,
          count(*) FILTER (WHERE t.va > yo.va)::float8 AS antes_total
        FROM t CROSS JOIN yo GROUP BY yo.va`,
@@ -324,12 +346,15 @@ async function detalleProducto(c: PoolClient, f: Filtro, ant: Filtro, prod: any,
       participacionTotal: pct(g.ventaNeta, totalGeneral),
       participacionCategoria: pct(g.ventaNeta, N(rk.venta_cat)),
       participacionSubcategoria: pct(g.ventaNeta, N(rk.venta_sub)),
+      participacionMarca: pct(g.ventaNeta, N(rk.venta_marca)),
       /** Precio promedio cobrado (sin IVA): por kg en granel, por unidad en enteros. */
       precioPromedio: esGranel
         ? (g.kilosGranel > 0 ? r2(g.ventaNeta / g.kilosGranel) : null)
         : (g.unidadesEnteros > 0 ? r2(g.ventaNeta / g.unidadesEnteros) : null),
     },
-    puesto: { subcategoria: puesto(rk.antes_sub, rk.en_sub), categoria: puesto(rk.antes_cat, rk.en_cat), total: puesto(rk.antes_total, rk.en_total) },
+    puesto: { subcategoria: puesto(rk.antes_sub, rk.en_sub), categoria: puesto(rk.antes_cat, rk.en_cat), marca: puesto(rk.antes_marca, rk.en_marca), total: puesto(rk.antes_total, rk.en_total) },
+    /** La marca de HOY del producto (para «el 2.º de Cachafaz»). */
+    marca: { id: marcaId, nombre: marcaId ? (prod.marca as string) || 'Marca eliminada' : 'Sin marca' },
     porSucursal: desgl(sucs.rows, (x) => x.nombre),
     porPresentacion: desgl(pres.rows, nombrePres),
     porLista: desgl(lists.rows, (x) => x.nombre),

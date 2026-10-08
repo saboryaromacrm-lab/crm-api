@@ -375,14 +375,20 @@ export class GastosService {
         // el selector se alimenta del bootstrap, no del padrón completo.
         letraGasto: proveedores.letraGasto,
       }).from(proveedores).orderBy(asc(proveedores.nombre)),
-      this.db.select({ id: sucursales.id, nombre: sucursales.nombre })
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa })
         .from(sucursales).orderBy(asc(sucursales.id)),
       this.db.select({ id: usuarios.id, nombre: usuarios.nombre, activo: usuarios.activo }).from(usuarios),
       verFijos
         ? this.db.select().from(gastosRecurrentes).orderBy(asc(gastosRecurrentes.nombre))
         : Promise.resolve([]),
     ]);
-    return { categorias, proveedores: provs, sucursales: sucs, usuarios: users, recurrentes };
+    /* Activas para elegir; las desactivadas (0143) solo por el nombre en el historial. */
+    return {
+      categorias, proveedores: provs,
+      sucursales: sucs.filter((x) => x.activa).map(({ id, nombre }) => ({ id, nombre })),
+      sucursalesInactivas: sucs.filter((x) => !x.activa).map(({ id, nombre }) => ({ id, nombre })),
+      usuarios: users, recurrentes,
+    };
   }
 
   listCategorias() {
@@ -1310,7 +1316,9 @@ export class GastosService {
    * generaba gastos de $0 que no aparecían en ningún lado pero dejaban el mes
    * como "ya generado".
    */
-  private async validarRecurrente(dto: RecurrenteDto, alta: boolean) {
+  /* `sucursalActual`: la que ya tiene el gasto fijo. Editar uno de un local que cerró (0143) —por ejemplo,
+   * para darlo de baja— no se traba: solo no se puede ELEGIR un local desactivado. */
+  private async validarRecurrente(dto: RecurrenteDto, alta: boolean, sucursalActual: number | null = null) {
     if (dto.categoriaId != null || alta) {
       const [c] = await this.db.select().from(gastoCategorias).where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
       if (!c) throw new BadRequestException('Elegí el rubro del gasto fijo.');
@@ -1321,8 +1329,9 @@ export class GastosService {
       if (!p) throw new BadRequestException('Proveedor inválido.');
     }
     if (dto.sucursalId) {
-      const [x] = await this.db.select({ id: sucursales.id }).from(sucursales).where(eq(sucursales.id, dto.sucursalId)).limit(1);
+      const [x] = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa }).from(sucursales).where(eq(sucursales.id, dto.sucursalId)).limit(1);
       if (!x) throw new BadRequestException('Sucursal inválida.');
+      if (!x.activa && x.id !== sucursalActual) throw new BadRequestException(`${x.nombre} está desactivada: el local cerró.`);
     }
     if ((alta || dto.importeEstimado != null) && !(Number(dto.importeEstimado) > 0)) {
       throw new BadRequestException('Poné el importe estimado: sin él se generan gastos de $0 que no aparecen en ningún lado.');
@@ -1352,7 +1361,7 @@ export class GastosService {
   async editarRecurrente(id: number, dto: RecurrenteDto) {
     const [r] = await this.db.select().from(gastosRecurrentes).where(eq(gastosRecurrentes.id, id)).limit(1);
     if (!r) throw new NotFoundException('Gasto fijo inexistente.');
-    await this.validarRecurrente(dto, false);
+    await this.validarRecurrente(dto, false, r.sucursalId ?? null);
     const patch: any = {};
     if (dto.nombre != null) {
       const n = String(dto.nombre).trim();

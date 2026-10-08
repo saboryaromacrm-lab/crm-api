@@ -746,8 +746,9 @@ export class ComprobantesService {
   /** La sucursal de recepción tiene que existir (antes: "error del servidor"). */
   private async exigirSucursal(sucursalId?: number | null) {
     if (sucursalId == null) return;
-    const [s] = await this.db.select({ id: sucursales.id }).from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
+    const [s] = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa }).from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     if (!s) throw new BadRequestException('La sucursal elegida no existe: volvé a elegirla.');
+    if (!s.activa) throw new BadRequestException(`${s.nombre} está desactivada: el local cerró. Elegí otra sucursal.`);
   }
 
   /**
