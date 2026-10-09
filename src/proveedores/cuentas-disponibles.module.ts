@@ -34,7 +34,8 @@ import {
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
-import { Permiso } from '../auth/auth.decoradores';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   clientes, cobranzaPagos, cobranzas, cuentaDisponiblePagos, cuentasDisponibles,
@@ -65,6 +66,19 @@ export class CrearCuentaDto {
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** Lo pone el AutorInterceptor con el usuario de la sesión. */
   @IsOptional() @IsInt() usuarioId?: number;
+}
+
+/** Un pago PROPIO a la cuenta (0151): Sabor y Aroma transfiere desde su cuenta, sin pasar por la caja. */
+export class PagoPropioDto {
+  @IsNumber() @Min(0.01, { message: 'El importe tiene que ser mayor a 0.' }) @Max(1_000_000_000) importe!: number;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
+  /** El número de operación o desde qué cuenta salió: va en la referencia del pago. */
+  @IsOptional() @IsString() @MaxLength(120) referencia?: string;
+  @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
+}
+
+export class AnularPagoPropioDto {
+  @IsString() @MaxLength(300) motivo!: string;
 }
 
 export class EditarCuentaDto {
@@ -427,6 +441,78 @@ export class CuentasDisponiblesService {
   }
 
   /**
+   * PAGO PROPIO (0151, 9/10/2026, pedido del dueño): Sabor y Aroma transfiere
+   * desde SU cuenta a la cuenta disponible del proveedor, sin pasar por la caja.
+   * Mismas reglas que una transferencia de cliente —candado, cortada, cubierta,
+   * no pasarse del resto— salvo el mínimo del proveedor (ese es para no recibir
+   * transferencias chiquitas de clientes; el dueño paga lo que decide). Lleva su
+   * espejo en la cuenta corriente del proveedor, como cualquier pago.
+   */
+  async registrarPagoPropio(id: number, dto: PagoPropioDto, usuarioId: number | null) {
+    const importe = money(dto.importe);
+    if (importe <= 0) throw new BadRequestException('El importe tiene que ser mayor a 0.');
+    const hoy = new Date();
+    const fecha = dto.fecha ? new Date(`${dto.fecha}T12:00:00`) : hoy;
+    if (dto.fecha && dto.fecha > hoy.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' })) {
+      throw new BadRequestException('La fecha no puede ser futura.');
+    }
+    const ref = String(dto.referencia ?? '').trim();
+    const obs = String(dto.observaciones ?? '').trim();
+    await this.db.transaction(async (tx) => {
+      const [c] = await tx.select().from(cuentasDisponibles).where(eq(cuentasDisponibles.id, id)).limit(1).for('update');
+      if (!c) throw new NotFoundException('Esa cuenta disponible no existe.');
+      const [prov] = await tx.select({
+        nombre: proveedores.nombre, proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos,
+      }).from(proveedores).where(eq(proveedores.id, c.proveedorId)).limit(1);
+      const quien = `${prov.nombre} (${c.titular})`;
+      if (c.corte) throw new BadRequestException(`La cuenta de ${quien} está cortada: no recibe más pagos.`);
+      const { pagado } = await this.sumas(tx, c.id);
+      const falta = money(c.importe - pagado);
+      if (falta <= EPS) throw new BadRequestException(`La cuenta de ${quien} ya está cubierta.`);
+      if (importe > falta + EPS) {
+        const pesos = (n: number) => `$${n.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+        throw new BadRequestException(`A la cuenta de ${quien} le faltan ${pesos(falta)}: no se puede pagar ${pesos(importe)}. Si hace falta más, subí el importe a cubrir.`);
+      }
+      await exigirFueraDeConciliado(tx, c.proveedorId, fecha, 'cargar un pago');
+      const [pp] = await tx.insert(proveedorPagos).values({
+        fecha,
+        proveedorId: c.proveedorId,
+        medio: 'transferencia',
+        importe,
+        destino: prov.proveeGastos && !prov.proveeMercaderia ? 'gastos' : 'mercaderia',
+        aplicado: 0,
+        concepto: `Pago propio a la cuenta disponible · ${c.titular}`,
+        referencia: `${c.titular} · ${c.cbuAlias}${ref ? ` · ${ref}` : ''}`,
+        usuarioId,
+        estado: 'activo',
+        observaciones: obs,
+      }).returning({ id: proveedorPagos.id });
+      await tx.insert(cuentaDisponiblePagos).values({
+        cuentaId: c.id, importe, fecha, propio: true, proveedorPagoId: pp.id, usuarioId,
+        observaciones: [ref, obs].filter(Boolean).join(' · '),
+      });
+    });
+    return this.get(id);
+  }
+
+  /** Anular un pago propio: con su espejo, salvo que ya esté aplicado a una factura. */
+  async anularPagoPropio(pagoId: number, motivo: string) {
+    const m = String(motivo ?? '').trim();
+    if (m.length < 3) throw new BadRequestException('Escribí por qué se anula.');
+    await this.db.transaction(async (tx) => {
+      const [f] = await tx.select({ cuentaId: cuentaDisponiblePagos.cuentaId, fecha: cuentaDisponiblePagos.fecha, propio: cuentaDisponiblePagos.propio, anuladoEn: cuentaDisponiblePagos.anuladoEn })
+        .from(cuentaDisponiblePagos).where(eq(cuentaDisponiblePagos.id, pagoId)).limit(1).for('update');
+      if (!f) throw new NotFoundException('Ese pago no existe.');
+      if (!f.propio) throw new BadRequestException('Ese pago es la transferencia de un cliente: se anula anulando su venta o su recibo.');
+      if (f.anuladoEn) throw new BadRequestException('Ese pago ya está anulado.');
+      const [c] = await tx.select({ proveedorId: cuentasDisponibles.proveedorId }).from(cuentasDisponibles).where(eq(cuentasDisponibles.id, f.cuentaId)).limit(1);
+      await exigirFueraDeConciliado(tx, c.proveedorId, f.fecha, 'anular un pago');
+      await this.anularPagos(tx, eq(cuentaDisponiblePagos.id, pagoId), m, 'Pago propio anulado');
+    });
+    return { ok: true };
+  }
+
+  /**
    * Los renglones "transferencia a proveedor" de una VENTA recién cobrada.
    * Además de registrar cada uno, le escribe al renglón la referencia
    * (proveedor · titular · alias) para que el detalle del ticket lo diga sin
@@ -452,7 +538,7 @@ export class CuentasDisponiblesService {
    * a una factura, se frena TODO: desaplicar a escondidas sería mover plata
    * de la cuenta del proveedor sin que nadie lo decida.
    */
-  private async anularPagos(tx: any, cond: any, motivo: string) {
+  private async anularPagos(tx: any, cond: any, motivo: string, como = 'Anulado con su cobro') {
     const filas = await tx.select({
       id: cuentaDisponiblePagos.id, cuentaId: cuentaDisponiblePagos.cuentaId,
       proveedorPagoId: cuentaDisponiblePagos.proveedorPagoId,
@@ -468,14 +554,14 @@ export class CuentasDisponiblesService {
         const [prov] = await tx.select({ nombre: proveedores.nombre }).from(proveedores)
           .where(eq(proveedores.id, c.proveedorId)).limit(1);
         throw new BadRequestException(
-          `El cobro fue una transferencia a la cuenta de ${prov?.nombre ?? 'proveedor'} (${c.titular}) y ese pago `
-          + `ya está aplicado a una factura. Desaplicalo en Proveedores antes de anular.`,
+          `El pago a la cuenta de ${prov?.nombre ?? 'proveedor'} (${c.titular}) ya está aplicado a una factura. `
+          + 'Desaplicalo en Proveedores antes de anular.',
         );
       }
       if (pp && pp.estado !== 'anulado') {
         await tx.update(proveedorPagos).set({
           estado: 'anulado',
-          observaciones: `${pp.observaciones ? `${pp.observaciones}\n` : ''}Anulado con su cobro: ${motivo}`,
+          observaciones: `${pp.observaciones ? `${pp.observaciones}\n` : ''}${como}: ${motivo}`,
         }).where(eq(proveedorPagos.id, pp.id));
       }
     }
@@ -504,11 +590,12 @@ export class CuentasDisponiblesService {
    */
   async origenDe(tx: any, proveedorPagoId: number): Promise<string | null> {
     const [f] = await tx.select({
-      ventaPagoId: cuentaDisponiblePagos.ventaPagoId, cobranzaPagoId: cuentaDisponiblePagos.cobranzaPagoId,
+      ventaPagoId: cuentaDisponiblePagos.ventaPagoId, cobranzaPagoId: cuentaDisponiblePagos.cobranzaPagoId, propio: cuentaDisponiblePagos.propio,
     }).from(cuentaDisponiblePagos)
       .where(and(eq(cuentaDisponiblePagos.proveedorPagoId, proveedorPagoId), isNull(cuentaDisponiblePagos.anuladoEn)))
       .limit(1);
     if (!f) return null;
+    if (f.propio) return 'su pago propio (en Proveedores › Cuentas disponibles › Pagos)';
     if (f.ventaPagoId) {
       const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
         .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
@@ -545,6 +632,7 @@ export class CuentasDisponiblesService {
       importe: cuentaDisponiblePagos.importe,
       observaciones: cuentaDisponiblePagos.observaciones,
       anuladoEn: cuentaDisponiblePagos.anuladoEn,
+      propio: cuentaDisponiblePagos.propio,
       cuentaId: cuentaDisponiblePagos.cuentaId,
       proveedorId: cuentasDisponibles.proveedorId,
       proveedorNombre: proveedores.nombre,
@@ -578,8 +666,11 @@ export class CuentasDisponiblesService {
       id: f.id, fecha: f.fecha, importe: f.importe, observaciones: f.observaciones, anuladoEn: f.anuladoEn,
       cuentaId: f.cuentaId, proveedorId: f.proveedorId, proveedorNombre: f.proveedorNombre,
       titular: f.titular, cbuAlias: f.cbuAlias, usuarioNombre: f.usuarioNombre,
-      clienteNombre: f.ventaCliente ?? f.cobranzaCliente ?? '',
-      documento: f.ventaId
+      propio: f.propio,
+      clienteNombre: f.propio ? 'Pago propio' : (f.ventaCliente ?? f.cobranzaCliente ?? ''),
+      documento: f.propio
+        ? { clase: 'propio', id: f.id, tipo: 'propio', etiqueta: 'Transferencia propia' }
+        : f.ventaId
         ? { clase: 'venta', id: f.ventaId, tipo: f.ventaTipo, etiqueta: nro(f.ventaPuntoVenta!, f.ventaNumero!) }
         : f.cobranzaId
           ? { clase: 'recibo', id: f.cobranzaId, tipo: 'recibo', etiqueta: nro(f.cobranzaPuntoVenta!, f.cobranzaNumero!) }
@@ -670,6 +761,17 @@ export class CuentasDisponiblesController {
 
   @Post() @Permiso('proveedores.cuentas')
   crear(@Body() dto: CrearCuentaDto) { return this.svc.crear(dto); }
+
+  /** Pago propio (0151): transferencia desde la cuenta de Sabor y Aroma, sin caja. */
+  @Post(':id/pagos') @Permiso('proveedores.cuentas')
+  pagoPropio(@Param('id', ParseIntPipe) id: number, @Body() dto: PagoPropioDto, @Auth() sesion: Sesion) {
+    return this.svc.registrarPagoPropio(id, dto, sesion?.usuarioId ?? null);
+  }
+
+  @Post('pagos/:pagoId/anular') @Permiso('proveedores.cuentas')
+  anularPagoPropio(@Param('pagoId', ParseIntPipe) pagoId: number, @Body() dto: AnularPagoPropioDto) {
+    return this.svc.anularPagoPropio(pagoId, dto.motivo);
+  }
 
   @Patch(':id') @Permiso('proveedores.cuentas')
   editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarCuentaDto) { return this.svc.editar(id, dto); }

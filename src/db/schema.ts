@@ -2638,6 +2638,16 @@ export const gastoCategorias = pgTable('gasto_categorias', {
   descripcion: text('descripcion').notNull().default(''),
   activa: boolean('activa').notNull().default(true),
   orden: integer('orden').notNull().default(0),
+  /**
+   * CÓMO ENTRA EN RESULTADOS (0152): `normal` va como gasto fijo o variable
+   * según `tipo`; `sueldos` cede ante la planilla de empleados; `iibb`,
+   * `municipalidad` y `comisiones` son el pago REAL que reemplaza al estimado
+   * del mes; `financiero` va abajo del operativo; `ganancias` no entra (manda
+   * el estimado del año) y `fuera` no es gasto del resultado.
+   */
+  resultado: text('resultado').notNull().default('normal'),
+  /** Un gasto de este rubro SIN local: true = se reparte entre los locales por ventas; false = «Administración». */
+  reparte: boolean('reparte').notNull().default(true),
 }, (t) => ({
   uqNombre: uniqueIndex('uq_gasto_categoria_nombre').on(t.nombre),
 }));
@@ -2703,6 +2713,8 @@ export const gastos = pgTable('gastos', {
   cuentaFecha: timestamp('cuenta_fecha', { withTimezone: true }),
   /** Si lo generó un gasto fijo, de cuál salió (para no duplicar el período). */
   recurrenteId: integer('recurrente_id'),
+  /** El mes al que corresponde (0152, devengado; día 1). Vacío = el mes de `fecha`. */
+  periodo: date('periodo', { mode: 'string' }),
   /** La NC de un gasto (0115): contra qué gasto descuenta. Su saldo baja por la NC. */
   refGastoId: integer('ref_gasto_id'),
   observaciones: text('observaciones').notNull().default(''),
@@ -3489,10 +3501,12 @@ export const cuentaDisponiblePagos = pgTable('cuenta_disponible_pagos', {
   cuentaId: integer('cuenta_id').notNull().references(() => cuentasDisponibles.id, { onDelete: 'restrict' }),
   importe: doublePrecision('importe').notNull().default(0),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
-  /* De dónde nació: el renglón de pago de una venta o de un recibo. Una y solo
-   * una (CHECK en la migración), como `proveedor_imputaciones`. */
+  /* De dónde nació: el renglón de pago de una venta o de un recibo, o un pago
+   * PROPIO (0151: Sabor y Aroma transfiere desde su cuenta). Uno y solo uno de
+   * los tres (CHECK en la migración), como `proveedor_imputaciones`. */
   ventaPagoId: integer('venta_pago_id').references(() => ventaPagos.id, { onDelete: 'restrict' }),
   cobranzaPagoId: integer('cobranza_pago_id').references(() => cobranzaPagos.id, { onDelete: 'restrict' }),
+  propio: boolean('propio').notNull().default(false),
   /** Su espejo en la cuenta del proveedor. */
   proveedorPagoId: integer('proveedor_pago_id').notNull().references(() => proveedorPagos.id, { onDelete: 'restrict' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
@@ -3638,4 +3652,81 @@ export const coffitcostEnvios = pgTable('coffitcost_envios', {
   respuesta: text('respuesta').notNull().default(''),
   firma: text('firma').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+
+/* ===================== RESULTADOS (0152, 9/10/2026) ===================== */
+
+/** Los empleados, para el costo de sueldos del estado de resultados. Sin local = según el rubro Sueldos (repartido o Administración). */
+export const empleados = pgTable('empleados', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  cuil: text('cuil').notNull().default(''),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  alta: date('alta', { mode: 'string' }).notNull(),
+  baja: date('baja', { mode: 'string' }),
+  observaciones: text('observaciones').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** El sueldo bruto y el % de cargas del empleador, vigentes desde un mes (día 1). */
+export const empleadoSueldos = pgTable('empleado_sueldos', {
+  id: serial('id').primaryKey(),
+  empleadoId: integer('empleado_id').notNull().references(() => empleados.id, { onDelete: 'cascade' }),
+  desde: date('desde', { mode: 'string' }).notNull(),
+  bruto: doublePrecision('bruto').notNull(),
+  cargas: doublePrecision('cargas').notNull().default(0),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  uqDesde: uniqueIndex('uq_empleado_sueldos_desde').on(t.empleadoId, t.desde),
+}));
+
+/** Bienes de uso para las amortizaciones (opcionales): valor neto, desde el mes de alta, en línea recta. */
+export const bienesUso = pgTable('bienes_uso', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  valor: doublePrecision('valor').notNull(),
+  alta: date('alta', { mode: 'string' }).notNull(),
+  vidaMeses: integer('vida_meses').notNull(),
+  baja: date('baja', { mode: 'string' }),
+  observaciones: text('observaciones').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Las tasas con «vigente desde»: iibb, municipalidad (por local, con mínimo) y tarjeta (por medio o todas). */
+export const resultadosTasas = pgTable('resultados_tasas', {
+  id: serial('id').primaryKey(),
+  concepto: text('concepto').notNull(),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'cascade' }),
+  medio: text('medio'),
+  porcentaje: doublePrecision('porcentaje').notNull(),
+  minimo: doublePrecision('minimo').notNull().default(0),
+  desde: date('desde', { mode: 'string' }).notNull(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Lo que se espera vender y ganar (antes de Ganancias) cada mes; sin local = la empresa. */
+export const resultadosObjetivos = pgTable('resultados_objetivos', {
+  id: serial('id').primaryKey(),
+  mes: date('mes', { mode: 'string' }).notNull(),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'cascade' }),
+  ventaNeta: doublePrecision('venta_neta'),
+  resultado: doublePrecision('resultado'),
+});
+
+/** La escala del artículo 94 y las deducciones del artículo 30 de cada año (personas humanas). */
+export const gananciasEscalas = pgTable('ganancias_escalas', {
+  anio: integer('anio').primaryKey(),
+  tramos: jsonb('tramos').$type<{ desde: number; fijo: number; pct: number }[]>().notNull(),
+  deducciones: jsonb('deducciones').$type<Record<string, number>>().notNull(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** La configuración de Resultados: una sola fila. */
+export const resultadosConfig = pgTable('resultados_config', {
+  id: integer('id').primaryKey().default(1),
+  valor: jsonb('valor').$type<Record<string, unknown>>().notNull().default({}),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });

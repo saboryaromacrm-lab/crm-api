@@ -46,15 +46,15 @@ const EN_DIAS = (col: string) =>
   `${col} >= ($1::date::timestamp at time zone '${ZONA}') and ${col} < (($2::date + 1)::timestamp at time zone '${ZONA}')`;
 const MES = (col: string) => `to_char(date_trunc('month', ${col} at time zone '${ZONA}'), 'YYYY-MM')`;
 
-/** La regla de `tipoPercepcion` (common/iva.ts), en SQL. */
-const TIPO_PERCEPCION_SQL = (t: string, n: string) => `case
+/** La regla de `tipoPercepcion` (common/iva.ts), en SQL. También la usa Resultados (percepciones de IIBB). */
+export const TIPO_PERCEPCION_SQL = (t: string, n: string) => `case
   when ${t} in ('iva','iibb','otro') then ${t}
   when lower(${n}) ~ '(^|[^a-z])iva([^a-z]|$)|rg\\s*(2408|3337|5329)' then 'iva'
   when lower(${n}) ~ 'iibb|ingresos\\s*brutos|(^|[^a-z])dgr([^a-z]|$)|(^|[^a-z])ib([^a-z]|$)' then 'iibb'
   else 'otro' end`;
 
 const SIGNO_VENTA = `case when v.tipo::text like 'nota_credito%' then -1 else 1 end`;
-const CLASE_VENTA = `case
+export const CLASE_VENTA = `case
   when v.tipo::text like 'factura_%' or v.tipo::text like 'nota_debito_%'
     or (v.tipo::text like 'nota_credito_%' and v.tipo::text <> 'nota_credito_ticket') then 'facturado'
   when v.tipo = 'ticket' and v.facturar_pendiente then 'pendiente'

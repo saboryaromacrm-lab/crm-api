@@ -1505,7 +1505,7 @@ export class PagosProveedorService {
       const origen = await this.ctasDisp.origenDe(tx, id);
       if (origen) {
         throw new BadRequestException(
-          `Este pago es la transferencia de un cliente a la cuenta disponible del proveedor: se anula anulando ${origen}, no desde acá.`,
+          `Este pago es de una cuenta disponible del proveedor: se anula anulando ${origen}, no desde acá.`,
         );
       }
       if (p.aplicado > EPS) {

@@ -92,8 +92,8 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   }
 
   /* ------------------------------ lectura ------------------------------ */
-  /** Corre `fn` en una transacción de SOLO LECTURA, con tope de tiempo. */
-  private async leer<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
+  /** Corre `fn` en una transacción de SOLO LECTURA, con tope de tiempo. También la usa Resultados (0152): mismo pool, mismas reglas. */
+  async leer<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
     const c = await this.pool.connect();
     try {
       await c.query('BEGIN READ ONLY');

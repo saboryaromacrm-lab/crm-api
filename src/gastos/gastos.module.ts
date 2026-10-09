@@ -46,6 +46,7 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { PagosModule, PagosProveedorService, esAdminPagos, exigirFechaPago } from '../pagos/pagos.module';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
+import { PERMISO_RESULTADOS } from '../resultados/permiso';
 
 /**
  * LAS FECHAS DEL GASTO (27/9/2026). Se aceptaba un gasto fechado en 2035 y un
@@ -117,7 +118,7 @@ const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
  * (misma plata, mismos caminos legítimos) más la acción propia de gastos.
  */
 const PISO_GASTOS = [
-  'gastos.gastos', 'gastos.pagos', 'gastos.pagos_proveedor', 'gastos.fijos',
+  'gastos.gastos', 'gastos.pagos', 'gastos.pagos_proveedor',
   'gastos.categorias', 'gastos.proveedores', 'gastos.resumen',
 ];
 /** Ver un gasto: las tres secciones que lo muestran en pantalla. */
@@ -162,6 +163,23 @@ const TIPOS_DOC = ['factura', 'ticket', 'recibo', 'nota_credito', 'otro'] as con
  * pagarle. La cargan en positivo, como dice el papel; el signo lo pone acá.
  */
 const esNotaCredito = (tipo?: string | null) => tipo === 'nota_credito';
+
+/**
+ * EL MES AL QUE CORRESPONDE (0152, devengado: el alquiler de octubre va en
+ * octubre aunque la factura sea de noviembre). 'AAAA-MM' → su día 1; vacío o
+ * el mismo mes de la fecha → null (vale el de la fecha, como siempre). Hasta
+ * un año para cada lado: más lejos es un error de tipeo.
+ */
+function periodoDe(periodo: string | null | undefined, fecha: Date): string | null {
+  if (!periodo) return null;
+  const [y, m] = periodo.split('-').map(Number);
+  const dif = (y - fecha.getFullYear()) * 12 + (m - (fecha.getMonth() + 1));
+  if (dif === 0) return null;
+  if (Math.abs(dif) > 12) {
+    throw new BadRequestException('El mes al que corresponde puede ser hasta un año antes o después de la fecha del gasto.');
+  }
+  return `${periodo}-01`;
+}
 const CAMPOS_IMPORTE = ['neto', 'iva', 'otros', 'impInternos', 'percDgi', 'percDgr', 'total'] as const;
 function conSigno<T extends Record<string, any>>(x: T, signo: 1 | -1): T {
   const out: any = { ...x };
@@ -216,6 +234,8 @@ class GastoDto {
   /** A qué negocio se imputa: la distribuidora (defecto) o la cafetería. */
   @IsOptional() @IsIn(['distribuidora', 'cafeteria']) negocio?: string;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vencimiento?: string;
+  /** El mes al que corresponde (0152, devengado). Vacío = el de la fecha. Es imputación: se corrige aunque haya pagos. */
+  @IsOptional() @Matches(/^(\d{4}-(0[1-9]|1[0-2]))?$/, { message: 'El mes al que corresponde va como AAAA-MM.' }) periodo?: string | null;
   /* Sin negativos (27/9/2026): se cargaba neto −$500 con IVA $600. La nota de
    * crédito va por su tipo, no con importes negativos. */
   @IsOptional() @IsNumber() @Min(0, { message: 'El neto no puede ser negativo (la nota de crédito va con su tipo).' }) @Max(TOPE_IMPORTE) neto?: number;
@@ -362,7 +382,7 @@ export class GastosService {
    * que el sub-sidebar, pero del lado que manda.
    */
   async bootstrap(sesion: Sesion) {
-    const verFijos = tienePermiso(sesion.permisos, ['gastos.fijos']);
+    const verFijos = tienePermiso(sesion.permisos, [PERMISO_RESULTADOS]);
     const [categorias, provs, sucs, users, recurrentes] = await Promise.all([
       this.db.select().from(gastoCategorias).orderBy(asc(gastoCategorias.orden), asc(gastoCategorias.nombre)),
       this.db.select({
@@ -879,6 +899,7 @@ export class GastosService {
         /* De Coffit y con fecha de un mes ya cerrado en su cuenta: entra hoy. */
         cuentaFecha: dto.negocio === 'cafeteria' ? await fechaDeCuenta(this.db, fechaLocal(dto.fecha) ?? new Date()) : null,
         vencimiento: fechaLocal(dto.vencimiento),
+        periodo: periodoDe(dto.periodo, fechaLocal(dto.fecha) ?? new Date()),
         neto, iva, otros, impInternos, percDgi, percDgr, total,
         pagado: 0,
         estado: esNc ? 'pagado' : 'pendiente',
@@ -1084,6 +1105,12 @@ export class GastosService {
       );
     }
     if (refFin !== (g.refGastoId ?? null)) patch.refGastoId = refFin;
+    /* El mes al que corresponde (0152): imputación como el negocio, se corrige
+     * aunque haya pagos. Si cambia la fecha y no viene, se revalida el que tenía. */
+    if (dto.periodo !== undefined || (patch.fecha && g.periodo)) {
+      const pedido = dto.periodo !== undefined ? dto.periodo : String(g.periodo).slice(0, 7);
+      patch.periodo = periodoDe(pedido, patch.fecha ?? g.fecha);
+    }
 
     /*
      * LA CUENTA CON COFFIT (0120). Si el gasto es (o pasa a ser) de Coffit y
@@ -1568,22 +1595,22 @@ export class GastosController {
     return this.svc.borrarCategoria(id);
   }
 
-  @Get('recurrentes') @Permiso('gastos.fijos') recurrentes() { return this.svc.listRecurrentes(); }
-  @Post('recurrentes') @Permiso('gastos.fijos') crearRecurrente(@Body() dto: RecurrenteDto) {
+  @Get('recurrentes') @Permiso(PERMISO_RESULTADOS) recurrentes() { return this.svc.listRecurrentes(); }
+  @Post('recurrentes') @Permiso(PERMISO_RESULTADOS) crearRecurrente(@Body() dto: RecurrenteDto) {
     return this.svc.crearRecurrente(dto);
   }
-  @Patch('recurrentes/:id') @Permiso('gastos.fijos') editarRecurrente(
+  @Patch('recurrentes/:id') @Permiso(PERMISO_RESULTADOS) editarRecurrente(
     @Param('id', ParseIntPipe) id: number, @Body() dto: RecurrenteDto,
   ) {
     return this.svc.editarRecurrente(id, dto);
   }
-  @Delete('recurrentes/:id') @Permiso('gastos.fijos') borrarRecurrente(@Param('id', ParseIntPipe) id: number) {
+  @Delete('recurrentes/:id') @Permiso(PERMISO_RESULTADOS) borrarRecurrente(@Param('id', ParseIntPipe) id: number) {
     return this.svc.borrarRecurrente(id);
   }
-  @Get('recurrentes/periodo/:periodo') @Permiso('gastos.fijos') previa(@Param('periodo') periodo: string) {
+  @Get('recurrentes/periodo/:periodo') @Permiso(PERMISO_RESULTADOS) previa(@Param('periodo') periodo: string) {
     return this.svc.previsualizarPeriodo(periodo);
   }
-  @Post('recurrentes/generar') @Permiso('gastos.fijos') generar(@Body() dto: GenerarPeriodoDto) {
+  @Post('recurrentes/generar') @Permiso(PERMISO_RESULTADOS) generar(@Body() dto: GenerarPeriodoDto) {
     return this.svc.generarPeriodo(dto.periodo, dto.usuarioId, dto.ids);
   }
 

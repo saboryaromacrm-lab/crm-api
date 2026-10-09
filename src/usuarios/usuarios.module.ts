@@ -213,7 +213,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'gastos.gastos', nombre: 'Gastos (carga de comprobantes)' },
       { clave: 'gastos.pagos', nombre: 'Cuentas a pagar' },
       { clave: 'gastos.pagos_proveedor', nombre: 'Pagos a proveedores (bandeja y aplicación)' },
-      { clave: 'gastos.fijos', nombre: 'Gastos fijos' },
+      // «Gastos fijos» salió el 9/10/2026 (0152): con los sueldos adentro, es
+      // solo del superadmin (llave `gerencia.resultados`, fuera del catálogo).
       { clave: 'gastos.categorias', nombre: 'Rubros de gasto' },
       { clave: 'gastos.proveedores', nombre: 'Proveedores de gastos' },
       { clave: 'gastos.resumen', nombre: 'Resumen de gastos' },
@@ -248,7 +249,7 @@ export const CATALOGO_PERMISOS = [
     secciones: [
       { clave: 'gerencia.usuarios', nombre: 'Usuarios y roles' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
-      /* Métricas, Cash Flow y Auditoría (0144) no están acá a propósito: solo el superadmin. */
+      /* Métricas, Cash Flow, Auditoría (0144) y Resultados (0152) no están acá a propósito: solo el superadmin. */
     ],
     acciones: [],
   },
