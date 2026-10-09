@@ -25,7 +25,7 @@ import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, notInArray, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   cajaMovimientos, cajaSesiones,
@@ -1807,6 +1807,8 @@ export class VentasService {
             porBulto: cfg.mayoristaPorBulto !== false,
           }
         : null,
+      /** 0150: si ESTA sucursal vende mayorista. Los datos de arriba viajan igual (carteles y ofertas los usan); la caja los apaga. */
+      vendeMayorista: sucs.find((x: any) => x.id === Number(sucursalId))?.vendeMayorista !== false,
       montoMayorista: cfg.montoMinimoMayorista > 0 && cfg.modalidadMontoId
         ? {
             monto: cfg.montoMinimoMayorista,
@@ -2056,6 +2058,7 @@ export class VentasService {
     const baseId = activas.find((l: any) => l.id === config.listaBaseId)?.id
       ?? activas[0]?.id ?? null;
     const delCliente = new Set(asignadas.map((a) => a.listaId));
+    const sinMayorista = await this.sinMayoristaEn(sucursalId, config);
 
     /*
      * Los AGREGADOS del ticket: unidades por producto y por marca. Se cuentan
@@ -2245,6 +2248,14 @@ export class VentasService {
                 : (modalidadPorMonto != null && elegida.lista.modalidadId === modalidadPorMonto) ? 'monto'
                   : congelado ? 'auto'
                     : null;
+      /* SUCURSAL SIN MAYORISTA (0150): ninguna puerta ni el permiso de pisar
+       * precios la abre — ahí todo va a precio minorista. La lista base nunca
+       * se rechaza (es el piso del local). */
+      if (sinMayorista && !esPiso && elegida.lista.modalidadId === config.modalidadMontoId) {
+        throw new BadRequestException(
+          `${etiqueta}: ${sinMayorista} no vende mayorista, así que va a precio minorista (la lista ${elegida.lista.nombre} es mayorista).`,
+        );
+      }
       const habilitada = puerta != null;
       if (!habilitada && !puedePisarPrecio) {
         throw new BadRequestException(
@@ -3035,6 +3046,18 @@ export class VentasService {
    * mayorista. `null` = sin restricción (sin medios configurados o sin
    * modalidad mayorista). `listas` = las listas de esa modalidad.
    */
+  /**
+   * LA SUCURSAL QUE NO VENDE MAYORISTA (0150, pedido del dueño): su nombre si
+   * ahí no se vende mayorista, o null. Sin modalidad mayorista configurada no
+   * hay nada que cuidar.
+   */
+  private async sinMayoristaEn(sucursalId: number | null | undefined, config: any): Promise<string | null> {
+    if (sucursalId == null || !config?.modalidadMontoId) return null;
+    const [s] = await this.db.select({ nombre: sucursales.nombre, vende: sucursales.vendeMayorista })
+      .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
+    return s && !s.vende ? s.nombre : null;
+  }
+
   async reglaMayorista(config?: any): Promise<{ permitidos: string[]; legibles: string; listas: Set<number> } | null> {
     const cfg = config ?? await this.cfg.get('ventas');
     const permitidos: string[] = cfg.mediosPagoMonto ?? [];
@@ -3984,6 +4007,18 @@ export class VentasService {
     }
 
     const pagos = this.validarPagos(condicionPago, fin.pagos, borrador.total);
+    /* El interruptor (0150) pudo apagarse con el ticket abierto: confirmar no
+     * vuelve a resolver los renglones, así que se mira acá. */
+    const sinMayorista = await this.sinMayoristaEn(borrador.sucursalId, config);
+    if (sinMayorista) {
+      const mayoristas = new Set((await this.db.select({ id: listasVenta.id }).from(listasVenta)
+        .where(eq(listasVenta.modalidadId, config.modalidadMontoId))).map((l) => l.id));
+      if ((borrador.items as any[]).some((it) => it.listaId != null && it.listaId !== config.listaBaseId && mayoristas.has(it.listaId))) {
+        throw new BadRequestException(
+          `${sinMayorista} no vende mayorista y este ticket tiene renglones a precio mayorista: pasalos a minorista y cobrá de nuevo.`,
+        );
+      }
+    }
     const esMayorista = await this.validarMediosMayorista(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
     /*
@@ -5428,8 +5463,23 @@ class DescuentoDto {
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() requiereAdmin?: boolean;
   @IsOptional() activo?: boolean;
+  /** 0149: el % pagando TODO en efectivo. Crea o edita su pareja «(efectivo)»; null o 0 la saca. */
+  @IsOptional() @IsNumber() @Min(0) @Max(100) porcentajeEfectivo?: number | null;
 }
 
+const pct2 = (v: unknown) => Math.round((Number(v) || 0) * 100) / 100;
+/** El nombre de la pareja en efectivo: es el que ve la cajera en el desplegable. */
+const nombreEfectivo = (nombre: string) => `${nombre} (efectivo)`;
+
+/*
+ * UN DESCUENTO CON DOS PORCENTAJES (0149, 8/10/2026, pedido del dueño): el
+ * general y uno mayor pagando en efectivo. El de efectivo es OTRO descuento,
+ * «solo con Efectivo» y enlazado por `efectivoDeId`, que copia todo lo demás
+ * del general (lista, sucursal, vencimiento, quién lo aplica, activo). Así lo
+ * controlan las reglas que ya existen —pago íntegro con ese medio, uno por
+ * lista— sin una cuenta nueva de plata, y la caja puede pasar de uno al otro.
+ * Se maneja SOLO desde el general: la pareja no se edita ni se borra sola.
+ */
 @Injectable()
 export class DescuentosService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
@@ -5438,13 +5488,48 @@ export class DescuentosService {
     return this.db.select().from(descuentos).orderBy(desc(descuentos.activo), descuentos.nombre);
   }
 
+  private async nombreLibre(nombre: string, excluir: number[] = []) {
+    const conds: any[] = [eq(descuentos.nombre, nombre)];
+    if (excluir.length) conds.push(notInArray(descuentos.id, excluir));
+    const [ya] = await this.db.select({ id: descuentos.id }).from(descuentos).where(and(...conds)).limit(1);
+    if (ya) throw new BadRequestException(`Ya existe un descuento llamado "${nombre}".`);
+  }
+
+  /** El % en efectivo pedido (0 = sin pareja), validado contra el general. */
+  private porcentajeEfectivo(pe: number, porcentaje: number, medioPago: string | null) {
+    if (!pe) return 0;
+    if (medioPago) {
+      throw new BadRequestException('El % en efectivo es para un descuento de cualquier forma de pago: este ya pide un medio.');
+    }
+    if (pe <= porcentaje) {
+      throw new BadRequestException(
+        `El % pagando en efectivo (${pe}%) tiene que ser mayor que el general (${porcentaje}%): si es igual o menor, no hace falta.`,
+      );
+    }
+    return pe;
+  }
+
+  private pareja(id: number) {
+    return this.db.select().from(descuentos).where(eq(descuentos.efectivoDeId, id)).limit(1).then((r) => r[0]);
+  }
+
+  /** La pareja de antes que quedó suelta al sacarle el % (ya se había usado): se vuelve a enlazar. */
+  private suelta(nombre: string) {
+    return this.db.select().from(descuentos)
+      .where(and(eq(descuentos.nombre, nombreEfectivo(nombre)), sql`${descuentos.efectivoDeId} is null`, eq(descuentos.medioPago, 'efectivo')))
+      .limit(1).then((r) => r[0]);
+  }
+
+  private async usos(ids: number[]) {
+    const [u] = await this.db.select({ n: sql<number>`count(*)::int` }).from(ventaItems)
+      .where(inArray(ventaItems.descuentoId, ids));
+    return Number(u?.n) || 0;
+  }
+
   private async validar(dto: DescuentoDto, id?: number) {
     const nombre = (dto.nombre ?? '').trim();
     if (!nombre) throw new BadRequestException('Poné un nombre para el descuento (es el que ve la cajera).');
-    const conds: any[] = [eq(descuentos.nombre, nombre)];
-    if (id) conds.push(ne(descuentos.id, id));
-    const [ya] = await this.db.select({ id: descuentos.id }).from(descuentos).where(and(...conds)).limit(1);
-    if (ya) throw new BadRequestException(`Ya existe un descuento llamado "${nombre}".`);
+    await this.nombreLibre(nombre, id ? [id] : []);
 
     /*
      * LA LISTA ES OBLIGATORIA y no tiene default. Es la identidad del
@@ -5467,26 +5552,39 @@ export class DescuentosService {
 
   async crear(dto: DescuentoDto) {
     const { nombre, listaId } = await this.validar(dto);
-    const [d] = await this.db.insert(descuentos).values({
+    const campos = {
       nombre,
-      porcentaje: Math.round((Number(dto.porcentaje) || 0) * 100) / 100,
+      porcentaje: pct2(dto.porcentaje),
       vence: vencimientoDe(dto.vence),
       medioPago: (dto.medioPago || null) as any,
       listaId,
       sucursalId: dto.sucursalId ?? null,
       requiereAdmin: !!dto.requiereAdmin,
       activo: dto.activo !== false,
-    }).returning();
-    return d;
+    };
+    const pe = this.porcentajeEfectivo(pct2(dto.porcentajeEfectivo), campos.porcentaje, campos.medioPago);
+    const vieja = pe ? await this.suelta(nombre) : undefined;
+    if (pe) await this.nombreLibre(nombreEfectivo(nombre), vieja ? [vieja.id] : []);
+    return this.db.transaction(async (tx) => {
+      const [d] = await tx.insert(descuentos).values(campos).returning();
+      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, medioPago: 'efectivo' as any, efectivoDeId: d.id };
+      if (pe && vieja) await tx.update(descuentos).set(copia).where(eq(descuentos.id, vieja.id));
+      else if (pe) await tx.insert(descuentos).values(copia);
+      return d;
+    });
   }
 
   async editar(id: number, dto: DescuentoDto) {
     const [actual] = await this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1);
     if (!actual) throw new NotFoundException('Ese descuento no existe.');
+    if (actual.efectivoDeId) {
+      throw new BadRequestException(`"${actual.nombre}" es el % en efectivo de otro descuento: se cambia desde ese.`);
+    }
+    const pareja = await this.pareja(id);
     const { nombre, listaId } = await this.validar({ ...dto, nombre: dto.nombre ?? actual.nombre, listaId: dto.listaId ?? actual.listaId }, id);
-    await this.db.update(descuentos).set({
+    const campos = {
       nombre,
-      porcentaje: dto.porcentaje != null ? Math.round(Number(dto.porcentaje) * 100) / 100 : actual.porcentaje,
+      porcentaje: dto.porcentaje != null ? pct2(dto.porcentaje) : actual.porcentaje,
       // `vence` se distingue de "no lo mandaron": una cadena vacía lo BORRA.
       vence: dto.vence !== undefined ? vencimientoDe(dto.vence) : actual.vence,
       medioPago: dto.medioPago !== undefined ? ((dto.medioPago || null) as any) : actual.medioPago,
@@ -5494,7 +5592,26 @@ export class DescuentosService {
       sucursalId: dto.sucursalId !== undefined ? (dto.sucursalId ?? null) : actual.sucursalId,
       requiereAdmin: dto.requiereAdmin != null ? !!dto.requiereAdmin : actual.requiereAdmin,
       activo: dto.activo != null ? !!dto.activo : actual.activo,
-    }).where(eq(descuentos.id, id));
+    };
+    // Sin mandarlo (activar, desactivar), la pareja sigue con su %.
+    const pe = this.porcentajeEfectivo(
+      dto.porcentajeEfectivo !== undefined ? pct2(dto.porcentajeEfectivo) : (pareja?.porcentaje ?? 0),
+      campos.porcentaje, campos.medioPago,
+    );
+    const vieja = pe && !pareja ? await this.suelta(nombre) : undefined;
+    const destino = pareja ?? vieja;
+    if (pe) await this.nombreLibre(nombreEfectivo(nombre), destino ? [destino.id] : []);
+    /* Sacar el % en efectivo: si la pareja ya se usó en ventas no se borra
+     * (perdería de dónde salió ese descuento); queda desactivada y suelta. */
+    const parejaUsada = !pe && pareja ? (await this.usos([pareja.id])) > 0 : false;
+    await this.db.transaction(async (tx) => {
+      await tx.update(descuentos).set(campos).where(eq(descuentos.id, id));
+      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, medioPago: 'efectivo' as any, efectivoDeId: id };
+      if (pe && destino) await tx.update(descuentos).set(copia).where(eq(descuentos.id, destino.id));
+      else if (pe) await tx.insert(descuentos).values(copia);
+      else if (pareja && parejaUsada) await tx.update(descuentos).set({ activo: false, efectivoDeId: null }).where(eq(descuentos.id, pareja.id));
+      else if (pareja) await tx.delete(descuentos).where(eq(descuentos.id, pareja.id));
+    });
     return this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1).then((r) => r[0]);
   }
 
@@ -5506,11 +5623,15 @@ export class DescuentosService {
   async borrar(id: number) {
     const [d] = await this.db.select().from(descuentos).where(eq(descuentos.id, id)).limit(1);
     if (!d) throw new NotFoundException('Ese descuento no existe.');
-    const [uso] = await this.db.select({ n: sql<number>`count(*)::int` }).from(ventaItems)
-      .where(eq(ventaItems.descuentoId, id));
-    if (Number(uso?.n) > 0) {
+    if (d.efectivoDeId) {
+      throw new BadRequestException(`"${d.nombre}" es el % en efectivo de otro descuento: se saca dejando vacío su % en efectivo.`);
+    }
+    // Con su pareja: el general borra también el de efectivo (cascade), así que cuentan los dos.
+    const pareja = await this.pareja(id);
+    const usos = await this.usos(pareja ? [id, pareja.id] : [id]);
+    if (usos > 0) {
       throw new BadRequestException(
-        `"${d.nombre}" ya se aplicó en ${uso.n} renglón(es) de venta: no se borra, se desactiva `
+        `"${d.nombre}" ya se aplicó en ${usos} renglón(es) de venta: no se borra, se desactiva `
         + 'para que deje de ofrecerse sin perder de dónde salió cada descuento hecho.',
       );
     }

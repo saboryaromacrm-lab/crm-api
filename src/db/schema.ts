@@ -21,6 +21,7 @@ import {
   uniqueIndex,
   date,
   bigint,
+  type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -129,6 +130,12 @@ export const sucursales = pgTable('sucursales', {
    */
   activa: boolean('activa').notNull().default(true),
   desactivadaEn: timestamp('desactivada_en', { withTimezone: true }),
+  /**
+   * VENDE MAYORISTA (0150): con false, todo a precio minorista. La caja no
+   * ofrece el mayorista y el servidor rechaza un renglón a lista mayorista acá.
+   * La Distribuidora no lo puede apagar: surte la tienda online, que es mayorista.
+   */
+  vendeMayorista: boolean('vende_mayorista').notNull().default(true),
 }, (t) => ({
   /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
    * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
@@ -2037,8 +2044,15 @@ export const descuentos = pgTable('descuentos', {
   sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'cascade' }),
   requiereAdmin: boolean('requiere_admin').notNull().default(false),
   activo: boolean('activo').notNull().default(true),
+  /**
+   * 0149: el % PAGANDO EN EFECTIVO de otro descuento. Es un descuento más
+   * («solo con Efectivo») enlazado al general: se crea, edita y borra desde él,
+   * y la caja ofrece pasar de uno al otro al cobrar.
+   */
+  efectivoDeId: integer('efectivo_de_id').references((): AnyPgColumn => descuentos.id, { onDelete: 'cascade' }),
 }, (t) => ({
   uqNombre: uniqueIndex('uq_descuentos_nombre').on(t.nombre),
+  uqEfectivoDe: uniqueIndex('uq_descuentos_efectivo_de').on(t.efectivoDeId).where(sql`${t.efectivoDeId} IS NOT NULL`),
   // El POS pregunta "cuáles sirven para ESTE ticket": activos, de estas listas.
   ixVigentes: index('ix_descuentos_vigentes').on(t.activo, t.listaId),
 }));

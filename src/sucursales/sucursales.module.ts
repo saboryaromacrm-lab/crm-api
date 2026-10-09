@@ -24,6 +24,8 @@ class UpsertSucursalDto {
   @IsOptional() @IsBoolean() facturaElectronica?: boolean;
   /** El fondo fijo de caja (0111). Solo lo cambia quien edita sucursales: el superadmin. */
   @IsOptional() @IsNumber() @Min(0, { message: 'El fondo de caja no puede ser negativo.' }) @Max(100_000_000) fondoCaja?: number;
+  /** Trabaja la venta mayorista (0150). Sin el campo, queda como estaba. */
+  @IsOptional() @IsBoolean() vendeMayorista?: boolean;
 }
 
 /**
@@ -42,7 +44,7 @@ export const normalizarPuntoVentaFiscal = (v: unknown) => {
 /** Lo que se audita de una sucursal (0144): el fondo de caja y la distribuidora mueven plata y mercadería. */
 const CAMPOS_SUCURSAL = {
   nombre: 'Nombre', tipo: 'Tipo', puntoVenta: 'Punto de venta ARCA', direccion: 'Domicilio',
-  facturaElectronica: 'Factura electrónica', fondoCaja: 'Fondo de caja',
+  facturaElectronica: 'Factura electrónica', fondoCaja: 'Fondo de caja', vendeMayorista: 'Vende mayorista',
 } as const;
 const textoSucursal = (s: Record<string, any>) => Object.fromEntries(Object.keys(CAMPOS_SUCURSAL).map((k) => {
   const v = s[k];
@@ -86,7 +88,7 @@ export class SucursalesService {
    * sucursales con el mismo punto de venta pedirían el mismo próximo número a
    * ARCA y se pisarían, y un error de índice único no explica nada de eso.
    */
-  private async normalizar(dto: UpsertSucursalDto, idPropio?: number, actual?: { facturaElectronica: boolean }) {
+  private async normalizar(dto: UpsertSucursalDto, idPropio?: number, actual?: { facturaElectronica: boolean; tipo: string; vendeMayorista: boolean }) {
     const puntoVenta = normalizarPuntoVentaFiscal(dto.puntoVenta);
     const direccion = (dto.direccion ?? '').trim();
     /*
@@ -105,6 +107,14 @@ export class SucursalesService {
     if (dto.facturaElectronica && !direccion) {
       throw new BadRequestException(
         'Para facturar electrónicamente, cargá el domicilio del local tal como está declarado en ARCA para ese punto de venta: va impreso en cada factura.',
+      );
+    }
+    /* VENDE MAYORISTA (0150): la Distribuidora no lo apaga — surte la tienda
+     * online, que vende a precio mayorista, y sus pedidos se cierran ahí. */
+    const tipo = dto.tipo ?? actual?.tipo ?? 'express';
+    if ((dto.vendeMayorista ?? actual?.vendeMayorista ?? true) === false && tipo === 'distribuidora') {
+      throw new BadRequestException(
+        'La Distribuidora tiene que vender mayorista: surte la tienda online, que vende a precio mayorista, y sus pedidos se cierran ahí.',
       );
     }
     if (puntoVenta) {
@@ -126,6 +136,7 @@ export class SucursalesService {
       facturaElectronica,
       // Sin el campo, el fondo queda como estaba: editar el nombre no lo borra.
       ...(dto.fondoCaja !== undefined ? { fondoCaja: Math.round(Number(dto.fondoCaja) * 100) / 100 } : {}),
+      ...(dto.vendeMayorista !== undefined ? { vendeMayorista: dto.vendeMayorista } : {}),
     };
   }
 
