@@ -610,6 +610,81 @@ export class ComprobantesService {
    * para que el detalle y la tabla lean el mismo objeto y no haya un campo que
    * exista en una pantalla y falte en la otra.
    */
+  /**
+   * LA COMPRA DEL DÍA CONTRA LO CARGADO (9/10/2026, pedido del dueño).
+   *
+   * Una compra mitad y mitad entra como DOS papeles del mismo proveedor y la
+   * misma fecha del papel: la factura y la liquidación. Al cargar cualquiera
+   * de los dos se mira el día completo:
+   *
+   *   CON CRÉDITO FISCAL  solo la letra A: la factura, más las notas de débito
+   *                       y menos las de crédito que la ajustan (las de ese día
+   *                       sobre una factura de ese día). La B y la C no dan
+   *                       crédito: no son la «parte con factura» del costo.
+   *   SIN FACTURA         la liquidación.
+   *
+   * Los dos en NETO (sin IVA ni percepciones): es la misma base sobre la que el
+   * costo parte la mercadería. Se compara contra lo que tienen cargado LOS
+   * PRODUCTOS de esta compra (su formato con este proveedor, ponderado por lo
+   * comprado), que es lo que de verdad mueve el costo y el margen; sin
+   * formatos, contra la ficha. Si se aparta más de 10 puntos (la tolerancia de
+   * Gerencia › Rentabilidad), la respuesta trae `mezcla` para avisar.
+   *
+   * Es solo informativo: una entrega no cambia el % (es un promedio), la
+   * cuenta y el IVA ya quedaron con lo que vino en cada papel. Si falla, no
+   * tira el alta: ya se guardó.
+   */
+  private async conMezcla<T extends { proveedorId: number; fecha: Date | string; tipo: string; estado: string }>(c: T) {
+    if (!['factura', 'liquidacion'].includes(c.tipo) || c.estado !== 'confirmado') return c;
+    try {
+      const dia = new Date(c.fecha).toISOString();
+      const papeles = await this.db.select({ id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra, neto: comprobantes.subtotalNeto, ref: comprobantes.refComprobanteId })
+        .from(comprobantes).where(and(
+          eq(comprobantes.proveedorId, c.proveedorId),
+          eq(comprobantes.estado, 'confirmado'),
+          inArray(comprobantes.tipo, ['factura', 'nota_debito', 'nota_credito', 'liquidacion'] as any),
+          sql`(${comprobantes.fecha} at time zone 'America/Argentina/Buenos_Aires')::date = (${dia}::timestamptz at time zone 'America/Argentina/Buenos_Aires')::date`,
+        ));
+      /* Las notas, solo si ajustan una factura A de ESE día: una NC de hoy sobre una compra vieja no es parte de esta. */
+      const facturasA = new Set(papeles.filter((p) => p.tipo === 'factura' && p.letra === 'A').map((p) => p.id));
+      const conCredito = papeles.filter((p) => p.letra === 'A' && (p.tipo === 'factura' || (p.ref != null && facturasA.has(p.ref))));
+      const liquidaciones = papeles.filter((p) => p.tipo === 'liquidacion');
+      const facturado = conCredito.reduce((a, p) => a + (p.tipo === 'nota_credito' ? -1 : 1) * (Number(p.neto) || 0), 0);
+      const liquidado = liquidaciones.reduce((a, p) => a + (Number(p.neto) || 0), 0);
+      if (!(facturado > 0.005 && liquidado > 0.005)) return c;
+      const porcReal = Math.round((liquidado / (facturado + liquidado)) * 1000) / 10;
+
+      /* Lo cargado en los productos de ESTA compra: el formato de cada uno con
+       * este proveedor (el primero por id, el mismo que actualiza la recepción),
+       * ponderado por lo que se compró de cada uno. */
+      const ids = [...conCredito.filter((p) => p.tipo === 'factura'), ...liquidaciones].map((p) => p.id);
+      const items = await this.db.select({ productoId: comprobanteItems.productoId, subtotal: comprobanteItems.subtotal })
+        .from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, ids));
+      const formatos = items.length
+        ? this.formatoPorProducto(await this.db.select().from(productoProveedores).where(and(
+          eq(productoProveedores.proveedorId, c.proveedorId),
+          inArray(productoProveedores.productoId, [...new Set(items.map((it) => it.productoId))]),
+        )))
+        : new Map<number, any>();
+      let peso = 0; let suma = 0;
+      for (const it of items) {
+        const f = formatos.get(it.productoId);
+        const w = Math.abs(Number(it.subtotal) || 0);
+        if (!f || !(w > 0)) continue;
+        peso += w; suma += w * (Number(f.porcSinFactura) || 0);
+      }
+      const [prov] = await this.db.select({ nombre: proveedores.nombre, porc: proveedores.porcSinFactura })
+        .from(proveedores).where(eq(proveedores.id, c.proveedorId)).limit(1);
+      if (!prov) return c;
+      const porcFicha = Number(prov.porc) || 0;
+      const porcProductos = peso > 0 ? Math.round((suma / peso) * 10) / 10 : porcFicha;
+      if (Math.abs(porcReal - porcProductos) <= 10) return c;
+      return { ...c, mezcla: { proveedor: prov.nombre, facturadoNeto: r2(facturado), liquidado: r2(liquidado), porcReal, porcProductos, porcFicha } };
+    } catch {
+      return c;
+    }
+  }
+
   async get(id: number) {
     const [c] = await this.db.select().from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
     if (!c) throw new NotFoundException('Comprobante inexistente.');
@@ -1467,7 +1542,7 @@ export class ComprobantesService {
     if (esNota && dto.refComprobanteId && estado === 'confirmado') {
       await this.pagos.sincronizarComprobante(dto.refComprobanteId);
     }
-    return this.get(id);
+    return this.conMezcla(await this.get(id));
   }
 
   /**
@@ -2253,7 +2328,7 @@ export class ComprobantesService {
       pagoContado: dto.pagoContado,
     }, opciones);
 
-    return this.get(id);
+    return this.conMezcla(await this.get(id));
   }
 
   /**

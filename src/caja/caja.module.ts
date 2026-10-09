@@ -247,6 +247,10 @@ async function sinCobrosQrVivos(tx: any, sucursalId: number) {
   }
 }
 
+/** Un día 'AAAA-MM-DD' de verdad (se valida antes de entrar al SQL). */
+const esDia = (v?: string): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
+  && (() => { const d = new Date(`${v}T12:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v; })();
+
 @Injectable()
 export class CajaService {
   constructor(
@@ -297,7 +301,6 @@ export class CajaService {
     if (q.estado) conds.push(eq(cajaSesiones.estado, q.estado as any));
     /* POR FECHA DE APERTURA, día argentino (6/10/2026, pedido del dueño: anteayer,
      * ayer o un rango a mano). La fecha se valida antes de entrar al SQL. */
-    const esDia = (v?: string) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && (() => { const d = new Date(`${v}T12:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v; })();
     if (esDia(q.desde)) conds.push(sql`${cajaSesiones.apertura} >= (${q.desde}::date::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
     if (esDia(q.hasta)) conds.push(sql`${cajaSesiones.apertura} < ((${q.hasta}::date + 1)::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
     const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 200);
@@ -305,6 +308,67 @@ export class CajaService {
       .where(conds.length ? and(...conds) : undefined)
       .orderBy(desc(cajaSesiones.id))
       .limit(limit);
+  }
+
+  /**
+   * LOS INGRESOS Y EGRESOS DE CAJA DE TODOS LOS TURNOS (9/10/2026, pedido del
+   * dueño: «dónde veo los egresos que tuvo una sucursal»). Antes se veían turno
+   * por turno, adentro del arqueo. Por día argentino del MOVIMIENTO.
+   *
+   * `clase` sale de cómo nació el movimiento, no del texto: pago a proveedor
+   * (tiene su pago enlazado), devolución (la nota de crédito en efectivo) u
+   * otro (lo que se cargó a mano en «Ingreso / egreso»). Las filas vienen
+   * hasta 2000; los totales y la agrupación son del filtro ENTERO.
+   */
+  async movimientosCaja(q: { sucursalId?: number | null; desde?: string; hasta?: string; tipo?: string; clase?: string; q?: string; anulados?: boolean }) {
+    const conds: any[] = [sql`true`];
+    if (q.sucursalId) conds.push(sql`cs.sucursal_id = ${q.sucursalId}`);
+    if (esDia(q.desde)) conds.push(sql`m.fecha >= (${q.desde}::date::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
+    if (esDia(q.hasta)) conds.push(sql`m.fecha < ((${q.hasta}::date + 1)::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
+    if (q.tipo === 'ingreso' || q.tipo === 'egreso') conds.push(sql`m.tipo = ${q.tipo}`);
+    if (!q.anulados) conds.push(sql`m.anulado_en is null`);
+    const texto = String(q.q ?? '').trim();
+    if (texto) conds.push(sql`(m.motivo ilike ${`%${texto}%`} or pr.nombre ilike ${`%${texto}%`})`);
+    const clase = ['pago_proveedor', 'devolucion', 'otro'].includes(String(q.clase)) ? String(q.clase) : '';
+    const base = sql`
+      select m.id, m.fecha, m.tipo, m.importe, m.motivo, m.posterior, m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo",
+        m.caja_sesion_id as "cajaSesionId", cs.sucursal_id as "sucursalId", su.nombre as sucursal, cs.apertura, cs.cierre,
+        coalesce(uc.nombre, ua.nombre, '') as cajero, um.nombre as "cargo", pr.nombre as proveedor,
+        case when pp.id is not null then 'pago_proveedor' when m.motivo like 'Devolución %' then 'devolucion' else 'otro' end as clase
+      from caja_movimientos m
+      join caja_sesiones cs on cs.id = m.caja_sesion_id
+      join sucursales su on su.id = cs.sucursal_id
+      left join usuarios ua on ua.id = cs.usuario_id
+      left join lateral (
+        select cc.usuario_id from caja_controles cc
+        where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1
+      ) cx on true
+      left join usuarios uc on uc.id = cx.usuario_id
+      left join usuarios um on um.id = m.usuario_id
+      left join proveedor_pagos pp on pp.caja_movimiento_id = m.id
+      left join proveedores pr on pr.id = pp.proveedor_id
+      where ${sql.join(conds, sql` and `)}`;
+    const filtro = clase ? sql`where b.clase = ${clase}` : sql``;
+    /* Lo anulado se lista (si se pide) pero no suma. */
+    const [filas, tot, grupos] = await Promise.all([
+      this.db.execute(sql`with b as (${base}) select * from b ${filtro} order by b.fecha desc, b.id desc limit 2000`),
+      this.db.execute(sql`with b as (${base}) select
+          coalesce(sum(b.importe) filter (where b.tipo = 'ingreso' and b."anuladoEn" is null), 0) as ingresos,
+          coalesce(sum(b.importe) filter (where b.tipo = 'egreso' and b."anuladoEn" is null), 0) as egresos,
+          count(*)::int as cantidad
+        from b ${filtro}`),
+      this.db.execute(sql`with b as (${base}) select b.tipo, b.clase,
+          case when b.clase = 'pago_proveedor' then coalesce(b.proveedor, 'Proveedor') when b.clase = 'devolucion' then 'Devoluciones a clientes' else b.motivo end as nombre,
+          coalesce(sum(b.importe), 0) as importe, count(*)::int as cantidad
+        from b ${clase ? sql`where b.clase = ${clase} and` : sql`where`} b."anuladoEn" is null
+        group by 1, 2, 3 order by 4 desc limit 50`),
+    ]);
+    const t: any = tot.rows[0] ?? {};
+    return {
+      filas: filas.rows.map((x: any) => ({ ...x, importe: money(x.importe) })),
+      totales: { ingresos: money(t.ingresos), egresos: money(t.egresos), cantidad: Number(t.cantidad) || 0 },
+      porMotivo: grupos.rows.map((x: any) => ({ ...x, importe: money(x.importe) })),
+    };
   }
 
   /**
@@ -962,6 +1026,20 @@ export class CajaController {
     });
     // El historial también a ciegas para el que cuenta a ciegas (0111).
     return (await this.ciego(sesion)) ? filas.map((f) => sesionCiega(f)) : filas;
+  }
+
+  /** Ingresos y egresos de caja de todos los turnos. El que no es jefe ve solo su sucursal (como los turnos). */
+  @Get('movimientos')
+  movimientos(
+    @Auth() sesion: Sesion,
+    @Query('sucursalId') sucursalId?: string, @Query('desde') desde?: string, @Query('hasta') hasta?: string,
+    @Query('tipo') tipo?: string, @Query('clase') clase?: string, @Query('q') q?: string, @Query('anulados') anulados?: string,
+  ) {
+    const mia = soloSuSucursal(sesion);
+    return this.svc.movimientosCaja({
+      sucursalId: mia ?? (Number(sucursalId) > 0 ? Number(sucursalId) : null),
+      desde, hasta, tipo, clase, q, anulados: anulados === '1',
+    });
   }
 
   /*

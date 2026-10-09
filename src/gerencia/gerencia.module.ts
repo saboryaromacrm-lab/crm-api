@@ -169,17 +169,22 @@ export class RentabilidadService {
       posicion: r2(fiscalVentas.debito - creditoCompras - filaGastos),
     };
 
-    /* ---- Compras del período por proveedor: lo declarado contra lo real ---- */
+    /* ---- Compras del período por proveedor: lo declarado contra lo real ----
+     * Sin los proveedores que facturan B o C (9/10/2026, pedido del dueño): su
+     * factura no da crédito fiscal, así que el «mitad y mitad» no aplica. Lo
+     * facturado es solo la A, igual que el aviso al cargar la compra. */
+    const emitenBC = new Set(['monotributo', 'exento', 'consumidor_final', 'no_categorizado']);
     const porProveedor = filasCompra
+      .filter((c: any) => !(Number(c.facturasBC) > 0) && !emitenBC.has((provRows.find((p) => p.id === c.proveedorId) as any)?.condicionIva))
       .map((c: any) => {
         const prov: any = provRows.find((p) => p.id === c.proveedorId) ?? {};
-        const base = c.facturadoNeto + c.liquidado;
+        const base = Number(c.facturadoNetoA) + c.liquidado;
         const porcReal = base > 0 ? r2((c.liquidado / base) * 100) : 0;
         const declarado = Number(prov.porcSinFactura) || 0;
         return {
           proveedorId: c.proveedorId,
           nombre: prov.nombre ?? `#${c.proveedorId}`,
-          facturadoNeto: r2(c.facturadoNeto),
+          facturadoNeto: r2(Number(c.facturadoNetoA)),
           liquidado: r2(c.liquidado),
           ivaCredito: r2(c.ivaCredito),
           porcReal,
@@ -313,6 +318,11 @@ export class RentabilidadService {
         + coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'nota_debito'), 0)
         - coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'nota_credito'), 0)`,
       liquidado: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'liquidacion'), 0)`,
+      /* El control de «sin factura» mira solo lo que da crédito fiscal: la letra A
+       * (9/10/2026). La B y la C no son la «parte con factura» del costo. */
+      facturadoNetoA: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} in ('factura', 'nota_debito') and ${comprobantes.letra} = 'A'), 0)
+        - coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'nota_credito' and ${comprobantes.letra} = 'A'), 0)`,
+      facturasBC: sql<number>`count(*) filter (where ${comprobantes.tipo} in ('factura', 'nota_debito', 'nota_credito') and ${comprobantes.letra} in ('B', 'C'))::int`,
       ivaCredito: sql<number>`coalesce(sum(${comprobantes.ivaTotal}) filter (where ${comprobantes.tipo} = 'factura'), 0)
         + coalesce(sum(${comprobantes.ivaTotal}) filter (where ${comprobantes.tipo} = 'nota_debito'), 0)
         - coalesce(sum(${comprobantes.ivaTotal}) filter (where ${comprobantes.tipo} = 'nota_credito'), 0)`,

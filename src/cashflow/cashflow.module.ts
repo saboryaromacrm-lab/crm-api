@@ -67,6 +67,8 @@ const hoyAr = () => diaAr(new Date());
 const desdeDia = (col: string, p: string) => sql.raw(`${col} >= ('${p}'::date::timestamp at time zone '${ZONA}')`);
 const hastaDia = (col: string, p: string) => sql.raw(`${col} < (('${p}'::date + 1)::timestamp at time zone '${ZONA}')`);
 const esUnico = (e: any) => e?.code === '23505' || e?.cause?.code === '23505';
+/** De dónde puede venir un movimiento, para filtrar los reportes (el saldo inicial no es un movimiento del período). */
+const ORIGENES_REPORTE = ['sobre', 'concepto', 'pago_proveedor', 'gasto', 'conteo'];
 const pesos = (n: number) => `$${money(n).toLocaleString('es-AR')}`;
 const diaVisible = (p: string) => `${p.slice(8, 10)}/${p.slice(5, 7)}/${p.slice(0, 4)}`;
 /**
@@ -405,7 +407,7 @@ export class CashflowService {
    * por día / semana / mes. Todo sale del libro y de los sobres: no hay
    * tablas resumen que puedan quedar viejas.
    */
-  async reporte(q: { desde?: string; hasta?: string }) {
+  async reporte(q: { desde?: string; hasta?: string; tipo?: string; origen?: string; conceptoId?: string | number; sucursalId?: string | number }) {
     const caja = await this.caja();
     const hoy = hoyAr();
     const desde = esDia(q.desde) ? q.desde : `${hoy.slice(0, 7)}-01`;
@@ -415,6 +417,28 @@ export class CashflowService {
     if (dias > 1100) throw new BadRequestException('El período puede ser de hasta 3 años.');
     const paso = dias <= 45 ? 'day' : dias <= 200 ? 'week' : 'month';
     if (!caja) return { caja: null, desde, hasta };
+    /*
+     * FILTROS (9/10/2026, pedido del dueño): ingresos o egresos, de dónde vino
+     * (sobres, conceptos, pagos a proveedor, gastos, conteos), un concepto y un
+     * local (este, solo para los sobres). Alcanzan a los totales, la serie y el
+     * «Por concepto». El efectivo al inicio y al fin es de la caja ENTERA: con
+     * filtros no se recorta (la pantalla lo dice), y los bloques de sobres solo
+     * aplican cuando el filtro puede incluir sobres.
+     */
+    const tipo = (TIPOS as readonly string[]).includes(String(q.tipo)) ? String(q.tipo) : '';
+    const origen = ORIGENES_REPORTE.includes(String(q.origen)) ? String(q.origen) : '';
+    const conceptoId = Number.isInteger(Number(q.conceptoId)) && Number(q.conceptoId) > 0 ? Number(q.conceptoId) : 0;
+    const sucursalId = Number.isInteger(Number(q.sucursalId)) && Number(q.sucursalId) > 0 ? Number(q.sucursalId) : 0;
+    const filtrado = !!(tipo || origen || conceptoId || sucursalId);
+    const filtro = sql.join([
+      sql`true`,
+      ...(tipo ? [sql`m.tipo = ${tipo}`] : []),
+      ...(origen ? [sql`m.origen = ${origen}`] : []),
+      ...(conceptoId ? [sql`m.concepto_id = ${conceptoId}`] : []),
+      ...(sucursalId ? [sql`exists (select 1 from cashflow_sobres fs join caja_sesiones fcs on fcs.id = fs.caja_sesion_id where fs.id = m.sobre_id and fcs.sucursal_id = ${sucursalId})`] : []),
+    ], sql` and `);
+    const conSobres = tipo !== 'egreso' && !conceptoId && (!origen || origen === 'sobre');
+    const sucSobres = sucursalId ? sql`and cs.sucursal_id = ${sucursalId}` : sql``;
     const vivo = sql`m.anulado_en is null`;
     const [antes, periodo, porConcepto, serie, sobresSuc, cajeros] = await Promise.all([
       this.db.execute(sql`select coalesce(sum(case when m.tipo = 'ingreso' then m.importe else -m.importe end), 0) as s
@@ -424,17 +448,17 @@ export class CashflowService {
           coalesce(sum(m.importe) filter (where m.tipo = 'ingreso' and m.origen = 'saldo_inicial'), 0) as "saldoInicial",
           coalesce(sum(m.importe) filter (where m.tipo = 'egreso'), 0) as egresos,
           count(*) filter (where m.origen <> 'saldo_inicial')::int as movimientos
-        from cashflow_movimientos m where ${vivo} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}`),
+        from cashflow_movimientos m where ${vivo} and ${filtro} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}`),
       this.db.execute(sql`select m.tipo, m.origen, coalesce(c.nombre, '') as concepto,
           coalesce(sum(m.importe), 0) as importe, count(*)::int as cantidad
         from cashflow_movimientos m left join cashflow_conceptos c on c.id = m.concepto_id
-        where ${vivo} and m.origen <> 'saldo_inicial' and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
+        where ${vivo} and ${filtro} and m.origen <> 'saldo_inicial' and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
         group by 1, 2, 3 order by 1, 4 desc`),
       this.db.execute(sql`select to_char(date_trunc('${sql.raw(paso)}', m.fecha at time zone '${sql.raw(ZONA)}'), 'YYYY-MM-DD') as periodo,
           coalesce(sum(m.importe) filter (where m.tipo = 'ingreso' and m.origen <> 'saldo_inicial'), 0) as ingresos,
           coalesce(sum(m.importe) filter (where m.tipo = 'egreso'), 0) as egresos
         from cashflow_movimientos m
-        where ${vivo} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
+        where ${vivo} and ${filtro} and ${desdeDia('m.fecha', desde)} and ${hastaDia('m.fecha', hasta)}
         group by 1 order by 1`),
       this.db.execute(sql`select su.id as "sucursalId", su.nombre as sucursal,
           count(*)::int as sobres, count(s.id)::int as controlados,
@@ -444,8 +468,8 @@ export class CashflowService {
           coalesce(sum(s.contado), 0) as contado, coalesce(sum(s.diferencia), 0) as diferencia
         from caja_sesiones cs join sucursales su on su.id = cs.sucursal_id
         left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
-        where cs.estado = 'cerrada' and cs.envio_efectivo > 0 and ${desdeDia('cs.cierre', caja.fechaInicio)}
-          and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)}
+        where ${conSobres ? sql`true` : sql`false`} and cs.estado = 'cerrada' and cs.envio_efectivo > 0 and ${desdeDia('cs.cierre', caja.fechaInicio)}
+          and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)} ${sucSobres}
         group by 1, 2 order by 2`),
       this.db.execute(sql`select coalesce(uc.id, ua.id) as "usuarioId", coalesce(uc.nombre, ua.nombre, 'Sin cajero') as cajero,
           count(*)::int as sobres, count(*) filter (where abs(s.diferencia) > 0.009)::int as "conDiferencia",
@@ -456,14 +480,14 @@ export class CashflowService {
         left join usuarios ua on ua.id = cs.usuario_id
         left join lateral (select cc.usuario_id from caja_controles cc where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1) cx on true
         left join usuarios uc on uc.id = cx.usuario_id
-        where s.anulado_en is null and not s.descartado and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)}
+        where ${conSobres ? sql`true` : sql`false`} and s.anulado_en is null and not s.descartado and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)} ${sucSobres}
         group by 1, 2 order by 5 asc`),
     ]);
     const p: any = periodo.rows[0] ?? {};
     const saldoInicio = money((antes.rows[0] as any)?.s);
     const ingresos = money(p.ingresos); const egresos = money(p.egresos); const saldoInicial = money(p.saldoInicial);
     return {
-      caja, desde, hasta, paso: paso === 'day' ? 'dia' : paso === 'week' ? 'semana' : 'mes',
+      caja, desde, hasta, paso: paso === 'day' ? 'dia' : paso === 'week' ? 'semana' : 'mes', filtrado, conSobres,
       saldoInicio, saldoInicial, ingresos, egresos, movimientos: Number(p.movimientos) || 0,
       saldoFin: money(saldoInicio + saldoInicial + ingresos - egresos),
       porConcepto: porConcepto.rows.map((x: any) => ({ ...x, importe: money(x.importe) })),
@@ -696,19 +720,30 @@ export class CashflowService {
 
   /* ------------------------------ Movimientos ------------------------------ */
 
-  async movimientos(q: { desde?: string; hasta?: string; tipo?: string; origen?: string; conceptoId?: string | number; anulados?: string; limite?: number }) {
+  async movimientos(q: { desde?: string; hasta?: string; tipo?: string; origen?: string; conceptoId?: string | number; sucursalId?: string | number; anulados?: string; limite?: number; fechaDe?: string }) {
     const cond: any[] = [];
     if (q.anulados !== '1') cond.push(sql`m.anulado_en is null`);
-    if (esDia(q.desde)) cond.push(desdeDia('m.fecha', q.desde));
-    if (esDia(q.hasta)) cond.push(hastaDia('m.fecha', q.hasta));
+    /*
+     * DOS FECHAS DISTINTAS (9/10/2026, pedido del dueño): la del movimiento es
+     * cuándo entró a tu caja (un sobre: el día que lo controlaste); la de la
+     * CAJA es el cierre del turno del local. Con `fechaDe=caja` el rango mira el
+     * cierre del turno, y entonces solo hay sobres: «los sobres del 7».
+     */
+    const porCaja = q.fechaDe === 'caja';
+    const col = porCaja ? 'cs.cierre' : 'm.fecha';
+    if (porCaja) cond.push(sql`m.sobre_id is not null`);
+    if (esDia(q.desde)) cond.push(desdeDia(col, q.desde));
+    if (esDia(q.hasta)) cond.push(hastaDia(col, q.hasta));
     if (q.tipo && (TIPOS as readonly string[]).includes(q.tipo)) cond.push(sql`m.tipo = ${q.tipo}`);
     if (q.origen) cond.push(sql`m.origen = ${String(q.origen)}`);
     const cid = Number(q.conceptoId);
     if (Number.isInteger(cid) && cid > 0) cond.push(sql`m.concepto_id = ${cid}`);
+    const suc = Number(q.sucursalId);
+    if (Number.isInteger(suc) && suc > 0) cond.push(sql`cs.sucursal_id = ${suc}`);
     const limite = Math.min(Math.max(Number(q.limite) || 500, 1), 2000);
     const r = await this.db.execute(sql`
       select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto,
-        m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia",
+        m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia", cs.cierre as "cierreCaja",
         m.pago_id as "pagoId", m.gasto_id as "gastoId", u.nombre as usuario,
         pr.nombre as proveedor, pp.medio, pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
         m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo", ua.nombre as "anuladoPor"
@@ -724,7 +759,7 @@ export class CashflowService {
       left join usuarios u on u.id = m.usuario_id
       left join usuarios ua on ua.id = m.anulado_por
       ${cond.length ? sql`where ${sql.join(cond, sql` and `)}` : sql``}
-      order by m.fecha desc, m.id desc
+      order by ${porCaja ? sql`cs.cierre desc, m.id desc` : sql`m.fecha desc, m.id desc`}
       limit ${limite}`);
     return r.rows.map((x: any) => ({ ...x, importe: money(x.importe), sobreDiferencia: x.sobreDiferencia == null ? null : money(x.sobreDiferencia) }));
   }

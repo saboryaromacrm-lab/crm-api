@@ -1,5 +1,5 @@
 import {
-  Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
+  Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import {
@@ -10,7 +10,7 @@ import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { ocultaCostoUnitario, tienePermiso } from '../auth/auth.guard';
+import { esJefe, ocultaCostoUnitario, tienePermiso } from '../auth/auth.guard';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasModule, ListasService, exigirUnaListaGranel } from '../listas/listas.module';
 import { PreciosModule, HistorialPreciosService } from '../precios/precios.module';
@@ -19,7 +19,7 @@ import { AuditoriaModule, AuditoriaService, type CambioAuditado } from '../audit
 import {
   categorias, coffitMovimientos, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
   modalidadesVenta, movimientos, pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
-  productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
+  productoProveedorCostos, productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
   transferenciaItems, vencimientos, ventaItems, webImagenes,
 } from '../db/schema';
 import {
@@ -2163,6 +2163,88 @@ export class ProductosService {
    * silencio la auditoría entera del producto. Solo se borra lo que el usuario
    * sacó de verdad de la lista.
    */
+  /*
+   * EL «SIN FACTURA %» DEL PROVEEDOR A TODOS SUS PRODUCTOS (9/10/2026, pedido
+   * del dueño). El de la ficha solo precarga los formatos NUEVOS; cada producto
+   * guarda el suyo, que es el que parte el costo (y con él la góndola). Cuando
+   * el proveedor cambia de verdad su forma de facturar, esto los pone a todos
+   * en el % de la ficha, de una vez, con auditoría por producto y la evolución
+   * de precios firmada. `sinFacturaDeProveedor` es la vista previa.
+   */
+  async sinFacturaDeProveedor(proveedorId: number) {
+    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre, porc: proveedores.porcSinFactura })
+      .from(proveedores).where(eq(proveedores.id, proveedorId)).limit(1);
+    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    const filas = await this.db.select({ productoId: productoProveedores.productoId, porc: productoProveedores.porcSinFactura })
+      .from(productoProveedores).where(eq(productoProveedores.proveedorId, proveedorId));
+    const porcFicha = Number(prov.porc) || 0;
+    const porPorc = new Map<number, Set<number>>();
+    for (const f of filas) {
+      const p = Number(f.porc) || 0;
+      if (!porPorc.has(p)) porPorc.set(p, new Set());
+      porPorc.get(p)!.add(f.productoId);
+    }
+    return {
+      proveedor: prov.nombre,
+      porcFicha,
+      productos: new Set(filas.map((f) => f.productoId)).size,
+      cambian: new Set(filas.filter((f) => Math.abs((Number(f.porc) || 0) - porcFicha) > 1e-9).map((f) => f.productoId)).size,
+      porcentajes: [...porPorc].map(([porc, ids]) => ({ porc, productos: ids.size })).sort((a, b) => b.productos - a.productos),
+    };
+  }
+
+  async aplicarSinFacturaProveedor(proveedorId: number, usuarioId: number | null) {
+    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre, porc: proveedores.porcSinFactura })
+      .from(proveedores).where(eq(proveedores.id, proveedorId)).limit(1);
+    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    const porcFicha = Number(prov.porc) || 0;
+    const aCambiar = await this.db.select({
+      fila: productoProveedores, nombre: productos.nombre, iva: productos.iva,
+    }).from(productoProveedores).innerJoin(productos, eq(productos.id, productoProveedores.productoId))
+      .where(and(eq(productoProveedores.proveedorId, proveedorId), sql`abs(${productoProveedores.porcSinFactura} - ${porcFicha}) > 0.000000001`));
+    if (!aCambiar.length) return { productos: 0, porcFicha };
+    /*
+     * EL COSTO NETO DE LA MERCADERÍA NO CAMBIA: cambia cómo se factura.
+     *
+     * En modo «lista» el % solo reparte el costo cargado: alcanza con cambiarlo.
+     * En modo «precio final» lo cargado es el DESEMBOLSO del bulto con los
+     * papeles del reparto viejo, y el neto se deriva de él con el % (ver
+     * `costosFormato`). Cambiar solo el % reinterpretaría el mismo desembolso
+     * con otro reparto y bajaría (o subiría) el neto sin que la mercadería haya
+     * cambiado de precio. Así que se conserva el neto y se recalcula el
+     * desembolso con el reparto nuevo: neto × ((1−q')·(1+IVA) + q'). Ese cambio
+     * de costo queda en el historial de costos, como cualquier otro.
+     */
+    const desembolso = (q: number, iva: number) => (1 - q / 100) * (1 + iva / 100) + q / 100;
+    const lote = `S${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    const motivo = `Sin factura % de ${prov.nombre} → ${porcFicha}% (aplicado desde la ficha; se conserva el costo neto)`;
+    await this.db.transaction(async (tx) => {
+      for (const { fila: f, iva } of aCambiar) {
+        const reparteFinal = f.modoCosto === 'final' && Number(f.costoFinal) > 0;
+        const costoFinal = reparteFinal
+          ? Math.round((Number(f.costoFinal) / desembolso(Number(f.porcSinFactura) || 0, Number(iva) || 0)) * desembolso(porcFicha, Number(iva) || 0) * 100) / 100
+          : f.costoFinal;
+        await tx.update(productoProveedores).set({ porcSinFactura: porcFicha, costoFinal }).where(eq(productoProveedores.id, f.id));
+        if (reparteFinal && Math.abs(costoFinal - Number(f.costoFinal)) >= 0.005) {
+          await tx.insert(productoProveedorCostos).values({
+            productoProveedorId: f.id,
+            costoAnterior: f.costo, descuentoAnterior: f.descuento, fleteAnterior: f.flete,
+            costo: f.costo, descuento: f.descuento, flete: f.flete,
+            costoFinalAnterior: f.costoFinal, costoFinal,
+            origen: 'masiva', motivo, lote, usuarioId,
+          });
+        }
+      }
+      await this.audit.registrar(aCambiar.map(({ fila: f, nombre }) => ({
+        entidad: 'proveedor', entidadId: prov.id, ambito: 'Formato de compra', detalle: nombre,
+        campo: 'Sin factura %', antes: `${Number(f.porcSinFactura) || 0}%`, despues: `${porcFicha}% (aplicado desde la ficha)`, usuarioId,
+      })), tx);
+    });
+    const ids = [...new Set(aCambiar.map(({ fila }) => fila.productoId))];
+    await this.evolucion.snapshot(ids, 'formato_compra', { usuarioId, detalle: motivo });
+    return { productos: ids.length, porcFicha };
+  }
+
   async setFormatosCompra(id: number, filas: any[], usuarioAudit?: number | null) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -2272,6 +2354,18 @@ export class ProductosService {
         const f = validas[i];
         const fid = Number(f.id);
         const v = valores(f, i);
+        /* «PRECIO FINAL» CON OTRO % SIN FACTURA (9/10/2026, pedido del dueño):
+         * si cambió el % y no el desembolso cargado, el neto de la mercadería se
+         * conserva y se recalcula lo que se paga con el reparto nuevo (la misma
+         * regla que «Aplicar a todos sus productos»). La pantalla ya lo hace en
+         * vivo; esto cubre a cualquier otro que guarde. */
+        const ant: any = porId.get(fid);
+        if (ant && ant.modoCosto === 'final' && v.modoCosto === 'final' && Number(ant.costoFinal) > 0
+          && Math.abs(v.porcSinFactura - (Number(ant.porcSinFactura) || 0)) > 1e-9
+          && Math.abs(v.costoFinal - Number(ant.costoFinal)) < 0.005) {
+          const factor = (q: number) => (1 - q / 100) * (1 + (Number(p.iva) || 0) / 100) + q / 100;
+          v.costoFinal = Math.round((Number(ant.costoFinal) / factor(Number(ant.porcSinFactura) || 0)) * factor(v.porcSinFactura) * 100) / 100;
+        }
         if (porId.has(fid)) {
           cambiosAudit.push(...this.audit.diferencias(
             baseAudit(v.proveedorId), fotoFormato(porId.get(fid)), fotoFormato(v), CAMPOS_FORMATO,
@@ -2353,6 +2447,22 @@ export class ProductosService {
 @Controller('productos')
 export class ProductosController {
   constructor(private readonly svc: ProductosService) {}
+
+  /* El «Sin factura %» de la ficha a todos los productos del proveedor: mueve
+   * costos y góndola de golpe, así que es de un jefe (y la ficha lo ofrece solo a ellos). */
+  @Permiso('compras.productos')
+  @Get('sin-factura-proveedor/:proveedorId')
+  sinFacturaDeProveedor(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('Lo aplica un administrador.');
+    return this.svc.sinFacturaDeProveedor(proveedorId);
+  }
+
+  @Permiso('compras.productos')
+  @Post('sin-factura-proveedor/:proveedorId')
+  aplicarSinFacturaProveedor(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('Lo aplica un administrador.');
+    return this.svc.aplicarSinFacturaProveedor(proveedorId, sesion?.usuarioId ?? null);
+  }
 
   /*
    * El catálogo lo lee todo el sistema, así que la LECTURA sigue abierta — pero
