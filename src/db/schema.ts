@@ -192,17 +192,9 @@ export const proveedores = pgTable('proveedores', {
   email: text('email').notNull().default(''),
   /** Vende mercadería que entra al stock (los que ya existían: default true). */
   proveeMercaderia: boolean('provee_mercaderia').notNull().default(true),
-  /**
-   * Con qué FORMATO se leen sus facturas PDF (0117): el id de una receta del
-   * navegador ('tango-bavosi'…). Vacío = todavía no tiene estructura. Varios
-   * proveedores comparten formato cuando facturan con el mismo sistema.
-   */
-  formatoFactura: text('formato_factura').notNull().default(''),
-  /**
-   * La ESTRUCTURA PROPIA que armó el asistente (0118): las posiciones de las
-   * columnas de sus facturas PDF. Se usa cuando `formatoFactura` = 'plantilla'.
-   */
-  plantillaFactura: jsonb('plantilla_factura').$type<Record<string, any> | null>(),
+  /* `formato_factura` y `plantilla_factura` (0117/0118, la lectura de PDF en el
+   * navegador) quedaron sin uso con la lectura por IA (0153): siguen en la base
+   * hasta la migración que las borre, pero el código ya no las nombra. */
   /** Factura gastos de la empresa (servicios, fletes, honorarios, alquiler…). */
   proveeGastos: boolean('provee_gastos').notNull().default(false),
   /**
@@ -1776,6 +1768,13 @@ export const facturaLecturas = pgTable('factura_lecturas', {
   /** sha256 del contenido: la misma foto subida dos veces se detecta al toque. */
   hash: text('hash').notNull().default(''),
   subidoEn: timestamp('subido_en', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * LA LECTURA CON IA (0153): '' sin leer · en_cola · leyendo · lista · error ·
+   * tope (se llegó al gasto del mes). `ia` guarda lo que devolvió: encabezado,
+   * renglones, pie, el control de la cuenta, el modelo y lo que costó.
+   */
+  iaEstado: text('ia_estado').notNull().default(''),
+  ia: jsonb('ia').$type<Record<string, any> | null>(),
 }, (t) => ({
   ixEstado: index('ix_factura_lecturas_estado').on(t.estado),
   // Para buscar si ya existe un comprobante con este número de este proveedor.
@@ -3728,5 +3727,32 @@ export const gananciasEscalas = pgTable('ganancias_escalas', {
 export const resultadosConfig = pgTable('resultados_config', {
   id: integer('id').primaryKey().default(1),
   valor: jsonb('valor').$type<Record<string, unknown>>().notNull().default({}),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/* ===================== FACTURAS CON IA (0153, 9/10/2026) ===================== */
+
+/** Cada llamada a la IA con sus tokens y su costo (el consumo del mes sale de acá). */
+export const facturasIaUsos = pgTable('facturas_ia_usos', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  lecturaId: integer('lectura_id'),
+  tarea: text('tarea').notNull(),
+  modelo: text('modelo').notNull(),
+  tokensEntrada: integer('tokens_entrada').notNull().default(0),
+  tokensSalida: integer('tokens_salida').notNull().default(0),
+  tokensCacheEscritura: integer('tokens_cache_escritura').notNull().default(0),
+  tokensCacheLectura: integer('tokens_cache_lectura').notNull().default(0),
+  costoUsd: doublePrecision('costo_usd').notNull().default(0),
+  ok: boolean('ok').notNull().default(true),
+  error: text('error').notNull().default(''),
+  usuarioId: integer('usuario_id'),
+});
+
+/** El tope de gasto del mes y si la factura se lee sola al subirla. Una fila. */
+export const facturasIaConfig = pgTable('facturas_ia_config', {
+  id: integer('id').primaryKey().default(1),
+  topeMensualUsd: doublePrecision('tope_mensual_usd').notNull().default(5),
+  leerAlSubir: boolean('leer_al_subir').notNull().default(true),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });

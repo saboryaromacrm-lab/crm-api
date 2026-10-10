@@ -19,7 +19,7 @@ import { Auth, Sesion } from '../auth/auth.decoradores';
 import { tienePermiso } from '../auth/auth.guard';
 // El MISMO normalizador que usan comprobantes y facturas: el punto de venta
 // tiene que quedar igual venga de donde venga (ver REGLAS, más abajo).
-import { normalizarPuntoVenta } from '../facturas/facturas.module';
+import { normalizarPuntoVenta } from '../facturas/comun';
 import { configuracion } from '../db/schema';
 
 /** Preferencias del circuito de ventas. */

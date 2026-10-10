@@ -21,7 +21,8 @@
  *
  *  - **El detalle de renglones sí hay que interpretarlo.** Argentina no tiene
  *    intercambio de factura estructurada (no hay CFDI ni NF-e): los ítems solo
- *    existen en el PDF del proveedor. Eso es la etapa siguiente.
+ *    existen en el papel del proveedor. Los lee la IA (0153, `ia/`): PDF,
+ *    fotos y escaneos; el encabezado que no dio el QR también sale de ahí.
  *
  * Y el dato más útil que trae el QR es el **total**: es el número contra el que
  * después se valida que los renglones cargados cierren. Una factura es
@@ -34,149 +35,31 @@
  * histórico de la presentación.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Post, Put, Query, Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { createHash } from 'crypto';
 import {
-  ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested,
   Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
-import { Permiso } from '../auth/auth.decoradores';
+import { and, asc, desc, eq, getTableColumns, inArray, ne, sql } from 'drizzle-orm';
+import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { esJefe } from '../auth/auth.guard';
 import { mimeReal, nombreSeguro } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  comprobantes, configuracion, facturaArchivos, facturaLecturas, productoProveedores, productos,
-  proveedorArticulos, proveedores, sucursales, usuarios,
+  comprobantes, configuracion, facturaArchivos, facturaLecturas, proveedores, sucursales, usuarios,
 } from '../db/schema';
-import { clave } from './extraccion';
-
-/* ============================================================================
- * LO QUE LEYÓ EL NAVEGADOR (28/9/2026)
- * ============================================================================
- * El PDF ya no se lee acá: lo lee la computadora de quien procesa la factura
- * (pdf.js + la receta del formato del proveedor) y manda solo el resultado.
- * Este servidor atiende las cajas; leer un PDF grande las frenaba. Acá queda
- * lo liviano: reconocer los productos contra la base. Todo se valida con
- * topes, porque viene del navegador.
- * ==========================================================================*/
-
-class RenglonLeidoDto {
-  @IsString() @MaxLength(40) codigo!: string;
-  @IsString() @MaxLength(300) descripcion!: string;
-  @IsNumber() @Min(0) cantidad!: number;
-  @IsOptional() @IsNumber() precioUnit?: number | null;
-  @IsOptional() @IsString() @MaxLength(12) unidad?: string;
-  @IsNumber() @Min(0) dto!: number;
-  @IsNumber() importe!: number;
-}
-class PercepcionLeidaDto {
-  @IsString() @MaxLength(120) nombre!: string;
-  @IsOptional() @IsNumber() alicuota?: number | null;
-  @IsNumber() importe!: number;
-}
-class PieLeidoDto {
-  @IsOptional() @IsNumber() bruto?: number | null;
-  @IsOptional() @IsNumber() bonifPct?: number | null;
-  @IsOptional() @IsNumber() bonifImporte?: number | null;
-  @IsOptional() @IsNumber() neto?: number | null;
-  @IsOptional() @IsNumber() ivaAlicuota?: number | null;
-  @IsOptional() @IsNumber() ivaImporte?: number | null;
-  @IsArray() @ArrayMaxSize(20) @ValidateNested({ each: true }) @Type(() => PercepcionLeidaDto) percepciones!: PercepcionLeidaDto[];
-  @IsOptional() @IsNumber() total?: number | null;
-}
-class EncabezadoLeidoDto {
-  @IsOptional() @IsInt() tipoArca?: number | null;
-  @IsOptional() @IsString() @MaxLength(8) puntoVenta?: string | null;
-  @IsOptional() @IsInt() @Max(99_999_999, { message: 'El número del comprobante tiene hasta 8 cifras, sin el punto de venta.' }) numero?: number | null;
-  @IsOptional() @IsString() @MaxLength(10) fecha?: string | null;
-  @IsOptional() @IsString() @MaxLength(20) cae?: string | null;
-  @IsOptional() @IsString() @MaxLength(10) vencimiento?: string | null;
-}
-class EmparejarDto {
-  @IsString() @MaxLength(80) receta!: string;
-  @ValidateNested() @Type(() => EncabezadoLeidoDto) encabezado!: EncabezadoLeidoDto;
-  @IsArray() @ArrayMaxSize(1000) @ValidateNested({ each: true }) @Type(() => RenglonLeidoDto) renglones!: RenglonLeidoDto[];
-  @ValidateNested() @Type(() => PieLeidoDto) pie!: PieLeidoDto;
-  @IsOptional() @IsArray() @ArrayMaxSize(30) @IsString({ each: true }) @MaxLength(400, { each: true }) avisos?: string[];
-}
-/**
- * La estructura del asistente: por cada dato, el rango X de su columna en la
- * hoja. Se valida entera acá — viene del navegador — y es chica a propósito.
- */
-const ROLES_PLANTILLA = ['codigo', 'descripcion', 'cantidad', 'unidad', 'precio', 'dto', 'importe'];
-function validarPlantilla(p: any) {
-  if (!p || typeof p !== 'object' || Array.isArray(p) || p.v !== 1) throw new BadRequestException('Estructura inválida.');
-  const cols = p.columnas;
-  if (!cols || typeof cols !== 'object' || Array.isArray(cols)) throw new BadRequestException('Estructura sin columnas.');
-  const columnas: Record<string, [number, number]> = {};
-  for (const [rol, rango] of Object.entries(cols)) {
-    if (!ROLES_PLANTILLA.includes(rol)) throw new BadRequestException(`Columna desconocida: ${rol}.`);
-    const [a, b] = Array.isArray(rango) ? rango : [];
-    if (!Number.isFinite(a) || !Number.isFinite(b) || a >= b || a < -50 || b > 3000) {
-      throw new BadRequestException(`La columna ${rol} tiene una posición inválida.`);
-    }
-    columnas[rol] = [Math.round(a * 10) / 10, Math.round(b * 10) / 10];
-  }
-  for (const r of ['descripcion', 'cantidad', 'importe']) {
-    if (!columnas[r]) throw new BadRequestException('La estructura necesita al menos descripción, cantidad e importe.');
-  }
-  return { v: 1, columnas, codigoAbajo: p.codigoAbajo === true };
-}
-class PlantillaProveedorDto {
-  // Declarada (el ValidationPipe descarta lo que no lo está); su forma la valida `validarPlantilla`.
-  @IsObject() plantilla!: any;
-}
-
-class FormatoProveedorDto {
-  /** Id de un formato del navegador ('tango-bavosi'); vacío = sin estructura. */
-  @IsString() @MaxLength(40) formato!: string;
-}
+import { TIPOS_ARCA, fechaDeTexto, normalizarPuntoVenta, soloDigitos } from './comun';
+import { FacturasIaService } from './ia/ia.service';
 
 /* ============================================================================
  * EL QR DE LA FACTURA (RG 4892)
  * ==========================================================================*/
 
-/**
- * Códigos de comprobante de ARCA → (tipo, letra) del sistema.
- *
- * Solo están los que emite un PROVEEDOR de mercadería. Los códigos 20x son la
- * **Factura de Crédito Electrónica MiPyME**, que muchos proveedores ya emiten
- * por defecto: sin mapearlas, una buena parte de las facturas reales caería en
- * "tipo desconocido".
- *
- * La letra **M** (51/52/53) no existe en el sistema: se mapea a A porque
- * discrimina IVA igual que una A, y queda anotado en las observaciones.
- */
-const TIPOS_ARCA: Record<number, { tipo: 'factura' | 'nota_credito' | 'nota_debito'; letra: 'A' | 'B' | 'C'; nota?: string }> = {
-  1: { tipo: 'factura', letra: 'A' },
-  2: { tipo: 'nota_debito', letra: 'A' },
-  3: { tipo: 'nota_credito', letra: 'A' },
-  6: { tipo: 'factura', letra: 'B' },
-  7: { tipo: 'nota_debito', letra: 'B' },
-  8: { tipo: 'nota_credito', letra: 'B' },
-  11: { tipo: 'factura', letra: 'C' },
-  12: { tipo: 'nota_debito', letra: 'C' },
-  13: { tipo: 'nota_credito', letra: 'C' },
-  51: { tipo: 'factura', letra: 'A', nota: 'Factura M (se cargó como A: discrimina IVA igual).' },
-  52: { tipo: 'nota_debito', letra: 'A', nota: 'Nota de débito M (se cargó como A).' },
-  53: { tipo: 'nota_credito', letra: 'A', nota: 'Nota de crédito M (se cargó como A).' },
-  81: { tipo: 'factura', letra: 'A', nota: 'Tique factura A.' },
-  82: { tipo: 'factura', letra: 'B', nota: 'Tique factura B.' },
-  83: { tipo: 'factura', letra: 'B', nota: 'Tique.' },
-  201: { tipo: 'factura', letra: 'A', nota: 'Factura de Crédito Electrónica MiPyME.' },
-  202: { tipo: 'nota_debito', letra: 'A', nota: 'ND de Crédito Electrónica MiPyME.' },
-  203: { tipo: 'nota_credito', letra: 'A', nota: 'NC de Crédito Electrónica MiPyME.' },
-  206: { tipo: 'factura', letra: 'B', nota: 'Factura de Crédito Electrónica MiPyME.' },
-  207: { tipo: 'nota_debito', letra: 'B', nota: 'ND de Crédito Electrónica MiPyME.' },
-  208: { tipo: 'nota_credito', letra: 'B', nota: 'NC de Crédito Electrónica MiPyME.' },
-  211: { tipo: 'factura', letra: 'C', nota: 'Factura de Crédito Electrónica MiPyME.' },
-  212: { tipo: 'nota_debito', letra: 'C', nota: 'ND de Crédito Electrónica MiPyME.' },
-  213: { tipo: 'nota_credito', letra: 'C', nota: 'NC de Crédito Electrónica MiPyME.' },
-};
 
 export type QrFactura = {
   cuit: string;
@@ -193,23 +76,8 @@ export type QrFactura = {
   nota: string;
 };
 
-const soloDigitos = (v: any) => String(v ?? '').replace(/\D/g, '');
 
-const r2 = (n: number) => Math.round(n * 100) / 100;
 
-/**
- * PUNTO DE VENTA, SIEMPRE IGUAL — cuatro dígitos.
- *
- * No es cosmético: el índice único de comprobantes compara `punto_venta` como
- * TEXTO. El papel imprime cinco dígitos ("00115"), el sistema usa cuatro
- * ("0001") y el QR trae el número pelado (115). Sin normalizar, la misma factura
- * cargada a mano desde el papel y la que entra por la bandeja quedaban como dos
- * puntos de venta distintos — y el control de duplicados no las cruzaba.
- */
-export const normalizarPuntoVenta = (v: any) => {
-  const d = soloDigitos(v).replace(/^0+/, '');
-  return (d || '1').padStart(4, '0');
-};
 
 /**
  * Interpreta el texto de un QR de factura. Acepta la URL completa
@@ -330,19 +198,24 @@ class VincularDto {
   @IsInt() comprobanteId!: number;
 }
 
+class IaConfigDto {
+  @IsOptional() @IsNumber() @Min(0) @Max(1000) topeMensualUsd?: number;
+  @IsOptional() @IsBoolean() leerAlSubir?: boolean;
+}
+
+class EncolarDto {
+  /** Las facturas a leer; vacío = todas las pendientes sin leer. */
+  @IsOptional() @IsArray() @ArrayMaxSize(500) @IsInt({ each: true }) ids?: number[];
+}
+
 /* ============================================================================
  * SERVICIO
  * ==========================================================================*/
 
-/** 'AAAA-MM-DD' → Date local. Sin la hora, la fecha se corre un día para atrás. */
-const fechaDeTexto = (f?: string | null) => {
-  const t = String(f || '').slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(t) ? new Date(`${t}T00:00:00`) : null;
-};
 
 @Injectable()
 export class FacturasService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(@Inject(DRIZZLE) private readonly db: Database, private readonly ia: FacturasIaService) {}
 
   /** El CUIT de la empresa, para poder avisar "esta factura no es nuestra". */
   private async cuitPropio(): Promise<string> {
@@ -450,6 +323,8 @@ export class FacturasService {
       return l.id;
     });
 
+    // A leer con la IA, en segundo plano (si está configurada y encendida).
+    await this.ia.alSubir(id);
     return this.get(id);
   }
 
@@ -470,6 +345,7 @@ export class FacturasService {
 
     const a = this.decodificar(dto);
     await this.db.insert(facturaArchivos).values({ lecturaId, ...a });
+    await this.ia.invalidar(lecturaId); // otra página: lo leído ya no es la factura entera
     return this.get(lecturaId);
   }
 
@@ -500,6 +376,7 @@ export class FacturasService {
       throw new BadRequestException('Es la única página: descartá la factura entera si no sirve.');
     }
     await this.db.delete(facturaArchivos).where(eq(facturaArchivos.id, id));
+    await this.ia.invalidar(a.lecturaId);
     return this.get(a.lecturaId);
   }
 
@@ -519,7 +396,8 @@ export class FacturasService {
     if (!l.tipo) rojos.push('Falta el tipo de comprobante.');
     if (!l.numero) rojos.push('Falta el número.');
     if (!l.sucursalId) rojos.push('Falta la sucursal que recibió la mercadería.');
-    if (!l.leido) amarillos.push('No se pudo leer el QR: el encabezado se carga a mano.');
+    /* Sin QR, el encabezado lo completa la IA al leerla (0153): solo se avisa mientras no lo hizo. */
+    if (!l.leido && l.iaEstado !== 'lista') amarillos.push('No se pudo leer el QR: el encabezado sale de lo que lea la IA (o se carga a mano).');
     if (l.moneda && l.moneda !== 'PES') amarillos.push('La factura no está en pesos.');
     if (!(Number(l.total) > 0)) amarillos.push('Sin el total del papel no se puede validar que los renglones cierren.');
     /* Volvió a la bandeja porque se anuló su comprobante, y el papel se había
@@ -543,8 +421,15 @@ export class FacturasService {
     const estado = o.estado && ['pendiente', 'cargada', 'descartada'].includes(o.estado)
       ? (o.estado as 'pendiente' | 'cargada' | 'descartada') : null;
 
+    const { ia: _ia, ...columnas } = getTableColumns(facturaLecturas);
     const filas = await this.db.select({
-      l: facturaLecturas,
+      l: columnas,
+      /* De la lectura con IA viaja solo el resumen: el detalle lo pide el alta. */
+      iaResumen: sql<any>`case when ${facturaLecturas.ia} is null then null else jsonb_build_object(
+        'cierra', ${facturaLecturas.ia}->'control'->'cierra', 'costoUsd', ${facturaLecturas.ia}->'costoUsd',
+        'modelo', ${facturaLecturas.ia}->'modelo', 'error', ${facturaLecturas.ia}->'error',
+        'renglones', jsonb_array_length(coalesce(${facturaLecturas.ia}->'renglones', '[]'::jsonb)),
+        'problemas', ${facturaLecturas.ia}->'control'->'problemas') end`,
       proveedorNombre: proveedores.nombre,
       sucursalNombre: sucursales.nombre,
       usuarioNombre: usuarios.nombre,
@@ -578,6 +463,7 @@ export class FacturasService {
 
     return filas.map((f: any) => ({
       ...f.l,
+      iaResumen: f.iaResumen ?? null,
       proveedorNombre: f.proveedorNombre ?? '',
       sucursalNombre: f.sucursalNombre ?? '',
       usuarioNombre: f.usuarioNombre ?? '',
@@ -611,10 +497,8 @@ export class FacturasService {
       }).from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id)),
 
       l.proveedorId
-        ? this.db.select({
-          nombre: proveedores.nombre, formatoFactura: proveedores.formatoFactura, plantillaFactura: proveedores.plantillaFactura,
-        }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
-        : Promise.resolve([] as Array<{ nombre: string; formatoFactura: string; plantillaFactura: any }>),
+        ? this.db.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, l.proveedorId)).limit(1)
+        : Promise.resolve([] as Array<{ nombre: string }>),
 
       l.proveedorId && l.numero && l.tipo
         ? this.db.select({ id: comprobantes.id }).from(comprobantes).where(and(
@@ -632,9 +516,6 @@ export class FacturasService {
     return {
       ...l,
       proveedorNombre: prov?.nombre ?? '',
-      /* Con qué receta la lee el navegador (0117): viaja acá para no pedirla aparte. */
-      formatoFactura: prov?.formatoFactura ?? '',
-      plantillaFactura: prov?.plantillaFactura ?? null,
       archivos,
       duplicadoDe: dup?.id ?? null,
       ...this.semaforo(l, { comprobanteId: dup?.id ?? null, otraLectura: null }, archivos.length),
@@ -766,231 +647,6 @@ export class FacturasService {
   }
 
   /* ====================================================================
-   * LECTURA DE RENGLONES desde el PDF digital
-   * ====================================================================
-   * La etapa que estaba EN ESPERA, resuelta para el caso barato: si el papel
-   * es un PDF con capa de texto (factura electrónica mandada por mail), los
-   * renglones se LEEN — no se interpretan — y acá se convierten en una
-   * propuesta para el alta. Todo local: el archivo ya vive en la base y no
-   * sale del sistema. Las fotos siguen siendo la etapa de visión (ficha en
-   * /info), que ahora solo tiene sentido para ellas.
-   */
-
-  /**
-   * ¿Qué producto del catálogo es "AVENA INSTANT FWP CUM10x400g"?
-   *
-   * Puntaje por tokens del NOMBRE DEL PRODUCTO (que está limpio) buscados en la
-   * descripción del papel (que viene rota: "AJ O GRANULADO"). Por eso se compara
-   * con `clave()` — sin espacios — y no palabra por palabra: los espacios del
-   * PDF no son confiables. Un token cuenta si aparece entero o por su prefijo
-   * (INSTANTANEA se encuentra en INSTANT). Empate en el puntaje = no se elige:
-   * mejor un renglón sin producto que un producto equivocado.
-   */
-  private matchearProducto(
-    descripcion: string,
-    catalogo: Array<{ id: number; nombre: string; iva: number; porBulto: number }>,
-  ) {
-    const desc = clave(descripcion);
-    if (!desc) return null;
-    let mejor: (typeof catalogo)[number] | null = null;
-    let mejorScore = 0;
-    let empate = false;
-    for (const p of catalogo) {
-      const toks = String(p.nombre).split(/\s+/).map(clave).filter((t) => t.length >= 3);
-      if (!toks.length) continue;
-      let hits = 0;
-      for (const t of toks) {
-        if (desc.includes(t) || (t.length > 4 && desc.includes(t.slice(0, 4)))) hits++;
-      }
-      const score = hits / toks.length;
-      if (score > mejorScore) { mejor = p; mejorScore = score; empate = false; }
-      else if (score === mejorScore && mejor && score > 0 && p.id !== mejor.id) empate = true;
-    }
-    if (!mejor || mejorScore < 0.6 || empate) return null;
-    return { ...mejor, confianza: r2(mejorScore * 100) / 100 };
-  }
-
-  /**
-   * LA PROPUESTA DE CARGA a partir de lo que leyó el navegador: encabezado
-   * mapeado, renglones con su producto reconocido, y si el total cierra con el
-   * del QR. NO escribe nada — el alta la usa para precargar y la persona
-   * confirma.
-   */
-  async emparejar(id: number, leida: EmparejarDto) {
-    const [l] = await this.db.select().from(facturaLecturas).where(eq(facturaLecturas.id, id)).limit(1);
-    if (!l) throw new NotFoundException('Esa factura no existe en la bandeja.');
-    const avisos = [...(leida.avisos ?? [])];
-
-    /* El encabezado del papel, mapeado al vocabulario del sistema. */
-    const mapeo = leida.encabezado.tipoArca != null ? TIPOS_ARCA[leida.encabezado.tipoArca] : undefined;
-    const encabezado = {
-      tipo: mapeo?.tipo ?? null,
-      letra: mapeo?.letra ?? null,
-      puntoVenta: leida.encabezado.puntoVenta ? normalizarPuntoVenta(leida.encabezado.puntoVenta) : null,
-      numero: leida.encabezado.numero ?? null,
-      fecha: leida.encabezado.fecha ?? null,
-      cae: leida.encabezado.cae ?? null,
-      vencimiento: leida.encabezado.vencimiento ?? null,
-    };
-
-    /*
-     * Matcheo contra el catálogo DEL PROVEEDOR (ahí están los nombres limpios) y
-     * contra lo APRENDIDO de facturas anteriores. Las dos consultas son
-     * independientes: van juntas.
-     *
-     * TRES NIVELES para reconocer el producto, del más confiable al menos:
-     *   1. `aprendido` — el mapeo (proveedor, código del papel) → producto que
-     *      quedó guardado la última vez que una persona CONFIRMÓ una factura.
-     *   2. `catalogo` — el código de proveedor cargado en el formato de compra.
-     *      Vino del sistema viejo y tiene corrimientos, por eso no alcanza solo.
-     *   3. `parecido` — similitud de nombres. Solo para el arranque en frío:
-     *      en cuanto la factura se guarda, el renglón pasa al nivel 1.
-     */
-    const [catalogo, aprendidos] = l.proveedorId
-      ? await Promise.all([
-        this.db.select({
-          id: productos.id, nombre: productos.nombre, iva: productos.iva,
-          porBulto: productoProveedores.cantidad,
-          codigoProveedor: productoProveedores.codigoProveedor,
-        }).from(productoProveedores)
-          .innerJoin(productos, eq(productos.id, productoProveedores.productoId))
-          .where(eq(productoProveedores.proveedorId, l.proveedorId)),
-        this.db.select({
-          codigo: proveedorArticulos.codigo, productoId: proveedorArticulos.productoId,
-          nombre: productos.nombre, iva: productos.iva,
-        }).from(proveedorArticulos)
-          .innerJoin(productos, eq(productos.id, proveedorArticulos.productoId))
-          .where(eq(proveedorArticulos.proveedorId, l.proveedorId)),
-      ])
-      : [[], []];
-    if (!catalogo.length) avisos.push('La lectura no tiene proveedor asignado (o el proveedor no tiene catálogo): los renglones van sin producto.');
-    const porAprendido = new Map(aprendidos.map((a) => [a.codigo, a]));
-    const porCatalogo = new Map<string, (typeof catalogo)[number]>();
-    for (const p of catalogo) {
-      const cod = String(p.codigoProveedor || '').trim();
-      if (cod && !porCatalogo.has(cod)) porCatalogo.set(cod, p);
-    }
-
-    const ivaFactura = leida.pie?.ivaAlicuota ?? 21;
-    const renglones = leida.renglones.map((ren) => {
-      let productoId: number | null = null;
-      let productoNombre: string | null = null;
-      let porBulto: number | null = null;
-      let confianza: number | null = null;
-      let fuente: 'aprendido' | 'catalogo' | 'parecido' | null = null;
-
-      const ap = porAprendido.get(ren.codigo);
-      const cat = porCatalogo.get(ren.codigo);
-      if (ap) {
-        productoId = ap.productoId;
-        productoNombre = ap.nombre;
-        // El formato de compra, si existe, aporta el tamaño del bulto.
-        porBulto = catalogo.find((c) => c.id === ap.productoId)?.porBulto ?? null;
-        confianza = 1;
-        fuente = 'aprendido';
-      } else if (cat) {
-        productoId = cat.id;
-        productoNombre = cat.nombre;
-        porBulto = cat.porBulto;
-        confianza = 1;
-        fuente = 'catalogo';
-      } else {
-        const m = this.matchearProducto(ren.descripcion, catalogo);
-        if (m) {
-          productoId = m.id;
-          productoNombre = m.nombre;
-          porBulto = m.porBulto;
-          confianza = m.confianza;
-          fuente = 'parecido';
-        }
-      }
-
-      /*
-       * El costo del bulto se deriva DEL IMPORTE, no del precio impreso:
-       * importe = cantidad × costoBulto × (1 − dto). Despejado así, la suma
-       * del alta cierra con el papel aunque el catálogo tenga otro precio.
-       */
-      const costoBulto = ren.cantidad > 0 && ren.dto < 100
-        ? r2(ren.importe / (ren.cantidad * (1 - ren.dto / 100)))
-        : null;
-      return { ...ren, iva: ivaFactura, costoBulto, productoId, productoNombre, porBulto, confianza, fuente };
-    });
-    const sinProducto = renglones.filter((x) => !x.productoId).length;
-    if (sinProducto) {
-      avisos.push(`${sinProducto} ${sinProducto === 1 ? 'renglón' : 'renglones'} sin producto reconocido: se agregan a mano (pueden ser artículos nuevos del proveedor).`);
-    }
-
-    /* El checksum de siempre: el total reconstruido contra el de la lectura. */
-    const totalPapel = leida.pie?.total ?? null;
-    const cierra = Number(l.total) > 0 && totalPapel != null
-      && Math.abs(totalPapel - Number(l.total)) <= 0.05;
-    if (Number(l.total) > 0 && totalPapel != null && !cierra) {
-      avisos.push(`El total leído del PDF (${totalPapel.toFixed(2)}) no coincide con el total de la lectura (${Number(l.total).toFixed(2)}).`);
-    }
-
-    return { receta: leida.receta, cierra, encabezado, renglones, pie: leida.pie, avisos };
-  }
-
-  /* ====================================================================
-   * PROVEEDORES: la guía de cuáles ya tienen estructura (28/9/2026)
-   * ==================================================================== */
-
-  /**
-   * Una fila por proveedor de mercadería: su formato de lectura, cuántas
-   * facturas esperan, cuántas se cargaron, cuándo fue la última y cuántos
-   * artículos suyos ya se reconocen solos. Todo en UNA consulta.
-   */
-  async resumenProveedores() {
-    const r = await this.db.execute(sql`
-      SELECT p.id, p.nombre, p.cuit, p.formato_factura AS formato,
-        (p.plantilla_factura IS NOT NULL) AS "tienePlantilla",
-        p.plantilla_factura AS plantilla,
-        coalesce(l.pendientes, 0)::int AS pendientes,
-        coalesce(l.cargadas, 0)::int AS cargadas,
-        to_json(l.ultima) #>> '{}' AS ultima,
-        coalesce(a.aprendidos, 0)::int AS aprendidos
-      FROM proveedores p
-      LEFT JOIN (
-        SELECT proveedor_id,
-          count(*) FILTER (WHERE estado = 'pendiente') AS pendientes,
-          count(*) FILTER (WHERE estado = 'cargada') AS cargadas,
-          max(subido_en) AS ultima
-        FROM factura_lecturas WHERE proveedor_id IS NOT NULL GROUP BY proveedor_id
-      ) l ON l.proveedor_id = p.id
-      LEFT JOIN (
-        SELECT proveedor_id, count(*) AS aprendidos FROM proveedor_articulos GROUP BY proveedor_id
-      ) a ON a.proveedor_id = p.id
-      WHERE p.provee_mercaderia
-      ORDER BY p.nombre
-    `);
-    return r.rows;
-  }
-
-  async setFormato(proveedorId: number, dto: FormatoProveedorDto) {
-    const formato = dto.formato.trim();
-    if (formato && !/^[a-z0-9-]{1,40}$/.test(formato)) throw new BadRequestException('Formato inválido.');
-    const [p] = await this.db.update(proveedores).set({ formatoFactura: formato })
-      .where(eq(proveedores.id, proveedorId))
-      .returning({ id: proveedores.id, formatoFactura: proveedores.formatoFactura });
-    if (!p) throw new NotFoundException('Ese proveedor no existe.');
-    return p;
-  }
-
-  /**
-   * Guarda la ESTRUCTURA PROPIA que armó el asistente y la deja en uso: desde
-   * ahora las facturas de este proveedor se leen con sus columnas.
-   */
-  async setPlantilla(proveedorId: number, dto: PlantillaProveedorDto) {
-    if (JSON.stringify(dto?.plantilla ?? null).length > 4000) throw new BadRequestException('Estructura demasiado grande.');
-    const plantilla = validarPlantilla(dto?.plantilla);
-    const [p] = await this.db.update(proveedores).set({ plantillaFactura: plantilla, formatoFactura: 'plantilla' })
-      .where(eq(proveedores.id, proveedorId))
-      .returning({ id: proveedores.id, formatoFactura: proveedores.formatoFactura, plantillaFactura: proveedores.plantillaFactura });
-    if (!p) throw new NotFoundException('Ese proveedor no existe.');
-    return p;
-  }
-
-  /* ====================================================================
    * EL PAPEL NO SE GUARDA UNA VEZ CARGADO (28/9/2026, pedido del dueño)
    * ====================================================================
    * La factura ya queda en el sistema como comprobante: guardar además el
@@ -1047,7 +703,7 @@ export class FacturasService {
 @Controller('facturas')
 @Permiso('compras.lecturas')
 export class FacturasController {
-  constructor(private readonly svc: FacturasService) {}
+  constructor(private readonly svc: FacturasService, private readonly ia: FacturasIaService) {}
 
   @Get('lecturas') list(@Query('estado') estado?: string, @Query('limit') limit?: string) {
     return this.svc.list({ estado, limit: limit ? Number(limit) : undefined });
@@ -1071,23 +727,24 @@ export class FacturasController {
     return this.svc.get(id);
   }
 
-  /** Lo que leyó el navegador del PDF, con los productos reconocidos. Solo lee. */
-  @Post('lecturas/:id/emparejar') emparejar(@Param('id', ParseIntPipe) id: number, @Body() dto: EmparejarDto) {
-    return this.svc.emparejar(id, dto);
-  }
+  /* ---------------- LA LECTURA CON IA (0153): solo superadmin y admin ---------------- */
 
-  /** La guía: cada proveedor con su formato de lectura y cuánto se procesó. */
-  @Get('proveedores') proveedores() {
-    return this.svc.resumenProveedores();
+  @Get('ia/estado') iaEstado(@Auth() s: Sesion) { soloJefe(s); return this.ia.estado(); }
+  @Put('ia/config') iaConfig(@Auth() s: Sesion, @Body() dto: IaConfigDto) { soloJefe(s); return this.ia.guardarConfig(dto); }
+  /** Leer (o volver a leer) estas facturas; sin ids, todas las pendientes sin leer. */
+  @Post('ia/leer') iaLeer(@Auth() s: Sesion, @Body() dto: EncolarDto) {
+    soloJefe(s);
+    return dto.ids?.length ? this.ia.encolar(dto.ids) : this.ia.encolarPendientes();
   }
-
-  @Put('proveedores/:id/formato') formato(@Param('id', ParseIntPipe) id: number, @Body() dto: FormatoProveedorDto) {
-    return this.svc.setFormato(id, dto);
+  /** Lo que el alta precarga: renglones con su producto, candidatos y sugerencias. */
+  @Get('lecturas/:id/propuesta') iaPropuesta(@Auth() s: Sesion, @Param('id', ParseIntPipe) id: number) {
+    soloJefe(s);
+    return this.ia.propuesta(id);
   }
-
-  /** La estructura propia que armó el asistente. */
-  @Put('proveedores/:id/plantilla') plantilla(@Param('id', ParseIntPipe) id: number, @Body() dto: PlantillaProveedorDto) {
-    return this.svc.setPlantilla(id, dto);
+  /** Que la IA elija entre los candidatos de los renglones sin producto (queda como sugerencia). */
+  @Post('lecturas/:id/elegir') iaElegir(@Auth() s: Sesion, @Param('id', ParseIntPipe) id: number) {
+    soloJefe(s);
+    return this.ia.elegir(id, s.usuarioId);
   }
 
   /** Cuánto ocupan todavía los papeles de facturas ya cargadas, y liberarlo. */
@@ -1128,9 +785,14 @@ export class FacturasController {
   }
 }
 
+/** La IA gasta plata: además de la bandeja, solo superadmin y admin (decisión del dueño). */
+function soloJefe(s: Sesion) {
+  if (!esJefe(s)) throw new ForbiddenException('La lectura con IA es solo para el superadmin y el admin.');
+}
+
 @Module({
   controllers: [FacturasController],
-  providers: [FacturasService],
+  providers: [FacturasService, FacturasIaService],
   exports: [FacturasService],
 })
 export class FacturasModule {}

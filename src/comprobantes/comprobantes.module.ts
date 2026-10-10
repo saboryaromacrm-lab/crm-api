@@ -23,7 +23,7 @@ import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { etiquetaDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ajustePorAnulacion, fechaDeCuenta } from '../cafeteria/cuenta';
-import { normalizarPuntoVenta } from '../facturas/facturas.module';
+import { normalizarPuntoVenta } from '../facturas/comun';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { costosFormato } from '../inventario/pricing';
