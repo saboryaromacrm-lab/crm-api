@@ -52,6 +52,21 @@ test('limpiar: letra M, remito sin letra, fecha inválida, no comprobante', () =
   assert.equal(limpiar({ esComprobante: false, encabezado: { tipo: 'otro' }, renglones: [], pie: {} }).esComprobante, false);
 });
 
+test('limpiar: papel interno = liquidación (X), y la empresa nunca queda de emisor', () => {
+  const liq = limpiar({ encabezado: { tipo: 'liquidacion', letra: 'A' }, renglones: [], pie: {} });
+  assert.deepEqual([liq.encabezado.tipo, liq.encabezado.letra], ['liquidacion', 'X'], 'liquidación: letra X siempre');
+  const interna = limpiar({ encabezado: { tipo: 'factura', letra: '', cae: '' }, renglones: [], pie: {} });
+  assert.deepEqual([interna.encabezado.tipo, interna.encabezado.letra], ['liquidacion', 'X'], '«Factura interna» sin CAE ni letra');
+  assert.match(interna.nota, /liquidación/);
+  const sinCaeConLetra = limpiar({ encabezado: { tipo: 'factura', letra: 'A', cae: '' }, renglones: [], pie: {} });
+  assert.equal(sinCaeConLetra.encabezado.tipo, 'factura', 'con letra fiscal sigue siendo factura (el CAE puede no leerse)');
+  const conArca = limpiar({ encabezado: { tipo: 'factura', letra: '', codigoArca: 1, cae: '' }, renglones: [], pie: {} });
+  assert.deepEqual([conArca.encabezado.tipo, conArca.encabezado.letra], ['factura', 'A'], 'el código de ARCA manda');
+  const propia = limpiar({ encabezado: { tipo: 'liquidacion', cuitEmisor: '20-12345678-6', razonSocialEmisor: 'NOSOTROS' }, renglones: [], pie: {} }, '20123456786');
+  assert.deepEqual([propia.encabezado.cuitEmisor, propia.encabezado.razonSocialEmisor], ['', ''], 'la empresa no es el proveedor');
+  assert.equal(limpiar({ encabezado: { cuitEmisor: '30711111119' }, renglones: [], pie: {} }, '20123456786').encabezado.cuitEmisor, '30711111119');
+});
+
 test('el renglón: cantidad × precio × (1 − descuentos) = importe', () => {
   assert.equal(renglonCierra(renglon()), true);
   assert.equal(renglonCierra(renglon({ descuentos: [10, 5], importe: 8550 })), true);

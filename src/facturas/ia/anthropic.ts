@@ -64,7 +64,13 @@ export async function llamarIa(o: {
     });
   } catch (e) {
     const t = /timeout|abort/i.test(String((e as Error)?.name) + String((e as Error)?.message));
-    throw new ErrorIa(t ? 'La IA tardó demasiado en contestar: se reintenta en un rato.' : 'No se pudo conectar con la IA (¿sin internet en el servidor?).', 0, true);
+    /* El motivo técnico va al final: "fetch failed" solo no dice si fue la red,
+     * el certificado o un proxy. */
+    const causa: any = (e as any)?.cause ?? e;
+    const motivo = String(causa?.code || causa?.message || '').slice(0, 120);
+    throw new ErrorIa(t
+      ? 'La IA tardó demasiado en contestar: se reintenta en un rato.'
+      : `No se pudo conectar con la IA (¿sin internet en el servidor?)${motivo ? ` [${motivo}]` : ''}.`, 0, true);
   }
   const texto = await res.text();
   let cuerpo: any = null;

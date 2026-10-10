@@ -199,11 +199,11 @@ export class FacturasIaService implements OnModuleInit {
     return { nombre: String(v.razonSocial || v.nombre || ''), cuit: soloDigitos(v.cuit) };
   }
 
-  private async intento(modelo: string, contenido: any[], lecturaId: number, totalQr: number) {
+  private async intento(modelo: string, contenido: any[], lecturaId: number, totalQr: number, propio: string) {
     try {
       const r = await llamarIa({ modelo, sistema: SISTEMA, contenido, esquema: ESQUEMA, maxTokens: MAX_TOKENS_LECTURA });
       const costo = await this.registrar({ lecturaId, tarea: 'leer', modelo, uso: r.uso, ok: true });
-      const leida = limpiar(r.json);
+      const leida = limpiar(r.json, propio);
       return { modelo, costo, uso: r.uso, leida, control: controlar(leida, totalQr), error: null as string | null };
     } catch (e) {
       const err = e as ErrorIa & { uso?: Uso };
@@ -231,15 +231,16 @@ export class FacturasIaService implements OnModuleInit {
       .from(facturaArchivos).where(eq(facturaArchivos.lecturaId, id)).orderBy(asc(facturaArchivos.id));
     if (!archivos.length) { await fin('error', { error: 'La factura no tiene páginas para leer.' }); return; }
 
-    const contenido = contenidoDe(archivos, await this.receptor());
+    const receptor = await this.receptor();
+    const contenido = contenidoDe(archivos, receptor);
     const totalQr = l.leido ? Number(l.total) || 0 : 0;
     const intentos: any[] = [];
-    let elegida = await this.intento(IA.modeloRapido, contenido, id, totalQr);
+    let elegida = await this.intento(IA.modeloRapido, contenido, id, totalQr, receptor.cuit);
     intentos.push(elegida);
     /* Si no cierra (o falló), el modelo fuerte. Salvo que el problema sea la clave o el saldo: ahí falla igual. */
     const fatal = !!elegida.error && /clave|saldo|configurada/i.test(elegida.error);
     if (!elegida.control?.cierra && !fatal && IA.modeloFuerte !== IA.modeloRapido && (await this.gastadoMes()).usd < cfg.topeMensualUsd) {
-      const fuerte = await this.intento(IA.modeloFuerte, contenido, id, totalQr);
+      const fuerte = await this.intento(IA.modeloFuerte, contenido, id, totalQr, receptor.cuit);
       intentos.push(fuerte);
       const peor = (x: typeof elegida) => (x.control ? x.control.problemas.length : 99);
       if (fuerte.leida && (!elegida.leida || peor(fuerte) <= peor(elegida))) elegida = fuerte;
@@ -262,19 +263,25 @@ export class FacturasIaService implements OnModuleInit {
   /**
    * Lo que el QR no dio (o no hubo QR), sale de lo leído: tipo, letra, número,
    * fecha, total, CAE y el proveedor por su CUIT. Lo que ya estaba (del QR o
-   * corregido a mano) NO se pisa.
+   * corregido a mano) NO se pisa; lo que había puesto una lectura ANTERIOR de
+   * la IA (sigue igual a lo que ella dijo) sí: «Leer de nuevo» corrige.
    */
   private async completarEncabezado(l: typeof facturaLecturas.$inferSelect, x: ReturnType<typeof limpiar>) {
     const e = x.encabezado;
+    const antes: any = l.leido ? null : l.ia;
+    const ae = antes?.encabezado ?? {};
+    /** Vacío, o todavía lo que dijo la IA la vez anterior (nadie lo tocó). */
+    const libre = (actual: unknown, previo: unknown) => !actual || (antes != null && String(actual) === String(previo ?? ''));
+    const mismoDia = (f: Date | null, previo: unknown) => !!f && fechaDeTexto(String(previo ?? ''))?.getTime() === f.getTime();
     const patch: any = {};
-    if (!l.tipo && e.tipo) patch.tipo = e.tipo;
-    if (!l.letra && e.letra) patch.letra = e.letra;
-    if (!l.puntoVenta && e.puntoVenta) patch.puntoVenta = e.puntoVenta;
-    if (!l.numero && e.numero) patch.numero = e.numero;
-    if (!l.fecha && e.fecha) patch.fecha = fechaDeTexto(e.fecha);
-    if (!(Number(l.total) > 0) && x.pie.total > 0) patch.total = x.pie.total;
-    if (!l.cae && e.cae) patch.cae = e.cae;
-    if (!l.cuit && e.cuitEmisor) patch.cuit = e.cuitEmisor;
+    if (e.tipo && e.tipo !== l.tipo && libre(l.tipo, ae.tipo)) patch.tipo = e.tipo;
+    if (e.letra && e.letra !== l.letra && libre(l.letra, ae.letra)) patch.letra = e.letra;
+    if (e.puntoVenta && libre(l.puntoVenta, ae.puntoVenta)) patch.puntoVenta = e.puntoVenta;
+    if (e.numero && libre(l.numero, ae.numero)) patch.numero = e.numero;
+    if (e.fecha && (!l.fecha || (antes != null && mismoDia(l.fecha, ae.fecha)))) patch.fecha = fechaDeTexto(e.fecha);
+    if (x.pie.total > 0 && libre(Number(l.total) > 0 ? l.total : 0, antes?.pie?.total)) patch.total = x.pie.total;
+    if (e.cae && libre(l.cae, ae.cae)) patch.cae = e.cae;
+    if (e.cuitEmisor && libre(l.cuit, ae.cuitEmisor)) patch.cuit = e.cuitEmisor;
     if (!l.moneda && e.moneda) patch.moneda = e.moneda;
     if (!l.cuitReceptor && e.cuitReceptor) patch.cuitReceptor = e.cuitReceptor;
     const notas: string[] = [];

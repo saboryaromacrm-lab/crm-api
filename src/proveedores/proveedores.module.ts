@@ -8,7 +8,7 @@ import {
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
+import { facturaLecturas, productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 
 class UpsertProveedorDto {
@@ -182,7 +182,25 @@ export class ProveedoresService {
       porcSinFactura: dto.porcSinFactura ?? (dto.condicionCompra === 'liquidacion' ? 100 : 0),
       minimoTransferencia: dto.minimoTransferencia ?? 0,
     }).returning();
+    await this.engancharFacturas(p);
     return p;
+  }
+
+  /**
+   * CUIT NUEVO → SUS FACTURAS DE LA BANDEJA (10/10/2026). Las que llegaron con
+   * ese CUIT cuando el proveedor todavía no lo tenía quedaron sin proveedor: se
+   * enganchan solas y se va la nota de «no está en el padrón».
+   */
+  private async engancharFacturas(p: { id: number; cuit: string | null }) {
+    const cuit = String(p.cuit ?? '').replace(/\D/g, '');
+    if (cuit.length !== 11) return;
+    const nota = `El CUIT ${cuit} no está en el padrón de proveedores.`;
+    await this.db.update(facturaLecturas).set({
+      proveedorId: p.id,
+      observaciones: sql`btrim(regexp_replace(replace(${facturaLecturas.observaciones}, ${nota}, ''), ' {2,}', ' ', 'g'))`,
+    }).where(and(
+      eq(facturaLecturas.estado, 'pendiente'), sql`${facturaLecturas.proveedorId} is null`, eq(facturaLecturas.cuit, cuit),
+    ));
   }
 
   async update(id: number, dto: UpsertProveedorDto, usuarioId?: number | null) {
@@ -221,6 +239,7 @@ export class ProveedoresService {
       porcSinFactura: dto.porcSinFactura ?? actual.porcSinFactura,
       minimoTransferencia: dto.minimoTransferencia ?? actual.minimoTransferencia,
     }).where(eq(proveedores.id, id)).returning();
+    if (cambiaCuit) await this.engancharFacturas(p);
 
     /* AUDITORÍA (0086): la identidad y la ficha comercial, campo por campo.
      * Se compara la FOTO legible antes/después — solo lo que cambió deja fila. */
