@@ -1504,6 +1504,25 @@ export const incidencias = pgTable('incidencias', {
   ixEstado: index('ix_incidencias_estado').on(t.estado, t.id),
 }));
 
+/**
+ * STOCK CONTROLADO (0159): por sucursal y forma, la ÚLTIMA vez que su stock
+ * quedó en lo real (control aplicado, ajuste a mano o ajuste de una venta sin
+ * stock). Una venta sin stock de algo que nunca se controló no es un hallazgo:
+ * el negativo es del número cargado, no de la góndola. Dato derivado: se va
+ * con su producto, presentación o sucursal.
+ */
+export const stockControlado = pgTable('stock_controlado', {
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'cascade' }),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /** De dónde salió, en palabras: «el control de stock «Marca X»», «un ajuste a mano». */
+  origen: text('origen').notNull().default(''),
+}, (t) => ({
+  // COALESCE porque dos NULL no chocan en un UNIQUE: la madre es UNA fila.
+  uqForma: uniqueIndex('uq_stock_controlado').on(t.sucursalId, t.productoId, sql`COALESCE(${t.presentacionId}, 0)`),
+}));
+
 /* ---------------- Facturación / comprobantes de compra ---------------- */
 /**
  * Tipos de comprobante de COMPRA.

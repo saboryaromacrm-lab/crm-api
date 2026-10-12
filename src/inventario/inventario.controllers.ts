@@ -237,6 +237,11 @@ class ResolverIncidenciaDto {
   @IsOptional() @IsNumber() @Min(0) @Max(MAX_CANT) contado?: number;
 }
 
+class CerrarAnterioresDto {
+  /** Solo las de esta sucursal; sin ella, todas. */
+  @IsOptional() @IsInt() sucursalId?: number;
+}
+
 /* ------------------------------ Lecturas ------------------------------ */
 
 @Controller('stock')
@@ -640,6 +645,18 @@ export class IncidenciasController {
       throw new ForbiddenException(`Tu rol no puede cerrar una incidencia como "${dto.resolucion}".`);
     }
     return this.inv.resolverIncidencia(id, dto.resolucion, sesion.usuarioId, soloSuSucursal(sesion), dto.contado);
+  }
+
+  /**
+   * CERRAR EN BLOQUE LAS VENTAS SIN STOCK ANTERIORES AL CONTROL (0159): las de
+   * antes de que el stock de su producto fuera real. Toca muchas a la vez, por
+   * eso es solo del superadmin. No mueve stock.
+   */
+  @Post('cerrar-anteriores')
+  @Permiso('inventario')
+  cerrarAnteriores(@Body() dto: CerrarAnterioresDto, @Auth() sesion: Sesion) {
+    if (!sesion.permisos.includes('*')) throw new ForbiddenException('Cerrar en bloque es solo del superadmin.');
+    return this.inv.cerrarSinStockAnteriores(dto.sucursalId ?? null, sesion.usuarioId);
   }
 }
 

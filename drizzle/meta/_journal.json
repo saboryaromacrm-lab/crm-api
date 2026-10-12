@@ -1114,6 +1114,13 @@
       "when": 1791610000000,
       "tag": "0158_facturas_del_mes",
       "breakpoints": true
+    },
+    {
+      "idx": 159,
+      "version": "7",
+      "when": 1791620000000,
+      "tag": "0159_stock_controlado",
+      "breakpoints": true
     }
   ]
 }

@@ -5,7 +5,7 @@ import { agruparPor, grupo } from '../common/agrupar';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
-  stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias,
+  stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias, stockControlado,
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos, enviosCafeteria, envioCafeteriaItems,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   conteos, conteoItems, ventas, clientes,
@@ -1039,7 +1039,11 @@ export class InventarioService {
       usuarioId: o.usuarioId ?? null, motivo: o.motivo || '',
       descripcion: `${meta.label} ${signo > 0 ? '+' : '−'}${this.fmtCant(prod.tipo, presId, c)}${o.motivo ? ' · ' + o.motivo : ''}`,
     });
-    return { ok: true, movimiento: m };
+    // Quien ajusta, miró la góndola: desde acá su stock cuenta como real (0159).
+    const incidenciasCerradas = o.tipo === 'ajuste'
+      ? await this.marcarControlado(tx, sucId, [{ productoId: prod.id, presentacionId: presId }], 'un ajuste a mano')
+      : 0;
+    return { ok: true, movimiento: m, incidenciasCerradas };
   }
 
   /**
@@ -1322,6 +1326,17 @@ export class InventarioService {
     disponible: number; vendido: number; faltante: number;
     ventaId: number; documento: string; usuarioId: number | null;
   }) {
+    /*
+     * SOLO CON EL STOCK CONTROLADO (0159). Si esta forma nunca pasó por un
+     * control ni un ajuste en esta sucursal, su número es el que se cargó, no
+     * el de la góndola: que no alcance no dice nada y la incidencia sería
+     * ruido. Una lectura por índice, y solo en el renglón que se fue a negativo.
+     */
+    const [controlado] = await tx.select({ x: sql`1` }).from(stockControlado).where(and(
+      eq(stockControlado.sucursalId, o.sucursalId), eq(stockControlado.productoId, o.prod.id),
+      sql`COALESCE(${stockControlado.presentacionId}, 0) = ${o.presentacionId ?? 0}`,
+    )).limit(1);
+    if (!controlado) return;
     const unidad = this.unidadDe(o.prod.tipo, o.presentacionId);
     const f = (n: number) => this.fmtCant(o.prod.tipo, o.presentacionId, n);
     const [inc] = await tx.insert(incidencias).values({
@@ -1347,6 +1362,79 @@ export class InventarioService {
     await tx.update(incidencias)
       .set({ codigo: `INC${String(inc.id).padStart(4, '0')}` })
       .where(eq(incidencias.id, inc.id));
+  }
+
+  /**
+   * EL STOCK DE ESTAS FORMAS QUEDÓ EN LO REAL (0159): un control aplicado, un
+   * ajuste a mano o el ajuste de una venta sin stock.
+   *
+   *   · Lo anota en `stock_controlado` (la fecha de su último control).
+   *   · Cierra las ventas sin stock ABIERTAS de esas formas en esa sucursal:
+   *     son de antes de este control, y el stock ya quedó en lo que hay en la
+   *     góndola — dejarlas abiertas sería pedir que se cuente otra vez lo que
+   *     se acaba de contar. Sin tocar el stock.
+   *
+   * Dos sentencias para cualquier cantidad de formas. Devuelve cuántas cerró.
+   */
+  private async marcarControlado(
+    tx: any, sucursalId: number, formas: { productoId: number; presentacionId: number | null }[], origen: string,
+  ): Promise<number> {
+    if (!formas.length) return 0;
+    const lista = JSON.stringify(formas.map((f) => ({ p: f.productoId, pr: f.presentacionId ?? 0 })));
+    const deLista = sql`(SELECT DISTINCT f.p, f.pr FROM jsonb_to_recordset(${lista}::jsonb) AS f(p int, pr int))`;
+    await tx.execute(sql`
+      INSERT INTO stock_controlado (sucursal_id, producto_id, presentacion_id, fecha, origen)
+      SELECT ${sucursalId}::int, l.p, NULLIF(l.pr, 0), now(), ${origen} FROM ${deLista} l
+      ON CONFLICT (sucursal_id, producto_id, (COALESCE(presentacion_id, 0)))
+      DO UPDATE SET fecha = EXCLUDED.fecha, origen = EXCLUDED.origen`);
+    const r: any = await tx.execute(sql`
+      UPDATE incidencias i SET estado = 'resuelta', resolucion = 'controlado', fecha_resolucion = now(), activa = false,
+        motivo = i.motivo || ${` · Cerrada por ${origen}: después de esta venta el stock se volvió a controlar (no se tocó el stock).`}
+        FROM ${deLista} l
+       WHERE i.tipo = ${InventarioService.TIPO_VENTA_SIN_STOCK} AND i.estado <> 'resuelta' AND i.sucursal_id = ${sucursalId}
+         AND i.producto_id = l.p AND COALESCE(i.presentacion_id, 0) = l.pr
+      RETURNING i.id`);
+    return (r.rows ?? r).length;
+  }
+
+  /**
+   * ¿Esta venta sin stock es ANTERIOR al control de su producto? (0159) Verdadero
+   * cuando la forma nunca se controló en esa sucursal, o su último control es
+   * posterior a la venta: el negativo es del stock cargado, no de la góndola.
+   * Una lectura por el índice único de `stock_controlado`.
+   */
+  private sinControlPrevio() {
+    return sql<boolean>`NOT EXISTS (SELECT 1 FROM stock_controlado sc
+      WHERE sc.sucursal_id = ${incidencias.sucursalId} AND sc.producto_id = ${incidencias.productoId}
+        AND COALESCE(sc.presentacion_id, 0) = COALESCE(${incidencias.presentacionId}, 0)
+        AND sc.fecha < ${incidencias.fecha})`;
+  }
+
+  /**
+   * CERRAR EN BLOQUE LAS VENTAS SIN STOCK ANTERIORES AL CONTROL (0159).
+   *
+   * Pedido del dueño al pasar al stock real: lo de antes lo confunde. No se
+   * borran —cada una está atada a su venta y es historia—: se cierran sin
+   * tocar el stock, con el motivo escrito, y salen de la lista y del contador.
+   * Solo las abiertas, solo ventas sin stock, y solo las que la regla dice que
+   * no sirven (`sinControlPrevio`): una venta sin stock de un producto ya
+   * controlado sigue en pie. `sucursalId` null = todas.
+   */
+  async cerrarSinStockAnteriores(sucursalId: number | null, autorId?: number) {
+    const [autor] = autorId
+      ? await this.db.select({ nombre: usuarios.nombre }).from(usuarios).where(eq(usuarios.id, autorId)).limit(1)
+      : [];
+    const cerradas = await this.db.update(incidencias).set({
+      estado: 'resuelta', resolucion: 'anterior_control', fechaResolucion: new Date(), activa: false,
+      motivo: sql`${incidencias.motivo} || ${` · Cerrada en bloque${autor ? ` por ${autor.nombre}` : ''} el ${new Date().toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}: `
+        + 'anterior al control de stock de este producto (no se tocó el stock).'}`,
+    }).where(and(
+      eq(incidencias.tipo, InventarioService.TIPO_VENTA_SIN_STOCK),
+      ne(incidencias.estado, 'resuelta'),
+      sucursalId != null ? eq(incidencias.sucursalId, sucursalId) : undefined,
+      this.sinControlPrevio(),
+    )).returning({ id: incidencias.id });
+    return { ok: true, cerradas: cerradas.length };
   }
 
   /**
@@ -2898,7 +2986,11 @@ export class InventarioService {
       `Contado ${this.fmtCant(prod.tipo, inc.presentacionId, objetivo)} contra `
       + `${this.fmtCant(prod.tipo, inc.presentacionId, actual)} del sistema: ajuste de ${this.cant3(delta)}.`,
     );
-    return { ok: true, ajuste: delta };
+    /* Contar la góndola resuelve también las otras ventas sin stock abiertas
+     * de este producto acá (esta ya está cerrada, no la toca). */
+    const otrasCerradas = await this.marcarControlado(tx, inc.sucursalId,
+      [{ productoId: prod.id, presentacionId: inc.presentacionId }], `el ajuste de ${inc.codigo}`);
+    return { ok: true, ajuste: delta, otrasCerradas };
   }
 
   /**
@@ -2929,6 +3021,10 @@ export class InventarioService {
       ventaTipo: sql<string>`coalesce(${ventas.tipo}::text, '')`,
       ventaEstado: sql<string>`coalesce(${ventas.estado}::text, '')`,
       clienteNombre: sql<string>`coalesce(${clientes.nombre}, '')`,
+      /* Venta sin stock ABIERTA de antes del control de su producto (0159): la
+       * pantalla la señala y ofrece cerrarla en bloque. */
+      sinControl: sql<boolean>`(${incidencias.tipo} = ${InventarioService.TIPO_VENTA_SIN_STOCK}
+        AND ${incidencias.estado} <> 'resuelta' AND ${this.sinControlPrevio()})`,
     };
     const base = () => this.db.select(columnas).from(incidencias)
       .leftJoin(ventas, eq(ventas.id, incidencias.ventaId))
@@ -3545,27 +3641,47 @@ export class InventarioService {
     }));
   }
 
+  /** Lo contado y aplicado hace menos de esto no vuelve a ofrecerse en un control nuevo (12/10/2026, pedido del dueño). */
+  static readonly DIAS_CONTEO_RECIENTE = 7;
+
   /**
    * LO QUE YA SE ESTÁ CONTANDO en una sucursal: las formas de los controles en
    * curso o cerrados sin aplicar (los dos van a ajustar stock). Es la misma
    * regla del candado de `crearConteo`; la pantalla de alta la usa para sacar
    * las marcas que ya no tienen nada libre y decir qué queda afuera.
+   *
+   * Y LO QUE SE CONTÓ HACE POCO (`recientes`): las formas CONTADAS de un
+   * control aplicado en los últimos `DIAS_CONTEO_RECIENTE` días. Ya se
+   * controlaron: volver a ofrecerlas es contar dos veces la misma marca. Lo
+   * que quedó sin contar en ese control no entra (sigue pendiente de verdad).
    */
   private async formasOcupadas(ex: any, sucursalId: number) {
     const controles = await ex.select({
       id: conteos.id, nombre: conteos.nombre, responsable: conteos.responsable, estado: conteos.estado,
     }).from(conteos).where(and(eq(conteos.sucursalId, sucursalId), inArray(conteos.estado, ['en_curso', 'cerrado'] as any)));
-    const formas = controles.length
-      ? await ex.select({ productoId: conteoItems.productoId, presentacionId: conteoItems.presentacionId, conteoId: conteoItems.conteoId })
-        .from(conteoItems).where(inArray(conteoItems.conteoId, controles.map((c: any) => c.id)))
-      : [];
-    return { controles, formas };
+    const [formas, recientes] = await Promise.all([
+      controles.length
+        ? ex.select({ productoId: conteoItems.productoId, presentacionId: conteoItems.presentacionId, conteoId: conteoItems.conteoId })
+          .from(conteoItems).where(inArray(conteoItems.conteoId, controles.map((c: any) => c.id)))
+        : [],
+      ex.selectDistinct({ productoId: conteoItems.productoId, presentacionId: conteoItems.presentacionId })
+        .from(conteoItems).innerJoin(conteos, eq(conteos.id, conteoItems.conteoId))
+        .where(and(
+          eq(conteos.sucursalId, sucursalId), eq(conteos.estado, 'aplicado' as any), isNotNull(conteoItems.contado),
+          sql`${conteos.aplicadoEn} >= now() - make_interval(days => ${InventarioService.DIAS_CONTEO_RECIENTE})`,
+        )),
+    ]);
+    return { controles, formas, recientes };
   }
 
   async conteosOcupados(sucursalId: number) {
-    const { controles, formas } = await this.formasOcupadas(this.db, sucursalId);
+    const { controles, formas, recientes } = await this.formasOcupadas(this.db, sucursalId);
     /* Compacto: [producto, presentación (0 = la madre), control]. Pueden ser miles. */
-    return { sucursalId, controles, formas: formas.map((f: any) => [f.productoId, f.presentacionId ?? 0, f.conteoId]) };
+    return {
+      sucursalId, controles, dias: InventarioService.DIAS_CONTEO_RECIENTE,
+      formas: formas.map((f: any) => [f.productoId, f.presentacionId ?? 0, f.conteoId]),
+      recientes: recientes.map((f: any) => [f.productoId, f.presentacionId ?? 0]),
+    };
   }
 
   /**
@@ -3641,11 +3757,21 @@ export class InventarioService {
       if (!filas.length) throw new BadRequestException('Con "solo con stock" no queda nada para contar en ese alcance.');
 
       /* Lo que ya se está contando (en curso o cerrado sin aplicar: los dos van a
-       * ajustar esas formas) queda afuera. */
-      const { controles, formas: ocupadas } = await this.formasOcupadas(tx, o.sucursalId);
-      const enUso = new Map(ocupadas.map((x: any) => [`${x.productoId}:${x.presentacionId ?? ''}`, x.conteoId]));
-      const libres = filas.filter((f) => !enUso.has(`${f.productoId}:${f.presentacionId ?? ''}`));
-      const afuera = filas.length - libres.length;
+       * ajustar esas formas) queda afuera, y también lo contado y aplicado en los
+       * últimos días (12/10/2026). */
+      const { controles, formas: ocupadas, recientes: contadas } = await this.formasOcupadas(tx, o.sucursalId);
+      const clave = (x: any) => `${x.productoId}:${x.presentacionId ?? ''}`;
+      const enUso = new Map(ocupadas.map((x: any) => [clave(x), x.conteoId]));
+      const yaContadas = new Set(contadas.map(clave));
+      const sinRecientes = filas.filter((f) => !yaContadas.has(clave(f)));
+      const recientes = filas.length - sinRecientes.length;
+      const libres = sinRecientes.filter((f) => !enUso.has(clave(f)));
+      const afuera = sinRecientes.length - libres.length;
+      if (!libres.length && !afuera) {
+        throw new BadRequestException(
+          `Todo eso ya se contó y se aplicó en los últimos ${InventarioService.DIAS_CONTEO_RECIENTE} días: no hace falta contarlo de nuevo.`,
+        );
+      }
       if (!libres.length) {
         const ids = new Set(filas.map((f) => enUso.get(`${f.productoId}:${f.presentacionId ?? ''}`)));
         const cuales = controles.filter((c: any) => ids.has(c.id))
@@ -3669,6 +3795,7 @@ export class InventarioService {
       if (o.tipo) partes.push(o.tipo === 'granel' ? 'Solo granel' : 'Solo enteros');
       if (o.soloConStock) partes.push('solo con stock');
       if (afuera) partes.push(`sin ${afuera} que ya estaban en otro control`);
+      if (recientes) partes.push(`sin ${recientes} contados en los últimos ${InventarioService.DIAS_CONTEO_RECIENTE} días`);
       const alcance = partes.join(' · ') || 'Todo el catálogo';
 
       const [c] = await tx.insert(conteos).values({
@@ -3680,7 +3807,7 @@ export class InventarioService {
         usuarioId: o.usuarioId ?? null,
       }).returning();
       await tx.insert(conteoItems).values(libres.map((f) => ({ ...f, conteoId: c.id })));
-      return { ...c, total: libres.length, contados: 0, afuera };
+      return { ...c, total: libres.length, contados: 0, afuera, recientes };
     });
   }
 
@@ -3928,8 +4055,12 @@ export class InventarioService {
         });
         ajustes += 1;
       }
+      /* Todo lo contado —con o sin diferencia— queda en lo real (0159), y sus
+       * ventas sin stock abiertas en esta sucursal se cierran solas. */
+      const incidenciasCerradas = await this.marcarControlado(tx, c.sucursalId, items,
+        `el control de stock «${c.nombre || `#${id}`}»`);
 
-      return { ...reclamo, ajustes, sinDiferencia: items.length - ajustes, avisos };
+      return { ...reclamo, ajustes, sinDiferencia: items.length - ajustes, avisos, incidenciasCerradas };
     });
   }
 
