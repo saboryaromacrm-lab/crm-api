@@ -655,6 +655,8 @@ class CrearConteoDto {
   @IsOptional() @IsBoolean() ciego?: boolean;
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsInt() marcaId?: number;
+  /** Varias marcas en un mismo control (12/10/2026). Vacío = todas. */
+  @IsOptional() @IsArray() @ArrayMaxSize(500) @IsInt({ each: true }) marcaIds?: number[];
   @IsOptional() @IsInt() categoriaId?: number;
   @IsOptional() @IsInt() proveedorId?: number;
   @IsOptional() @IsIn(['entero', 'granel']) tipo?: 'entero' | 'granel';
@@ -700,6 +702,13 @@ export class ConteosController {
     /* El jefe puede mirar cualquier sucursal; el resto, la suya. */
     const pedida = sucursalId ? parseInt(sucursalId, 10) : undefined;
     return this.inv.listarConteos(soloSuSucursal(sesion) ?? pedida ?? null);
+  }
+
+  /** Lo que ya se está contando (en curso o cerrado sin aplicar): la pantalla de alta lo deja afuera. */
+  @Get('ocupados')
+  ocupados(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
+    const pedida = sucursalId ? parseInt(sucursalId, 10) : undefined;
+    return this.inv.conteosOcupados(soloSuSucursal(sesion) ?? sucursalDeOperacion(sesion, pedida)!);
   }
 
   @Get(':id')

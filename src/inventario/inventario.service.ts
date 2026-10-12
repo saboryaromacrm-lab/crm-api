@@ -3546,26 +3546,55 @@ export class InventarioService {
   }
 
   /**
+   * LO QUE YA SE ESTÁ CONTANDO en una sucursal: las formas de los controles en
+   * curso o cerrados sin aplicar (los dos van a ajustar stock). Es la misma
+   * regla del candado de `crearConteo`; la pantalla de alta la usa para sacar
+   * las marcas que ya no tienen nada libre y decir qué queda afuera.
+   */
+  private async formasOcupadas(ex: any, sucursalId: number) {
+    const controles = await ex.select({
+      id: conteos.id, nombre: conteos.nombre, responsable: conteos.responsable, estado: conteos.estado,
+    }).from(conteos).where(and(eq(conteos.sucursalId, sucursalId), inArray(conteos.estado, ['en_curso', 'cerrado'] as any)));
+    const formas = controles.length
+      ? await ex.select({ productoId: conteoItems.productoId, presentacionId: conteoItems.presentacionId, conteoId: conteoItems.conteoId })
+        .from(conteoItems).where(inArray(conteoItems.conteoId, controles.map((c: any) => c.id)))
+      : [];
+    return { controles, formas };
+  }
+
+  async conteosOcupados(sucursalId: number) {
+    const { controles, formas } = await this.formasOcupadas(this.db, sucursalId);
+    /* Compacto: [producto, presentación (0 = la madre), control]. Pueden ser miles. */
+    return { sucursalId, controles, formas: formas.map((f: any) => [f.productoId, f.presentacionId ?? 0, f.conteoId]) };
+  }
+
+  /**
    * ABRE LA SESIÓN Y CONGELA SU LISTA. Los filtros se resuelven UNA vez, acá:
    * la sesión nace con sus renglones en pendiente y se cuenta la góndola de
    * esa noche, no el catálogo vivo — un alta a mitad del conteo no se cuela.
    *
    * EL CANDADO DE SOLAPAMIENTO es de forma física, no de sesión: un producto
    * no puede estar en dos sesiones abiertas de la misma sucursal, porque dos
-   * conteos del mismo producto se aplicarían dos veces. El mensaje dice en
-   * cuál está, porque "no se puede" sin el porqué manda a buscar al que sabe.
+   * conteos del mismo producto se aplicarían dos veces. Desde el 12/10/2026 lo
+   * que ya se está contando QUEDA AFUERA del control nuevo (y se dice cuánto)
+   * en vez de frenarlo entero: «KONY enteros y granel» con los enteros ya en
+   * otro control abre solo el granel. Si no queda nada, se dice en cuáles está.
+   * Dos altas a la vez de la misma sucursal se ponen en fila (candado).
    */
   async crearConteo(o: {
     sucursalId: number; usuarioId?: number | null; nombre?: string; ciego?: boolean; responsable?: string;
-    marcaId?: number | null; categoriaId?: number | null; proveedorId?: number | null;
+    marcaId?: number | null; marcaIds?: number[] | null; categoriaId?: number | null; proveedorId?: number | null;
     tipo?: 'entero' | 'granel' | null; soloConStock?: boolean; incluirArchivados?: boolean;
   }) {
     const responsable = String(o.responsable ?? '').replace(/\s+/g, ' ').trim();
     if (!responsable) throw new BadRequestException('Poné el nombre del responsable del control.');
+    /* Una o varias marcas (`marcaId` queda por compatibilidad con el ERP viejo). */
+    const marcaIds = [...new Set([...(o.marcaIds ?? []), ...(o.marcaId ? [o.marcaId] : [])].map(Number).filter((n) => n > 0))];
     return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext('conteos:' || ${o.sucursalId}::text))`);
       const conds: any[] = [];
       if (!o.incluirArchivados) conds.push(ne(productos.estado, 'archivado' as any));
-      if (o.marcaId) conds.push(eq(productos.marcaId, o.marcaId));
+      if (marcaIds.length) conds.push(inArray(productos.marcaId, marcaIds));
       if (o.categoriaId) conds.push(eq(productos.categoriaId, o.categoriaId));
       if (o.tipo) conds.push(eq(productos.tipo, o.tipo));
       let prods = await tx.select().from(productos).where(conds.length ? and(...conds) : undefined)
@@ -3610,47 +3639,48 @@ export class InventarioService {
         }
       }
       if (!filas.length) throw new BadRequestException('Con "solo con stock" no queda nada para contar en ese alcance.');
-      if (filas.length > 5000) throw new BadRequestException('El alcance es demasiado grande: partilo con los filtros.');
 
-      /* El solapamiento se chequea contra TODO lo no terminado (en_curso y
-       * cerrado sin aplicar): un cerrado esperando aplicación también va a
-       * ajustar esas formas. */
-      const abiertos = await tx.select().from(conteos).where(and(
-        eq(conteos.sucursalId, o.sucursalId),
-        inArray(conteos.estado, ['en_curso', 'cerrado'] as any),
-      ));
-      if (abiertos.length) {
-        const ocupadas = await tx.select().from(conteoItems)
-          .where(inArray(conteoItems.conteoId, abiertos.map((a: any) => a.id)));
-        const enUso = new Map(ocupadas.map((x: any) => [`${x.productoId}:${x.presentacionId ?? ''}`, x.conteoId]));
-        const choque = filas.find((f) => enUso.has(`${f.productoId}:${f.presentacionId ?? ''}`));
-        if (choque) {
-          const s = abiertos.find((a: any) => a.id === enUso.get(`${choque.productoId}:${choque.presentacionId ?? ''}`));
-          throw new BadRequestException(
-            `"${choque.nombre}" ya está en el control "${s?.nombre || `#${s?.id}`}" (${s?.estado === 'cerrado' ? 'cerrado sin aplicar' : 'en curso'}). `
-            + 'Aplicalo o descartalo antes de abrir otro que lo incluya.',
-          );
-        }
+      /* Lo que ya se está contando (en curso o cerrado sin aplicar: los dos van a
+       * ajustar esas formas) queda afuera. */
+      const { controles, formas: ocupadas } = await this.formasOcupadas(tx, o.sucursalId);
+      const enUso = new Map(ocupadas.map((x: any) => [`${x.productoId}:${x.presentacionId ?? ''}`, x.conteoId]));
+      const libres = filas.filter((f) => !enUso.has(`${f.productoId}:${f.presentacionId ?? ''}`));
+      const afuera = filas.length - libres.length;
+      if (!libres.length) {
+        const ids = new Set(filas.map((f) => enUso.get(`${f.productoId}:${f.presentacionId ?? ''}`)));
+        const cuales = controles.filter((c: any) => ids.has(c.id))
+          .map((c: any) => `"${c.nombre || `#${c.id}`}"${c.responsable ? ` (${c.responsable})` : ''}`);
+        throw new BadRequestException(
+          `Todo eso ya se está contando en ${cuales.join(', ')}. Aplicá o descartá ${cuales.length > 1 ? 'esos controles' : 'ese control'} antes de abrir otro que lo incluya.`,
+        );
       }
+      if (libres.length > 5000) throw new BadRequestException('El alcance es demasiado grande: partilo con los filtros.');
 
       const partes: string[] = [];
-      if (o.marcaId) partes.push(`Marca ${(await tx.select().from(marcas).where(eq(marcas.id, o.marcaId)).limit(1))[0]?.nombre ?? o.marcaId}`);
+      if (marcaIds.length) {
+        const nombres = (await tx.select({ nombre: marcas.nombre }).from(marcas).where(inArray(marcas.id, marcaIds)).orderBy(asc(marcas.nombre)))
+          .map((m: any) => m.nombre);
+        partes.push(nombres.length === 1
+          ? `Marca ${nombres[0]}`
+          : `Marcas ${nombres.length > 6 ? `${nombres.slice(0, 6).join(', ')} y ${nombres.length - 6} más` : nombres.join(', ')}`);
+      }
       if (o.categoriaId) partes.push(`Categoría ${(await tx.select().from(categorias).where(eq(categorias.id, o.categoriaId)).limit(1))[0]?.nombre ?? o.categoriaId}`);
       if (o.proveedorId) partes.push(`Proveedor ${(await tx.select().from(proveedores).where(eq(proveedores.id, o.proveedorId)).limit(1))[0]?.nombre ?? o.proveedorId}`);
       if (o.tipo) partes.push(o.tipo === 'granel' ? 'Solo granel' : 'Solo enteros');
       if (o.soloConStock) partes.push('solo con stock');
+      if (afuera) partes.push(`sin ${afuera} que ya estaban en otro control`);
       const alcance = partes.join(' · ') || 'Todo el catálogo';
 
       const [c] = await tx.insert(conteos).values({
         sucursalId: o.sucursalId,
-        nombre: (o.nombre || '').trim() || alcance,
+        nombre: (o.nombre || '').trim() || partes.filter((x) => !x.startsWith('sin ')).join(' · ') || 'Todo el catálogo',
         alcance,
         responsable,
         ciego: o.ciego ?? true,
         usuarioId: o.usuarioId ?? null,
       }).returning();
-      await tx.insert(conteoItems).values(filas.map((f) => ({ ...f, conteoId: c.id })));
-      return { ...c, total: filas.length, contados: 0 };
+      await tx.insert(conteoItems).values(libres.map((f) => ({ ...f, conteoId: c.id })));
+      return { ...c, total: libres.length, contados: 0, afuera };
     });
   }
 
