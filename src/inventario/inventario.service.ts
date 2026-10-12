@@ -1426,8 +1426,15 @@ export class InventarioService {
       : [];
     const cerradas = await this.db.update(incidencias).set({
       estado: 'resuelta', resolucion: 'anterior_control', fechaResolucion: new Date(), activa: false,
-      motivo: sql`${incidencias.motivo} || ${` · Cerrada en bloque${autor ? ` por ${autor.nombre}` : ''} el ${new Date().toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}: `
-        + 'anterior al control de stock de este producto (no se tocó el stock).'}`,
+      /* El porqué, en palabras del que lo lee (12/10/2026): no es lo mismo «nunca
+       * se controló» que «se controló, pero después de la venta». */
+      motivo: sql`${incidencias.motivo} || ${` · Cerrada en bloque${autor ? ` por ${autor.nombre}` : ''} el ${new Date().toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}: `}
+        || CASE WHEN EXISTS (SELECT 1 FROM stock_controlado sc
+             WHERE sc.sucursal_id = ${incidencias.sucursalId} AND sc.producto_id = ${incidencias.productoId}
+               AND COALESCE(sc.presentacion_id, 0) = COALESCE(${incidencias.presentacionId}, 0))
+           THEN 'la venta fue antes del último control de stock de este producto (no se tocó el stock).'
+           ELSE 'el stock de este producto en ' || COALESCE((SELECT s.nombre FROM sucursales s WHERE s.id = ${incidencias.sucursalId}), 'esta sucursal')
+             || ' nunca se controló, así que el sistema no tenía el número real (no se tocó el stock).' END`,
     }).where(and(
       eq(incidencias.tipo, InventarioService.TIPO_VENTA_SIN_STOCK),
       ne(incidencias.estado, 'resuelta'),

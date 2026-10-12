@@ -1121,6 +1121,13 @@
       "when": 1791620000000,
       "tag": "0159_stock_controlado",
       "breakpoints": true
+    },
+    {
+      "idx": 160,
+      "version": "7",
+      "when": 1791630000000,
+      "tag": "0160_incidencias_texto_cierre",
+      "breakpoints": true
     }
   ]
 }

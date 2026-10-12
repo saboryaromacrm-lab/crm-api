@@ -41,14 +41,15 @@ class AltaPedidosDto {
   @IsOptional() @IsString() @MaxLength(2000) notas?: string;
 }
 
+/* 8000: la orden de pedido de Almacén (12/10/2026) anota la lista entera como nota. */
 class PedidoDirectoDto {
   @IsInt() proveedorId!: number;
-  @IsOptional() @IsString() @MaxLength(2000) notas?: string;
+  @IsOptional() @IsString() @MaxLength(8000) notas?: string;
 }
 
 class EditarPedidoDto {
   @IsOptional() @IsInt() proveedorId?: number;
-  @IsOptional() @IsString() @MaxLength(2000) notas?: string;
+  @IsOptional() @IsString() @MaxLength(8000) notas?: string;
 }
 
 class EstadoPedidoDto {

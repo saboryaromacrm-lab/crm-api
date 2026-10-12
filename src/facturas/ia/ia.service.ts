@@ -357,8 +357,10 @@ export class FacturasIaService implements OnModuleInit {
         const claro = elegido(delProveedor);
         if (claro) prod = { id: claro.id, nombre: claro.nombre, porBulto: claro.porBulto, confianza: claro.confianza, fuente: 'parecido' };
         else {
-          /* Del proveedor no salió nada firme: se buscan también en todo el catálogo. */
-          if (!lista.length || lista[0].score < 0.5) lista = [...lista, ...candidatos(r.descripcion, await catalogoEntero(), 5)];
+          /* SOLO LOS DEL PROVEEDOR (12/10/2026, pedido del dueño): mezclar parecidos
+           * de otros proveedores confundía la elección. Todo el catálogo, solo si
+           * el proveedor todavía no tiene ningún producto cargado. */
+          if (!deProveedor.length) lista = candidatos(r.descripcion, await catalogoEntero(), 5);
           const vistos = new Set<number>();
           cands = lista.filter((x) => (vistos.has(x.p.id) ? false : (vistos.add(x.p.id), true))).slice(0, 6)
             .map((x) => ({ id: x.p.id, nombre: x.p.nombre, score: Math.round(x.score * 100) / 100 }));
