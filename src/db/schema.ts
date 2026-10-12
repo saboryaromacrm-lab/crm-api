@@ -1733,6 +1733,12 @@ export const comprobanteItems = pgTable('comprobante_items', {
    * marca puede cambiar mañana y esta factura ya dijo de quién fue.
    */
   paraCafeteria: boolean('para_cafeteria').notNull().default(false),
+  /**
+   * EL BULTO CON QUE SE CARGÓ (0161): unidades (o kg) por bulto, congelado,
+   * para mostrar el renglón como la factura («4 bultos × 14 u.»). NULL = por
+   * unidad o sin dato.
+   */
+  porBulto: doublePrecision('por_bulto'),
 }, (t) => ({
   /** Lo comprado para Coffit por artículo, para el cupo de los envíos (0119). */
   ixCafe: index('ix_comprobante_items_cafe').on(t.productoId).where(sql`${t.paraCafeteria}`),
