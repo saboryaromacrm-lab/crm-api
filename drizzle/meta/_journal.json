@@ -1079,6 +1079,41 @@
       "when": 1791560000000,
       "tag": "0153_facturas_ia",
       "breakpoints": true
+    },
+    {
+      "idx": 154,
+      "version": "7",
+      "when": 1791570000000,
+      "tag": "0154_conteo_responsable",
+      "breakpoints": true
+    },
+    {
+      "idx": 155,
+      "version": "7",
+      "when": 1791580000000,
+      "tag": "0155_tienda_accesos",
+      "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1791590000000,
+      "tag": "0156_cartel_mayorista",
+      "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1791600000000,
+      "tag": "0157_comision_proveedor",
+      "breakpoints": true
+    },
+    {
+      "idx": 158,
+      "version": "7",
+      "when": 1791610000000,
+      "tag": "0158_facturas_del_mes",
+      "breakpoints": true
     }
   ]
 }

@@ -684,7 +684,8 @@ export class PreciosService {
         && Math.abs(a.descuento - f.descuento) < 0.005
         && Math.abs(a.flete - f.flete) < 0.005
         && (f.cantidad == null || Math.abs(a.cantidad - f.cantidad) < 0.0005)
-        && (f.costoFinal == null || Math.abs(a.costoFinal - f.costoFinal) < 0.005);
+        && (f.costoFinal == null || Math.abs(a.costoFinal - f.costoFinal) < 0.005)
+        && (f.comision == null || Math.abs(a.comision - f.comision) < 0.005);
       if (!intacta) { salteadas.push({ id: f.productoProveedorId, f, a, motivo: 'Cambió después de este lote.' }); continue; }
 
       // Si la fila cambió el formato activo, ese cambio también tiene que
@@ -708,15 +709,15 @@ export class PreciosService {
 
     if (revertibles.length) {
       const valores = sql.join(
-        revertibles.map(({ f, a }) => sql`(${f.productoProveedorId}::int, ${f.costoAnterior}::double precision, ${f.descuentoAnterior}::double precision, ${f.fleteAnterior}::double precision, ${f.cantidadAnterior ?? a.cantidad}::double precision, ${f.costoFinalAnterior ?? a.costoFinal}::double precision)`),
+        revertibles.map(({ f, a }) => sql`(${f.productoProveedorId}::int, ${f.costoAnterior}::double precision, ${f.descuentoAnterior}::double precision, ${f.fleteAnterior}::double precision, ${f.cantidadAnterior ?? a.cantidad}::double precision, ${f.costoFinalAnterior ?? a.costoFinal}::double precision, ${f.comisionAnterior ?? a.comision}::double precision)`),
         sql`, `,
       );
-      /* El bulto y el precio final vuelven también (0108): el lote que no los
-       * tocó los deja como están. */
+      /* El bulto, el precio final y la comisión vuelven también (0108, 0157):
+       * el lote que no los tocó los deja como están. */
       await tx.execute(sql`
         UPDATE producto_proveedores AS t
-        SET costo = v.costo, descuento = v.descuento, flete = v.flete, cantidad = v.cantidad, costo_final = v.costo_final
-        FROM (VALUES ${valores}) AS v(id, costo, descuento, flete, cantidad, costo_final)
+        SET costo = v.costo, descuento = v.descuento, flete = v.flete, cantidad = v.cantidad, costo_final = v.costo_final, comision = v.comision
+        FROM (VALUES ${valores}) AS v(id, costo, descuento, flete, cantidad, costo_final, comision)
         WHERE t.id = v.id
       `);
 
@@ -738,6 +739,7 @@ export class PreciosService {
         costo: f.costoAnterior, descuento: f.descuentoAnterior, flete: f.fleteAnterior,
         ...(f.cantidad != null ? { cantidadAnterior: a.cantidad, cantidad: f.cantidadAnterior } : {}),
         ...(f.costoFinal != null ? { costoFinalAnterior: a.costoFinal, costoFinal: f.costoFinalAnterior } : {}),
+        ...(f.comision != null ? { comisionAnterior: a.comision, comision: f.comisionAnterior } : {}),
         // Invertidos: esta fila deshace lo que hizo la original.
         activoAnterior: f.activoNuevo ?? null,
         activoNuevo: f.activoNuevo != null ? (f.activoAnterior ?? null) : null,

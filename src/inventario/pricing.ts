@@ -43,6 +43,11 @@ export interface CostoEntry {
   descuento3?: number;
   descuento4?: number;
   flete: number;
+  /**
+   * COMISIÓN DEL PROVEEDOR (0157): % SIN FACTURA sobre la mercadería sin IVA
+   * (la comisión de fin de mes). Vale en los dos modos. Ver `conComision`.
+   */
+  comision?: number;
   /** 'final' ignora descuentos y flete: el costo se carga ya cerrado y con IVA. */
   modoCosto?: 'lista' | 'final';
   costoFinal?: number;
@@ -109,6 +114,38 @@ export interface CostosFormato {
    */
   desembolso: number;
   desembolsoUnitario: number;
+  /** La comisión del proveedor del bulto (0157), sin IVA: ya está DENTRO de `costoNeto`. */
+  costoComision: number;
+  costoComisionUnitario: number;
+}
+
+/**
+ * LA COMISIÓN DEL PROVEEDOR (0157, pedido del dueño): un costo que el proveedor
+ * cobra APARTE y SIN FACTURA, como % de la mercadería sin IVA (`M`, después de
+ * descuentos; en modo final, el neto derivado). Es plata que sale y no trae
+ * IVA para recuperar, así que se trata como la mercadería sin factura:
+ *
+ *   costoNeto    += K           el costo real: entera
+ *   costoPrecio  += K ÷ factor   la base del markup: al vender, el IVA de esa
+ *   ivaAbsorbido += K − K÷factor  parte lo absorbe el negocio (sin crédito)
+ *
+ * con K = M × comisión%. La identidad de control sigue cerrando:
+ * `costoPrecio × factor` = lo pagado al proveedor + al fletero + la comisión.
+ * NO toca `costoFinal` ni `desembolso` (lo de la mercadería y su papel): las
+ * comparaciones con las facturas siguen siendo mercadería contra mercadería.
+ */
+function conComision<T extends CostosFormato>(r: T, mercaderia: number, pct: unknown, factorIva: number): T {
+  const k = mercaderia * Math.min(Math.max(Number(pct) || 0, 0), 100) / 100;
+  if (!(k > 0)) return r;
+  const costoNeto = r.costoNeto + k;
+  const costoPrecio = r.costoPrecio + k / factorIva;
+  const ivaAbsorbido = r.ivaAbsorbido + k - k / factorIva;
+  return {
+    ...r, costoComision: k, costoComisionUnitario: k / r.cantidad,
+    costoNeto, costoNetoUnitario: costoNeto / r.cantidad,
+    costoPrecio, costoPrecioUnitario: costoPrecio / r.cantidad,
+    ivaAbsorbido, ivaAbsorbidoUnitario: ivaAbsorbido / r.cantidad,
+  };
 }
 
 /**
@@ -184,6 +221,7 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     costoBruto: 0, costoNeto: 0, costoFinal: 0, costoNetoUnitario: 0, costoFinalUnitario: 0,
     porcSinFactura: 0, costoPrecio: 0, costoPrecioUnitario: 0,
     ivaAbsorbido: 0, ivaAbsorbidoUnitario: 0, desembolso: 0, desembolsoUnitario: 0,
+    costoComision: 0, costoComisionUnitario: 0,
   };
   if (!e) return vacio;
 
@@ -239,7 +277,7 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
      */
     const costoFinal = Number(e.costoFinal) || 0;
     const costoNeto = costoFinal / ((1 - q) * factorIva + q);
-    return {
+    return conComision({
       cantidad,
       costoLista: 0,
       costoListaUnitario: 0,
@@ -251,7 +289,8 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
       costoFinalUnitario: costoFinal / cantidad,
       // En modo final no hay flete (queda fuera del cálculo): todo es mercadería.
       ...partir(costoNeto, 0),
-    };
+      costoComision: 0, costoComisionUnitario: 0,
+    }, costoNeto, e.comision, factorIva);
   }
 
   const costoLista = Number(e.costo) || 0;
@@ -264,7 +303,7 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
   const fleteNeto = flete * ratio;
   const costoNeto = costoBruto + fleteNeto;
   const costoFinal = costoNeto * factorIva;
-  return {
+  return conComision({
     cantidad,
     costoLista,
     costoListaUnitario: costoLista / cantidad,
@@ -277,7 +316,8 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     // La mercadería es el bruto (post descuentos); el flete va NOMINAL —
     // `partir` le aplica el ratio adentro, junto con la mercadería.
     ...partir(costoBruto, flete),
-  };
+    costoComision: 0, costoComisionUnitario: 0,
+  }, costoBruto, e.comision, factorIva);
 }
 
 /**

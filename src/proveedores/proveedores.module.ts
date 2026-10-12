@@ -9,6 +9,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { facturaLecturas, productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
+import { esNombreCoffit, sincronizarProveedorCoffit } from '../productos/proveedorCoffit';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 
 class UpsertProveedorDto {
@@ -41,6 +42,8 @@ class UpsertProveedorDto {
   /** Plazo en días del diferido ("Cta cte 15"). null/0 = sin plazo cargado. */
   @IsOptional() @IsInt() @Min(0) @Max(365) diasPago?: number | null;
   @IsOptional() @IsIn(['facturas', 'libre']) modoCuenta?: string;
+  /** Junta las entregas y factura a fin de mes (0158): sus facturas van a «Facturas del mes». */
+  @IsOptional() @IsBoolean() facturaMensual?: boolean;
   /**
    * Qué parte del valor vende SIN factura, habitualmente (0–100, 0072). Es el
    * default que precarga los formatos de compra nuevos de este proveedor; el
@@ -106,6 +109,7 @@ export class ProveedoresService {
       medioHabitual: p.medioHabitual ? (LEGIBLE_MEDIO[p.medioHabitual] ?? p.medioHabitual) : 'Sin definir',
       diasPago: p.diasPago ? `${p.diasPago} día(s)` : 'Sin plazo',
       modoCuenta: p.modoCuenta === 'libre' ? 'Libre' : 'Por facturas',
+      facturaMensual: p.facturaMensual ? 'Sí' : 'No',
       porcSinFactura: `${Number(p.porcSinFactura) || 0}%`,
       minimoTransferencia: Number(p.minimoTransferencia) > 0 ? `$${Number(p.minimoTransferencia)}` : 'Sin mínimo',
     };
@@ -178,11 +182,14 @@ export class ProveedoresService {
       medioHabitual: (dto.medioHabitual || null) as any,
       diasPago: dto.diasPago || null,
       modoCuenta: (dto.modoCuenta ?? 'facturas') as any,
+      facturaMensual: dto.facturaMensual ?? false,
       // Sin número explícito, "emite liquidación" solo puede querer decir 100.
       porcSinFactura: dto.porcSinFactura ?? (dto.condicionCompra === 'liquidacion' ? 100 : 0),
       minimoTransferencia: dto.minimoTransferencia ?? 0,
     }).returning();
     await this.engancharFacturas(p);
+    /* El proveedor de Coffit: se le enganchan todos los productos que elabora Coffit. */
+    if (esNombreCoffit(p.nombre)) await sincronizarProveedorCoffit(this.db);
     return p;
   }
 
@@ -236,10 +243,12 @@ export class ProveedoresService {
       medioHabitual: (dto.medioHabitual === undefined ? actual.medioHabitual : (dto.medioHabitual || null)) as any,
       diasPago: dto.diasPago === undefined ? actual.diasPago : (dto.diasPago || null),
       modoCuenta: (dto.modoCuenta ?? actual.modoCuenta) as any,
+      facturaMensual: dto.facturaMensual ?? actual.facturaMensual,
       porcSinFactura: dto.porcSinFactura ?? actual.porcSinFactura,
       minimoTransferencia: dto.minimoTransferencia ?? actual.minimoTransferencia,
     }).where(eq(proveedores.id, id)).returning();
     if (cambiaCuit) await this.engancharFacturas(p);
+    if (cambiaNombre && esNombreCoffit(p.nombre)) await sincronizarProveedorCoffit(this.db);
 
     /* AUDITORÍA (0086): la identidad y la ficha comercial, campo por campo.
      * Se compara la FOTO legible antes/después — solo lo que cambió deja fila. */
@@ -249,7 +258,7 @@ export class ProveedoresService {
       {
         nombre: 'Nombre', cuit: 'CUIT',
         condicionCompra: 'Condición de compra', medioHabitual: 'Medio de pago habitual',
-        diasPago: 'Plazo de pago', modoCuenta: 'Modo de cuenta',
+        diasPago: 'Plazo de pago', modoCuenta: 'Modo de cuenta', facturaMensual: 'Factura a fin de mes',
         porcSinFactura: 'Sin factura % (default de sus formatos)',
         minimoTransferencia: 'Mínimo de transferencia (cuentas disponibles)',
       },

@@ -24,6 +24,12 @@
  *   y liquidaciones (para la casa ese IVA es costo). En B, C y X el ERP guarda
  *   IVA 0 y el neto ES el total del papel (comprobantes.armarPie).
  *
+ * FACTURAS DEL MES (0158): las del proveedor que junta los remitos y factura a
+ *   fin de mes cuentan como cualquier factura (A: neto + IVA crédito; B/C: su
+ *   importe) por SU fecha, con sus percepciones. Las entregas que cubren
+ *   (`facturacion_mes_id`) dejan de contar como «sin factura»: si no, la misma
+ *   mercadería estaría dos veces. Un mes cerrado sin sus facturas se avisa.
+ *
  * GASTOS: crédito fiscal = IVA de los de letra A (las NC de gasto ya vienen en
  *   negativo); percepción de IVA = `perc_dgi`.
  *
@@ -66,6 +72,9 @@ const CLASE_COMPRA = `case
   when c.letra = 'A' then 'factura_a'
   else 'factura_bc' end`;
 
+/** Las facturas del mes, con la sucursal de su mes (para el filtro por sucursal). */
+const FACTURAS_MES = 'facturaciones_mes_facturas ff join facturaciones_mes fm on fm.id = ff.facturacion_id';
+
 type Rango = { desde: string; hasta: string; sucursalId: number | null };
 
 /** Las cifras de un rango, agrupadas por mes o en un solo renglón (`mes` = 'total'). */
@@ -73,12 +82,14 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
   const grupoV = porMes ? MES('v.fecha') : `'total'`;
   const grupoC = porMes ? MES('c.fecha') : `'total'`;
   const grupoG = porMes ? MES('g.fecha') : `'total'`;
+  const grupoF = porMes ? MES('ff.fecha') : `'total'`;
   const p = [r.desde, r.hasta, r.sucursalId];
   const sucV = `($3::int is null or v.sucursal_id = $3)`;
   const sucC = `($3::int is null or c.sucursal_id = $3)`;
   const sucG = `($3::int is null or g.sucursal_id = $3)`;
+  const sucF = `ff.activa and ($3::int is null or fm.sucursal_id = $3)`;
 
-  const [ventas, alic, compras, percs, gastos] = await Promise.all([
+  const [ventas, alic, compras, percs, gastos, delMes] = await Promise.all([
     c.query(`
       select ${grupoV} as mes, ${CLASE_VENTA} as clase,
         coalesce(sum(v.total * ${SIGNO_VENTA}), 0) as total,
@@ -104,24 +115,35 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
         from venta_extras ve join vv on vv.id = ve.venta_id
       ) x
       group by 1, 2`, p),
+    /* Las entregas que cubren unas facturas del mes no cuentan: cuentan esas facturas. */
     c.query(`
-      select ${grupoC} as mes, ${CLASE_COMPRA} as clase,
-        coalesce(sum(c.subtotal_neto * ${SIGNO_COMPRA}), 0) as neto,
-        coalesce(sum(c.iva_total * ${SIGNO_COMPRA}), 0) as iva,
-        coalesce(sum(c.total * ${SIGNO_COMPRA}), 0) as total,
-        count(*) filter (where c.tipo <> 'nota_credito')::int as comprobantes,
-        count(*) filter (where c.tipo = 'nota_credito')::int as notas
-      from comprobantes c
-      where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito','remito')
-        and ${EN_DIAS('c.fecha')} and ${sucC}
+      select mes, clase, coalesce(sum(neto), 0) as neto, coalesce(sum(iva), 0) as iva, coalesce(sum(total), 0) as total,
+        coalesce(sum(comprobantes), 0)::int as comprobantes, coalesce(sum(notas), 0)::int as notas
+      from (
+        select ${grupoC} as mes, ${CLASE_COMPRA} as clase,
+          c.subtotal_neto * ${SIGNO_COMPRA} as neto, c.iva_total * ${SIGNO_COMPRA} as iva, c.total * ${SIGNO_COMPRA} as total,
+          (c.tipo <> 'nota_credito')::int as comprobantes, (c.tipo = 'nota_credito')::int as notas
+        from comprobantes c
+        where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito','remito')
+          and c.facturacion_mes_id is null and ${EN_DIAS('c.fecha')} and ${sucC}
+        union all
+        select ${grupoF}, case when ff.letra = 'A' then 'factura_a' else 'factura_bc' end, ff.neto, ff.iva, ff.total, 1, 0
+        from ${FACTURAS_MES} where ${sucF} and ${EN_DIAS('ff.fecha')}
+      ) x
       group by 1, 2`, p),
     c.query(`
-      select ${grupoC} as mes, ${TIPO_PERCEPCION_SQL('cp.tipo', 'cp.nombre')} as tipo,
-        coalesce(sum(cp.importe * ${SIGNO_COMPRA}), 0) as importe, count(*)::int as cantidad,
-        count(*) filter (where cp.tipo = '')::int as sin_marcar
-      from comprobante_percepciones cp join comprobantes c on c.id = cp.comprobante_id
-      where c.estado = 'confirmado' and c.tipo in ('factura','nota_credito','nota_debito') and c.letra <> 'X'
-        and ${EN_DIAS('c.fecha')} and ${sucC}
+      select mes, tipo, coalesce(sum(importe), 0) as importe, count(*)::int as cantidad, coalesce(sum(sin_marcar), 0)::int as sin_marcar
+      from (
+        select ${grupoC} as mes, ${TIPO_PERCEPCION_SQL('cp.tipo', 'cp.nombre')} as tipo,
+          cp.importe * ${SIGNO_COMPRA} as importe, (cp.tipo = '')::int as sin_marcar
+        from comprobante_percepciones cp join comprobantes c on c.id = cp.comprobante_id
+        where c.estado = 'confirmado' and c.tipo in ('factura','nota_credito','nota_debito') and c.letra <> 'X'
+          and ${EN_DIAS('c.fecha')} and ${sucC}
+        union all
+        select ${grupoF}, t.tipo, t.importe, 0
+        from ${FACTURAS_MES} cross join lateral (values ('iva', ff.perc_iva), ('iibb', ff.perc_iibb)) as t(tipo, importe)
+        where ${sucF} and t.importe > 0 and ${EN_DIAS('ff.fecha')}
+      ) x
       group by 1, 2`, p),
     c.query(`
       select ${grupoG} as mes,
@@ -134,10 +156,14 @@ async function cifras(c: PoolClient, r: Rango, porMes: boolean) {
       from gastos g
       where g.estado <> 'anulado' and ${EN_DIAS('g.fecha')} and ${sucG}
       group by 1`, p),
+    c.query(`
+      select ${grupoF} as mes, coalesce(sum(ff.neto), 0) as neto, coalesce(sum(ff.iva), 0) as iva, count(*)::int as comprobantes
+      from ${FACTURAS_MES} where ${sucF} and ${EN_DIAS('ff.fecha')}
+      group by 1`, p),
   ]);
   const porClave = (rows: any[]) => new Map<string, any>(rows.map((x) => [`${x.mes}|${x.clase ?? ''}`, x]));
   return {
-    ventas: porClave(ventas.rows), compras: porClave(compras.rows), gastos: porClave(gastos.rows),
+    ventas: porClave(ventas.rows), compras: porClave(compras.rows), gastos: porClave(gastos.rows), delMes: porClave(delMes.rows),
     alicuotas: alic.rows, percepciones: percs.rows,
   };
 }
@@ -147,6 +173,7 @@ function armar(d: Awaited<ReturnType<typeof cifras>>, mes: string) {
   const v = (cl: string) => d.ventas.get(`${mes}|${cl}`);
   const c = (cl: string) => d.compras.get(`${mes}|${cl}`);
   const g = d.gastos.get(`${mes}|`);
+  const fm = d.delMes.get(`${mes}|`);
   const percIvaCompras = r2(d.percepciones.filter((x: any) => x.mes === mes && x.tipo === 'iva').reduce((a: number, x: any) => a + N(x.importe), 0));
   const ventas = {
     facturado: { total: r2(N(v('facturado')?.total)), iva: r2(N(v('facturado')?.iva)), comprobantes: N(v('facturado')?.comprobantes), notas: N(v('facturado')?.notas) },
@@ -159,6 +186,8 @@ function armar(d: Awaited<ReturnType<typeof cifras>>, mes: string) {
     facturaBC: { total: r2(N(c('factura_bc')?.neto)), comprobantes: N(c('factura_bc')?.comprobantes), notas: N(c('factura_bc')?.notas) },
     sinFactura: { total: r2(N(c('sin_factura')?.neto)), comprobantes: N(c('sin_factura')?.comprobantes), notas: N(c('sin_factura')?.notas) },
     remitos: { total: r2(N(c('remito')?.neto)), comprobantes: N(c('remito')?.comprobantes) },
+    /** Ya sumadas en factura A o B/C: el desglose, para mostrarlas aparte. */
+    facturasMes: { neto: r2(N(fm?.neto)), iva: r2(N(fm?.iva)), comprobantes: N(fm?.comprobantes) },
   };
   const compradoFacturado = compras.facturaA.neto + compras.facturaBC.total;
   const baseC = compradoFacturado + compras.sinFactura.total;
@@ -259,13 +288,35 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
 
   /* Por proveedor: cuánto le compraste con y sin factura en el período. */
   const prov = await c.query(`
-    select p.id, p.nombre,
-      coalesce(sum(case when c.tipo <> 'liquidacion' and c.letra <> 'X' then c.subtotal_neto else 0 end * ${SIGNO_COMPRA}), 0) as facturado,
-      coalesce(sum(case when c.tipo = 'liquidacion' or c.letra = 'X' then c.subtotal_neto else 0 end * ${SIGNO_COMPRA}), 0) as sin_factura
-    from comprobantes c join proveedores p on p.id = c.proveedor_id
-    where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito')
-      and ${EN_DIAS('c.fecha')} and ($3::int is null or c.sucursal_id = $3)
+    select p.id, p.nombre, coalesce(sum(x.facturado), 0) as facturado, coalesce(sum(x.sin_factura), 0) as sin_factura
+    from (
+      select c.proveedor_id as pid,
+        case when c.tipo <> 'liquidacion' and c.letra <> 'X' then c.subtotal_neto else 0 end * ${SIGNO_COMPRA} as facturado,
+        case when c.tipo = 'liquidacion' or c.letra = 'X' then c.subtotal_neto else 0 end * ${SIGNO_COMPRA} as sin_factura
+      from comprobantes c
+      where c.estado = 'confirmado' and c.tipo in ('factura','liquidacion','nota_credito','nota_debito')
+        and c.facturacion_mes_id is null and ${EN_DIAS('c.fecha')} and ($3::int is null or c.sucursal_id = $3)
+      union all
+      select ff.proveedor_id, ff.neto, 0
+      from ${FACTURAS_MES} where ff.activa and ($3::int is null or fm.sucursal_id = $3) and ${EN_DIAS('ff.fecha')}
+    ) x join proveedores p on p.id = x.pid
     group by 1, 2`, [f.desde, f.hasta, f.sucursalId]);
+
+  /* Los meses CERRADOS del período con entregas de proveedores «factura a fin
+   * de mes» que no tienen sus facturas (o que se cargaron después de ellas). */
+  const faltan = await c.query(`
+    select p.nombre, x.mes, count(*)::int as entregas, coalesce(sum(x.neto), 0) as neto,
+      exists (select 1 from facturaciones_mes m where m.proveedor_id = p.id and m.mes = x.mes and m.estado = 'activa') as facturado
+    from (
+      select c.proveedor_id as pid, to_char(c.fecha at time zone '${ZONA}', 'YYYY-MM') as mes, c.subtotal_neto as neto
+      from comprobantes c
+      where c.estado = 'confirmado' and c.tipo in ('remito','liquidacion') and c.facturacion_mes_id is null
+        and not exists (select 1 from facturaciones_mes_facturas ff where ff.comision_comprobante_id = c.id)
+        and ${EN_DIAS('c.fecha')} and ($3::int is null or c.sucursal_id = $3)
+        and c.fecha < (date_trunc('month', now() at time zone '${ZONA}') at time zone '${ZONA}')
+    ) x join proveedores p on p.id = x.pid and p.factura_mensual
+    group by p.id, p.nombre, x.mes
+    order by x.mes, p.nombre`, [f.desde, f.hasta, f.sucursalId]);
   const porProveedor = prov.rows
     .map((x: any) => {
       const fac = r2(N(x.facturado)); const sin = r2(N(x.sin_factura));
@@ -285,6 +336,16 @@ export async function reporteIva(c: PoolClient, f: Filtro, saldoInicial: { impor
   }
   if (total.compras.remitos.comprobantes > 0) {
     avisos.push(`${total.compras.remitos.comprobantes} remito(s) de compra sin facturar: no entran en los % hasta que se sepa si llegan con factura o sin factura.`);
+  }
+  for (const x of faltan.rows as any[]) {
+    const [y, m] = String(x.mes).split('-').map(Number);
+    const mesTxt = new Date(y, m - 1, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+    avisos.push(x.facturado
+      ? `${x.nombre}: ${x.entregas} entrega(s) de ${mesTxt} se cargaron DESPUÉS de sus facturas del mes y no están cubiertas (cuentan como «sin factura»). Anulá esas facturas del mes y volvé a cargarlas, en su estado de cuenta.`
+      : `${x.nombre}: ${x.entregas} entrega(s) de ${mesTxt} por ${pesos(N(x.neto))} sin IVA todavía sin sus facturas del mes: cuentan como «sin factura» hasta que las cargues (estado de cuenta › «Facturas del mes»).`);
+  }
+  if (total.compras.facturasMes.iva > 0) {
+    avisos.push(`El crédito incluye ${pesos(total.compras.facturasMes.iva)} de IVA de ${total.compras.facturasMes.comprobantes} factura(s) del mes: entregas que se pagaron sin IVA y se facturaron a fin de mes. Ese crédito confirmalo con tu contadora antes de declararlo.`);
   }
   if (percOtras > 0) avisos.push(`${percOtras} percepción(es) de compra no se reconocen como IVA ni IIBB por su nombre: marcales el tipo en la ficha del proveedor.`);
   if (total.gastos.ivaSinCredito > 0) avisos.push(`${total.gastos.ivaSinCredito} gasto(s) de letra B/C/ticket tienen IVA cargado: no es crédito fiscal y no se suma.`);

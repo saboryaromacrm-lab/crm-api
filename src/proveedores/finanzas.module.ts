@@ -39,9 +39,10 @@ import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
 import {
-  comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
+  comprobantes, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
   proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
+import { nombreMes } from './facturas-mes.module';
 import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } from '../pagos/pagos.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
@@ -916,6 +917,26 @@ export class FinanzasProveedorService {
         sucursalNombre: p.sucursalNombre || '',
       });
     }
+    /* LAS FACTURAS DEL MES (0158), a la vista y en CERO: son el papel fiscal de
+     * las entregas del mes, que ya están arriba como liquidaciones (lo que se
+     * paga, sin IVA). Su comisión, si cobra, es otra liquidación. */
+    const delMes = await this.db.select({ f: facturacionesMesFacturas, mes: facturacionesMes.mes })
+      .from(facturacionesMesFacturas)
+      .innerJoin(facturacionesMes, eq(facturacionesMes.id, facturacionesMesFacturas.facturacionId))
+      .where(and(eq(facturacionesMesFacturas.proveedorId, proveedorId), eq(facturacionesMesFacturas.activa, true)));
+    const $ = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    for (const { f, mes } of delMes) {
+      movs.push({
+        kind: 'factura_mes',
+        id: f.id,
+        fecha: f.fecha,
+        etiqueta: `Factura ${f.letra} ${f.puntoVenta}-${String(f.numero).padStart(8, '0')}`,
+        detalle: `Factura de las entregas de ${nombreMes(mes)} por ${$(f.total)}${f.iva > 0 ? ` (IVA ${$(f.iva)}: crédito fiscal)` : ''}. `
+          + `No suma deuda: se pagan las entregas sin IVA${f.comision > 0 ? ` y la comisión (${$(f.comision)})` : ''}.`,
+        debe: 0,
+        haber: 0,
+      });
+    }
     for (const a of ajs) {
       const esDebe = a.importe >= 0;
       movs.push({
@@ -981,7 +1002,7 @@ export class FinanzasProveedorService {
       proveedor: {
         id: prov.id, nombre: prov.nombre, cuit: prov.cuit,
         modoCuenta: prov.modoCuenta, medioHabitual: prov.medioHabitual, diasPago: prov.diasPago,
-        condicionCompra: prov.condicionCompra, porcSinFactura: prov.porcSinFactura,
+        condicionCompra: prov.condicionCompra, porcSinFactura: prov.porcSinFactura, facturaMensual: prov.facturaMensual,
         proveeMercaderia: prov.proveeMercaderia, proveeGastos: prov.proveeGastos,
         telefono: prov.telefono, email: prov.email,
         conciliadoHasta: prov.conciliadoHasta, conciliadoAt: prov.conciliadoAt,

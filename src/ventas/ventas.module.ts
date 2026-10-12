@@ -32,7 +32,7 @@ import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
-  listasVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
+  listasVenta, modalidadesVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
   type ReceptorVenta,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
@@ -830,7 +830,10 @@ export class VentasService {
      * (F10): tickets internos y sus devoluciones. Las NC restan en su lado.
      */
     const FACTURADO = sql`(${ventas.tipo}::text like 'factura%' or (${ventas.tipo}::text like 'nota_credito_%' and ${ventas.tipo}::text <> 'nota_credito_ticket') or ${ventas.facturarPendiente})`;
-    const [filas, [tot], porMedio, [fac], porLista, [ren], mpTipos] = await Promise.all([
+    /** La mercadería con IVA de los renglones (la NC resta) y en cuántos tickets: por lista y por modalidad. */
+    const IMPORTE_LISTA = sql<number>`coalesce(sum(${ventaItems.subtotal} * (1 + coalesce(${ventaItems.iva}, 21) / 100.0) * ${SIGNO_NC}), 0)`;
+    const TICKETS_LISTA = sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`;
+    const [filas, [tot], porMedio, [fac], porLista, porModalidad, [ren], mpTipos] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -891,15 +894,33 @@ export class VentasService {
        * son de ninguna lista: quedan fuera de este reparto. */
       this.db.select({
         listaId: ventaItems.listaId,
+        modalidadId: sql<number | null>`max(${listasVenta.modalidadId})`,
         nombre: sql<string>`coalesce(max(${listasVenta.nombre}), max(nullif(${ventaItems.lista}, '')), 'Sin lista')`,
-        importe: sql<number>`coalesce(sum(${ventaItems.subtotal} * (1 + coalesce(${ventaItems.iva}, 21) / 100.0) * ${SIGNO_NC}), 0)`,
-        ventas: sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+        importe: IMPORTE_LISTA,
+        ventas: TICKETS_LISTA,
       }).from(ventaItems)
         .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .leftJoin(listasVenta, eq(listasVenta.id, ventaItems.listaId))
         .where(vivas)
         .groupBy(ventaItems.listaId),
+      /* POR MODALIDAD (12/10/2026, pedido del dueño): lo mismo agrupado por la
+       * modalidad de la lista (Minorista, Mayorista…), con los tickets contados
+       * UNA vez por modalidad (un ticket con dos listas minoristas es uno). Lo
+       * que no tiene lista (o la lista ya no existe) va a «Sin modalidad». */
+      this.db.select({
+        modalidadId: listasVenta.modalidadId,
+        nombre: sql<string>`coalesce(max(${modalidadesVenta.nombre}), 'Sin modalidad')`,
+        orden: sql<number>`coalesce(max(${modalidadesVenta.orden}), 999)`,
+        importe: IMPORTE_LISTA,
+        ventas: TICKETS_LISTA,
+      }).from(ventaItems)
+        .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .leftJoin(listasVenta, eq(listasVenta.id, ventaItems.listaId))
+        .leftJoin(modalidadesVenta, eq(modalidadesVenta.id, listasVenta.modalidadId))
+        .where(vivas)
+        .groupBy(listasVenta.modalidadId),
 
       /* RENTABILIDAD DEL FILTRO (1/10/2026, pedido del dueño): la mercadería
        * SIN IVA contra el costo CONGELADO al vender (0072) — la misma cuenta
@@ -1068,12 +1089,21 @@ export class VentasService {
             liquidado: l, liquidaciones: Number(fac?.liquidaciones) || 0, pctLiquidado: pct(l),
           };
         })(),
-        porLista: (() => {
-          const filasL = porLista.map((x) => ({ listaId: x.listaId, nombre: x.nombre, importe: money(Number(x.importe)), ventas: Number(x.ventas) || 0 }));
-          const base = filasL.reduce((a, x) => a + x.importe, 0);
-          return filasL
-            .map((x) => ({ ...x, pct: base > 0 ? Math.round((x.importe / base) * 1000) / 10 : null }))
-            .sort((a, b) => b.importe - a.importe);
+        /* Cada modalidad con su % del total y, adentro, sus listas con su % de la modalidad. */
+        porModalidad: (() => {
+          const pctDe = (x: number, base: number) => (base > 0 ? Math.round((x / base) * 1000) / 10 : null);
+          const base = porModalidad.reduce((a, m) => a + money(Number(m.importe)), 0);
+          return porModalidad
+            .map((m) => {
+              const importe = money(Number(m.importe));
+              const listas = porLista
+                .filter((l) => (l.modalidadId ?? null) === (m.modalidadId ?? null))
+                .map((l) => ({ listaId: l.listaId, nombre: l.nombre, importe: money(Number(l.importe)), ventas: Number(l.ventas) || 0 }))
+                .map((l) => ({ ...l, pct: pctDe(l.importe, importe) }))
+                .sort((a, b) => b.importe - a.importe);
+              return { modalidadId: m.modalidadId, nombre: m.nombre, orden: Number(m.orden), importe, ventas: Number(m.ventas) || 0, pct: pctDe(importe, base), listas };
+            })
+            .sort((a, b) => b.importe - a.importe || a.orden - b.orden);
         })(),
       },
     };

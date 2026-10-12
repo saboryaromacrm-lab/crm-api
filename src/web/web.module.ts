@@ -21,6 +21,7 @@ import {
 } from '@nestjs/common';
 import { and, eq, gte, inArray, isNull, lt, ne } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { TiendaModule, TiendaService } from '../tienda/tienda.module';
 import { tienePermiso } from '../auth/auth.guard';
 import { MIMES_IMAGEN, mimeReal } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -360,7 +361,16 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
  */
 @Controller('web')
 export class WebController {
-  constructor(private readonly svc: WebService) {}
+  constructor(private readonly svc: WebService, private readonly tienda: TiendaService) {}
+
+  /**
+   * Lo que ve un cliente habilitado, CON precios (0155): el público
+   * `/tienda/catalogo` sale sin plata a quien no ingresó a la tienda, y el ERP no
+   * ingresa a la tienda. Lo pide la página entera, así que alcanza cualquier sección.
+   */
+  @Get('catalogo')
+  @Permiso('web.productos', 'web.ofertas', 'web.contenido', 'web.estadisticas', 'web.configuracion')
+  catalogo() { return this.tienda.catalogoCompleto(); }
 
   @Get('estadisticas')
   @Permiso('web.estadisticas')
@@ -403,6 +413,7 @@ export class WebController {
 }
 
 @Module({
+  imports: [TiendaModule],
   controllers: [WebController],
   providers: [WebService],
 })

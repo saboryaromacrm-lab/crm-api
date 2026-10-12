@@ -223,6 +223,13 @@ export const proveedores = pgTable('proveedores', {
    */
   minimoTransferencia: doublePrecision('minimo_transferencia').notNull().default(0),
   modoCuenta: modoCuentaProvEnum('modo_cuenta').notNull().default('facturas'),
+  /**
+   * JUNTA LAS ENTREGAS Y FACTURA A FIN DE MES (0158): cada entrega llega con
+   * remito sin IVA (es lo que se le paga) y las facturas del mes se cargan
+   * aparte, en «Facturas del mes» — solo fiscales. Sus facturas comunes quedan
+   * bloqueadas en Compras: entrarían de nuevo al stock y a la deuda.
+   */
+  facturaMensual: boolean('factura_mensual').notNull().default(false),
   /** "Cuadré contra el resumen del proveedor hasta esta fecha" — con quién y cuándo. */
   conciliadoHasta: timestamp('conciliado_hasta', { withTimezone: true }),
   conciliadoPor: integer('conciliado_por'),
@@ -693,6 +700,8 @@ export const productoProveedores = pgTable('producto_proveedores', {
   descuento3: doublePrecision('descuento3').notNull().default(0),
   descuento4: doublePrecision('descuento4').notNull().default(0),
   flete: doublePrecision('flete').notNull().default(0),
+  /** Comisión del proveedor SIN FACTURA, % sobre la mercadería sin IVA (0157): va entera al costo. */
+  comision: doublePrecision('comision').notNull().default(0),
   /**
    * De dónde sale el costo:
    *   'lista' — se carga el costo de lista y el sistema aplica descuentos y flete
@@ -794,6 +803,9 @@ export const productoProveedorCostos = pgTable('producto_proveedor_costos', {
   // esta fila no lo tocó.
   costoFinalAnterior: doublePrecision('costo_final_anterior'),
   costoFinal: doublePrecision('costo_final'),
+  // La comisión del proveedor (0157): nula = esta fila no la tocó.
+  comisionAnterior: doublePrecision('comision_anterior'),
+  comision: doublePrecision('comision'),
   origen: origenCostoEnum('origen').notNull().default('manual'),
   // Cambio de PROVEEDOR ACTIVO. Mueve el precio tanto como un cambio de costo,
   // así que se audita en la misma tabla: sin esto, el historial no puede
@@ -1322,6 +1334,8 @@ export const conteos = pgTable('conteos', {
   nombre: text('nombre').notNull().default(''),
   /** Los filtros del alcance, congelados como texto humano ("Marca CUMANA"). */
   alcance: text('alcance').notNull().default(''),
+  /** Quién responde por el conteo, escrito a mano al abrirlo (0154): puede no tener usuario. */
+  responsable: text('responsable').notNull().default(''),
   ciego: boolean('ciego').notNull().default(true),
   estado: estadoConteoEnum('estado').notNull().default('en_curso'),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
@@ -1588,6 +1602,13 @@ export const comprobantes = pgTable('comprobantes', {
   anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   motivoAnulacion: text('motivo_anulacion').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /**
+   * LAS FACTURAS DEL MES QUE CUBREN ESTA ENTREGA (0158). Solo liquidaciones
+   * (los remitos del mes pasan a serlo al facturar): sigue siendo la deuda sin
+   * IVA que se paga, pero en el IVA ya no cuenta como «sin factura» — la cubren
+   * esas facturas. Mientras esté puesta, no se anula sola.
+   */
+  facturacionMesId: integer('facturacion_mes_id'),
 }, (t) => ({
   /**
    * EL MISMO COMPROBANTE NO SE CARGA DOS VECES.
@@ -1626,6 +1647,7 @@ export const comprobantes = pgTable('comprobantes', {
    * `estado` de segunda porque casi todas esas consultas descartan las anuladas.
    */
   ixProveedor: index('ix_comprobantes_proveedor').on(t.proveedorId, t.estado),
+  ixFacturacionMes: index('ix_comprobantes_facturacion_mes').on(t.facturacionMesId).where(sql`${t.facturacionMesId} is not null`),
 }));
 
 /**
@@ -1700,6 +1722,65 @@ export const comprobanteItems = pgTable('comprobante_items', {
    * Faltaba (0058) y era un scan completo en cada apertura de Facturación.
    */
   ixComprobante: index('ix_comprobante_items_comprobante').on(t.comprobanteId),
+}));
+
+/* ----------------------------------------------------------------------------
+ * FACTURAS DEL MES (0158) — el proveedor que entrega con remitos sin IVA y
+ * factura todo a fin de mes. Ver la migración.
+ * --------------------------------------------------------------------------*/
+
+/** El mes facturado de un proveedor: uno activo por mes; se anula, no se borra. */
+export const facturacionesMes = pgTable('facturaciones_mes', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  /** 'AAAA-MM': el mes de las ENTREGAS (las facturas pueden tener fecha del siguiente). */
+  mes: text('mes').notNull(),
+  /** La de la mayoría de las entregas: ahí van la comisión y el IVA por sucursal. */
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  /** Lo que sumaban las entregas sin IVA al facturar: lo que se le paga. */
+  netoDocumentos: doublePrecision('neto_documentos').notNull().default(0),
+  estado: text('estado').notNull().default('activa'),
+  observaciones: text('observaciones').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  motivoAnulacion: text('motivo_anulacion').notNull().default(''),
+}, (t) => ({
+  uq: uniqueIndex('uq_facturaciones_mes').on(t.proveedorId, t.mes).where(sql`${t.estado} = 'activa'`),
+}));
+
+/**
+ * Cada factura del papel. SOLO FISCAL: su IVA es crédito y sus percepciones
+ * pago a cuenta, por SU fecha; no mueve stock ni suma deuda (se pagan las
+ * entregas sin IVA). La comisión que el proveedor cobra por ella es una
+ * liquidación aparte, `comisionComprobanteId`: deuda sin IVA.
+ */
+export const facturacionesMesFacturas = pgTable('facturaciones_mes_facturas', {
+  id: serial('id').primaryKey(),
+  facturacionId: integer('facturacion_id').notNull().references(() => facturacionesMes.id, { onDelete: 'cascade' }),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  /** Falsa cuando se anuló su mes: deja de contar y libera el número. */
+  activa: boolean('activa').notNull().default(true),
+  letra: letraComprobanteEnum('letra').notNull(),
+  puntoVenta: text('punto_venta').notNull(),
+  numero: integer('numero').notNull(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull(),
+  cae: text('cae').notNull().default(''),
+  /** En la A, el neto gravado; en la B y la C (sin IVA discriminado), el importe sin percepciones. */
+  neto: doublePrecision('neto').notNull(),
+  iva: doublePrecision('iva').notNull().default(0),
+  percIva: doublePrecision('perc_iva').notNull().default(0),
+  percIibb: doublePrecision('perc_iibb').notNull().default(0),
+  percOtras: doublePrecision('perc_otras').notNull().default(0),
+  total: doublePrecision('total').notNull(),
+  comision: doublePrecision('comision').notNull().default(0),
+  comisionComprobanteId: integer('comision_comprobante_id').references(() => comprobantes.id, { onDelete: 'restrict' }),
+}, (t) => ({
+  uqNumero: uniqueIndex('uq_facturaciones_mes_facturas').on(t.proveedorId, t.letra, t.puntoVenta, t.numero).where(sql`${t.activa}`),
+  ixFecha: index('ix_facturaciones_mes_facturas_fecha').on(t.fecha).where(sql`${t.activa}`),
+  ixFacturacion: index('ix_facturaciones_mes_facturas_facturacion').on(t.facturacionId),
+  ixComision: index('ix_facturaciones_mes_facturas_comision').on(t.comisionComprobanteId).where(sql`${t.comisionComprobanteId} is not null`),
 }));
 
 /* ----------------------------------------------------------------------------
@@ -2596,6 +2677,43 @@ export const webEventos = pgTable('web_eventos', {
 }, (t) => ({
   ixFecha: index('ix_web_eventos_fecha').on(t.fecha),
   ixProducto: index('ix_web_eventos_producto').on(t.productoId),
+}));
+
+/**
+ * INGRESO A LA TIENDA MAYORISTA (0155): una fila por DNI. `pendiente` hasta que
+ * alguien del ERP decide; `bloqueado` = rechazado o deshabilitado (no entra ni
+ * puede volver a pedir). `clienteId`: su ficha (la que ya tenía ese DNI, o la
+ * que se crea al habilitar).
+ */
+export const tiendaAccesos = pgTable('tienda_accesos', {
+  id: serial('id').primaryKey(),
+  dni: text('dni').notNull(),
+  nombre: text('nombre').notNull(),
+  /** 10 dígitos (área + abonado), como los guarda `telefonoArgentino`. */
+  whatsapp: text('whatsapp').notNull(),
+  localidad: text('localidad').notNull().default(''),
+  cuit: text('cuit').notNull().default(''),
+  clienteId: integer('cliente_id').references(() => clientes.id, { onDelete: 'set null' }),
+  estado: text('estado').$type<'pendiente' | 'habilitado' | 'bloqueado'>().notNull().default('pendiente'),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  resueltoEn: timestamp('resuelto_en', { withTimezone: true }),
+  resueltoPor: integer('resuelto_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  avisadoRecibidaEn: timestamp('avisado_recibida_en', { withTimezone: true }),
+  avisadoHabilitadoEn: timestamp('avisado_habilitado_en', { withTimezone: true }),
+  ultimoIngreso: timestamp('ultimo_ingreso', { withTimezone: true }),
+}, (t) => ({
+  uxDni: uniqueIndex('ux_tienda_accesos_dni').on(t.dni),
+  ixEstado: index('ix_tienda_accesos_estado').on(t.estado, t.creadoEn),
+}));
+
+/** El aparato que ingresó a la tienda (0155): solo el HASH del token; vence a los 90 días sin uso. */
+export const tiendaSesiones = pgTable('tienda_sesiones', {
+  tokenHash: text('token_hash').primaryKey(),
+  accesoId: integer('acceso_id').notNull().references(() => tiendaAccesos.id, { onDelete: 'cascade' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  expiraEn: timestamp('expira_en', { withTimezone: true }).notNull(),
+}, (t) => ({
+  ixAcceso: index('ix_tienda_sesiones_acceso').on(t.accesoId),
 }));
 
 /* ============================================================================

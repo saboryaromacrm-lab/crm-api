@@ -649,6 +649,8 @@ export class IncidenciasController {
 
 class CrearConteoDto {
   @IsOptional() @IsString() @MaxLength(120) nombre?: string;
+  /** Quién responde por el conteo (0154): obligatorio (lo exige el servicio, con su mensaje), se escribe a mano. */
+  @IsOptional() @IsString() @MaxLength(80, { message: 'El nombre del responsable es demasiado largo.' }) responsable?: string;
   /** Solo el jefe puede apagarlo: ciego por defecto es decisión del dueño. */
   @IsOptional() @IsBoolean() ciego?: boolean;
   @IsOptional() @IsInt() sucursalId?: number;

@@ -11,6 +11,7 @@ import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
+  facturacionesMes, facturacionesMesFacturas,
   productoProveedores, productos, proveedores, proveedorCompromisos, proveedorEcheqs,
   proveedorImputaciones, proveedorPagos, sucursales, usuarios, productoProveedorCostos, presentaciones,
 } from '../db/schema';
@@ -376,14 +377,14 @@ const LLEVAN_NUMERO = new Set(['factura', 'remito', 'nota_credito', 'nota_debito
  * servidor le sumaba el 21% a una factura C: la deuda y el costo inflados en
  * un IVA que el proveedor nunca cobró.
  */
-const LETRAS_POR_CONDICION: Record<string, string[]> = {
+export const LETRAS_POR_CONDICION: Record<string, string[]> = {
   responsable_inscripto: ['A', 'B'],
   monotributo: ['C'],
   exento: ['B', 'C'],
   consumidor_final: ['C'],
   no_categorizado: ['C'],
 };
-const CONDICION_TEXTO: Record<string, string> = {
+export const CONDICION_TEXTO: Record<string, string> = {
   responsable_inscripto: 'responsable inscripto', monotributo: 'monotributista', exento: 'exento',
   consumidor_final: 'consumidor final', no_categorizado: 'no categorizado',
 };
@@ -778,6 +779,7 @@ export class ComprobantesService {
     if (!ids.length) return new Set();
     const filas = await this.db.select({
       id: productos.id, nombre: productos.nombre, estado: productos.estado, soloCafeteria: productos.soloCafeteria,
+      origenCafeteria: productos.origenCafeteria,
     }).from(productos).where(inArray(productos.id, ids));
     /* Un producto que no existe daba "error del servidor" (la clave foránea). */
     const faltan = ids.filter((id) => !filas.some((f) => f.id === id));
@@ -785,6 +787,15 @@ export class ComprobantesService {
       throw new BadRequestException(`Hay renglones con un producto que no existe (código interno ${faltan.join(', ')}): quitalo y buscalo de nuevo.`);
     }
     await this.exigirPaquetesDelProducto(items, filas);
+    /* Lo que ELABORA Coffit no se compra (10/10/2026): entra por sus envíos, con el costo que
+     * ella declara. Desde que tiene proveedor COFFIT (para verlo y filtrarlo) podría colarse acá. */
+    const deCoffit = filas.filter((f) => f.origenCafeteria);
+    if (deCoffit.length) {
+      throw new BadRequestException(
+        `Esto lo elabora Coffit y no se compra con factura: ${deCoffit.map((d) => d.nombre).join(', ')}. `
+        + 'Entra por Almacén › Coffit › «Nos mandó».',
+      );
+    }
     const dados = filas.filter((f) => f.estado !== 'activo');
     if (dados.length) {
       const nombres = dados.map((d) => `${d.nombre} (${d.estado})`).join(', ');
@@ -1176,6 +1187,9 @@ export class ComprobantesService {
     /* La LETRA del papel, y con ella el IVA (ver LETRAS_POR_CONDICION). */
     const letraDoc = dto.tipo === 'liquidacion' ? 'X' : (dto.letra ?? letraPorDefecto(prov.condicionIva));
     if (ES_PAPEL_FISCAL.has(dto.tipo)) this.exigirLetra(letraDoc, prov);
+    if (dto.tipo === 'factura') {
+      await this.exigirNoEsDelMes(prov, letraDoc, normalizarPuntoVenta(dto.puntoVenta ?? '0001'), dto.numero ?? null);
+    }
     const discriminaIva = fiscal && letraDoc === 'A';
     this.validarFechas(dto);
     await this.exigirUnidadesEnteras(dto.items);
@@ -1565,6 +1579,33 @@ export class ComprobantesService {
    * Es el espejo de Ventas ⚠ Sin facturar (0073): el documento provisorio
    * pasa a ser el definitivo, con rastro en observaciones.
    */
+  /**
+   * LAS FACTURAS DEL MES NO ENTRAN POR ACÁ (0158). El proveedor que junta los
+   * remitos y factura a fin de mes ya tiene la mercadería y la deuda (sin IVA)
+   * en sus entregas: su factura cargada como factura común entraría OTRA VEZ al
+   * stock y a la deuda, con un IVA que no se le paga. Y el mismo papel tampoco
+   * puede estar en las dos puertas, aunque después se le saque la marca.
+   */
+  private async exigirNoEsDelMes(prov: { id: number; nombre: string; facturaMensual?: boolean | null }, letra: string, puntoVenta: string, numero: number | null) {
+    if (prov.facturaMensual) {
+      throw new BadRequestException(
+        `${prov.nombre} junta los remitos y factura a fin de mes: sus facturas se cargan en su estado de cuenta › «Facturas del mes» `
+        + '(así la mercadería y la deuda no entran dos veces). Cada entrega se carga como remito o liquidación.',
+      );
+    }
+    if (!numero) return;
+    const [ya] = await this.db.select({ mes: facturacionesMes.mes }).from(facturacionesMesFacturas)
+      .innerJoin(facturacionesMes, eq(facturacionesMes.id, facturacionesMesFacturas.facturacionId))
+      .where(and(
+        eq(facturacionesMesFacturas.proveedorId, prov.id), eq(facturacionesMesFacturas.activa, true),
+        eq(facturacionesMesFacturas.letra, letra as any), eq(facturacionesMesFacturas.puntoVenta, puntoVenta),
+        eq(facturacionesMesFacturas.numero, numero),
+      )).limit(1);
+    if (ya) {
+      throw new BadRequestException(`Esa factura ya está cargada en las facturas del mes de ${prov.nombre} (${ya.mes}): no se carga de nuevo.`);
+    }
+  }
+
   /** La letra tiene que ser una que ese proveedor PUEDE emitir (ver LETRAS_POR_CONDICION). */
   private exigirLetra(letra: string, prov: { nombre: string; condicionIva?: string | null }) {
     if (letra === 'X') {
@@ -1731,7 +1772,9 @@ export class ComprobantesService {
        * final, el costo neto que deriva el formato contra el neto del papel. */
       let antes: number; let despues: number;
       if (e.modoCosto === 'final') {
-        antes = costosFormato(e, ivaDe.get(x.productoId) ?? 0).costoNetoUnitario;
+        /* La MERCADERÍA (sin la comisión del proveedor, 0157): es lo que dice el papel. */
+        const cf = costosFormato(e, ivaDe.get(x.productoId) ?? 0);
+        antes = cf.costoBruto / cf.cantidad;
         despues = (Number(x.costo) || 0) * (1 - (Number(x.descuentoPapel) || 0) / 100) / bulto;
       } else {
         antes = Number(e.costo) / (Number(e.cantidad) > 0 ? Number(e.cantidad) : 1);
@@ -1895,6 +1938,19 @@ export class ComprobantesService {
         stock: { sentido: 0, sucursalId: c.sucursalId, renglones: [] as any[] }, costos: [] as any[],
         cuotasPendientes: 0, lectura: null, lotes: [] as string[],
       };
+    }
+
+    /* Lo que es de unas FACTURAS DEL MES (0158) se anula desde ahí: la entrega
+     * que esas facturas cubren y la comisión de cada una. */
+    if (c.facturacionMesId) {
+      const [m] = await ex.select({ mes: facturacionesMes.mes }).from(facturacionesMes).where(eq(facturacionesMes.id, c.facturacionMesId)).limit(1);
+      bloqueos.push(`Está cubierta por las facturas del mes${m ? ` (${m.mes})` : ''}: anulá primero esas facturas, en el estado de cuenta del proveedor › «Facturas del mes».`);
+    }
+    const [deComision] = await ex.select({ mes: facturacionesMes.mes }).from(facturacionesMesFacturas)
+      .innerJoin(facturacionesMes, eq(facturacionesMes.id, facturacionesMesFacturas.facturacionId))
+      .where(and(eq(facturacionesMesFacturas.comisionComprobanteId, c.id), eq(facturacionesMesFacturas.activa, true))).limit(1);
+    if (deComision) {
+      bloqueos.push(`Es la comisión de una factura del mes (${deComision.mes}): se anula anulando esas facturas, en el estado de cuenta del proveedor › «Facturas del mes».`);
     }
 
     /* Pagos aplicados: la plata ya salió contra este papel. Se desaplican
@@ -2115,6 +2171,7 @@ export class ComprobantesService {
     // La factura que llegó: su letra decide el IVA, igual que en el alta.
     const letraFactura = dto.letra ?? letraPorDefecto(prov.condicionIva);
     this.exigirLetra(letraFactura, prov);
+    await this.exigirNoEsDelMes(prov, letraFactura, normalizarPuntoVenta(dto.puntoVenta ?? c.puntoVenta ?? '0001'), dto.numero ?? c.numero ?? null);
     this.validarFechas(dto);
     const base = filasRemito.map((f) => {
       const o = porItem.get(f.id);

@@ -16,20 +16,25 @@
  * El pedido nace como PRESUPUESTO en estado `enviado` (no hay nadie
  * cotizando en el medio): alguien del local lo confirma y lo arma, tal como
  * ya funciona para los pedidos que llegan por WhatsApp.
+ *
+ * PRECIOS SOLO PARA LOS HABILITADOS (0155, 10/10/2026): sin una sesión válida
+ * (`X-Tienda-Sesion`, ver accesos.ts) el catálogo sale SIN NADA DE PLATA y el
+ * pedido se rechaza. Se quita acá, en el servidor: ocultarlo en la pantalla y
+ * mandarlo igual sería un precio oculto que se lee con F12.
  */
 import {
-  BadRequestException, Body, Controller, Get, Inject, Injectable, Module,
-  NotFoundException, Param, ParseIntPipe, Post, Res, UseGuards,
+  BadRequestException, Body, Controller, Get, Headers, Inject, Injectable, Module,
+  NotFoundException, Param, ParseIntPipe, Post, Res, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
 import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
 import type { Response } from 'express';
-import { and, desc, eq, gte, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, gte, ne } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, subcategorias, clientes, presupuestos, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
+  categorias, subcategorias, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
@@ -38,7 +43,9 @@ import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { PresupuestosModule } from '../presupuestos/presupuestos.module';
-import { ClientesModule, ClientesService } from '../clientes/clientes.module';
+import { ClientesModule } from '../clientes/clientes.module';
+import { AccesosTiendaService } from './accesos';
+import { AccesosTiendaController } from './accesos.controller';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
@@ -54,6 +61,25 @@ const DIAS_REINGRESO = 14;
 
 /** Renglones máximos de un pedido del sitio. Es el único endpoint público que ESCRIBE. */
 const MAX_RENGLONES_PEDIDO = 100;
+
+/** Cabecera con el token del aparato que ingresó a la tienda (0155). */
+const SESION = 'x-tienda-sesion';
+
+/**
+ * EL CATÁLOGO DEL QUE NO INGRESÓ (0155): el mismo, sin nada de plata —precios,
+ * ofertas, ahorros, montos mínimos ni la lista—. Las cantidades (stock, mínimos
+ * en unidades) quedan: no son precio. La COMPRA MÍNIMA también queda (pedido del
+ * dueño: el cartel de bienvenida la anuncia a todos); del piso del envío sin
+ * costo queda solo SI hay uno.
+ */
+export function sinPrecios(cat: any) {
+  const limpiar = ({ precio, oferta, precioKg, precioPaquete, ahorroPct, ahorroMinorista, ...resto }: any) => resto;
+  return {
+    ...cat, conPrecios: false, cliente: null, listaId: null, listaNombre: '', montoMinimoCamioneta: 0,
+    hayMinimoEnvio: Number(cat.montoMinimoCamioneta) > 0,
+    items: cat.items.map((it: any) => ({ ...limpiar(it), ...(it.variantes ? { variantes: it.variantes.map(limpiar) } : {}) })),
+  };
+}
 
 /**
  * ¿La oferta está vigente ahora, en esta sucursal? Misma regla que el motor
@@ -130,66 +156,8 @@ export class TiendaService {
     private readonly cfg: ConfiguracionService,
     private readonly presupuestos: PresupuestosService,
     private readonly ofertasSvc: OfertasService,
-    private readonly clientesSvc: ClientesService,
+    private readonly accesos: AccesosTiendaService,
   ) {}
-
-  /**
-   * EL CHECKOUT RECONOCE AL CLIENTE POR SU DNI (4/10/2026, pedido del dueño:
-   * «si ya está registrado, que se completen solos sus datos»). Devuelve SOLO
-   * lo que el formulario usa —nombre, apellido, WhatsApp y dirección—, nunca
-   * crédito, saldo ni correo. Con cupo estricto por IP (regla `cliente`).
-   *
-   * El nombre y el apellido salen del último pedido web con ese DNI (ahí
-   * vinieron separados); si no hay, se parte el de la ficha en el último
-   * espacio («Juan Pablo Pérez» → «Juan Pablo» / «Pérez»). La dirección, de la
-   * ficha; si está vacía, la del último pedido con envío.
-   */
-  async clientePorDni(dto: any) {
-    const dni = String(dto?.dni ?? '').replace(/\D/g, '');
-    if (dni.length < 7 || dni.length > 8) return { encontrado: false };
-    const [cli] = await this.db.select().from(clientes)
-      .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni), eq(clientes.activo, true), eq(clientes.esConsumidorFinal, false)))
-      .limit(1);
-    if (!cli) return { encontrado: false };
-    const [ultimo] = await this.db.select({ wc: presupuestos.webCliente }).from(presupuestos)
-      .where(sql`${presupuestos.webCliente}->>'dni' = ${dni}`)
-      .orderBy(desc(presupuestos.id)).limit(1);
-    const wc: any = ultimo?.wc ?? {};
-    const completo = String(cli.nombre ?? '').trim().replace(/\s+/g, ' ');
-    const corte = completo.lastIndexOf(' ');
-    const nombre = String(wc.nombre ?? '').trim() || (corte > 0 ? completo.slice(0, corte) : completo);
-    const apellido = String(wc.apellido ?? '').trim() || (corte > 0 ? completo.slice(corte + 1) : '');
-    return {
-      encontrado: true,
-      nombre: nombre.slice(0, 60),
-      apellido: apellido.slice(0, 60),
-      telefono: String(cli.telefono || wc.telefono || '').trim(),
-      direccion: String(cli.direccion || wc.direccion || '').trim().slice(0, MAX_CALLE),
-      localidad: String(cli.localidad || wc.localidad || '').trim().slice(0, MAX_LOCALIDAD),
-    };
-  }
-
-  /**
-   * PRIMERA COMPRA = CLIENTE NUEVO EN EL MOMENTO (4/10/2026, pedido del dueño:
-   * «si es un DNI que no se encuentra, que le guarde ya los datos»). Antes el
-   * alta esperaba a que alguien aceptara la orden en el ERP. Se da de alta con
-   * lo que escribió (consumidor final, sin crédito) y una nota de origen. Si dos
-   * pedidos con el mismo DNI llegan juntos, el segundo encuentra al primero.
-   */
-  private async altaClienteWeb(d: { nombre: string; dni: string; telefono: string; direccion: string; localidad: string }) {
-    try {
-      const c = await this.clientesSvc.create({
-        nombre: d.nombre, tipoDoc: 'dni', numeroDoc: d.dni, telefono: d.telefono,
-        direccion: d.direccion, localidad: d.localidad, condicionIva: 'consumidor_final',
-        observaciones: 'Alta automática desde la tienda online (primer pedido).',
-      } as any, false);
-      return c.id as number;
-    } catch {
-      const [ya] = await this.db.select({ id: clientes.id }).from(clientes)
-        .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, d.dni))).limit(1);
-      return ya?.id ?? null;
-    }
-  }
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
   private async sucursalTienda() {
@@ -199,9 +167,19 @@ export class TiendaService {
     return cualquiera;
   }
 
-  /** El catálogo PÚBLICO del sitio: sin los datos internos de stock. */
-  async catalogo() {
-    return (await this.armarCatalogo()).catalogo;
+  /**
+   * El catálogo PÚBLICO del sitio, sin los datos internos de stock. Con sesión
+   * válida, con precios y los datos del cliente para el checkout; sin ella, sin
+   * nada de plata (`sinPrecios`).
+   */
+  async catalogo(token?: string) {
+    const [completo, s] = await Promise.all([this.catalogoCompleto(), this.accesos.sesion(token)]);
+    return s ? { ...completo, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(completo);
+  }
+
+  /** El catálogo CON precios, tal cual lo ve un cliente habilitado: el de Tienda online del ERP (`GET /web/catalogo`). */
+  async catalogoCompleto() {
+    return { ...(await this.armarCatalogo()).catalogo, conPrecios: true, cliente: null };
   }
 
   /**
@@ -801,22 +779,19 @@ export class TiendaService {
    * Alta de un pedido del sitio. Recotiza TODO server-side (nunca confía en lo
    * que mandó el navegador), valida el mínimo de compra y crea el presupuesto.
    */
-  async pedido(dto: any) {
+  async pedido(dto: any, token?: string) {
+    /* Compra solo el habilitado (0155): quién es sale de la SESIÓN, no del body. */
+    const s = await this.accesos.sesion(token);
+    if (!s) throw new UnauthorizedException('Para comprar, ingresá con tu DNI.');
     const carritoIn: any[] = Array.isArray(dto?.items) ? dto.items : [];
     if (!carritoIn.length) throw new BadRequestException('El carrito está vacío.');
 
-    const c = dto?.cliente ?? {};
-    const nombreCompleto = `${c.nombre ?? ''} ${c.apellido ?? ''}`.trim();
-    if (!nombreCompleto) throw new BadRequestException('Ingresá tu nombre y apellido.');
-    const telefono = String(c.telefono ?? '').trim();
-    if (!telefono) throw new BadRequestException('Ingresá tu WhatsApp.');
-    // El WhatsApp es el único canal de vuelta: sin un número completo el
-    // pedido queda huérfano. Área + abonado = 10 dígitos (sin 0 ni 15).
-    if (!telefonoArgentino(telefono)) {
+    /* El WhatsApp de ESTE pedido (puede cambiarlo; su acceso no se toca). Área + abonado = 10 dígitos. */
+    const telCrudo = String(dto?.cliente?.telefono ?? '').trim();
+    const telefono = telCrudo ? telefonoArgentino(telCrudo) : s.whatsapp;
+    if (!telefono) {
       throw new BadRequestException('El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
     }
-    const dni = String(c.dni ?? '').replace(/\D/g, '');
-    if (dni.length < 7 || dni.length > 8) throw new BadRequestException('El DNI debe tener entre 7 y 8 dígitos (es solo para identificarte, no es de facturación).');
 
     const entrega: EntregaTienda = ENTREGAS_TIENDA.includes(dto?.entrega) ? dto.entrega : 'retiro';
     // Se valida ANTES de cotizar: si falta la dirección no hay para qué tocar el catálogo.
@@ -989,15 +964,6 @@ export class TiendaService {
     }
 
     /*
-     * Cliente: se busca por DNI. Si ya existe, el pedido queda adjudicado a ESE
-     * cliente y su ficha NO se toca (pedido del dueño): el WhatsApp y la
-     * dirección que escribió viajan en `webCliente` y son los que muestra la
-     * orden. Si no existe, se da de alta más abajo, ya validado el pedido.
-     */
-    const [existente] = await this.db.select().from(clientes)
-      .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni))).limit(1);
-
-    /*
      * EL RENGLÓN DEL PEDIDO, EN LA UNIDAD DEL STOCK: la bolsa viaja en KILOS
      * (2 bolsas de 10 kg = 20 kg del producto, a precio por kilo) y el paquete
      * en PAQUETES (una caja de 6 = 6 paquetes, a precio por paquete). Así la
@@ -1026,22 +992,16 @@ export class TiendaService {
       };
     });
 
-    /* Último paso antes de grabar: todo lo de arriba (stock, mínimos, envío) ya pasó. */
-    const clienteId = existente?.id ?? await this.altaClienteWeb({
-      nombre: nombreCompleto.slice(0, 121), dni, telefono,
-      direccion: domicilio?.direccion ?? '', localidad: domicilio?.localidad ?? '',
-    });
-
+    /* El cliente es el de su acceso (su ficha se creó al habilitarlo y NO se toca): el WhatsApp
+     * y la dirección de este pedido viajan en `webCliente`, que es lo que muestra la orden. */
     return this.presupuestos.crearDesdeWeb({
-      clienteId, sucursalId: cat.sucursalId,
+      clienteId: s.clienteId, sucursalId: cat.sucursalId,
       // Topes de largo del lado del servidor: el `maxLength` del checkout vive
       // en el navegador y no protege al `POST` directo. Un pedido con 3 MB de
       // texto en observaciones vuelve inusable la bandeja de Órdenes al pintarla.
       entrega, observaciones: String(dto.observaciones ?? '').slice(0, 500),
       webCliente: {
-        nombre: String(c.nombre ?? '').trim().slice(0, 60),
-        apellido: String(c.apellido ?? '').trim().slice(0, 60),
-        telefono, dni,
+        nombre: s.nombre, apellido: '', telefono, dni: s.dni,
         // La dirección viaja con los datos del cliente (jsonb, sin migración):
         // el ERP la muestra en la orden y la usa al darlo de alta.
         ...(domicilio ?? {}),
@@ -1060,20 +1020,28 @@ export class TiendaService {
 @Publico()
 @UseGuards(TiendaRateLimitGuard)
 export class TiendaController {
-  constructor(private readonly svc: TiendaService) {}
+  constructor(private readonly svc: TiendaService, private readonly accesos: AccesosTiendaService) {}
 
   @Get('catalogo')
   @RateLimit('catalogo')
-  catalogo() { return this.svc.catalogo(); }
+  catalogo(@Headers(SESION) token?: string) { return this.svc.catalogo(token); }
 
   @Post('pedidos')
   @RateLimit('pedidos')
-  pedido(@Body() body: any) { return this.svc.pedido(body ?? {}); }
+  pedido(@Body() body: any, @Headers(SESION) token?: string) { return this.svc.pedido(body ?? {}, token); }
 
-  /** POST y no GET: el DNI no queda escrito en la dirección (ni en los registros del servidor). */
-  @Post('cliente')
-  @RateLimit('cliente')
-  cliente(@Body() body: any) { return this.svc.clientePorDni(body ?? {}); }
+  /* Ingreso a la tienda (0155). POST y no GET: el DNI no queda escrito en la dirección ni en los registros. */
+  @Post('registro')
+  @RateLimit('registro')
+  registro(@Body() body: any) { return this.accesos.registrar(body ?? {}); }
+
+  @Post('ingresar')
+  @RateLimit('ingreso')
+  ingresar(@Body() body: any) { return this.accesos.ingresar(body ?? {}); }
+
+  @Post('salir')
+  @RateLimit('ingreso')
+  salir(@Headers(SESION) token?: string) { return this.accesos.salir(token); }
 
   @Post('eventos')
   @RateLimit('eventos')
@@ -1127,7 +1095,8 @@ export class TiendaController {
 
 @Module({
   imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule],
-  controllers: [TiendaController],
-  providers: [TiendaService, TiendaRateLimitGuard],
+  controllers: [TiendaController, AccesosTiendaController],
+  providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard],
+  exports: [TiendaService],
 })
 export class TiendaModule {}

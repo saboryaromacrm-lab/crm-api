@@ -25,7 +25,7 @@ import { veMetricasDelCafe } from '../auth/auth.guard';
 import { totalesCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, gastos, marcas, productoProveedores,
+  categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, facturacionesMesFacturas, gastos, marcas, productoProveedores,
   productos, proveedores, stock, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { costosFormato, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
@@ -309,6 +309,39 @@ export class RentabilidadService {
    * lo facturado — una devolución grande sin restar diría que se compró de más.
    */
   private async comprasPorProveedor(desde: Date, hastaEx: Date) {
+    const [filas, delMes] = await Promise.all([this.comprasDeComprobantes(desde, hastaEx), this.facturasDelMes(desde, hastaEx)]);
+    /* Las facturas del mes (0158) son facturas como cualquiera: suman a lo
+     * facturado de su proveedor y su IVA es crédito. */
+    const porProv = new Map(filas.map((f) => [f.proveedorId, { ...f }]));
+    for (const m of delMes) {
+      const f = porProv.get(m.proveedorId) ?? {
+        proveedorId: m.proveedorId, facturadoNeto: 0, liquidado: 0, facturadoNetoA: 0, facturasBC: 0, ivaCredito: 0,
+      };
+      f.facturadoNeto = Number(f.facturadoNeto) + Number(m.neto);
+      f.facturadoNetoA = Number(f.facturadoNetoA) + Number(m.netoA);
+      f.facturasBC = Number(f.facturasBC) + Number(m.bc);
+      f.ivaCredito = Number(f.ivaCredito) + Number(m.iva);
+      porProv.set(m.proveedorId, f);
+    }
+    return [...porProv.values()];
+  }
+
+  private facturasDelMes(desde: Date, hastaEx: Date) {
+    return this.db.select({
+      proveedorId: facturacionesMesFacturas.proveedorId,
+      neto: sql<number>`coalesce(sum(${facturacionesMesFacturas.neto}), 0)`,
+      netoA: sql<number>`coalesce(sum(${facturacionesMesFacturas.neto}) filter (where ${facturacionesMesFacturas.letra} = 'A'), 0)`,
+      bc: sql<number>`count(*) filter (where ${facturacionesMesFacturas.letra} in ('B', 'C'))::int`,
+      iva: sql<number>`coalesce(sum(${facturacionesMesFacturas.iva}), 0)`,
+    }).from(facturacionesMesFacturas)
+      .where(and(
+        eq(facturacionesMesFacturas.activa, true),
+        gte(facturacionesMesFacturas.fecha, desde), lt(facturacionesMesFacturas.fecha, hastaEx),
+      ))
+      .groupBy(facturacionesMesFacturas.proveedorId);
+  }
+
+  private comprasDeComprobantes(desde: Date, hastaEx: Date) {
     return this.db.select({
       proveedorId: comprobantes.proveedorId,
       /* Cada `filter` con su propio coalesce: un proveedor sin notas de débito
@@ -317,7 +350,8 @@ export class RentabilidadService {
       facturadoNeto: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'factura'), 0)
         + coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'nota_debito'), 0)
         - coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'nota_credito'), 0)`,
-      liquidado: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'liquidacion'), 0)`,
+      /* Sin las entregas que cubren unas facturas del mes (0158): esas cuentan como facturadas, abajo. */
+      liquidado: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} = 'liquidacion' and ${comprobantes.facturacionMesId} is null), 0)`,
       /* El control de «sin factura» mira solo lo que da crédito fiscal: la letra A
        * (9/10/2026). La B y la C no son la «parte con factura» del costo. */
       facturadoNetoA: sql<number>`coalesce(sum(${comprobantes.subtotalNeto}) filter (where ${comprobantes.tipo} in ('factura', 'nota_debito') and ${comprobantes.letra} = 'A'), 0)

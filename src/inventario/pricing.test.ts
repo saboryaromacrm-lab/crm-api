@@ -87,6 +87,41 @@ test('costosFormato: la identidad de control cierra con parte sin factura y flet
   cerca(sinNegro.costoPrecio, sinNegro.costoNeto);
 });
 
+test('costosFormato: la comisión del proveedor va entera al costo y no toca el flete ni el papel', () => {
+  const iva = 21;
+  const factor = 1 + iva / 100;
+  /* El caso real: 5,94 % sobre la mercadería sin IVA, todo facturado, flete 12 %. */
+  const sin = costosFormato({ costo: 1000, descuento: 0, flete: 12 }, iva);
+  const con = costosFormato({ costo: 1000, descuento: 0, flete: 12, comision: 5.94 }, iva);
+  cerca(con.costoComision, 59.4, 'comisión = mercadería × %');
+  /* El monto va con otro nombre: el detalle del producto mezcla el formato con su
+   * costo, y un `comision` en pesos pisaba el % guardado (59,4 en vez de 5,94). */
+  assert.ok(!('comision' in con), 'el resultado no pisa el % del formato');
+  cerca(con.costoNeto, sin.costoNeto + 59.4, 'entera al costo real');
+  cerca(con.costoPrecio, sin.costoPrecio + 59.4 / factor, 'a la base del precio, sin el IVA que se absorbe');
+  cerca(con.ivaAbsorbido, 59.4 - 59.4 / factor, 'el IVA de la comisión lo absorbe el negocio');
+  cerca(con.costoFinal, sin.costoFinal, 'el costo con IVA de la mercadería y el flete no cambia');
+  cerca(con.desembolso, sin.desembolso, 'lo que se le paga por la mercadería no cambia');
+  cerca(con.costoNeto - con.costoComision - con.costoBruto, sin.costoNeto - sin.costoBruto, 'el flete sigue siendo el mismo');
+  /* La identidad de control sigue cerrando: base × factor = proveedor + fletero + comisión. */
+  cerca(con.costoPrecio * factor, sin.costoPrecio * factor + 59.4, 'identidad con comisión');
+
+  /* Con mercadería 100 % sin factura: la comisión sigue entera (no se achica como el flete). */
+  const negro = costosFormato({ costo: 1000, descuento: 0, flete: 0, porcSinFactura: 100, comision: 10 }, iva);
+  cerca(negro.costoNeto, 1100, 'negro + comisión, enteros');
+  cerca(negro.costoPrecio, 1100 / factor, 'base: todo ÷ factor');
+
+  /* En modo precio final también se aplica, sobre el neto derivado; el «costo bruto» queda en la mercadería. */
+  const fin = costosFormato({ modoCosto: 'final', costoFinal: 1210, cantidad: 10, costo: 0, descuento: 0, flete: 0, comision: 5 }, iva);
+  cerca(fin.costoBruto, 1000, 'mercadería del papel');
+  cerca(fin.costoNeto, 1050, 'neto + 5 %');
+  cerca(fin.costoNetoUnitario, 105);
+  cerca(fin.costoFinal, 1210, 'lo cargado no se toca');
+
+  /* Sin comisión (o fuera de rango por debajo), nada cambia. */
+  assert.deepEqual(costosFormato({ costo: 1000, descuento: 0, flete: 12, comision: -3 }, iva), sin);
+});
+
 test('redondearPrecio: sin redondeo normaliza a centavos; con unidad, a la unidad', () => {
   assert.equal(redondearPrecio(1234.567), 1234.57);
   assert.equal(redondearPrecio(1234.567, 1), 1235);

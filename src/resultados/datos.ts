@@ -106,6 +106,10 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
         union all
         select ${MES('g.fecha')}, g.perc_dgr from gastos g
         where g.estado <> 'anulado' and g.perc_dgr <> 0 and ${RANGO('g.fecha')}
+        union all
+        /* Las de las facturas del mes (0158), por su fecha. */
+        select ${MES('ff.fecha')}, ff.perc_iibb from facturaciones_mes_facturas ff
+        where ff.activa and ff.perc_iibb <> 0 and ${RANGO('ff.fecha')}
       ) x group by 1`, p),
     c.query(`
       select ${MES('r.fecha')} as mes, coalesce(r.sucursal_id, 0) as suc, coalesce(sum(r.costo_total), 0) as costo

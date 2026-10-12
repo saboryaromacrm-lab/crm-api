@@ -3556,10 +3556,12 @@ export class InventarioService {
    * cuál está, porque "no se puede" sin el porqué manda a buscar al que sabe.
    */
   async crearConteo(o: {
-    sucursalId: number; usuarioId?: number | null; nombre?: string; ciego?: boolean;
+    sucursalId: number; usuarioId?: number | null; nombre?: string; ciego?: boolean; responsable?: string;
     marcaId?: number | null; categoriaId?: number | null; proveedorId?: number | null;
     tipo?: 'entero' | 'granel' | null; soloConStock?: boolean; incluirArchivados?: boolean;
   }) {
+    const responsable = String(o.responsable ?? '').replace(/\s+/g, ' ').trim();
+    if (!responsable) throw new BadRequestException('Poné el nombre del responsable del control.');
     return this.db.transaction(async (tx) => {
       const conds: any[] = [];
       if (!o.incluirArchivados) conds.push(ne(productos.estado, 'archivado' as any));
@@ -3643,6 +3645,7 @@ export class InventarioService {
         sucursalId: o.sucursalId,
         nombre: (o.nombre || '').trim() || alcance,
         alcance,
+        responsable,
         ciego: o.ciego ?? true,
         usuarioId: o.usuarioId ?? null,
       }).returning();

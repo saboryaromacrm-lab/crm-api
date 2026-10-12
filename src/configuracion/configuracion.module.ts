@@ -330,7 +330,7 @@ export const WEB_DEFAULTS = {
    */
   popupActivo: true as boolean,
   popupEtiqueta: '🍃 Bienvenido' as string,
-  popupTitulo: 'Sabor y Aroma mayorista, ahora online' as string,
+  popupTitulo: 'Ahorrá hasta 30% en tu compra comprando por mayor' as string,
   popupTexto: 'Armá tu pedido cuando quieras, las 24 horas. Coordinamos el pago y la entrega por WhatsApp, igual que siempre.' as string,
   slides: [
     {

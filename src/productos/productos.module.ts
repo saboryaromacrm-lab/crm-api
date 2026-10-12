@@ -22,6 +22,7 @@ import {
   productoProveedorCostos, productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
   transferenciaItems, vencimientos, ventaItems, webImagenes,
 } from '../db/schema';
+import { sincronizarProveedorCoffit } from './proveedorCoffit';
 import {
   costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, formatoDeCosto,
   precioVentaFila, type OpcionesPrecio,
@@ -784,6 +785,9 @@ export class ProductosService {
 
     // Se valida ANTES de insertar: un proveedor inválido no puede dejar el
     // producto creado a medias, sin la relación que el alta prometía.
+    if (dto.proveedorId && dto.origenCafeteria) {
+      throw new BadRequestException('Lo que elabora Coffit queda con proveedor COFFIT: no se le elige otro.');
+    }
     let prov: any = null;
     if (dto.proveedorId) {
       [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
@@ -817,6 +821,8 @@ export class ProductosService {
         usarParaPrecio: true,
       });
     }
+    /* Lo que elabora Coffit nace con proveedor COFFIT (ver proveedorCoffit.ts). */
+    if (valores.origenCafeteria) await sincronizarProveedorCoffit(this.db, [p.id]);
     return this.get(p.id);
   }
 
@@ -1734,8 +1740,11 @@ export class ProductosService {
     await this.validarCodigos(dto, id);
 
     await this.db.transaction(async (tx) => {
-      await tx.update(productos).set(this.valores(dto, p)).where(eq(productos.id, id));
+      const valores = this.valores(dto, p);
+      await tx.update(productos).set(valores).where(eq(productos.id, id));
       if (dto.soloCafeteria === true && !p.soloCafeteria) await this.cobrarStockAlMarcarExclusivo(tx, p, usuarioId);
+      /* Cambió «lo elabora Coffit»: gana o pierde el proveedor COFFIT en la misma transacción. */
+      if (valores.origenCafeteria !== !!p.origenCafeteria) await sincronizarProveedorCoffit(tx, [id]);
     });
     if (dto.etiquetas) await this.setEtiquetas(id, dto.etiquetas);
     return this.get(id);
@@ -2245,6 +2254,70 @@ export class ProductosService {
     return { productos: ids.length, porcFicha };
   }
 
+  /**
+   * «COMISIÓN % A TODOS SUS PRODUCTOS» (11/10/2026, pedido del dueño). La
+   * comisión que el proveedor cobra aparte y sin factura (la de fin de mes) va
+   * a la COMISIÓN de todos sus formatos de compra —en los dos modos—, sin tocar
+   * el flete. Entra al costo (ver `conComision` en pricing.ts) y de ahí a la
+   * góndola; las facturas nuevas no la pisan. `comisionDeProveedor` es la vista previa.
+   */
+  async comisionDeProveedor(proveedorId: number) {
+    const prov = await this.proveedorDe(proveedorId);
+    const filas = await this.db.select({ productoId: productoProveedores.productoId, comision: productoProveedores.comision })
+      .from(productoProveedores).where(eq(productoProveedores.proveedorId, proveedorId));
+    const porComision = new Map<number, Set<number>>();
+    for (const f of filas) {
+      const k = Number(f.comision) || 0;
+      if (!porComision.has(k)) porComision.set(k, new Set());
+      porComision.get(k)!.add(f.productoId);
+    }
+    return {
+      proveedor: prov.nombre,
+      productos: new Set(filas.map((f) => f.productoId)).size,
+      comisiones: [...porComision].map(([comision, ids]) => ({ comision, productos: ids.size })).sort((a, b) => b.productos - a.productos),
+    };
+  }
+
+  async aplicarComisionProveedor(proveedorId: number, crudo: unknown, usuarioId: number | null) {
+    const comision = Math.round(Number(crudo) * 100) / 100;
+    if (crudo === '' || crudo == null || !Number.isFinite(comision) || comision < 0 || comision > 100) {
+      throw new BadRequestException('La comisión va de 0 a 100 %.');
+    }
+    const prov = await this.proveedorDe(proveedorId);
+    const aCambiar = await this.db.select({ fila: productoProveedores, nombre: productos.nombre })
+      .from(productoProveedores).innerJoin(productos, eq(productos.id, productoProveedores.productoId))
+      .where(and(eq(productoProveedores.proveedorId, proveedorId), sql`abs(${productoProveedores.comision} - ${comision}) >= 0.005`));
+    if (!aCambiar.length) return { productos: 0, comision };
+    const lote = `K${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    const motivo = `Comisión de ${prov.nombre} → ${comision} % (a todos sus productos, desde la ficha)`;
+    await this.db.transaction(async (tx) => {
+      await tx.update(productoProveedores).set({ comision })
+        .where(inArray(productoProveedores.id, aCambiar.map(({ fila }) => fila.id)));
+      /* El historial de costos, como cualquier cambio de costo: se ve y se deshace por lote. */
+      await tx.insert(productoProveedorCostos).values(aCambiar.map(({ fila: f }) => ({
+        productoProveedorId: f.id,
+        costoAnterior: f.costo, descuentoAnterior: f.descuento, fleteAnterior: f.flete,
+        costo: f.costo, descuento: f.descuento, flete: f.flete,
+        comisionAnterior: f.comision, comision,
+        origen: 'masiva' as const, motivo, lote, usuarioId,
+      })));
+      await this.audit.registrar(aCambiar.map(({ fila: f, nombre }) => ({
+        entidad: 'proveedor', entidadId: prov.id, ambito: 'Formato de compra', detalle: nombre,
+        campo: 'Comisión %', antes: `${Number(f.comision) || 0}%`, despues: `${comision}% (a todos sus productos)`, usuarioId,
+      })), tx);
+    });
+    const ids = [...new Set(aCambiar.map(({ fila }) => fila.productoId))];
+    await this.evolucion.snapshot(ids, 'formato_compra', { usuarioId, detalle: motivo });
+    return { productos: ids.length, comision };
+  }
+
+  private async proveedorDe(id: number) {
+    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores)
+      .where(eq(proveedores.id, id)).limit(1);
+    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    return prov;
+  }
+
   async setFormatosCompra(id: number, filas: any[], usuarioAudit?: number | null) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -2302,6 +2375,7 @@ export class ProductosService {
       descuento3: pct(f.descuento3),
       descuento4: pct(f.descuento4),
       flete: plata(f.flete),
+      comision: pct(f.comision),
       modoCosto: (f.modoCosto === 'final' ? 'final' : 'lista') as 'lista' | 'final',
       costoFinal: plata(f.costoFinal),
       // Qué parte viene sin factura (0072). `pct` la acota a 0–100: un 170
@@ -2324,18 +2398,19 @@ export class ProductosService {
       descuentos: [v.descuento, v.descuento2, v.descuento3, v.descuento4]
         .map((d: any) => Number(d) || 0).filter((d: number) => d > 0).map((d: number) => `${d}%`).join(' + ') || 'Sin descuentos',
       flete: `${Number(v.flete) || 0}%`,
+      comision: `${Number(v.comision) || 0}%`,
       porcSinFactura: `${Number(v.porcSinFactura) || 0}%`,
       usarParaPrecio: v.usarParaPrecio ? 'Sí' : 'No',
       codigoProveedor: v.codigoProveedor || '',
     });
     const CAMPOS_FORMATO = {
       cantidad: 'Unidades por bulto', costo: 'Costo del bulto', modoCosto: 'Cómo se carga el costo',
-      descuentos: 'Descuentos', flete: 'Flete %', porcSinFactura: 'Sin factura %',
+      descuentos: 'Descuentos', flete: 'Flete %', comision: 'Comisión %', porcSinFactura: 'Sin factura %',
       usarParaPrecio: 'Fija el precio', codigoProveedor: 'Código del proveedor',
     };
     const resumenFormato = (v: any) => {
       const foto = fotoFormato(v);
-      return `bulto ${foto.cantidad} · ${foto.costo} · flete ${foto.flete} · sin factura ${foto.porcSinFactura}`;
+      return `bulto ${foto.cantidad} · ${foto.costo} · flete ${foto.flete} · comisión ${foto.comision} · sin factura ${foto.porcSinFactura}`;
     };
     const cambiosAudit: CambioAuditado[] = [];
     const baseAudit = (proveedorId: number) => ({
@@ -2455,6 +2530,20 @@ export class ProductosController {
   sinFacturaDeProveedor(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Auth() sesion: Sesion) {
     if (!esJefe(sesion)) throw new ForbiddenException('Lo aplica un administrador.');
     return this.svc.sinFacturaDeProveedor(proveedorId);
+  }
+
+  @Permiso('compras.productos')
+  @Get('comision-proveedor/:proveedorId')
+  comisionDeProveedor(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('Lo aplica un administrador.');
+    return this.svc.comisionDeProveedor(proveedorId);
+  }
+
+  @Permiso('compras.productos')
+  @Post('comision-proveedor/:proveedorId')
+  aplicarComisionProveedor(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Body() body: any, @Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('Lo aplica un administrador.');
+    return this.svc.aplicarComisionProveedor(proveedorId, body?.comision, sesion?.usuarioId ?? null);
   }
 
   @Permiso('compras.productos')
