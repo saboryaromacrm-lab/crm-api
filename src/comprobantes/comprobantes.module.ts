@@ -108,6 +108,13 @@ class ComprobanteItemDto {
   /** La descripción del papel, para poder auditar el mapeo después. */
   @IsOptional() @IsString() @MaxLength(200) descripcionPapel?: string;
   /**
+   * GUARDAR ESE CÓDIGO EN EL FORMATO (12/10/2026, pedido del dueño): el
+   * código del papel pasa a ser el «código de proveedor» del producto con este
+   * proveedor. Es el código con el que la mercadería llega, y el del catálogo
+   * vino del sistema viejo con corrimientos.
+   */
+  @IsOptional() @IsBoolean() guardarCodigo?: boolean;
+  /**
    * EL RENGLÓN ES PARA COFFIT (0119): lo tildó quien cargó la factura (o tildó
    * «toda la factura es de Coffit»). Un artículo de uso exclusivo de Coffit lo
    * es siempre, venga o no el tilde: la marca de la ficha no se destilda acá.
@@ -1495,6 +1502,28 @@ export class ComprobantesService {
           usuarioId: dto.usuarioId,
           comprobanteId: c.id,
         }, tx);
+      }
+
+      /*
+       * EL CÓDIGO DEL PAPEL AL FORMATO (12/10/2026): en los renglones tildados,
+       * el código impreso queda como «código de proveedor» del producto con
+       * este proveedor (en el formato que ya lo tenga, o en el más viejo —el
+       * mismo que actualiza el costo—). Va después del ingreso, que puede crear
+       * el formato. Un código es de UN artículo del proveedor: si lo tenía otro
+       * producto suyo, se le saca (el papel dice que es este).
+       */
+      for (const it of dto.items) {
+        const codigo = String(it.codigoProveedor ?? '').trim();
+        if (!it.guardarCodigo || !codigo || codigo.startsWith('D:')) continue;
+        const suyos = await tx.select().from(productoProveedores).where(and(
+          eq(productoProveedores.proveedorId, prov.id), eq(productoProveedores.productoId, Number(it.productoId)),
+        ));
+        if (!suyos.length || suyos.some((f: any) => f.codigoProveedor === codigo)) continue;
+        await tx.update(productoProveedores).set({ codigoProveedor: '' }).where(and(
+          eq(productoProveedores.proveedorId, prov.id), eq(productoProveedores.codigoProveedor, codigo),
+        ));
+        await tx.update(productoProveedores).set({ codigoProveedor: codigo })
+          .where(eq(productoProveedores.id, this.formatoPorProducto(suyos).get(Number(it.productoId)).id));
       }
 
       /**
