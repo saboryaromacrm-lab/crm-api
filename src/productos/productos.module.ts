@@ -59,6 +59,20 @@ class ArchivarLoteDto {
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
 }
 
+/* ACCIONES EN LOTE desde Almacén › Existencias (13/10/2026, pedido del dueño). */
+const MAX_LOTE = 1000;
+class BajaLoteDto {
+  @IsArray() @ArrayMaxSize(MAX_LOTE) @IsInt({ each: true }) ids!: number[];
+  @IsOptional() @IsString() @MaxLength(300) motivo?: string;
+}
+/** Ausente = no tocar. La subcategoría tiene que ser de la categoría (la nueva, o la que ya tiene cada producto si no se cambia). */
+class ClasificarLoteDto {
+  @IsArray() @ArrayMaxSize(MAX_LOTE) @IsInt({ each: true }) ids!: number[];
+  @IsOptional() @IsInt() marcaId?: number;
+  @IsOptional() @IsInt() categoriaId?: number;
+  @IsOptional() @IsInt() subcategoriaId?: number;
+}
+
 class UpsertProductoDto {
   @IsString() nombre!: string;
   @IsOptional() @IsString() descripcion?: string;
@@ -1956,6 +1970,110 @@ export class ProductosService {
     return { archivados, omitidos };
   }
 
+  /**
+   * DAR DE BAJA EN LOTE (13/10/2026, pedido del dueño): la regla de la marca
+   * inhabilitada (0135), producto por producto y en una sola transacción. Con
+   * stock vivo → discontinuado (se vende hasta agotar); sin stock →
+   * archivado. No toca el stock. El que ya está así (o archivado) no cambia.
+   * Si después le vuelve a entrar stock a un archivado, `despertarArchivado`
+   * lo pasa solo a discontinuado.
+   */
+  async bajaLote(dto: BajaLoteDto, usuarioId: number | null) {
+    const ids = [...new Set(dto.ids)];
+    if (!ids.length) throw new BadRequestException('Elegí al menos un producto.');
+    const motivo = (dto.motivo ?? '').trim() || 'Dado de baja en lote';
+    return this.db.transaction(async (tx) => {
+      const filas = await tx.select({ id: productos.id, nombre: productos.nombre, estado: productos.estado })
+        .from(productos).where(inArray(productos.id, ids));
+      const conStock = new Set((await tx.selectDistinct({ id: stock.productoId }).from(stock).where(and(
+        inArray(stock.productoId, ids), gt(stock.cantidad, 1e-9), inArray(stock.estado, [...ESTADOS_STOCK_VIVO]),
+      ))).map((r) => r.id));
+      const destino = (id: number) => (conStock.has(id) ? 'discontinuado' : 'archivado') as 'discontinuado' | 'archivado';
+      const cambian = filas.filter((p) => p.estado !== 'archivado' && p.estado !== destino(p.id));
+      const ahora = new Date();
+      for (const estado of ['discontinuado', 'archivado'] as const) {
+        const ids2 = cambian.filter((p) => destino(p.id) === estado).map((p) => p.id);
+        if (ids2.length) {
+          await tx.update(productos).set({ estado, estadoDesde: ahora, motivoBaja: motivo, bajaPorMarca: false })
+            .where(inArray(productos.id, ids2));
+        }
+      }
+      await this.audit.registrar(cambian.map((p) => ({
+        entidad: 'producto', entidadId: p.id, ambito: 'Ficha', detalle: p.nombre,
+        campo: 'Estado', antes: p.estado, despues: `${destino(p.id)} (baja en lote: ${motivo})`, usuarioId,
+      })), tx);
+      return {
+        discontinuados: cambian.filter((p) => destino(p.id) === 'discontinuado').map((p) => p.nombre),
+        archivados: cambian.filter((p) => destino(p.id) === 'archivado').map((p) => p.nombre),
+        sinCambio: filas.length - cambian.length,
+      };
+    });
+  }
+
+  /**
+   * MARCA / CATEGORÍA EN LOTE (13/10/2026). Solo marcas, categorías y
+   * subcategorías habilitadas. Cambiar la categoría sin elegir subcategoría
+   * le saca la subcategoría al que cambia de categoría (sería de otra); el que
+   * ya estaba en esa categoría la conserva. Cada cambio queda en la auditoría.
+   */
+  async clasificarLote(dto: ClasificarLoteDto, usuarioId: number | null) {
+    const ids = [...new Set(dto.ids)];
+    if (!ids.length) throw new BadRequestException('Elegí al menos un producto.');
+    const { marcaId, subcategoriaId } = dto;
+    let { categoriaId } = dto;
+    if (marcaId == null && categoriaId == null && subcategoriaId == null) throw new BadRequestException('Elegí la marca, la categoría o la subcategoría.');
+    const [marca] = marcaId != null ? await this.db.select().from(marcas).where(eq(marcas.id, marcaId)).limit(1) : [null];
+    if (marcaId != null && !marca?.activa) throw new BadRequestException('Esa marca no existe o está inhabilitada.');
+    const [sub] = subcategoriaId != null ? await this.db.select().from(subcategorias).where(eq(subcategorias.id, subcategoriaId)).limit(1) : [null];
+    if (subcategoriaId != null && !sub?.activa) throw new BadRequestException('Esa subcategoría no existe o está inactiva.');
+    if (sub && categoriaId != null && sub.categoriaId !== categoriaId) throw new BadRequestException('La subcategoría no es de esa categoría.');
+    if (sub) categoriaId = sub.categoriaId;
+    const [cat] = categoriaId != null ? await this.db.select().from(categorias).where(eq(categorias.id, categoriaId)).limit(1) : [null];
+    if (categoriaId != null && !cat?.activa) throw new BadRequestException('Esa categoría no existe o está inactiva.');
+
+    return this.db.transaction(async (tx) => {
+      const filas = await tx.select({
+        id: productos.id, nombre: productos.nombre, marcaId: productos.marcaId,
+        categoriaId: productos.categoriaId, subcategoriaId: productos.subcategoriaId,
+      }).from(productos).where(inArray(productos.id, ids));
+      const nombres = async (t: any, lista: (number | null)[]) => {
+        const xs = [...new Set(lista.filter((x): x is number => x != null))];
+        return new Map<number, string>(xs.length ? (await tx.select({ id: t.id, nombre: t.nombre }).from(t).where(inArray(t.id, xs))).map((r: any) => [r.id, r.nombre]) : []);
+      };
+      const [nMarca, nCat, nSub] = await Promise.all([
+        nombres(marcas, [...filas.map((f) => f.marcaId), marcaId ?? null]),
+        nombres(categorias, [...filas.map((f) => f.categoriaId), categoriaId ?? null]),
+        nombres(subcategorias, [...filas.map((f) => f.subcategoriaId), subcategoriaId ?? null]),
+      ]);
+      const txt = (m: Map<number, string>, id: number | null) => (id == null ? '(sin)' : m.get(id) ?? `#${id}`);
+      const cambios: CambioAuditado[] = [];
+      /* Los que quedan igual (misma marca, categoría y subcategoría) van en un solo UPDATE. */
+      const grupos = new Map<string, { valores: { marcaId: number | null; categoriaId: number | null; subcategoriaId: number | null }; ids: number[] }>();
+      for (const f of filas) {
+        const nuevo = {
+          marcaId: marcaId ?? f.marcaId,
+          categoriaId: categoriaId ?? f.categoriaId,
+          /* Con subcategoría elegida, esa; si cambia de categoría sin elegirla, ninguna (la vieja es de otra). */
+          subcategoriaId: subcategoriaId ?? (categoriaId != null && categoriaId !== f.categoriaId ? null : f.subcategoriaId),
+        };
+        const campos = ([['marcaId', 'Marca', nMarca], ['categoriaId', 'Categoría', nCat], ['subcategoriaId', 'Subcategoría', nSub]] as const)
+          .filter(([k]) => nuevo[k] !== f[k]);
+        if (!campos.length) continue;
+        const clave = `${nuevo.marcaId}|${nuevo.categoriaId}|${nuevo.subcategoriaId}`;
+        const g = grupos.get(clave) ?? { valores: nuevo, ids: [] };
+        g.ids.push(f.id);
+        grupos.set(clave, g);
+        for (const [k, campo, m] of campos) {
+          cambios.push({ entidad: 'producto', entidadId: f.id, ambito: 'Ficha (en lote)', detalle: f.nombre, campo, antes: txt(m, f[k]), despues: txt(m, nuevo[k]), usuarioId });
+        }
+      }
+      for (const g of grupos.values()) await tx.update(productos).set(g.valores).where(inArray(productos.id, g.ids));
+      await this.audit.registrar(cambios, tx);
+      const actualizados = [...grupos.values()].reduce((n, g) => n + g.ids.length, 0);
+      return { actualizados, sinCambio: filas.length - actualizados };
+    });
+  }
+
   async remove(id: number) {
     const [p] = await this.db.select().from(productos).where(eq(productos.id, id)).limit(1);
     if (!p) throw new NotFoundException('Producto inexistente.');
@@ -2655,6 +2773,15 @@ export class ProductosController {
   @Permiso('compras.productos')
   @Post('archivar-lote') archivarLote(@Body() dto: ArchivarLoteDto) {
     return this.svc.archivarLote(dto.ids, dto.motivo);
+  }
+  /* Acciones en lote de Almacén › Existencias: la misma llave que editar la ficha y dar de baja. */
+  @Permiso('compras.productos')
+  @Post('baja-lote') bajaLote(@Body() dto: BajaLoteDto, @Auth() sesion: Sesion) {
+    return this.svc.bajaLote(dto, sesion?.usuarioId ?? null);
+  }
+  @Permiso('compras.productos')
+  @Post('clasificar-lote') clasificarLote(@Body() dto: ClasificarLoteDto, @Auth() sesion: Sesion) {
+    return this.svc.clasificarLote(dto, sesion?.usuarioId ?? null);
   }
 
   @Permiso('compras.productos')
