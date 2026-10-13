@@ -118,6 +118,14 @@ export const VENTAS_DEFAULTS = {
   /** Lo mismo para los ENTEROS (1/10/2026, pedido del dueño): independiente del granel. */
   controlStockEnteros: true as boolean,
   /**
+   * BAJOS EN STOCK (12/10/2026, pedido del dueño). El mínimo automático de un
+   * producto es su venta diaria (últimos 30 días) × estos días; y un proveedor
+   * se pone en ROJO cuando este % de sus productos está sin stock o bajo
+   * (amarillo desde la mitad). Se manejan desde Almacén › Configuración.
+   */
+  bajosDiasCobertura: 7 as number,
+  bajosUmbralRojo: 50 as number,
+  /**
    * EL CAJERO VE LO QUE TIENE QUE HABER EN CAJA (1/10/2026, pedido del dueño).
    * `false` (como venía): a ciegas — ni durante el turno ni al cerrar ve el
    * efectivo esperado ni la diferencia; cuenta los billetes y envía. `true`:
@@ -764,7 +772,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  * guardado que toca SOLO estas llaves lo puede hacer también quien tiene
  * `almacen.configuracion`; si trae cualquier otra, vuelve a pedir la de ventas.
  */
-const LLAVES_STOCK = new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo']);
+const LLAVES_STOCK = new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']);
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];
   if (!base || clave !== 'ventas') return base;

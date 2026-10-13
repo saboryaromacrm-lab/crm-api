@@ -5,7 +5,7 @@ import { InventarioService } from './inventario.service';
 import { FraccionamientosController, FraccionamientosService } from './fraccionamientos';
 import {
   StockController, BootstrapController, MovimientosController, OperacionesController,
-  TransferenciasController, IncidenciasController, ConteosController, SinMovimientoController,
+  TransferenciasController, IncidenciasController, ConteosController, SinMovimientoController, BajosStockController,
 } from './inventario.controllers';
 
 @Module({
@@ -13,7 +13,7 @@ import {
   controllers: [
     StockController, BootstrapController, MovimientosController, OperacionesController,
     TransferenciasController, IncidenciasController, ConteosController, FraccionamientosController,
-    SinMovimientoController,
+    SinMovimientoController, BajosStockController,
   ],
   providers: [InventarioService, FraccionamientosService],
   exports: [InventarioService],

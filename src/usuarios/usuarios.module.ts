@@ -157,6 +157,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'almacen.vencimientos', nombre: 'Vencimientos (control de fechas)' },
       /* Qué mercadería está quieta hace 7/14/21/30 días, por local (7/10/2026). */
       { clave: 'almacen.sin-movimiento', nombre: 'Productos sin movimiento' },
+      { clave: 'almacen.bajos', nombre: 'Bajos en stock (por proveedor)' },
       { clave: 'almacen.cafeteria', nombre: 'Coffit (envíos)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
@@ -241,7 +242,6 @@ export const CATALOGO_PERMISOS = [
       { clave: 'proveedores.edoc', nombre: 'Estados de cuenta' },
       { clave: 'proveedores.cuentas', nombre: 'Cuentas disponibles (transferencias de clientes a proveedores)' },
       { clave: 'proveedores.padron', nombre: 'Ficha de proveedores' },
-      { clave: 'proveedores.stock_provisorio', nombre: 'Stock provisorio de granel (planilla temporal, bolsas a ojo)' },
     ],
     acciones: [],
   },

@@ -142,7 +142,7 @@ export class FraccionamientosService {
      * solo operador y un solo tipo, así que los conteos se suman sin doblar. */
     const dondeTotales = y([...cab, ...ren]);
 
-    const [pagina, grupos, gramajes] = await Promise.all([
+    const [pagina, grupos, gramajes, turnos] = await Promise.all([
       this.filas<any>(sql`
         select f.id, to_json(f.fecha) as fecha, f.turno, to_json(f.registrado_en) as "registradoEn",
                (f.registrado_en <> f.fecha) as diferido,
@@ -159,7 +159,7 @@ export class FraccionamientosService {
         order by f.fecha desc, f.id desc
         limit ${limit} offset ${offset}`),
       this.filas<any>(sql`
-        select f.operador_id as "operadorId", o.nombre as "operadorNombre", f.origen,
+        select f.operador_id as "operadorId", o.nombre as "operadorNombre", f.origen, f.turno,
                count(distinct f.id)::int as registros,
                coalesce(sum(fi.paquetes), 0)::int as paquetes,
                coalesce(sum(fi.paquetes * fi.tam_kg), 0)::float8 as kg
@@ -168,7 +168,7 @@ export class FraccionamientosService {
         left join fraccion_operadores o on o.id = f.operador_id
         ${cruces}
         where ${dondeTotales}
-        group by f.operador_id, o.nombre, f.origen`),
+        group by f.operador_id, o.nombre, f.origen, f.turno`),
       this.filas<any>(sql`
         select fi.tam_kg::float8 as "tamKg", count(distinct f.id)::int as registros, coalesce(sum(fi.paquetes), 0)::int as paquetes
         from fraccionamiento_items fi
@@ -177,7 +177,26 @@ export class FraccionamientosService {
         where ${dondeTotales}
         group by fi.tam_kg
         order by fi.tam_kg desc`),
+      /*
+       * LOS TURNOS TRABAJADOS (12/10/2026, pedido del dueño: «promedio por
+       * turno»): cada (sucursal, día, turno) con algo fraccionado es UN turno.
+       * Las correcciones no cuentan: arreglan una tanda, no son un turno de
+       * trabajo. Una sola lectura con tres agrupaciones: el total, el de cada
+       * operador (sus turnos) y el de cada turno (cuántas mañanas, cuántas tardes).
+       */
+      this.filas<any>(sql`
+        select f.operador_id as "operadorId", f.turno,
+               grouping(f.operador_id)::int as "sinOperador", grouping(f.turno)::int as "sinTurno",
+               count(distinct (f.sucursal_id, (f.fecha at time zone 'America/Argentina/Buenos_Aires')::date, f.turno))::int as turnos
+        from fraccionamiento_items fi
+        join fraccionamientos f on f.id = fi.fraccionamiento_id
+        ${cruces}
+        where ${y([...cab, ...ren, sql`f.origen <> 'correccion'`])}
+        group by grouping sets ((), (f.operador_id), (f.turno))`),
     ]);
+    const turnosTotal = turnos.find((t) => t.sinOperador && t.sinTurno)?.turnos ?? 0;
+    const turnosDe = new Map(turnos.filter((t) => !t.sinOperador).map((t) => [String(t.operadorId ?? 'sin'), t.turnos]));
+    const turnosPorTurno = new Map(turnos.filter((t) => !t.sinTurno && t.sinOperador).map((t) => [t.turno, t.turnos]));
 
     /* Los renglones de la página, con el nombre del producto: una consulta. */
     const ids: number[] = pagina.map((f) => f.id);
@@ -204,7 +223,13 @@ export class FraccionamientosService {
 
     const totales = { registros: 0, paquetes: 0, kg: 0, correcciones: 0, pedidos: 0, sinOperador: 0 };
     const operadores = new Map<string, { operadorId: number | null; nombre: string; registros: number; paquetes: number; kg: number }>();
+    const porTurno = new Map<string, { turno: string; registros: number; paquetes: number; kg: number }>();
     for (const g of grupos) {
+      const pt = porTurno.get(g.turno) ?? { turno: g.turno, registros: 0, paquetes: 0, kg: 0 };
+      pt.registros += g.registros;
+      pt.paquetes += g.paquetes;
+      pt.kg += Number(g.kg) || 0;
+      porTurno.set(g.turno, pt);
       totales.registros += g.registros;
       totales.paquetes += g.paquetes;
       totales.kg += Number(g.kg) || 0;
@@ -223,11 +248,14 @@ export class FraccionamientosService {
       filas: pagina.map((f) => ({ ...f, kg: n3(f.kg), productos: porRegistro.get(f.id) ?? [] })),
       total: totales.registros,
       paginado: { offset, limit },
-      totales: { ...totales, kg: n3(totales.kg) },
+      totales: { ...totales, kg: n3(totales.kg), turnos: turnosTotal },
       porOperador: [...operadores.values()]
-        .map((o) => ({ ...o, kg: n3(o.kg) }))
+        .map((o) => ({ ...o, kg: n3(o.kg), turnos: turnosDe.get(String(o.operadorId ?? 'sin')) ?? 0 }))
         .sort((a, b) => b.kg - a.kg || a.nombre.localeCompare(b.nombre)),
       porGramaje: gramajes,
+      /** Mañana y tarde: cuánto se armó en cada una y en cuántos turnos (para el promedio). */
+      porTurno: ['manana', 'tarde'].filter((t) => porTurno.has(t))
+        .map((t) => ({ ...porTurno.get(t)!, kg: n3(porTurno.get(t)!.kg), turnos: turnosPorTurno.get(t) ?? 0 })),
     };
   }
 

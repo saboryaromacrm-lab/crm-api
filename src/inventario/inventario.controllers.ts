@@ -49,6 +49,10 @@ const verCostos = (sesion: Sesion) => tienePermiso(sesion?.permisos ?? [], ['pre
 import { InventarioService } from './inventario.service';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { productosSinMovimiento } from './sin-movimiento';
+import { datosBajosStock } from './bajos-stock';
+import { ConfiguracionService } from '../configuracion/configuracion.module';
+import { eq, sql } from 'drizzle-orm';
+import { productos as productosT, sucursales as sucursalesT } from '../db/schema';
 
 /*
  * TOPES. Cien mil unidades es más de lo que entra en cualquier depósito de este
@@ -803,6 +807,50 @@ export class ConteosController {
       puedeAplicar: this.puedeAplicar(sesion),
       soloSuc: soloSuSucursal(sesion),
     });
+  }
+}
+
+class StockMinimoDto {
+  /** Unidades (o kg en el granel). 0 = automático, por la venta. */
+  @IsNumber() @Min(0) @Max(1_000_000) stockMin!: number;
+}
+
+/**
+ * ALMACÉN › BAJOS EN STOCK (12/10/2026). La venta de 30 días y lo controlado
+ * de la sucursal (por defecto la Distribuidora, que es la que compra; «todas»
+ * solo el jefe; el resto, la suya), y el mínimo a mano de un producto.
+ */
+@Controller('bajos-stock')
+@Permiso('almacen.bajos')
+export class BajosStockController {
+  constructor(@Inject(DRIZZLE) private readonly db: Database, private readonly cfg: ConfiguracionService) {}
+
+  @Get()
+  async datos(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
+    const propia = soloSuSucursal(sesion);
+    let suc: number | null;
+    if (propia != null) suc = propia;
+    else if (sucursalId === 'todas') suc = null;
+    else if (Number(sucursalId) > 0) suc = Number(sucursalId);
+    else {
+      const [d] = await this.db.select({ id: sucursalesT.id }).from(sucursalesT)
+        .where(sql`${sucursalesT.tipo} = 'distribuidora' AND ${sucursalesT.activa}`).orderBy(sucursalesT.id).limit(1);
+      suc = d?.id ?? null;
+    }
+    return datosBajosStock(this.db, await this.cfg.get('ventas'), suc);
+  }
+
+  /** El mínimo a mano manda sobre el automático; 0 lo vuelve automático. Quien maneja stock o la ficha del producto. */
+  @Patch('minimo/:productoId')
+  async minimo(@Param('productoId', ParseIntPipe) productoId: number, @Body() dto: StockMinimoDto, @Auth() sesion: Sesion) {
+    if (!tienePermiso(sesion?.permisos ?? [], ['inventario', 'compras.productos'])) {
+      throw new ForbiddenException('Tu rol no puede cambiar el stock mínimo.');
+    }
+    const valor = Math.round(dto.stockMin * 1000) / 1000;
+    const [p] = await this.db.update(productosT).set({ stockMin: valor }).where(eq(productosT.id, productoId))
+      .returning({ id: productosT.id, stockMin: productosT.stockMin });
+    if (!p) throw new BadRequestException('Ese producto no existe.');
+    return p;
   }
 }
 

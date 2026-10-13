@@ -3745,22 +3745,6 @@ export const respaldoDrive = pgTable('respaldo_drive', {
 });
 
 /**
- * STOCK PROVISORIO DE GRANEL (0138) — TEMPORAL. Bolsas cerradas contadas a ojo
- * de cada producto a granel madre, en una planilla aparte que NO toca `stock`.
- * Se elimina entera cuando el stock real del sistema esté bien.
- */
-export const stockProvisorioConteos = pgTable('stock_provisorio_conteos', {
-  id: serial('id').primaryKey(),
-  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
-  bolsas: integer('bolsas').notNull(),
-  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
-  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-  observacion: text('observacion').notNull().default(''),
-}, (t) => ({
-  ixProducto: index('ix_stock_provisorio_producto').on(t.productoId, t.id),
-}));
-
-/**
  * COFFIT · INGREDIENTES (0140): los productos que Coffit usa como ingrediente,
  * con el contenido del envase y la unidad en que se quiere el costo. El costo
  * se calcula siempre del último comprobante con precio real (ver

@@ -41,7 +41,6 @@ import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IngredientesModule } from './cafeteria/ingredientes.module';
 // TEMPORAL (0138): se borra junto con su panel cuando el stock real esté bien.
-import { StockProvisorioModule } from './stock-provisorio/stock-provisorio.module';
 import { MercadoPagoModule } from './mercadopago/mercadopago.module';
 
 @Module({
@@ -59,7 +58,6 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     ResultadosModule,
     RetirosModule,
     IngredientesModule,
-    StockProvisorioModule,
     InventarioModule,
     ComprobantesModule,
     FacturasModule,
