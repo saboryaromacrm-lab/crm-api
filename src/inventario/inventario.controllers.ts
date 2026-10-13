@@ -52,7 +52,9 @@ import { productosSinMovimiento } from './sin-movimiento';
 import { datosBajosStock } from './bajos-stock';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { eq, sql } from 'drizzle-orm';
-import { productos as productosT, sucursales as sucursalesT } from '../db/schema';
+import {
+  productos as productosT, sucursales as sucursalesT, ultimoPedidoProveedor, usuarios as usuariosT,
+} from '../db/schema';
 
 /*
  * TOPES. Cien mil unidades es más de lo que entra en cualquier depósito de este
@@ -851,6 +853,45 @@ export class BajosStockController {
       .returning({ id: productosT.id, stockMin: productosT.stockMin });
     if (!p) throw new BadRequestException('Ese producto no existe.');
     return p;
+  }
+}
+
+class UltimoPedidoDto {
+  @IsString() @MaxLength(8000) texto!: string;
+}
+
+/**
+ * EL ÚLTIMO PEDIDO DE LA ORDEN DE PEDIDO (0165, 13/10/2026): el mensaje que se
+ * copió o mandó, uno por proveedor (el nuevo pisa al anterior). Lo usa quien
+ * puede abrir la orden: desde Existencias o desde Bajos en stock.
+ */
+@Controller('orden-pedido')
+@Permiso('almacen.existencias', 'almacen.bajos')
+export class OrdenPedidoController {
+  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+
+  @Get('ultimo/:proveedorId')
+  async ultimo(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
+    const [p] = await this.db.select({
+      texto: ultimoPedidoProveedor.texto, fecha: ultimoPedidoProveedor.fecha, usuario: usuariosT.nombre,
+    }).from(ultimoPedidoProveedor)
+      .leftJoin(usuariosT, eq(usuariosT.id, ultimoPedidoProveedor.usuarioId))
+      .where(eq(ultimoPedidoProveedor.proveedorId, proveedorId)).limit(1);
+    return { pedido: p ?? null };
+  }
+
+  @Put('ultimo/:proveedorId')
+  async guardar(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Body() dto: UltimoPedidoDto, @Auth() sesion: Sesion) {
+    const texto = dto.texto.trim();
+    if (!texto) throw new BadRequestException('El pedido está vacío.');
+    /* Una sola consulta: inserta (o pisa) solo si el proveedor existe; sin fila devuelta, no existe. */
+    const r: any = await this.db.execute(sql`
+      INSERT INTO ultimo_pedido_proveedor (proveedor_id, texto, fecha, usuario_id)
+      SELECT id, ${texto}, now(), ${sesion?.usuarioId ?? null} FROM proveedores WHERE id = ${proveedorId}
+      ON CONFLICT (proveedor_id) DO UPDATE SET texto = EXCLUDED.texto, fecha = EXCLUDED.fecha, usuario_id = EXCLUDED.usuario_id
+      RETURNING proveedor_id`);
+    if (!(r.rows ?? r).length) throw new BadRequestException('Ese proveedor no existe.');
+    return { ok: true };
   }
 }
 

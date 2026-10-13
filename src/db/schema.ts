@@ -3519,6 +3519,19 @@ export const pedidosProveedor = pgTable('pedidos_proveedor', {
   ixRecepcion: index('ix_pedidos_proveedor_recepcion').on(t.fechaRecepcion),
 }));
 
+/**
+ * EL ÚLTIMO PEDIDO DE LA ORDEN DE PEDIDO (0165, 13/10/2026): el mensaje tal
+ * cual se copió o se mandó por WhatsApp, UNO por proveedor (cada pedido pisa
+ * al anterior). Solo para mirarlo la próxima vez: no toca stock, deuda ni la
+ * pizarra de Pedidos.
+ */
+export const ultimoPedidoProveedor = pgTable('ultimo_pedido_proveedor', {
+  proveedorId: integer('proveedor_id').primaryKey().references(() => proveedores.id, { onDelete: 'cascade' }),
+  texto: text('texto').notNull(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+
 export const origenCompromisoEnum = pgEnum('origen_compromiso', ['factura', 'manual']);
 
 /**
