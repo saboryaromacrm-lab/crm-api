@@ -27,6 +27,8 @@ class UpsertProveedorDto {
    */
   @IsOptional() @IsBoolean() proveeMercaderia?: boolean;
   @IsOptional() @IsBoolean() proveeGastos?: boolean;
+  /** De la misma localidad (0164): solo una marca para filtrar. */
+  @IsOptional() @IsBoolean() esLocal?: boolean;
   /**
    * La letra que factura (0067): se pregunta UNA vez acá y la carga de gastos
    * la precarga, editable. `''` = borrarla (vuelve a "sin definir"), ausente =
@@ -110,6 +112,7 @@ export class ProveedoresService {
       diasPago: p.diasPago ? `${p.diasPago} día(s)` : 'Sin plazo',
       modoCuenta: p.modoCuenta === 'libre' ? 'Libre' : 'Por facturas',
       facturaMensual: p.facturaMensual ? 'Sí' : 'No',
+      esLocal: p.esLocal ? 'Sí' : 'No',
       porcSinFactura: `${Number(p.porcSinFactura) || 0}%`,
       minimoTransferencia: Number(p.minimoTransferencia) > 0 ? `$${Number(p.minimoTransferencia)}` : 'Sin mínimo',
     };
@@ -177,6 +180,7 @@ export class ProveedoresService {
       // Sin indicar nada se asume el proveedor clásico: el que trae mercadería.
       proveeMercaderia: dto.proveeMercaderia ?? true,
       proveeGastos: dto.proveeGastos ?? false,
+      esLocal: dto.esLocal ?? false,
       letraGasto: (dto.letraGasto || null) as any,
       condicionCompra: (dto.condicionCompra ?? 'factura') as any,
       medioHabitual: (dto.medioHabitual || null) as any,
@@ -234,6 +238,7 @@ export class ProveedoresService {
       // proveedor sin querer: si no vienen, se conserva lo que ya tenía.
       proveeMercaderia: dto.proveeMercaderia ?? actual.proveeMercaderia,
       proveeGastos: dto.proveeGastos ?? actual.proveeGastos,
+      esLocal: dto.esLocal ?? actual.esLocal,
       // '' borra a propósito; ausente conserva (mismo criterio que los flags).
       letraGasto: (dto.letraGasto === undefined ? actual.letraGasto : (dto.letraGasto || null)) as any,
       /* La ficha comercial sigue el mismo contrato: ausente conserva, '' borra.
@@ -259,6 +264,7 @@ export class ProveedoresService {
         nombre: 'Nombre', cuit: 'CUIT',
         condicionCompra: 'Condición de compra', medioHabitual: 'Medio de pago habitual',
         diasPago: 'Plazo de pago', modoCuenta: 'Modo de cuenta', facturaMensual: 'Factura a fin de mes',
+        esLocal: 'Proveedor local',
         porcSinFactura: 'Sin factura % (default de sus formatos)',
         minimoTransferencia: 'Mínimo de transferencia (cuentas disponibles)',
       },

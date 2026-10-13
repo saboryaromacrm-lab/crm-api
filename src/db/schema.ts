@@ -197,6 +197,8 @@ export const proveedores = pgTable('proveedores', {
    * hasta la migración que las borre, pero el código ya no las nombra. */
   /** Factura gastos de la empresa (servicios, fletes, honorarios, alquiler…). */
   proveeGastos: boolean('provee_gastos').notNull().default(false),
+  /** De la misma localidad que el negocio (0164): una marca para filtrar, no cambia ninguna cuenta. */
+  esLocal: boolean('es_local').notNull().default(false),
   /**
    * La letra que este proveedor factura (0067). Edesur hace siempre la misma:
    * se pregunta UNA vez acá y la carga de gastos la precarga, editable.

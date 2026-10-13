@@ -1149,6 +1149,13 @@
       "when": 1791660000000,
       "tag": "0163_bajos_en_stock",
       "breakpoints": true
+    },
+    {
+      "idx": 164,
+      "version": "7",
+      "when": 1791670000000,
+      "tag": "0164_proveedor_local",
+      "breakpoints": true
     }
   ]
 }
