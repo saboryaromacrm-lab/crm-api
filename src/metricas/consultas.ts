@@ -440,7 +440,7 @@ export async function reporteGranel(c: PoolClient, f: Filtro, paso: Paso) {
  * Dos rangos en una misma consulta, con FILTER por rango: cada suma mira solo
  * el suyo aunque los períodos se pisen. $1–$2 = A, $3–$4 = B, $5 = sucursal.
  */
-const dosRangos = (a: Filtro, b: Filtro, al: string) => {
+export const dosRangos = (a: Filtro, b: Filtro, al: string) => {
   const A = `${al}.dia BETWEEN $1::date AND $2::date`;
   const B = `${al}.dia BETWEEN $3::date AND $4::date`;
   return {

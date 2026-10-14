@@ -28,7 +28,13 @@ const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 const ESTADOS_PROPIOS = ['disponible', 'comprometido', 'retenido', 'en_transito'] as const;
 export const UMBRALES = { agotarseDias: 7, sobrestockDias: 180, historiaDias: 730 } as const;
 
-export async function reporteStock(
+/**
+ * UNA FILA POR PRODUCTO CON STOCK, VALUADA A COSTO DE HOY (14/10/2026): la
+ * cuenta de esta pantalla, separada para que Proveedores › Montos use LA MISMA
+ * (así los dos números nunca difieren). Cada fila trae además el proveedor que
+ * fija el precio, el tipo, la categoría y la marca, para agrupar y filtrar.
+ */
+export async function valorizarStock(
   db: Database, pool: Pool, q: { sucursalId: number | null; ventana: number },
 ) {
   const hoy = hoyAr();
@@ -69,14 +75,19 @@ export async function reporteStock(
   const vendidoDe = new Map<number, { vendido: number; ultima: string | null }>(
     ventas.rows.map((x: any) => [Number(x.producto_id), { vendido: Number(x.vendido), ultima: x.ultima_venta ?? null }]));
 
-  /** Costo de HOY por unidad base (neto, sin IVA), con la misma cuenta que Gerencia. */
-  const costoDe = new Map<number, number>();
+  /** Costo de HOY por unidad base (neto, sin IVA), con la misma cuenta que Gerencia, y el proveedor de ese formato. */
+  const costoDe = new Map<number, { costo: number; proveedorId: number | null }>();
   const costo = (p: any) => {
-    if (!costoDe.has(p.id)) costoDe.set(p.id, costosFormato(formatoDeCosto(p, provsDe.get(p.id) ?? []) as any, p.iva).costoNetoUnitario);
-    return costoDe.get(p.id)!;
+    let c = costoDe.get(p.id);
+    if (!c) {
+      const formato: any = formatoDeCosto(p, provsDe.get(p.id) ?? []);
+      c = { costo: costosFormato(formato, p.iva).costoNetoUnitario, proveedorId: formato?.proveedorId ?? null };
+      costoDe.set(p.id, c);
+    }
+    return c;
   };
 
-  type Acum = { cant: number; valor: number; porSuc: Map<number, number> };
+  type Acum = { cant: number; valor: number };
   const porProd = new Map<number, Acum>();
   const porSucursal = new Map<number, { valor: number; productos: Set<number> }>();
   for (const f of filas) {
@@ -85,10 +96,9 @@ export async function reporteStock(
     const tam = f.presentacionId ? (tamDe.get(f.presentacionId) ?? 0) : 1;
     const base = f.cantidad * (f.presentacionId ? tam : 1);
     const escala = f.presentacionId ? escalaPaquete(tam, Number(p.merma) || 0) : 1;
-    const valor = f.cantidad * costo(p) * escala;
-    const a = porProd.get(p.id) ?? { cant: 0, valor: 0, porSuc: new Map() };
+    const valor = f.cantidad * costo(p).costo * escala;
+    const a = porProd.get(p.id) ?? { cant: 0, valor: 0 };
     a.cant += base; a.valor += valor;
-    a.porSuc.set(f.sucursalId, (a.porSuc.get(f.sucursalId) ?? 0) + base);
     porProd.set(p.id, a);
     if (!p.soloCafeteria) {
       const s = porSucursal.get(f.sucursalId) ?? { valor: 0, productos: new Set<number>() };
@@ -97,33 +107,42 @@ export async function reporteStock(
     }
   }
 
-  let valorPropio = 0; let valorCoffit = 0; let valorParado = 0; let productosParados = 0;
-  let productosPorAgotarse = 0; let valorSobrestock = 0;
   const lista = [...porProd.entries()].map(([id, a]) => {
     const p: any = infoProd.get(id);
     const v = vendidoDe.get(id);
     const vendido = v?.vendido ?? 0;
     const porDia = vendido / ventana;
     const diasDeStock = porDia > 0 ? Math.round(a.cant / porDia) : null;
-    const deCoffit = !!p.soloCafeteria;
     let estado: 'parado' | 'por_agotarse' | 'sobrestock' | 'ok' = 'ok';
     if (vendido <= 0) estado = 'parado';
     else if (diasDeStock != null && diasDeStock < UMBRALES.agotarseDias) estado = 'por_agotarse';
     else if (diasDeStock != null && diasDeStock > UMBRALES.sobrestockDias) estado = 'sobrestock';
-    if (deCoffit) valorCoffit += a.valor;
-    else {
-      valorPropio += a.valor;
-      if (estado === 'parado') { valorParado += a.valor; productosParados += 1; }
-      if (estado === 'por_agotarse') productosPorAgotarse += 1;
-      if (estado === 'sobrestock') valorSobrestock += a.valor;
-    }
+    const { costo: costoUnit, proveedorId } = costo(p);
     return {
       productoId: id, nombre: p.nombre as string, categoria: nombreCat.get(p.categoriaId) ?? '', marca: nombreMarca.get(p.marcaId) ?? '',
-      unidad: p.tipo === 'granel' ? 'kg' : 'u.', stock: r3(a.cant), valor: r2(a.valor), costoUnitario: r2(costo(p)),
+      unidad: p.tipo === 'granel' ? 'kg' : 'u.', stock: r3(a.cant), valor: r2(a.valor), costoUnitario: r2(costoUnit),
       vendido: r3(vendido), promedioPorDia: r3(porDia), diasDeStock, ultimaVenta: v?.ultima ?? null,
-      estado, deCoffit,
+      estado, deCoffit: !!p.soloCafeteria,
+      proveedorId, tipo: p.tipo as string, categoriaId: (p.categoriaId ?? null) as number | null, marcaId: (p.marcaId ?? null) as number | null,
     };
   }).sort((x, y) => y.valor - x.valor);
+
+  return { hoy, ventana, lista, porSucursal, nombreSuc, nombreCat, nombreMarca };
+}
+
+export async function reporteStock(
+  db: Database, pool: Pool, q: { sucursalId: number | null; ventana: number },
+) {
+  const { hoy, ventana, lista, porSucursal, nombreSuc } = await valorizarStock(db, pool, q);
+  let valorPropio = 0; let valorCoffit = 0; let valorParado = 0; let productosParados = 0;
+  let productosPorAgotarse = 0; let valorSobrestock = 0;
+  for (const x of lista) {
+    if (x.deCoffit) { valorCoffit += x.valor; continue; }
+    valorPropio += x.valor;
+    if (x.estado === 'parado') { valorParado += x.valor; productosParados += 1; }
+    if (x.estado === 'por_agotarse') productosPorAgotarse += 1;
+    if (x.estado === 'sobrestock') valorSobrestock += x.valor;
+  }
 
   return {
     hoy, ventana, umbrales: UMBRALES,

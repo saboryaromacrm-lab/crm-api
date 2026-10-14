@@ -91,6 +91,7 @@ export const CATALOGO_PERMISOS = [
     secciones: [
       { clave: 'ventas.pos', nombre: 'Punto de venta' },
       { clave: 'ventas.listado', nombre: 'Ventas (listado de tickets del POS)' },
+      { clave: 'ventas.variaciones', nombre: 'Variaciones (cuánto subió o bajó lo vendido)' },
       { clave: 'ventas.ordenes', nombre: 'Órdenes web (bandeja de pedidos del sitio)' },
       { clave: 'ventas.presupuestos', nombre: 'Presupuestos' },
       { clave: 'ventas.clientes', nombre: 'Clientes' },
@@ -242,6 +243,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'proveedores.edoc', nombre: 'Estados de cuenta' },
       { clave: 'proveedores.cuentas', nombre: 'Cuentas disponibles (transferencias de clientes a proveedores)' },
       { clave: 'proveedores.padron', nombre: 'Ficha de proveedores' },
+      { clave: 'proveedores.montos', nombre: 'Montos (mercadería a costo por proveedor)' },
     ],
     acciones: [],
   },

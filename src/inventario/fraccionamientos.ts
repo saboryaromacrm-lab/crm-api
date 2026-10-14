@@ -70,6 +70,22 @@ class EditarOperadorDto {
   @IsOptional() @IsBoolean() activo?: boolean;
 }
 
+/**
+ * EL PERÍODO ANTERIOR, DEL MISMO LARGO (14/10/2026): ayer → anteayer, los
+ * últimos 7 días → los 7 de antes, un rango a mano → el tramo previo igual de
+ * largo. Sin las dos fechas no hay con qué comparar.
+ */
+function rangoAnterior(desde?: string, hasta?: string) {
+  if (!desde || !hasta) return null;
+  const DIA = 86_400_000;
+  const d = Date.parse(`${desde}T00:00:00Z`);
+  const h = Date.parse(`${hasta}T00:00:00Z`);
+  if (!(h >= d)) return null;
+  const largo = Math.round((h - d) / DIA) + 1;
+  const iso = (t: number) => new Date(t).toISOString().slice(0, 10);
+  return { desde: iso(d - largo * DIA), hasta: iso(d - DIA) };
+}
+
 /* El formato ya lo validó el DTO; esto ataja el día imposible ("2026-13-45"),
  * que pasa la expresión y llegaría a la base como fecha inválida. */
 function dia(s: string | undefined, hora: string) {
@@ -142,7 +158,8 @@ export class FraccionamientosService {
      * solo operador y un solo tipo, así que los conteos se suman sin doblar. */
     const dondeTotales = y([...cab, ...ren]);
 
-    const [pagina, grupos, gramajes, turnos] = await Promise.all([
+    const anterior = rangoAnterior(q.desde, q.hasta);
+    const [pagina, grupos, gramajes, turnos, resumen, resumenAnterior] = await Promise.all([
       this.filas<any>(sql`
         select f.id, to_json(f.fecha) as fecha, f.turno, to_json(f.registrado_en) as "registradoEn",
                (f.registrado_en <> f.fecha) as diferido,
@@ -193,6 +210,8 @@ export class FraccionamientosService {
         ${cruces}
         where ${y([...cab, ...ren, sql`f.origen <> 'correccion'`])}
         group by grouping sets ((), (f.operador_id), (f.turno))`),
+      this.resumen(q),
+      anterior ? this.resumen({ ...q, ...anterior }) : null,
     ]);
     const turnosTotal = turnos.find((t) => t.sinOperador && t.sinTurno)?.turnos ?? 0;
     const turnosDe = new Map(turnos.filter((t) => !t.sinOperador).map((t) => [String(t.operadorId ?? 'sin'), t.turnos]));
@@ -248,7 +267,13 @@ export class FraccionamientosService {
       filas: pagina.map((f) => ({ ...f, kg: n3(f.kg), productos: porRegistro.get(f.id) ?? [] })),
       total: totales.registros,
       paginado: { offset, limit },
-      totales: { ...totales, kg: n3(totales.kg), turnos: turnosTotal },
+      totales: {
+        ...totales, kg: n3(totales.kg), turnos: turnosTotal,
+        colaboradores: resumen.colaboradores, turnosPersona: resumen.turnosPersona,
+        paquetesPersona: resumen.paquetesPersona, kgPersona: resumen.kgPersona,
+      },
+      /** Lo mismo en el período anterior del mismo largo, para las flechas de variación (null sin rango). */
+      anterior: resumenAnterior && { ...anterior, ...resumenAnterior },
       porOperador: [...operadores.values()]
         .map((o) => ({ ...o, kg: n3(o.kg), turnos: turnosDe.get(String(o.operadorId ?? 'sin')) ?? 0 }))
         .sort((a, b) => b.kg - a.kg || a.nombre.localeCompare(b.nombre)),
@@ -257,6 +282,36 @@ export class FraccionamientosService {
       porTurno: ['manana', 'tarde'].filter((t) => porTurno.has(t))
         .map((t) => ({ ...porTurno.get(t)!, kg: n3(porTurno.get(t)!.kg), turnos: turnosPorTurno.get(t) ?? 0 })),
     };
+  }
+
+  /**
+   * LAS CIFRAS DE LAS TARJETAS EN UNA LECTURA (14/10/2026): las del período y,
+   * con la misma función, las del anterior. Turnos, colaboradores y «por
+   * persona» sin correcciones (arreglan una tanda, no son trabajo de un turno):
+   *   · colaboradores: operadores distintos que fraccionaron;
+   *   · turnosPersona: cada (operador, sucursal, día, turno) — dos personas en
+   *     la misma mañana son dos turnos-persona;
+   *   · paquetes/kgPersona: lo que armaron los que tienen operador cargado.
+   */
+  private async resumen(q: FiltrosDto) {
+    const { cab, ren, cruces } = this.condiciones(q);
+    const dia = sql`(f.fecha at time zone 'America/Argentina/Buenos_Aires')::date`;
+    const trabajo = sql`f.origen <> 'correccion'`;
+    const conOperador = sql`f.origen <> 'correccion' and f.operador_id is not null`;
+    const [r] = await this.filas<any>(sql`
+      select count(distinct f.id)::int as registros,
+             coalesce(sum(fi.paquetes), 0)::int as paquetes,
+             coalesce(sum(fi.paquetes * fi.tam_kg), 0)::float8 as kg,
+             count(distinct (f.sucursal_id, ${dia}, f.turno)) filter (where ${trabajo})::int as turnos,
+             count(distinct f.operador_id) filter (where ${trabajo})::int as colaboradores,
+             count(distinct (f.operador_id, f.sucursal_id, ${dia}, f.turno)) filter (where ${conOperador})::int as "turnosPersona",
+             coalesce(sum(fi.paquetes) filter (where ${conOperador}), 0)::int as "paquetesPersona",
+             coalesce(sum(fi.paquetes * fi.tam_kg) filter (where ${conOperador}), 0)::float8 as "kgPersona"
+      from fraccionamiento_items fi
+      join fraccionamientos f on f.id = fi.fraccionamiento_id
+      ${cruces}
+      where ${y([...cab, ...ren])}`);
+    return { ...r, kg: n3(r.kg), kgPersona: n3(r.kgPersona) };
   }
 
   /**

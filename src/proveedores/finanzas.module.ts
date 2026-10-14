@@ -869,6 +869,10 @@ export class FinanzasProveedorService {
         debe: esNc ? 0 : money(c.total),
         haber: esNc ? money(c.total) : 0,
         saldoDoc: esNc ? null : (saldoVivo.get(c.id) ?? 0),
+        /* La parte comprada para Coffit (14/10/2026), al neto: la MISMA cifra que
+         * suma su cuenta corriente (`neto_cafeteria`). Solo informa: el proveedor
+         * cobra la factura entera, así que no cambia este saldo. */
+        paraCoffit: money(c.netoCafeteria),
       });
     }
     for (const g of gs) {
@@ -883,6 +887,9 @@ export class FinanzasProveedorService {
         debe: esNc ? 0 : money(g.total),
         haber: esNc ? money(-g.total) : 0,
         saldoDoc: esNc ? null : money(g.total - g.pagado),
+        /* Gasto cargado con Negocio: Coffit → todo es de Coffit, al neto de lo que
+         * la empresa recupera (la fórmula de su cuenta corriente). En positivo. */
+        paraCoffit: g.negocio === 'cafeteria' ? money(Math.abs(g.total - g.iva - g.percDgi - g.percDgr)) : 0,
       });
     }
     for (const p of pgs) {
@@ -993,6 +1000,9 @@ export class FinanzasProveedorService {
        * suma aparte, sería contarlo dos veces): es el desglose que responde
        * "¿por qué a una factura de $100.000 se le pagaron $80.000?". */
       fletes: sumar((m) => m.kind === 'pago' && m.esFlete, 'haber'),
+      /* Cuánto de lo facturado (compras y gastos) fue para Coffit, al neto; las
+       * NC restan. Va DENTRO de lo de arriba: es el desglose, no se suma aparte. */
+      paraCoffit: money(movs.reduce((a, m) => a + (m.paraCoffit || 0) * (m.kind === 'nc' || m.kind === 'nc_gasto' ? -1 : 1), 0)),
     };
     /** Plata ya pagada que todavía no se imputó a ningún documento: baja el
      *  saldo del proveedor pero deja facturas figurando impagas. */

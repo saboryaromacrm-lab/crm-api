@@ -30,6 +30,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { IsIn, IsOptional } from 'class-validator';
+import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolClient } from 'pg';
 import { Permiso } from '../auth/auth.decoradores';
@@ -45,6 +46,8 @@ import { reporteIva } from './iva';
 import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
 import { reporteProductos } from './productos';
 import { reporteStock } from './stock';
+import { montosPorProveedor } from './montos';
+import { reporteVariaciones } from './variaciones';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
 export const PERMISO_METRICAS = 'gerencia.metricas';
@@ -170,17 +173,43 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
    * A = desde/hasta (el período de arriba); B = bDesde/bHasta. Sin B, el período
    * anterior del mismo largo. La sucursal vale para los dos.
    */
-  comparar(q: any) {
+  private dosPeriodos(q: any): [Filtro, Filtro] {
     const a = this.filtro(q);
     const b = diaValido(q.bDesde) && diaValido(q.bHasta)
       ? this.filtro({ desde: q.bDesde, hasta: q.bHasta, sucursalId: q.sucursalId })
       : periodoAnterior(a);
+    return [a, b];
+  }
+
+  comparar(q: any) {
+    const [a, b] = this.dosPeriodos(q);
     return this.leer((c) => reporteComparar(c, a, b, this.paso(q.paso)));
+  }
+
+  /** Ventas › Variaciones (14/10/2026): todas las sucursales; la pantalla filtra y agrupa. */
+  variaciones(q: any) {
+    const [a, b] = this.dosPeriodos({ ...q, sucursalId: undefined });
+    return this.leer((c) => reporteVariaciones(c, a, b));
   }
 
   stock(q: any) {
     const suc = Number(q.sucursalId);
     return reporteStock(this.db, this.pool, { sucursalId: Number.isInteger(suc) && suc > 0 ? suc : null, ventana: Number(q.ventana) || 60 });
+  }
+
+  /**
+   * PROVEEDORES › MONTOS (14/10/2026): sobre el pool de Métricas y con su misma
+   * valuación. Sin sucursal pedida, la Distribuidora; «todas» = todas.
+   */
+  async montos(q: any) {
+    const sucs = await this.db.select({ id: schema.sucursales.id, nombre: schema.sucursales.nombre, tipo: schema.sucursales.tipo })
+      .from(schema.sucursales).where(eq(schema.sucursales.activa, true)).orderBy(schema.sucursales.id);
+    const pedida = Number(q.sucursalId);
+    const sucursalId = q.sucursalId === 'todas' ? null
+      : sucs.some((s) => s.id === pedida) ? pedida
+        : (sucs.find((s) => s.tipo === 'distribuidora')?.id ?? null);
+    const datos = await montosPorProveedor(this.db, this.pool, { sucursalId, ventana: Number(q.ventana) || 30 });
+    return { ...datos, sucursales: sucs };
   }
 
   async sucursales() {
@@ -325,8 +354,26 @@ export class MetricasController {
   }
 }
 
+/** Proveedores › Montos: vive acá por el pool y la valuación, con la llave de su sección. */
+@Controller('proveedores-montos')
+@Permiso('proveedores.montos')
+export class MontosProveedoresController {
+  constructor(private readonly svc: MetricasService) {}
+
+  @Get() montos(@Query() q: any) { return this.svc.montos(q); }
+}
+
+/** Ventas › Variaciones: lee los resúmenes de Métricas, con la llave de su sección (sin costos). */
+@Controller('ventas-variaciones')
+@Permiso('ventas.variaciones')
+export class VariacionesController {
+  constructor(private readonly svc: MetricasService) {}
+
+  @Get() variaciones(@Query() q: any) { return this.svc.variaciones(q); }
+}
+
 @Module({
-  controllers: [MetricasController],
+  controllers: [MetricasController, MontosProveedoresController, VariacionesController],
   providers: [MetricasService],
   exports: [MetricasService],
 })
