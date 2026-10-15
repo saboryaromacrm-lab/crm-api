@@ -116,6 +116,8 @@ class FraccionarRegistroDto {
   /** Para asentar un fraccionado que se olvidó cargar: el día y el turno en que se hizo. */
   @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/) dia?: string;
   @IsOptional() @IsIn(['manana', 'tarde']) turno?: 'manana' | 'tarde';
+  /** Cargado desde un pedido de fraccionado de la Distribuidora (0169): se cierra en la misma transacción. */
+  @IsOptional() @IsInt() pedidoId?: number;
   @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => RenglonFraccionadoDto)
   items!: RenglonFraccionadoDto[];
 }

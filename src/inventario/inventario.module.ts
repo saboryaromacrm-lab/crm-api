@@ -3,6 +3,7 @@ import { ConfiguracionModule } from '../configuracion/configuracion.module';
 import { ListasModule } from '../listas/listas.module';
 import { InventarioService } from './inventario.service';
 import { FraccionamientosController, FraccionamientosService } from './fraccionamientos';
+import { PedidosFraccionController, PedidosFraccionService } from './pedidos-fraccion';
 import {
   StockController, BootstrapController, MovimientosController, OperacionesController,
   TransferenciasController, IncidenciasController, ConteosController, SinMovimientoController, BajosStockController,
@@ -14,9 +15,9 @@ import {
   controllers: [
     StockController, BootstrapController, MovimientosController, OperacionesController,
     TransferenciasController, IncidenciasController, ConteosController, FraccionamientosController,
-    SinMovimientoController, BajosStockController, OrdenPedidoController,
+    SinMovimientoController, BajosStockController, OrdenPedidoController, PedidosFraccionController,
   ],
-  providers: [InventarioService, FraccionamientosService],
+  providers: [InventarioService, FraccionamientosService, PedidosFraccionService],
   exports: [InventarioService],
 })
 export class InventarioModule {}

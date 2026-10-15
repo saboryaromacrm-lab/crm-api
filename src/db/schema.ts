@@ -1307,6 +1307,41 @@ export const fraccionamientoItems = pgTable('fraccionamiento_items', {
   ixProd: index('ix_fracc_items_prod').on(t.productoId, t.fraccionamientoId),
 }));
 
+/* ---------------- Pedidos de fraccionado de la Distribuidora (0169) ---------------- */
+/**
+ * La Distribuidora se pide paquetes a sí misma (15/10/2026, pedido del dueño):
+ * una lista de qué armar para su propia góndola. NO mueve stock: el stock se
+ * mueve recién cuando el fraccionador registra lo que fraccionó desde el
+ * pedido, y en esa misma transacción el pedido pasa a `hecho` y apunta al
+ * registro (`fraccionamientoId`), que es donde se ve lo que de verdad se armó.
+ */
+export const fraccionPedidos = pgTable('fraccion_pedidos', {
+  id: serial('id').primaryKey(),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  estado: text('estado').$type<'pendiente' | 'hecho'>().notNull().default('pendiente'),
+  observaciones: text('observaciones').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+  hechoEn: timestamp('hecho_en', { withTimezone: true }),
+  hechoPor: integer('hecho_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  fraccionamientoId: integer('fraccionamiento_id').references(() => fraccionamientos.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixEstado: index('ix_fracc_pedidos_estado').on(t.estado, t.creadoEn.desc()),
+}));
+
+/** Qué paquete y cuántos. El tamaño se congela: si mañana se borra el paquete, el pedido sigue diciendo qué se pidió. */
+export const fraccionPedidoItems = pgTable('fraccion_pedido_items', {
+  id: serial('id').primaryKey(),
+  pedidoId: integer('pedido_id').notNull().references(() => fraccionPedidos.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
+  tamKg: doublePrecision('tam_kg').notNull(),
+  paquetes: integer('paquetes').notNull(),
+}, (t) => ({
+  ixPedido: index('ix_fracc_pedido_items_pedido').on(t.pedidoId),
+}));
+
 /* ---------------- Control de stock (0066) ---------------- */
 /**
  * El físico contra el virtual, como SESIÓN de trabajo: dura horas, se
@@ -3638,6 +3673,11 @@ export const cuentasDisponibles = pgTable('cuentas_disponibles', {
   /** Cuánto hay que hacerle llegar. Editable, nunca por debajo de lo pagado. */
   importe: doublePrecision('importe').notNull().default(0),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * SOLO PARA VENTAS DESDE ESTE TOTAL (0168, 15/10/2026, pedido del dueño): la
+   * caja no la ofrece en tickets (o recibos) más chicos. 0 = sin piso.
+   */
+  ventaMinima: doublePrecision('venta_minima').notNull().default(0),
   /** La estrella: se ofrece primero al cobrar. */
   prioritaria: boolean('prioritaria').notNull().default(false),
   /** Ya se le mandó el resumen de transferencias al proveedor. */

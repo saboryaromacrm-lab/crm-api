@@ -449,6 +449,7 @@ export class CobranzasService {
         await this.ctasDisp.registrarDeCobranza(tx, tercerizados, {
           sucursalId, usuarioId: autor,
           documento: `Recibo ${puntoVenta}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+          totalOperacion: total,
         });
       }
 

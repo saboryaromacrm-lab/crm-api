@@ -48,7 +48,7 @@ import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService, stockSinControl } from '../inventario/inventario.service';
 import { bultoCerrado, costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila, r6 } from '../inventario/pricing';
 import { ArcaModule, ArcaService } from '../arca/arca.module';
-import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
+import { CuentasDisponiblesModule, CuentasDisponiblesService, type ContextoCobro } from '../proveedores/cuentas-disponibles.module';
 import { urlQrFiscal, codigoComprobante } from '../arca/qr';
 import { faltaIdentificar } from '../arca/comprobante';
 import { consultarCuit, cuitValido, ErrorPadron, soloDigitos } from '../arca/padron';
@@ -833,7 +833,7 @@ export class VentasService {
     /** La mercadería con IVA de los renglones (la NC resta) y en cuántos tickets: por lista y por modalidad. */
     const IMPORTE_LISTA = sql<number>`coalesce(sum(${ventaItems.subtotal} * (1 + coalesce(${ventaItems.iva}, 21) / 100.0) * ${SIGNO_NC}), 0)`;
     const TICKETS_LISTA = sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`;
-    const [filas, [tot], porMedio, [fac], porLista, porModalidad, [ren], mpTipos] = await Promise.all([
+    const [filas, [tot], porMedio, [fac], porLista, porModalidad, [ren], mpTipos, porSucursal] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -958,6 +958,20 @@ export class VentasService {
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .where(and(vivas, eq(mpCobros.estado, 'pagado')))
         .groupBy(sql`1`),
+
+      /* POR SUCURSAL (15/10/2026, pedido del dueño): lo vendido de cada local
+       * con la MISMA cuenta que «Vendido» (total con IVA, la NC resta) y sus
+       * tickets (las notas no cuentan): las sucursales suman ese total. */
+      this.db.select({
+        sucursalId: ventas.sucursalId,
+        nombre: sql<string>`coalesce(max(${sucursales.nombre}), 'Sin sucursal')`,
+        importe: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}), 0)`,
+        tickets: sql<number>`count(*) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+      }).from(ventas)
+        .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+        .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
+        .where(vivas)
+        .groupBy(ventas.sucursalId),
     ]);
 
     const ids = filas.map((f) => f.v.id);
@@ -1089,6 +1103,13 @@ export class VentasService {
             liquidado: l, liquidaciones: Number(fac?.liquidaciones) || 0, pctLiquidado: pct(l),
           };
         })(),
+        /* Cada sucursal con su % de lo vendido y su ticket promedio, de mayor a menor. */
+        porSucursal: porSucursal
+          .map((x) => {
+            const importe = money(Number(x.importe)); const tk = Number(x.tickets) || 0;
+            return { sucursalId: x.sucursalId, nombre: x.nombre, importe, tickets: tk, promedio: tk ? money(importe / tk) : 0, pct: plata > 0 ? Math.round((importe / plata) * 1000) / 10 : null };
+          })
+          .sort((a, b) => b.importe - a.importe),
         /* Cada modalidad con su % del total y, adentro, sus listas con su % de la modalidad. */
         porModalidad: (() => {
           const pctDe = (x: number, base: number) => (base > 0 ? Math.round((x / base) * 1000) / 10 : null);
@@ -2751,7 +2772,7 @@ export class VentasService {
    */
   private async insertarPagos(
     tx: any, ventaId: number, pagos: VentaPagoDto[],
-    ctx: { sucursalId: number; usuarioId?: number | null; documento: string; clienteNombre: string },
+    ctx: ContextoCobro,
   ) {
     if (!pagos.length) return;
     const filas = await tx.insert(ventaPagos).values(pagos.map((p) => ({
@@ -3635,6 +3656,7 @@ export class VentasService {
       await this.insertarPagos(tx, v.id, pagos, {
         sucursalId, usuarioId: autor ?? dto.usuarioId,
         documento: `Venta ${puntoVentaFinal}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+        totalOperacion: tot.total,
       });
 
       if (dto.presupuestoId) {
@@ -4224,6 +4246,7 @@ export class VentasService {
       await this.insertarPagos(tx, id, pagos, {
         sucursalId, usuarioId: cobrador ?? borrador.usuarioId,
         documento: `Venta ${puntoVentaFinal}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
+        totalOperacion: borrador.total,
       });
 
       // El borrador nació de un presupuesto: este cobro lo cierra.

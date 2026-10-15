@@ -9,7 +9,7 @@ import {
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos, enviosCafeteria, envioCafeteriaItems,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   conteos, conteoItems, ventas, clientes,
-  fraccionOperadores, fraccionamientos, fraccionamientoItems,
+  fraccionOperadores, fraccionamientos, fraccionamientoItems, fraccionPedidos,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
@@ -783,13 +783,15 @@ export class InventarioService {
    */
   async opFraccionarRegistro(o: {
     sucursalId: number; usuarioId?: number; operadorId?: number; motivo?: string;
-    dia?: string; turno?: 'manana' | 'tarde';
+    dia?: string; turno?: 'manana' | 'tarde'; pedidoId?: number;
     items: { productoId: number; presId: number; cant: number }[];
   }) {
     // Antes de abrir la transacción: una fecha imposible no toca nada.
     const momento = this.momentoDeFraccionado(o.dia, o.turno);
     return this.db.transaction(async (tx) => {
       const sucId = o.sucursalId;
+      // Primero el candado del pedido: dos cargas del mismo pedido, una sola pasa.
+      if (o.pedidoId) await this.pedidoFraccionPendiente(tx, o.pedidoId, sucId);
       /* Renglones agrupados por producto y tamaño: el mismo paquete cargado
        * dos veces suma, no se registra dos veces. */
       const porProducto = new Map<number, Map<number, number>>();
@@ -848,6 +850,11 @@ export class InventarioService {
         origen: 'manual', sucursalId: sucId, operadorId, usuarioId: o.usuarioId,
         motivo: (o.motivo ?? '').trim(), items: renglones, fecha: momento.fecha, turno: momento.turno,
       });
+      if (o.pedidoId) {
+        await tx.update(fraccionPedidos).set({
+          estado: 'hecho', hechoEn: new Date(), hechoPor: o.usuarioId ?? null, fraccionamientoId: registroId,
+        }).where(eq(fraccionPedidos.id, o.pedidoId));
+      }
       const fotos = await Promise.all(ids.map((pid) => this.fotoProducto(tx, pid)));
       return {
         ok: true, registroId, movimientos, fotos,
@@ -855,6 +862,20 @@ export class InventarioService {
         kg: this.cant3(renglones.reduce((a, r) => a + r.paquetes * r.tamKg, 0)),
       };
     });
+  }
+
+  /**
+   * EL PEDIDO DE FRACCIONADO QUE SE ESTÁ CARGANDO (0169), con candado: tiene
+   * que estar pendiente y ser de la sucursal donde se fracciona. Lo que se
+   * registra puede diferir de lo pedido (se hizo lo que alcanzó): el pedido se
+   * cierra igual y la diferencia se lee del registro.
+   */
+  private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number) {
+    const [p] = await tx.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, pedidoId)).limit(1).for('update');
+    const codigo = `PF${String(pedidoId).padStart(4, '0')}`;
+    if (!p) throw new BadRequestException('Ese pedido de fraccionado ya no existe: actualizá la pantalla.');
+    if (p.estado !== 'pendiente') throw new BadRequestException(`${codigo} ya se cargó como fraccionado.`);
+    if (p.sucursalId !== sucursalId) throw new BadRequestException(`${codigo} es de la Distribuidora: cargalo entrando con esa sucursal.`);
   }
 
   /**

@@ -63,6 +63,8 @@ export class CrearCuentaDto {
   @IsNumber() @Min(0.01, { message: 'El importe a cubrir tiene que ser mayor a 0.' }) @Max(1_000_000_000) importe!: number;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
   @IsOptional() @IsBoolean() prioritaria?: boolean;
+  /** Solo se ofrece en ventas (o recibos) desde este total; 0 = siempre. */
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) ventaMinima?: number;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** Lo pone el AutorInterceptor con el usuario de la sesión. */
   @IsOptional() @IsInt() usuarioId?: number;
@@ -87,6 +89,7 @@ export class EditarCuentaDto {
   @IsOptional() @IsBoolean() prioritaria?: boolean;
   @IsOptional() @IsBoolean() enviado?: boolean;
   @IsOptional() @IsBoolean() corte?: boolean;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) ventaMinima?: number;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** Solo mientras la cuenta no tenga historia. */
   @IsOptional() @IsString() @MaxLength(120) titular?: string;
@@ -108,6 +111,8 @@ export interface ContextoCobro {
   /** "Venta 0001-00000123" / "Recibo 0001-00000045": va al concepto del pago. */
   documento: string;
   clienteNombre: string;
+  /** El total de la venta o del recibo: contra él se mira la venta mínima de cada cuenta. */
+  totalOperacion: number;
 }
 
 /* -------------------------------- Service -------------------------------- */
@@ -135,6 +140,7 @@ export class CuentasDisponiblesService {
       importe: cuentasDisponibles.importe,
       fecha: cuentasDisponibles.fecha,
       prioritaria: cuentasDisponibles.prioritaria,
+      ventaMinima: cuentasDisponibles.ventaMinima,
       enviado: cuentasDisponibles.enviado,
       corte: cuentasDisponibles.corte,
       corteEn: cuentasDisponibles.corteEn,
@@ -216,7 +222,7 @@ export class CuentasDisponiblesService {
         id: d.id, proveedorId: d.proveedorId, proveedorNombre: d.proveedorNombre,
         titular: d.titular, cbuAlias: d.cbuAlias,
         importe: d.importe, pagado: d.pagado, falta: d.falta, minimo: d.minimo,
-        prioritaria: d.prioritaria, fecha: d.fecha,
+        ventaMinima: money(Number(d.ventaMinima)), prioritaria: d.prioritaria, fecha: d.fecha,
       };
     });
   }
@@ -286,6 +292,7 @@ export class CuentasDisponiblesService {
         importe: money(dto.importe),
         fecha: fechaDe(dto.fecha) ?? new Date(),
         prioritaria: dto.prioritaria === true,
+        ventaMinima: money(dto.ventaMinima ?? 0),
         observaciones: (dto.observaciones ?? '').trim(),
         usuarioId: dto.usuarioId ?? null,
       }).returning({ id: cuentasDisponibles.id });
@@ -325,6 +332,7 @@ export class CuentasDisponiblesService {
       }
       if (dto.fecha !== undefined) set.fecha = fechaDe(dto.fecha);
       if (dto.prioritaria !== undefined) set.prioritaria = dto.prioritaria;
+      if (dto.ventaMinima !== undefined) set.ventaMinima = money(dto.ventaMinima);
       if (dto.enviado !== undefined) set.enviado = dto.enviado;
       if (dto.corte !== undefined && dto.corte !== c.corte) {
         set.corte = dto.corte;
@@ -385,6 +393,12 @@ export class CuentasDisponiblesService {
     }
     const importe = money(p.importe);
     if (importe <= 0) throw new BadRequestException('El importe de la transferencia tiene que ser mayor a 0.');
+    const ventaMinima = money(c.ventaMinima);
+    if (ventaMinima > 0 && money(ctx.totalOperacion) < ventaMinima - EPS) {
+      throw new BadRequestException(
+        `La cuenta de ${quien} es solo para ventas desde $${ventaMinima.toFixed(2)} y esta es de $${money(ctx.totalOperacion).toFixed(2)}: elegí otra cuenta u otro medio.`,
+      );
+    }
 
     const { pagado } = await this.sumas(tx, c.id);
     const falta = money(c.importe - pagado);
