@@ -35,6 +35,7 @@ import {
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
 import { CacheCorto } from './cache';
+import { MULTI_UNIDAD, totalConOferta } from './oferta-linea';
 import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
@@ -326,17 +327,16 @@ export class TiendaService {
 
     // Ofertas de vidriera vigentes: solo mecánicas de UN producto (combo/ticket no aplican al catálogo).
     /*
-     * Mayorista: `sin listas` es la traducción EXACTA del viejo `!soloPrecioBase`
-     * (0065): publica las que corren en TODAS las listas (decisión del dueño,
-     * 15/8/2026). Minorista: además las acotadas a la lista base, que es la que
-     * cobra — son exactamente las promos que ve el mostrador.
+     * LAS LISTAS DE LA OFERTA, COMO EN LA CAJA (16/10/2026, pedido del dueño):
+     * «solo sobre las tildadas: un renglón cotizado con otra lista no recibe la
+     * promo». Cada opción del sitio se cotiza con UNA lista (la de mostrador en
+     * minorista; Mayorista 1 o la caja de Mayorista 2 en mayorista) y recibe la
+     * oferta si no tiene listas o si la tiene tildada. Antes el mayorista
+     * descartaba toda oferta con listas, aunque fuera justo la de la opción.
      */
-    const corre = (o: any) => {
-      const listasOferta = String(o.listas ?? '').split(',').map((x: string) => x.trim()).filter(Boolean);
-      return !listasOferta.length || (minorista && !!listaTienda && listasOferta.includes(String(listaTienda.id)));
-    };
-    const ofertasWeb = ofertasActivas.filter((o: any) =>
-      corre(o) && o.tipo !== 'combo' && o.tipo !== 'ticket' && ofertaVigente(o, suc?.id ?? null));
+    const ofertasWeb = ofertasActivas
+      .filter((o: any) => o.tipo !== 'combo' && o.tipo !== 'ticket' && ofertaVigente(o, suc?.id ?? null))
+      .map((o: any) => ({ ...o, listasSet: new Set(String(o.listas ?? '').split(',').map((x: string) => Number(x.trim())).filter(Boolean)) }));
 
     /**
      * Contenido editable del sitio (módulo Web): slides de la portada, logo,
@@ -483,12 +483,17 @@ export class TiendaService {
        * `precioUnidad` es el precio de UNA unidad del producto (el kilo de la
        * bolsa, un paquete) y `por` cuántas lleva la opción: el precio con la
        * promo es el de la unidad × `por`, igual que lo cobraría la caja.
+       * `listaId`: la lista con la que se cotiza la opción (ver `ofertasWeb`).
+       *
+       * Las de VARIAS UNIDADES (3×2, 2ª unidad, pack) viajan con sus números:
+       * el carrito y el pedido las cobran con `totalConOferta`.
        */
-      const ofertaDe = (presentacionId: number | null, precioUnidad: number, por: number) => {
+      const ofertaDe = (presentacionId: number | null, precioUnidad: number, por: number, listaId: number) => {
         const r = { productoId: p.id, presentacionId, marcaId: p.marcaId, categoriaId: p.categoriaId, etiquetas: etiquetasIds };
         let mejor: any = null;
         let mejorPrecio: number | null = null;
         for (const o of ofertasWeb) {
+          if (o.listasSet.size && !o.listasSet.has(listaId)) continue;
           if (!ofertaAlcanza(o, r)) continue;
           const pOferta = precioConOferta(o, precioUnidad);
           if (pOferta != null && (mejorPrecio == null || pOferta < mejorPrecio)) {
@@ -497,9 +502,14 @@ export class TiendaService {
             mejor = o; // nxm / segunda_unidad / pack: sin precio unitario, pero se avisa igual.
           }
         }
-        return mejor
-          ? { id: mejor.id, nombre: mejor.nombre, tipo: mejor.tipo, badge: describirOferta(mejor), precioOferta: mejorPrecio != null ? money(mejorPrecio * por) : null }
-          : null;
+        if (!mejor) return null;
+        return {
+          id: mejor.id, nombre: mejor.nombre, tipo: mejor.tipo, badge: describirOferta(mejor),
+          precioOferta: mejorPrecio != null ? money(mejorPrecio * por) : null,
+          ...(MULTI_UNIDAD.has(mejor.tipo)
+            ? { lleva: Number(mejor.lleva) || 0, paga: Number(mejor.paga) || 0, porcentaje: Number(mejor.porcentaje) || 0, precioPack: Number(mejor.precio) || 0 }
+            : {}),
+        };
       };
       const base = {
         id: p.id,
@@ -570,7 +580,7 @@ export class TiendaService {
               unidadesMinimas: minimo((Number(f.fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(f.fila.unidadesMinimas) / f.n - 1e-9) : 0),
               enStock: sinTope || (disponible ?? 0) >= 1,
               disponible,
-              oferta: ofertaDe(null, f.pv.finalUnitario, f.n),
+              oferta: ofertaDe(null, f.pv.finalUnitario, f.n, f.lista.id),
               ahorroMinorista: null,
             };
           });
@@ -603,7 +613,7 @@ export class TiendaService {
           unidadesMinimas: minimo(filaTienda.unidadesMinimas || 0),
           enStock: disponibleWeb,
           disponible: disponibleParaWeb,
-          oferta: ofertaDe(null, pv.finalUnitario, 1),
+          oferta: ofertaDe(null, pv.finalUnitario, 1, formasE[0].lista.id),
           reingreso: disponibleWeb && reingresados.has(p.id),
         });
         continue;
@@ -659,7 +669,7 @@ export class TiendaService {
             unidadesMinimas: minimo((Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / kgBolsa - 1e-9) : 0),
             enStock: sinTope || (disponible ?? 0) >= 1,
             disponible,
-            oferta: ofertaDe(null, pv.finalUnitario, kgBolsa),
+            oferta: ofertaDe(null, pv.finalUnitario, kgBolsa, lista.id),
           });
         }
       }
@@ -691,7 +701,7 @@ export class TiendaService {
             unidadesMinimas: minimo((Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0),
             enStock: sinTope || (disponible ?? 0) >= 1,
             disponible,
-            oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja),
+            oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja, lista.id),
           });
         }
         if (!delTamano.length) continue;
@@ -958,7 +968,19 @@ export class TiendaService {
     // Precio EFECTIVO: si hay una promo con precio propio (porcentaje / precio_fijo),
     // el pedido se cotiza con ese precio — el cliente vio ese número, se le cobra ese número.
     const precioEfectivo = (r: Renglon) => de(r).oferta?.precioOferta ?? de(r).precio;
-    const total = resueltos.reduce((a, r) => a + r.cantidad * precioEfectivo(r), 0);
+    /*
+     * LO QUE VALE EL RENGLÓN. Las promos de VARIAS UNIDADES (3×2, 2ª unidad,
+     * pack) se cuentan en las unidades que cuenta la caja: una caja x6 son 6
+     * (`paquetesPorUnidad`); una bolsa cerrada, una bolsa. La misma cuenta que
+     * el carrito del sitio.
+     */
+    const totalRenglon = (r: Renglon) => {
+      const x = de(r);
+      if (!MULTI_UNIDAD.has(x.oferta?.tipo)) return r.cantidad * precioEfectivo(r);
+      const n = r.v?.paquetesPorUnidad ?? 1;
+      return totalConOferta(x.oferta, x.precio / n, r.cantidad * n);
+    };
+    const total = resueltos.reduce((a, r) => a + totalRenglon(r), 0);
 
     /*
      * EL RENGLÓN DEL PEDIDO, EN LA UNIDAD DEL STOCK: la bolsa viaja en KILOS
@@ -973,8 +995,11 @@ export class TiendaService {
       const x = de(r);
       const unidadesStock = r.v ? (r.v.unidadesStock ?? (r.v.presentacionId == null ? r.v.kgPorUnidad : (r.v.paquetesPorUnidad || 1))) : 1;
       const esPorcentaje = x.oferta?.tipo === 'porcentaje' && x.oferta.precioOferta != null;
-      const precioCompra = esPorcentaje ? x.precio : precioEfectivo(r);
-      const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio)) : 0;
+      const multi = MULTI_UNIDAD.has(x.oferta?.tipo);
+      const precioCompra = esPorcentaje || multi ? x.precio : precioEfectivo(r);
+      /* Varias unidades: el renglón va a precio lleno con el descuento que deja el total exacto (3×2 de 3 = 33,33 %). */
+      const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio))
+        : multi ? Math.round(1e6 * (1 - totalRenglon(r) / (r.cantidad * x.precio))) / 1e4 : 0;
       /* La lista de la opción (la caja de 5 puede ser Mayorista 2): con esa se cotizó y con esa cierra la caja. */
       const lista = listaDeOpcion.get(`${r.prod.id}:${r.v ? r.v.clave : ''}`) ?? null;
       return {
