@@ -1233,6 +1233,13 @@
       "when": 1792037700000,
       "tag": "0175_pago_efectivo_por_transferencia",
       "breakpoints": true
+    },
+    {
+      "idx": 176,
+      "version": "7",
+      "when": 1792038600000,
+      "tag": "0176_coffit_precio_final",
+      "breakpoints": true
     }
   ]
 }

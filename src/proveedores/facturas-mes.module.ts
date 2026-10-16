@@ -366,6 +366,8 @@ export class FacturasMesService {
           const rastro = `Era el ${etiquetaDoc(c)}: pasó a liquidación al cargar las facturas de ${mesTexto} (se paga sin IVA; el stock no se movió).`;
           const [ok] = await tx.update(comprobantes).set({
             tipo: 'liquidacion', letra: 'X', ivaTotal: 0, percepcionesTotal: 0, total: r2(c.subtotalNeto),
+            /* Sin IVA ni percepciones, lo que Coffit paga es su neto (0176). */
+            finalCafeteria: c.netoCafeteria,
             condicionPago: 'cuenta_corriente', facturacionMesId: cab.id,
             cuentaFecha: Number(c.netoCafeteria) > 0 ? await fechaDeCuenta(tx, new Date(c.fecha)) : null,
             observaciones: [String(c.observaciones ?? '').trim(), rastro].filter(Boolean).join('\n'),

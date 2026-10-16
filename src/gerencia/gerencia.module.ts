@@ -407,9 +407,10 @@ export class RentabilidadService {
    */
   private async parteDeCoffit(desde: Date, hastaEx: Date) {
     /* LA MISMA REGLA QUE LA CUENTA CON COFFIT (`cafeteria/cuenta.ts`, 0120),
-     * por la fecha del papel: lo que se le cobra de un envío es sin lo que ya
-     * había pagado y con los faltantes al recibir descontados. */
-    const t = await totalesCuenta(this.db, desde, new Date(hastaEx.getTime() - 1), true);
+     * por la fecha del papel y AL NETO (0176): lo que se le cobra de un envío
+     * es sin lo que ya había pagado y con los faltantes al recibir descontados;
+     * Coffit paga precio final, pero las compras de la empresa son netas. */
+    const t = await totalesCuenta(this.db, desde, new Date(hastaEx.getTime() - 1), 'gerencia');
     return { compradoDirecto: t.compras, enviadoDesdeStock: t.envios };
   }
 

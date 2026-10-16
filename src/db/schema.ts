@@ -1663,6 +1663,12 @@ export const comprobantes = pgTable('comprobantes', {
    */
   netoCafeteria: doublePrecision('neto_cafeteria').notNull().default(0),
   /**
+   * LO QUE COFFIT PAGA DE ESTE PAPEL (0176): su parte a PRECIO FINAL —neto,
+   * IVA y percepciones en proporción— (`finalCafeteria` en cafeteria/cuenta.ts).
+   * Es lo que suma su cuenta corriente; el neto de arriba queda para Gerencia.
+   */
+  finalCafeteria: doublePrecision('final_cafeteria').notNull().default(0),
+  /**
    * CUÁNDO ENTRA A LA CUENTA CON COFFIT, si no es su fecha (0120): una factura
    * con fecha de un mes ya cerrado entra el día que se carga. Vacía = su fecha.
    */
@@ -3139,6 +3145,13 @@ export const envioCafeteriaItems = pgTable('envio_cafeteria_items', {
    * cafetería en un período ya mirado.
    */
   costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
+  /**
+   * El mismo costo AL NETO (0176). En la salida `costoUnitario` es el PRECIO
+   * FINAL —lo que Coffit paga— y este el neto, que es el que suma Gerencia (las
+   * compras de la empresa son netas). En la entrada son iguales: lo que declara
+   * Coffit.
+   */
+  costoNeto: doublePrecision('costo_neto').notNull().default(0),
   /* Snapshot para el remito y para que la pantalla de matcheo en coffit sea legible. */
   nombre: text('nombre').notNull().default(''),
   unidad: text('unidad').notNull().default(''),

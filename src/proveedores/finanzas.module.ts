@@ -38,6 +38,7 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
+import { segunCorte, sinIvaHasta } from '../cafeteria/cuenta';
 import {
   comprobantes, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
   proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
@@ -795,7 +796,7 @@ export class FinanzasProveedorService {
       .where(eq(proveedores.id, proveedorId)).limit(1);
     if (!prov) throw new NotFoundException('Proveedor inexistente.');
 
-    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes] = await Promise.all([
+    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit] = await Promise.all([
       this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -844,6 +845,7 @@ export class FinanzasProveedorService {
        * pago: la pantalla paga desde acá y no puede ofrecer algo distinto de lo
        * que la aplicación va a aceptar. */
       this.pagos.documentosPendientes(proveedorId),
+      sinIvaHasta(this.db),
     ]);
 
     const formasPorPago = new Map<number, any[]>();
@@ -870,10 +872,10 @@ export class FinanzasProveedorService {
         debe: esNc ? 0 : money(c.total),
         haber: esNc ? money(c.total) : 0,
         saldoDoc: esNc ? null : (saldoVivo.get(c.id) ?? 0),
-        /* La parte comprada para Coffit (14/10/2026), al neto: la MISMA cifra que
-         * suma su cuenta corriente (`neto_cafeteria`). Solo informa: el proveedor
-         * cobra la factura entera, así que no cambia este saldo. */
-        paraCoffit: money(c.netoCafeteria),
+        /* La parte comprada para Coffit (14/10/2026): la MISMA cifra que suma su
+         * cuenta corriente —a precio final desde 0176—. Solo informa: el
+         * proveedor cobra la factura entera, así que no cambia este saldo. */
+        paraCoffit: money(segunCorte(corteCoffit, c.cuentaFecha ?? c.fecha, c.netoCafeteria, c.finalCafeteria)),
       });
     }
     for (const g of gs) {
@@ -888,9 +890,11 @@ export class FinanzasProveedorService {
         debe: esNc ? 0 : money(g.total),
         haber: esNc ? money(-g.total) : 0,
         saldoDoc: esNc ? null : money(g.total - g.pagado),
-        /* Gasto cargado con Negocio: Coffit → todo es de Coffit, al neto de lo que
-         * la empresa recupera (la fórmula de su cuenta corriente). En positivo. */
-        paraCoffit: g.negocio === 'cafeteria' ? money(Math.abs(g.total - g.iva - g.percDgi - g.percDgr)) : 0,
+        /* Gasto cargado con Negocio: Coffit → todo es de Coffit, con la fórmula de
+         * su cuenta corriente (el total desde 0176). En positivo. */
+        paraCoffit: g.negocio === 'cafeteria'
+          ? money(Math.abs(segunCorte(corteCoffit, g.cuentaFecha ?? g.fecha, g.total - g.iva - g.percDgi - g.percDgr, g.total)))
+          : 0,
       });
     }
     for (const p of pgs) {

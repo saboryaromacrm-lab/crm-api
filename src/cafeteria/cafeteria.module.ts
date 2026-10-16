@@ -54,10 +54,10 @@ import { ProductosModule, ProductosService } from '../productos/productos.module
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
+import { escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import {
-  costoUltimaFactura, cupoCafe, exigirCuentaAbierta, finDia, hoyAr, inicioDia, lineasCuenta, saldoAl, sumaTotales, sumarDias, totalesCuenta,
-  totalesDeLineas, ultimoCierre,
+  type CostoCafe, costoCafe, costoUltimaFactura, cupoCafe, exigirCuentaAbierta, finDia, hoyAr, inicioDia, lineasCuenta, saldoAl,
+  segunCorte, sinIvaHasta, sumaTotales, sumarDias, totalesCuenta, totalesDeLineas, ultimoCierre,
 } from './cuenta';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -87,6 +87,8 @@ const TIPO_RECEPCION_CAFE = InventarioService.TIPO_RECEPCION_CAFE;
  */
 const ALICUOTAS_CAFE = [21, 10.5, 0];
 const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
+/** Cada artículo de un envío valuado: el costo FINAL (`costoU`, lo que paga Coffit) y el neto (0176). */
+type ValuacionCafe = Map<string, { prod: any; pres: any; costoU: number; costoN: number }>;
 /** Una cantidad como se lee: 2,5 y no 2.5000000001. */
 /** Un importe como se lee acá: $5.000,00. */
 const plata = (n: number) => `$${Number(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -304,10 +306,10 @@ export class CafeteriaService {
     const presPorId = new Map<number, any>(press.map((p: any) => [p.id, p]));
     /* LO QUE SALE HACIA COFFIT VA AL COSTO DE LA ÚLTIMA FACTURA (29/9/2026,
      * decisión del dueño en la conciliación): lo que de verdad se pagó, no la
-     * lista de hoy. Sin factura, el costo del formato de compra. */
-    const ultimaFactura = conCosto ? await this.costoUltimaFactura(tx, ids) : new Map<number, number>();
+     * lista de hoy, y a PRECIO FINAL (0176). Sin factura, el del formato. */
+    const ultimaFactura = conCosto ? await this.costoUltimaFactura(tx, ids) : new Map<number, CostoCafe>();
 
-    const out = new Map<string, { prod: any; pres: any; costoU: number }>();
+    const out: ValuacionCafe = new Map();
     for (const it of items) {
       const clave = `${it.productoId}-${it.presentacionId ?? 0}`;
       if (out.has(clave)) continue;
@@ -322,31 +324,33 @@ export class CafeteriaService {
         pres = presPorId.get(it.presentacionId) ?? null;
         if (!pres || pres.productoId !== prod.id) throw new BadRequestException(`Presentación inválida para ${prod.nombre}.`);
       }
-      const cnKg = !conCosto ? 0
-        : (ultimaFactura.get(prod.id)
-          ?? costoNetoEntry(formatoDeCosto(prod, provs.filter((p: any) => p.productoId === prod.id)) as any, prod.iva));
-      out.set(clave, { prod, pres, costoU: pres ? cnKg * escalaPaquete(pres.tamKg ?? 1, prod.merma) : cnKg });
+      const c = conCosto
+        ? costoCafe(prod, formatoDeCosto(prod, provs.filter((p: any) => p.productoId === prod.id)), ultimaFactura)
+        : { neto: 0, final: 0 };
+      const esc = pres ? escalaPaquete(pres.tamKg ?? 1, prod.merma) : 1;
+      out.set(clave, { prod, pres, costoU: c.final * esc, costoN: c.neto * esc });
     }
     return out;
   }
 
   /**
    * Los renglones listos para insertar, con el MODO DE UNIDAD explícito.
-   * `costoDe` decide el costo unitario de cada renglón: en el alta es el de
-   * hoy; en la edición conserva el congelado de los renglones que ya estaban.
+   * `costoDe` decide el costo de cada renglón —el final (`u`, lo que paga
+   * Coffit) y el neto (`n`)—: en el alta es el de hoy; en la edición conserva
+   * el congelado de los renglones que ya estaban.
    */
   private armarFilas(
     items: EnvioItemDto[],
-    val: Map<string, { prod: any; pres: any; costoU: number }>,
-    costoDe: (clave: string, costoHoy: number, it: EnvioItemDto) => number,
+    val: ValuacionCafe,
+    costoDe: (clave: string, hoy: { u: number; n: number }, it: EnvioItemDto) => { u: number; n: number },
   ) {
     let total = 0;
     const filas: any[] = [];
     for (const it of items) {
       const clave = `${it.productoId}-${it.presentacionId ?? 0}`;
-      const { prod, pres, costoU } = val.get(clave)!;
+      const { prod, pres, costoU, costoN } = val.get(clave)!;
       const cantidad = Number(it.cantidad);
-      const costo = costoDe(clave, costoU, it);
+      const { u: costo, n: costoNeto } = costoDe(clave, { u: costoU, n: costoN }, it);
       total += costo * cantidad;
 
       const esGranel = prod.tipo === 'granel' && !pres;
@@ -377,6 +381,7 @@ export class CafeteriaService {
         cantidad,
         tamKg,
         costoUnitario: costo,
+        costoNeto,
         nombre: pres ? `${prod.nombre} · ${tam}` : prod.nombre,
         unidad: esGranel ? 'kg' : (pres ? 'paq.' : 'u.'),
         codigoBarras: (pres?.codigoBarras || prod.codigoBarras || ''),
@@ -432,7 +437,7 @@ export class CafeteriaService {
    * declarado a dedo, y ese costo pisaría el costo real del proveedor en la
    * rentabilidad — en silencio y sin forma de notarlo después.
    */
-  private validarEntrada(val: Map<string, { prod: any; pres: any; costoU: number }>, items: EnvioItemDto[]) {
+  private validarEntrada(val: ValuacionCafe, items: EnvioItemDto[]) {
     for (const { prod } of val.values()) {
       if (!prod.origenCafeteria) {
         throw new BadRequestException(
@@ -858,12 +863,8 @@ export class CafeteriaService {
     }
   }
 
-  /**
-   * $ por unidad base (kg o u.) de la ÚLTIMA factura (o liquidación) de cada
-   * producto: el neto del renglón con su descuento y la bonificación general ya
-   * repartida, sin IVA. Una sola consulta con DISTINCT ON.
-   */
-  private costoUltimaFactura(tx: any, ids: number[]): Promise<Map<number, number>> {
+  /** $ por unidad base (kg o u.) de la ÚLTIMA factura de cada producto, neto y final (ver `cuenta.ts`). */
+  private costoUltimaFactura(tx: any, ids: number[]): Promise<Map<number, CostoCafe>> {
     return costoUltimaFactura(tx, ids);
   }
 
@@ -1017,7 +1018,7 @@ export class CafeteriaService {
       if (entrada) this.validarEntrada(val, items);
       const { filas, total } = this.armarFilas(
         items, val,
-        entrada ? (_c, _hoy, it) => r2(Number(it.costoUnitario)) : (_c, hoy) => hoy,
+        entrada ? (_c, _hoy, it) => ({ u: r2(Number(it.costoUnitario)), n: r2(Number(it.costoUnitario)) }) : (_c, hoy) => hoy,
       );
 
       const fecha = this.fechaDelEnvio(o.fecha);
@@ -1124,7 +1125,7 @@ export class CafeteriaService {
 
       /* 3 — el detalle nuevo, conservando el costo congelado de lo que ya estaba. */
       const entrada = envio.sentido === 'entrada';
-      const costoViejo = new Map(viejos.map((f) => [`${f.productoId}-${f.presentacionId ?? 0}`, f.costoUnitario]));
+      const costoViejo = new Map(viejos.map((f) => [`${f.productoId}-${f.presentacionId ?? 0}`, { u: f.costoUnitario, n: f.costoNeto }]));
       /* La marca «uso exclusivo» con que salió cada renglón queda como estaba
        * (29/9/2026): prender o apagar la marca en la ficha después no puede
        * cambiar quién pagó un envío ya hecho. */
@@ -1140,14 +1141,14 @@ export class CafeteriaService {
         if (entrada) {
           /* Ya recibida, el costo quedó fijo (0120): es lo que se le reconoció a
            * Coffit en la cuenta. Un cambio posterior va como ajuste. */
-          const antes = costoViejo.get(clave);
+          const antes = costoViejo.get(clave)?.u;
           if (envio.recepcion !== 'pendiente' && antes != null && Math.abs(Number(it.costoUnitario) - antes) > 0.004) {
             throw new BadRequestException(
               `${envio.codigo} ya se recibió: el costo de ${val.get(clave)!.prod.nombre} quedó fijo en ${antes}. `
               + 'Si hay que reconocer otra cosa, va como ajuste en la cuenta corriente.',
             );
           }
-          return r2(Number(it.costoUnitario));
+          return { u: r2(Number(it.costoUnitario)), n: r2(Number(it.costoUnitario)) };
         }
         const congelado = costoViejo.get(clave);
         if (congelado != null) return congelado;
@@ -2012,7 +2013,7 @@ export class CafeteriaService {
     ]);
     const de = (s: string) => porSentido.find((x) => x.sentido === s);
     return {
-      /** Comprado a proveedores para Coffit en el período (neto, la NC resta). */
+      /** Comprado a proveedores para Coffit en el período (precio final, la NC resta). */
       compradoDirecto: tot.compras,
       comprasCantidad: Number(compra?.cantidad ?? 0),
       /** Mercadería de Coffit guardada HOY en las sucursales. Es una foto, no un período. */
@@ -2025,7 +2026,7 @@ export class CafeteriaService {
       recibidosCantidad: Number(de('entrada')?.cantidad ?? 0),
       /** Lo que se le cobra de lo mandado: sin lo ya pagado y con los faltantes descontados. */
       enviadoDesdeStock: tot.envios,
-      /** Gastos de Coffit al neto de lo que recupera la empresa (IVA y percepciones). */
+      /** Gastos de Coffit por su total (0176: paga precio final). */
       gastos: tot.gastos,
       gastosCantidad: Number(g?.cantidad ?? 0),
       /** Pagos, compensaciones y ajustes del período (+ = a favor de S&A). */
@@ -2075,12 +2076,12 @@ export class CafeteriaService {
     const prodDe = new Map(prods.map((p) => [p.id, p]));
     const presDe = new Map(press.map((p) => [p.id, p]));
     /* Valuado como se cobra (29/9/2026): al costo de la última factura, y sin
-     * factura al del formato de compra. Una vez por producto, no por fila. */
+     * factura al del formato de compra, a precio final (0176). Una vez por
+     * producto, no por fila. */
     const ultima = await this.costoUltimaFactura(this.db, ids);
     const costoKg = new Map<number, number>();
     for (const p of prods) {
-      costoKg.set(p.id, ultima.get(p.id)
-        ?? costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)) as any, p.iva));
+      costoKg.set(p.id, costoCafe(p, formatoActivo(provs.filter((x) => x.productoId === p.id)), ultima).final);
     }
 
     /* Un renglón por artículo (producto + presentación), con su stock por sucursal. */
@@ -2146,8 +2147,7 @@ export class CafeteriaService {
       this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
     ]);
     return prods.map((p) => {
-      const costoU = r2(ultima.get(p.id)
-        ?? costoNetoEntry(formatoActivo(provs.filter((x) => x.productoId === p.id)) as any, p.iva));
+      const costoU = r2(costoCafe(p, formatoActivo(provs.filter((x) => x.productoId === p.id)), ultima).final);
       const total = r3(cupo.get(p.id) ?? 0);
       return {
         productoId: p.id, presentacionId: null, nombre: p.nombre, codigoPropio: p.codigoPropio || '',
@@ -2291,8 +2291,9 @@ export class CafeteriaService {
    * ==================================================================== *
    * Pedido del dueño: ver qué se compró para el café, factura por factura y
    * artículo por artículo, y aparte los gastos. Los totales son los MISMOS
-   * números que el resumen y Gerencia (`compradoDirecto` y `gastos`): mismas
-   * condiciones, mismo signo por tipo de documento.
+   * números que el resumen y la cuenta (`compradoDirecto` y `gastos`): mismas
+   * condiciones, mismo signo por tipo de documento, a precio final (0176) salvo
+   * lo que ya estaba firmado sin IVA.
    */
   async comprasDelCafe(q: { desde?: string; hasta?: string }) {
     const desde = fechaLocal(q.desde);
@@ -2311,9 +2312,10 @@ export class CafeteriaService {
       id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra, puntoVenta: comprobantes.puntoVenta,
       numero: comprobantes.numero, fecha: comprobantes.fecha, proveedor: proveedores.nombre,
       sucursal: sucursales.nombre, subtotalNeto: comprobantes.subtotalNeto, total: comprobantes.total,
-      netoCafeteria: comprobantes.netoCafeteria,
+      netoCafeteria: comprobantes.netoCafeteria, finalCafeteria: comprobantes.finalCafeteria,
+      cuentaFecha: comprobantes.cuentaFecha,
     };
-    const [docs, remitos] = await Promise.all([
+    const [docs, remitos, corte] = await Promise.all([
       this.db.select(cabecera).from(comprobantes)
         .innerJoin(proveedores, eq(proveedores.id, comprobantes.proveedorId))
         .leftJoin(sucursales, eq(sucursales.id, comprobantes.sucursalId))
@@ -2326,6 +2328,7 @@ export class CafeteriaService {
         .where(and(...condsRemito, sql`exists (select 1 from ${comprobanteItems}
           where ${comprobanteItems.comprobanteId} = ${comprobantes.id} and ${comprobanteItems.paraCafeteria})`))
         .orderBy(desc(comprobantes.fecha), desc(comprobantes.id)).limit(500),
+      sinIvaHasta(this.db),
     ]);
     const ids = [...docs, ...remitos].map((d) => d.id);
     const items = ids.length
@@ -2354,6 +2357,8 @@ export class CafeteriaService {
       id: d.id, tipo: d.tipo, letra: d.letra, puntoVenta: d.puntoVenta, numero: d.numero, fecha: d.fecha,
       proveedor: d.proveedor, sucursal: d.sucursal ?? '',
       neto: r2(signo * Number(d.netoCafeteria)),
+      /** Lo que entra a su cuenta: el total del papel de su parte (o lo firmado sin IVA). */
+      cuenta: r2(signo * segunCorte(corte, d.cuentaFecha ?? d.fecha, Number(d.netoCafeteria), Number(d.finalCafeteria))),
       subtotalNeto: r2(signo * Number(d.subtotalNeto)),
       /** Toda la factura es de Coffit: su parte es el neto entero. */
       todo: Math.abs(Number(d.netoCafeteria) - Number(d.subtotalNeto)) < 0.02,
@@ -2392,7 +2397,7 @@ export class CafeteriaService {
       documentos,
       articulos,
       remitos: remitos.map((d) => armar(d, 1)),
-      total: r2(documentos.reduce((a, d) => a + d.neto, 0)),
+      total: r2(documentos.reduce((a, d) => a + d.cuenta, 0)),
       facturas: documentos.filter((d) => d.tipo === 'factura' || d.tipo === 'liquidacion').length,
       limitado: docs.length >= 2000,
     };
@@ -2410,13 +2415,14 @@ export class CafeteriaService {
       id: gastos.id, fecha: gastos.fecha, tipoDoc: gastos.tipoDoc, letra: gastos.letra, numero: gastos.numero,
       proveedor: proveedores.nombre, proveedorTexto: gastos.proveedorTexto, rubro: gastoCategorias.nombre,
       sucursal: sucursales.nombre, descripcion: gastos.descripcion, neto: gastos.neto, iva: gastos.iva,
-      percDgi: gastos.percDgi, percDgr: gastos.percDgr,
+      percDgi: gastos.percDgi, percDgr: gastos.percDgr, cuentaFecha: gastos.cuentaFecha,
       total: gastos.total, pagado: gastos.pagado, estado: gastos.estado,
     }).from(gastos)
       .innerJoin(gastoCategorias, eq(gastoCategorias.id, gastos.categoriaId))
       .leftJoin(proveedores, eq(proveedores.id, gastos.proveedorId))
       .leftJoin(sucursales, eq(sucursales.id, gastos.sucursalId))
       .where(and(...conds)).orderBy(desc(gastos.fecha), desc(gastos.id)).limit(2000);
+    const corte = await sinIvaHasta(this.db);
     const renglones = filas.length
       ? await this.db.select({ gastoId: gastoItems.gastoId, concepto: gastoItems.concepto, monto: gastoItems.monto })
         .from(gastoItems).where(inArray(gastoItems.gastoId, filas.map((f) => f.id))).orderBy(gastoItems.id)
@@ -2432,8 +2438,8 @@ export class CafeteriaService {
       proveedor: f.proveedor || f.proveedorTexto || '', rubro: f.rubro, sucursal: f.sucursal ?? '',
       descripcion: f.descripcion, neto: r2(Number(f.neto)), iva: r2(Number(f.iva)),
       total: r2(Number(f.total)), pagado: r2(Number(f.pagado)), estado: f.estado,
-      /** Lo que entra a la cuenta con Coffit: sin lo que recupera la empresa (0120). */
-      paraCuenta: r2(Number(f.total) - Number(f.iva) - Number(f.percDgi) - Number(f.percDgr)),
+      /** Lo que entra a la cuenta con Coffit: el total (0176), o lo firmado sin IVA ni percepciones. */
+      paraCuenta: r2(segunCorte(corte, f.cuentaFecha ?? f.fecha, Number(f.total) - Number(f.iva) - Number(f.percDgi) - Number(f.percDgr), Number(f.total))),
       renglones: porGasto.get(f.id) ?? [],
     }));
     const rubros = new Map<string, { rubro: string; total: number; cantidad: number }>();

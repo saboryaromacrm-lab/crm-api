@@ -28,7 +28,7 @@ import {
   precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
-import { costoUltimaFactura, cupoCafe } from '../cafeteria/cuenta';
+import { costoCafe, costoUltimaFactura, cupoCafe } from '../cafeteria/cuenta';
 
 /*
  * Las alícuotas legales de IVA viven en `common/iva`: es una lista cerrada a
@@ -1768,7 +1768,8 @@ export class ProductosService {
    * MARCAR «USO EXCLUSIVO DE COFFIT» UN ARTÍCULO QUE YA TIENE STOCK (0120,
    * acordado en la conciliación entre los dos negocios). Desde ese momento los
    * envíos lo mandan sin cobrar —es de Coffit—, así que el stock que había (de
-   * la distribuidora) se le cobra ACÁ, una vez, al costo de la última factura.
+   * la distribuidora) se le cobra ACÁ, una vez, al costo de la última factura
+   * y a PRECIO FINAL (0176: Coffit paga con IVA y percepciones).
    * Lo que Coffit ya había pagado en facturas (su cupo) no se cobra de nuevo.
    * El movimiento guarda la cantidad: si mañana se desmarca, esas unidades
    * siguen siendo suyas (suman a su cupo).
@@ -1782,11 +1783,9 @@ export class ProductosService {
     const yaPagado = Math.max(0, (await cupoCafe(tx, [p.id])).get(p.id) ?? 0);
     const cantidad = Math.round((enStock - yaPagado) * 1e6) / 1e6;
     if (cantidad <= 1e-6) return;
-    let costo = (await costoUltimaFactura(tx, [p.id])).get(p.id);
-    if (costo == null) {
-      const provs = await tx.select().from(productoProveedores).where(eq(productoProveedores.productoId, p.id));
-      costo = costoNetoEntry(formatoActivo(provs) as any, p.iva);
-    }
+    const ultima = await costoUltimaFactura(tx, [p.id]);
+    const provs = ultima.has(p.id) ? [] : await tx.select().from(productoProveedores).where(eq(productoProveedores.productoId, p.id));
+    const costo = costoCafe(p, formatoActivo(provs), ultima).final;
     const importe = Math.round(cantidad * (Number(costo) || 0) * 100) / 100;
     if (importe < 0.01) return;
     const unidad = p.tipo === 'granel' ? 'kg' : 'u.';

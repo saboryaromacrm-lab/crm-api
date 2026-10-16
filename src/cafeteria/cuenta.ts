@@ -11,21 +11,31 @@
  * LOS RENGLONES SALEN DE LOS DOCUMENTOS, no se copian a una tabla: así no hay
  * dos versiones del mismo hecho que se puedan desfasar.
  *
- *   · compra        — la parte de Coffit de cada factura de compra, al neto
- *                     (sin IVA: es crédito fiscal de la empresa). La NC resta.
- *   · envio         — lo que S&A le manda desde su stock, al costo congelado
- *                     del envío, MENOS lo que Coffit ya había pagado en la
- *                     factura (`cantidad_exclusiva`).
+ *   · compra        — la parte de Coffit de cada factura de compra, a PRECIO
+ *                     FINAL (`final_cafeteria`). La NC resta.
+ *   · envio         — lo que S&A le manda desde su stock, al costo final
+ *                     congelado del envío, MENOS lo que Coffit ya había pagado
+ *                     en la factura (`cantidad_exclusiva`).
  *   · dif_envio     — al recibir, lo que no llegó lo pierde el que mandó:
  *                     (contado − enviado) × costo, en la FECHA DE RECEPCIÓN.
  *   · entrada       — lo que Coffit elabora y manda a una sucursal (resta).
  *   · dif_entrada   — igual que dif_envio, del otro lado (lo que no llegó lo
  *                     pierde Coffit).
- *   · gasto         — los gastos cargados con Negocio: Coffit, al neto de lo
- *                     que la empresa recupera (IVA y percepciones).
+ *   · gasto         — los gastos cargados con Negocio: Coffit, por su total.
  *   · manuales      — `coffit_movimientos`: saldo inicial, pagos,
  *                     compensaciones, ajustes y el stock que pasa a Coffit al
  *                     marcar un artículo exclusivo.
+ *
+ * COFFIT PAGA PRECIO FINAL (0176, 16/10/2026, decisión del dueño): lo que se
+ * compra para Coffit, lo que se le manda y sus gastos se le cobran CON IVA y
+ * percepciones —el total del papel—, aunque el crédito fiscal siga siendo de
+ * la empresa. Un remito o una liquidación (sin IVA) ya es su precio final, y
+ * una factura B o C trae el IVA adentro. Rige desde el principio: los meses que
+ * estaban cerrados se siguen viendo como se firmaron (hasta `coffit_sin_iva_hasta`)
+ * y su diferencia entró como un ajuste en el mes abierto.
+ *
+ * GERENCIA mira otra cosa —qué parte de las compras fue de Coffit— y por eso
+ * suma al NETO (`modo: 'gerencia'`): las compras de la empresa son netas.
  *
  * Por qué la diferencia al recibir va en SU fecha y no en la del envío: así un
  * mes cerrado no cambia nunca. Un envío del 30 recibido el 2 cuenta entero el
@@ -33,6 +43,7 @@
  */
 import { BadRequestException } from '@nestjs/common';
 import { and, desc, eq, gt, inArray, ne, sql } from 'drizzle-orm';
+import { costoNetoEntry } from '../inventario/pricing';
 import {
   coffitCierres, coffitMovimientos, comprobanteItems, comprobantes, envioCafeteriaItems, enviosCafeteria, presentaciones,
 } from '../db/schema';
@@ -76,29 +87,86 @@ export const sumarDias = (d: string, n: number) => {
 };
 
 /**
- * Los renglones de la cuenta en [desde, hasta] (fechas inclusive, null = sin
- * límite), en UNA consulta. Con `agregado` devuelve solo la suma por tipo:
- * es lo que usan el saldo anterior, el resumen y Gerencia.
+ * HASTA CUÁNDO LA CUENTA SE CALCULÓ SIN IVA (0176): el fin del último mes que
+ * estaba cerrado el día del cambio. Lo de esa fecha o antes se sigue contando
+ * como se firmó; null (no había cierres) = todo a precio final.
  */
-function unionCuenta(desde: Date | null, hasta: Date | null, fechaDoc = false) {
+const SIN_IVA_HASTA = sql`(select (valor #>> '{}')::timestamptz from configuracion where clave = 'coffit_sin_iva_hasta')`;
+
+export async function sinIvaHasta(db: any): Promise<Date | null> {
+  const r = await db.execute(sql`select ${SIN_IVA_HASTA} as corte`);
+  const v = filasDe(r)[0]?.corte;
+  return v ? new Date(v) : null;
+}
+
+/** Lo que un papel le suma a la cuenta, según su fecha en ella: lo firmado sin IVA o el precio final. */
+export const segunCorte = (corte: Date | null, fechaCuenta: Date, sinIva: number, final: number) =>
+  (corte && new Date(fechaCuenta).getTime() <= corte.getTime() ? sinIva : final);
+
+export async function importeEnCuenta(db: any, fechaCuenta: Date, sinIva: number, final: number) {
+  return segunCorte(await sinIvaHasta(db), fechaCuenta, sinIva, final);
+}
+
+/**
+ * LO QUE COFFIT PAGA DE UNA FACTURA (0176): el total del papel de su parte. Su
+ * neto, el IVA de la factura en proporción al IVA de sus renglones (así, si la
+ * factura es entera de Coffit, da el IVA exacto del papel) y las percepciones
+ * en proporción a su neto. En B, C y X el IVA de los renglones es cero: el
+ * precio ya es el final.
+ */
+export function finalCafeteria(
+  pie: { items: Array<{ subtotal: number; iva: number }>; subtotalNeto: number; ivaTotal: number; percepcionesTotal: number },
+  esDelCafe: (it: any) => boolean,
+): number {
+  let neto = 0;
+  let ivaCafe = 0;
+  let ivaTodo = 0;
+  for (const it of pie.items) {
+    const v = Number(it.subtotal) * (Number(it.iva) || 0);
+    ivaTodo += v;
+    if (esDelCafe(it)) { neto += Number(it.subtotal); ivaCafe += v; }
+  }
+  if (neto <= 0) return 0;
+  const iva = ivaTodo > 0 ? Number(pie.ivaTotal) * ivaCafe / ivaTodo : 0;
+  const perc = Number(pie.subtotalNeto) > 0 ? Number(pie.percepcionesTotal) * neto / Number(pie.subtotalNeto) : 0;
+  return r2(neto + iva + perc);
+}
+
+/**
+ * Los renglones de la cuenta en [desde, hasta] (fechas inclusive, null = sin
+ * límite), en UNA consulta.
+ *   · 'cuenta'   — lo que Coffit debe: a precio final (salvo lo firmado sin IVA),
+ *                  por la fecha en que cada papel entró a la cuenta.
+ *   · 'gerencia' — qué parte de las compras fue de Coffit: al NETO y por la
+ *                  fecha del papel.
+ */
+type ModoCuenta = 'cuenta' | 'gerencia';
+function unionCuenta(desde: Date | null, hasta: Date | null, modo: ModoCuenta = 'cuenta') {
   const rango = (col: any) => sql`${desde ? sql` and ${col} >= ${desde}` : sql``}${hasta ? sql` and ${col} <= ${hasta}` : sql``}`;
+  const gerencia = modo === 'gerencia';
   /* La compra y el gasto cuentan en su fecha, salvo que hayan llegado después
    * del cierre de su mes (`cuenta_fecha`). Gerencia mira la fecha del papel. */
-  const fc = fechaDoc ? sql`c.fecha` : sql`coalesce(c.cuenta_fecha, c.fecha)`;
-  const fg = fechaDoc ? sql`g.fecha` : sql`coalesce(g.cuenta_fecha, g.fecha)`;
+  const fc = gerencia ? sql`c.fecha` : sql`coalesce(c.cuenta_fecha, c.fecha)`;
+  const fg = gerencia ? sql`g.fecha` : sql`coalesce(g.cuenta_fecha, g.fecha)`;
+  /* Neto o precio final, según el modo y la fecha (ver `SIN_IVA_HASTA`). */
+  const segun = (fecha: any, neto: any, final: any) => (gerencia ? neto : sql`(case when ${fecha} <= ${SIN_IVA_HASTA} then ${neto} else ${final} end)`);
+  const compra = segun(fc, sql`c.neto_cafeteria`, sql`c.final_cafeteria`);
+  const costoEnvio = segun(sql`e.fecha`, sql`i.costo_neto`, sql`i.costo_unitario`);
+  const costoDif = segun(sql`e.recibido_en`, sql`i.costo_neto`, sql`i.costo_unitario`);
+  const gasto = segun(fg, sql`g.total - g.iva - g.perc_dgi - g.perc_dgr`, sql`g.total`);
   return sql`
     select 'compra'::text as tipo, ${fc} as fecha, c.id as ref,
       (case c.tipo when 'nota_credito' then 'NC ' when 'nota_debito' then 'ND ' when 'liquidacion' then 'Liquidación ' else 'Factura ' end)
         || c.letra::text || ' ' || c.punto_venta || '-' || lpad(coalesce(c.numero, c.id)::text, 8, '0') as documento,
       pr.nombre as detalle,
-      c.neto_cafeteria * (case when c.tipo = 'nota_credito' then -1 else 1 end) as importe
+      ${compra} * (case when c.tipo = 'nota_credito' then -1 else 1 end) as importe
     from comprobantes c join proveedores pr on pr.id = c.proveedor_id
     where c.estado = 'confirmado' and c.neto_cafeteria > 0
       and c.tipo in ('factura', 'liquidacion', 'nota_debito', 'nota_credito')${rango(fc)}
     union all
     select case e.sentido when 'salida' then 'envio' else 'entrada' end, e.fecha, e.id, e.codigo, s.nombre,
       case e.sentido
-        when 'salida' then sum((i.cantidad - i.cantidad_exclusiva) * i.costo_unitario)
+        when 'salida' then sum((i.cantidad - i.cantidad_exclusiva) * ${costoEnvio})
         else -sum(i.cantidad * i.costo_unitario) end
     from envios_cafeteria e
       join envio_cafeteria_items i on i.envio_id = e.id
@@ -109,17 +177,17 @@ function unionCuenta(desde: Date | null, hasta: Date | null, fechaDoc = false) {
     select case e.sentido when 'salida' then 'dif_envio' else 'dif_entrada' end, e.recibido_en, e.id, e.codigo,
       'Diferencia al recibir',
       (case e.sentido when 'salida' then 1 else -1 end)
-        * sum((coalesce(i.cantidad_recibida, i.cantidad) - i.cantidad) * i.costo_unitario)
+        * sum((coalesce(i.cantidad_recibida, i.cantidad) - i.cantidad) * ${costoDif})
     from envios_cafeteria e join envio_cafeteria_items i on i.envio_id = e.id
     where e.estado = 'enviado' and e.recepcion <> 'pendiente' and e.recibido_en is not null${rango(sql`e.recibido_en`)}
     group by e.id
-    having abs(sum((coalesce(i.cantidad_recibida, i.cantidad) - i.cantidad) * i.costo_unitario)) > 0.004
+    having abs(sum((coalesce(i.cantidad_recibida, i.cantidad) - i.cantidad) * ${costoDif})) > 0.004
     union all
     select 'gasto', ${fg}, g.id,
       (case g.tipo_doc when 'nota_credito' then 'NC ' when 'ticket' then 'Ticket ' when 'recibo' then 'Recibo ' when 'otro' then '' else 'Factura ' end)
         || trim(g.letra::text || ' ' || g.numero),
       coalesce(nullif(pr.nombre, ''), nullif(g.proveedor_texto, ''), 'Sin proveedor') || ' · ' || gc.nombre,
-      g.total - g.iva - g.perc_dgi - g.perc_dgr
+      ${gasto}
     from gastos g
       join gasto_categorias gc on gc.id = g.categoria_id
       left join proveedores pr on pr.id = g.proveedor_id
@@ -141,8 +209,8 @@ export async function lineasCuenta(db: any, desde: Date | null, hasta: Date | nu
   }));
 }
 
-export async function totalesCuenta(db: any, desde: Date | null, hasta: Date | null, fechaDoc = false): Promise<Totales> {
-  const r = await db.execute(sql`select x.tipo, sum(x.importe) as total from (${unionCuenta(desde, hasta, fechaDoc)}) x group by x.tipo`);
+export async function totalesCuenta(db: any, desde: Date | null, hasta: Date | null, modo: ModoCuenta = 'cuenta'): Promise<Totales> {
+  const r = await db.execute(sql`select x.tipo, sum(x.importe) as total from (${unionCuenta(desde, hasta, modo)}) x group by x.tipo`);
   const t = TOTALES_VACIOS();
   for (const f of filasDe(r)) {
     const g = GRUPO[f.tipo as TipoLinea];
@@ -300,28 +368,63 @@ export async function cupoCafe(tx: any, ids: number[], exceptoEnvioId?: number) 
   return cupo;
 }
 
+/** El costo de un artículo para Coffit: el neto (Gerencia) y el precio final (lo que paga, 0176). */
+export type CostoCafe = { neto: number; final: number };
+
+/**
+ * EL PRECIO FINAL SIN FACTURA A MANO (0176): del costo neto del formato de
+ * compra, la parte facturada con su IVA y la parte sin factura tal cual (no
+ * se pagó IVA). Lo que elabora Coffit no lleva IVA: es el costo que declaró.
+ */
+export function finalDelFormato(neto: number, iva: number, porcSinFactura: number, deCoffit = false): number {
+  if (deCoffit) return neto;
+  const q = Math.min(Math.max(Number(porcSinFactura) || 0, 0), 100) / 100;
+  return neto * ((1 - q) * (1 + (Number(iva) || 0) / 100) + q);
+}
+
+/**
+ * LO QUE VALE UN ARTÍCULO PARA COFFIT (0176), por unidad base: el de su última
+ * factura (`costoUltimaFactura`) y, sin factura, el de su formato de compra.
+ */
+export function costoCafe(
+  prod: { id: number; iva?: number | null; origenCafeteria?: boolean | null }, formato: any, ultima: Map<number, CostoCafe>,
+): CostoCafe {
+  const u = ultima.get(prod.id);
+  if (u) return u;
+  const neto = costoNetoEntry(formato, Number(prod.iva) || 0);
+  return { neto, final: finalDelFormato(neto, Number(prod.iva) || 0, formato?.porcSinFactura, !!prod.origenCafeteria) };
+}
+
 /**
  * $ por unidad base (kg o u.) de la ÚLTIMA factura (o liquidación) de cada
- * producto: el neto del renglón con su descuento y la bonificación general ya
- * repartida, sin IVA. Es el costo al que se le cobra a Coffit lo que sale del
- * stock (decisión del dueño, 29/9/2026). Una sola consulta con DISTINCT ON.
+ * producto (decisión del dueño, 29/9/2026): el neto del renglón con su
+ * descuento y la bonificación general ya repartida, y su PRECIO FINAL —el
+ * renglón con su parte del IVA y de las percepciones de la factura, la misma
+ * cuenta que `finalCafeteria`—, que es lo que se le cobra a Coffit (0176).
+ * Una sola consulta con DISTINCT ON.
  */
-export async function costoUltimaFactura(tx: any, ids: number[]): Promise<Map<number, number>> {
-  const out = new Map<number, number>();
+export async function costoUltimaFactura(tx: any, ids: number[]): Promise<Map<number, CostoCafe>> {
+  const out = new Map<number, CostoCafe>();
   if (!ids.length) return out;
   const r = await tx.execute(sql`
     select distinct on (ci.producto_id) ci.producto_id as "productoId",
-      ci.subtotal / nullif(ci.cantidad * coalesce(p.tam_kg, 1), 0) as costo
+      ci.subtotal / nullif(ci.cantidad * coalesce(p.tam_kg, 1), 0) as neto,
+      (ci.subtotal
+        + coalesce(c.iva_total * ci.subtotal * ci.iva / nullif(d.base_iva, 0), 0)
+        + coalesce(c.percepciones_total * ci.subtotal / nullif(c.subtotal_neto, 0), 0))
+        / nullif(ci.cantidad * coalesce(p.tam_kg, 1), 0) as final
     from comprobante_items ci
       join comprobantes c on c.id = ci.comprobante_id
       left join presentaciones p on p.id = ci.presentacion_id
+      cross join lateral (select sum(x.subtotal * x.iva) as base_iva from comprobante_items x where x.comprobante_id = c.id) d
     where ci.producto_id in (${sql.join(ids.map((i) => sql`${i}`), sql`, `)})
       and c.estado = 'confirmado' and c.tipo in ('factura', 'liquidacion')
       and ci.cantidad > 0 and ci.subtotal > 0
     order by ci.producto_id, c.fecha desc, c.id desc, ci.id desc`);
+  const r4 = (n: number) => Math.round(n * 10000) / 10000;
   for (const f of filasDe(r)) {
-    const v = Number(f.costo);
-    if (v > 0) out.set(Number(f.productoId), Math.round(v * 10000) / 10000);
+    const neto = Number(f.neto);
+    if (neto > 0) out.set(Number(f.productoId), { neto: r4(neto), final: r4(Number(f.final) || neto) });
   }
   return out;
 }

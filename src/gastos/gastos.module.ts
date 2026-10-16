@@ -30,17 +30,19 @@ import { and, asc, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm'
 import { mimeReal, nombreSeguro } from '../common/archivos';
 import { fechaLocal } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
-import { ajustePorAnulacion, fechaDeCuenta } from '../cafeteria/cuenta';
+import { ajustePorAnulacion, fechaDeCuenta, importeEnCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   auditoria, gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
 
 /**
- * LO QUE UN GASTO DE COFFIT LE SUMA A SU CUENTA (0120): el total menos lo que
- * la empresa recupera (IVA y percepciones). Con signo: la NC resta.
+ * LO QUE UN GASTO DE COFFIT LE SUMA A SU CUENTA: su TOTAL, con IVA y
+ * percepciones (0176: Coffit paga precio final). Con signo: la NC resta.
  */
-const paraCuentaCoffit = (g: { total: number; iva: number; percDgi: number; percDgr: number }) =>
+const paraCuentaCoffit = (g: { total: number }) => Math.round(Number(g.total) * 100) / 100;
+/** Lo que se le sumaba antes del cambio (0120): sin lo que recupera la empresa. Es lo que contaron los meses cerrados. */
+const paraCuentaSinIva = (g: { total: number; iva: number; percDgi: number; percDgr: number }) =>
   Math.round((Number(g.total) - Number(g.iva) - Number(g.percDgi) - Number(g.percDgr)) * 100) / 100;
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
@@ -1177,8 +1179,9 @@ export class GastosService {
       });
       /* De Coffit y en un mes cerrado de su cuenta: el ajuste contrario (0120). */
       if (g.negocio === 'cafeteria') {
+        const fechaCuenta = g.cuentaFecha ?? g.fecha;
         await ajustePorAnulacion(tx, {
-          fechaCuenta: g.cuentaFecha ?? g.fecha, efecto: paraCuentaCoffit(g),
+          fechaCuenta, efecto: await importeEnCuenta(tx, fechaCuenta, paraCuentaSinIva(g), paraCuentaCoffit(g)),
           documento: `el gasto #${id}${g.numero ? ` (${g.numero})` : ''}`,
         });
       }

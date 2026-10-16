@@ -23,7 +23,7 @@ import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { etiquetaDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
-import { ajustePorAnulacion, fechaDeCuenta } from '../cafeteria/cuenta';
+import { ajustePorAnulacion, fechaDeCuenta, finalCafeteria, importeEnCuenta } from '../cafeteria/cuenta';
 import { normalizarPuntoVenta } from '../facturas/comun';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
@@ -1225,6 +1225,8 @@ export class ComprobantesService {
     const esDelCafe = (it: { productoId: number; paraCafeteria?: boolean }) => delCafe.has(it.productoId)
       || heredados.has(it.productoId) || it.paraCafeteria === true;
     const netoCafeteria = this.netoCafeteriaDe(items, esDelCafe);
+    /* Y lo que Coffit paga de él: el total del papel de su parte (0176). */
+    const finalCafe = finalCafeteria({ items, subtotalNeto, ivaTotal, percepcionesTotal }, esDelCafe);
     /*
      * UN COMPROBANTE QUE SUMA DEUDA NO PUEDE TENER TOTAL NEGATIVO.
      *
@@ -1375,7 +1377,7 @@ export class ComprobantesService {
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
         subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
-        netoCafeteria,
+        netoCafeteria, finalCafeteria: finalCafe,
         /* Un comprobante no fiscal NO GUARDA CAE. Se podía cargar el papel de una
          * factura A real (con su CAE y su IVA) eligiendo tipo liquidación: la
          * API forzaba IVA 0 y letra X pero se guardaba el CAE igual, y quedaba un
@@ -2119,9 +2121,11 @@ export class ComprobantesService {
       /* Si ya estaba en un mes cerrado de la cuenta con Coffit, el cierre lo
        * contó: la anulación deja el ajuste contrario en el mes abierto (0120). */
       if (Number(c.netoCafeteria) > 0 && ['factura', 'liquidacion', 'nota_debito', 'nota_credito'].includes(c.tipo)) {
+        const fechaCuenta = c.cuentaFecha ?? c.fecha;
         await ajustePorAnulacion(tx, {
-          fechaCuenta: c.cuentaFecha ?? c.fecha,
-          efecto: Number(c.netoCafeteria) * (c.tipo === 'nota_credito' ? -1 : 1),
+          fechaCuenta,
+          /* Lo que el cierre contó: sin IVA si es de antes del cambio (0176), si no el precio final. */
+          efecto: await importeEnCuenta(tx, fechaCuenta, Number(c.netoCafeteria), Number(c.finalCafeteria)) * (c.tipo === 'nota_credito' ? -1 : 1),
           documento: etiquetaDoc(c),
           usuarioId: dto.usuarioId ?? null,
         });
@@ -2239,6 +2243,7 @@ export class ComprobantesService {
      * los precios, así que la parte del café se recalcula sobre esa marca. */
     const delCafe = new Set(filasRemito.filter((f) => f.paraCafeteria).map((f) => f.id));
     const netoCafeteria = this.netoCafeteriaDe(pieReal.items, (it) => delCafe.has(it.itemId));
+    const finalCafe = finalCafeteria(pieReal, (it) => delCafe.has(it.itemId));
 
     const puntoVenta = normalizarPuntoVenta(dto.puntoVenta ?? c.puntoVenta ?? '0001');
     const numeroFactura = dto.numero ?? c.numero ?? null;
@@ -2296,7 +2301,7 @@ export class ComprobantesService {
         ivaTotal: pieReal.ivaTotal,
         percepcionesTotal: r2(pieReal.percepcionesTotal),
         total: pieReal.total,
-        netoCafeteria,
+        netoCafeteria, finalCafeteria: finalCafe,
         cae: String(dto.cae ?? '').slice(0, 32),
         observaciones: [String(dto.observaciones ?? '').trim(), String(c.observaciones ?? '').trim(), rastro]
           .filter(Boolean).join('\n'),
