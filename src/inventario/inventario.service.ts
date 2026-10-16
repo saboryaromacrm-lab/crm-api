@@ -878,7 +878,8 @@ export class InventarioService {
    * del registro.
    *
    * Con `conRenglones` (la caja) devuelve qué registrar: los renglones vivos
-   * y, de los que la caja canceló, los que se armaron igual (`armados`, 0172).
+   * (menos los que fraccionado marcó sin stock, 0174) y, de los que la caja
+   * canceló, los que se armaron igual (`armados`, 0172).
    * Si hay cancelados, decirlo es obligatorio: si no, lo armado quedaría fuera
    * del stock. Un pedido cancelado entero mientras se armaba también se asienta
    * así, una sola vez.
@@ -902,7 +903,7 @@ export class InventarioService {
     if ([...elegidos].some((id) => !cancelados.some((it: any) => it.id === id))) {
       throw new BadRequestException(`Eso no está cancelado en ${codigo}: actualizá la pantalla.`);
     }
-    const usar = todos.filter((it: any) => (!it.canceladoEn && p.estado === 'armando') || elegidos.has(it.id));
+    const usar = todos.filter((it: any) => (!it.canceladoEn && !it.sinStockEn && p.estado === 'armando') || elegidos.has(it.id));
     if (!usar.length) throw new BadRequestException(`Marcá lo que armaste de ${codigo}, o «No armé nada».`);
     if (usar.some((it: any) => it.presentacionId == null)) {
       throw new BadRequestException(`Uno de los paquetes de ${codigo} ya no existe: marcalo como «No se puede».`);

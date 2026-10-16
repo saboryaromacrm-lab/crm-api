@@ -15,6 +15,9 @@
  *   · HECHO: «Listo» registra el fraccionado con ese operador, todo junto.
  *   · RECHAZADO: «No se puede», con el motivo. El cajero ve cómo terminó hasta
  *     que lo marca visto.
+ *   · SIN STOCK (0174): fraccionado marca un renglón que no preparó; la caja lo
+ *     ve en el momento y «Listo» asienta el resto. Si no queda nada por armar,
+ *     el pedido se cierra como «No se puede» con el motivo «No hay stock».
  *   · CANCELADO (0171): el cajero que lo pidió lo cancela entero o por renglón
  *     mientras no esté cerrado; lo cancelado queda marcado, no se borra.
  *     Si ya lo estaban armando pudo quedar hecho (0172): fraccionado decide
@@ -31,7 +34,7 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize, ArrayNotEmpty, IsArray, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
@@ -79,6 +82,12 @@ class ResolverCanceladoDto {
   @IsArray() @ArrayMaxSize(1000) @IsInt({ each: true }) itemIds!: number[];
 }
 
+class SinStockDto {
+  @IsInt() itemId!: number;
+  /** false = desmarcar (se tildó por error). */
+  @IsBoolean() sinStock!: boolean;
+}
+
 class RechazarDto {
   @IsString() @IsNotEmpty({ message: 'Decí por qué no se puede.' }) @MaxLength(120) motivo!: string;
 }
@@ -104,7 +113,8 @@ export class PedidosFraccionService {
    * Las cabeceras (filas crudas de `fraccion_pedidos`) con sus renglones, los
    * nombres de quién pidió, tomó y cerró, el operador y, en los hechos, cuánto
    * se fraccionó de cada renglón. Lo que la caja canceló (0171) va aparte, en
-   * `cancelados`: no cuenta en los totales ni se arma.
+   * `cancelados`: no cuenta en los totales ni se arma. Lo que fraccionado marcó
+   * sin stock (0174) queda en `items` con `sinStockEn`, fuera de los totales.
    */
   private async armar(cab: any[]) {
     if (!cab.length) return [];
@@ -116,7 +126,7 @@ export class PedidosFraccionService {
       this.db.select({
         id: fraccionPedidoItems.id, pedidoId: fraccionPedidoItems.pedidoId, productoId: fraccionPedidoItems.productoId,
         presentacionId: fraccionPedidoItems.presentacionId, tamKg: fraccionPedidoItems.tamKg, paquetes: fraccionPedidoItems.paquetes,
-        canceladoEn: fraccionPedidoItems.canceladoEn, nombre: productos.nombre,
+        canceladoEn: fraccionPedidoItems.canceladoEn, sinStockEn: fraccionPedidoItems.sinStockEn, nombre: productos.nombre,
       }).from(fraccionPedidoItems).innerJoin(productos, eq(productos.id, fraccionPedidoItems.productoId))
         .where(inArray(fraccionPedidoItems.pedidoId, ids)).orderBy(productos.nombre, desc(fraccionPedidoItems.tamKg)),
       regs.length
@@ -144,6 +154,7 @@ export class PedidosFraccionService {
     });
     return cab.map((c) => {
       const suyos = items.filter((it) => it.pedidoId === c.id && !it.canceladoEn).map(conFraccionado(c));
+      const aArmar = suyos.filter((it) => !it.sinStockEn);
       return {
         id: c.id, codigo: codigoPedidoFraccion(c.id), origen: c.origen, estado: c.estado, observaciones: c.observaciones,
         creadoEn: c.creado_en, actualizadoEn: c.actualizado_en, usuario: nombreUsr.get(c.usuario_id) ?? null,
@@ -153,8 +164,8 @@ export class PedidosFraccionService {
         motivo: c.motivo, vistoEn: c.visto_en, cancelacionResueltaEn: c.cancelacion_resuelta_en,
         items: suyos,
         cancelados: items.filter((it) => it.pedidoId === c.id && it.canceladoEn).map(conFraccionado(c)),
-        paquetes: suyos.reduce((a, it) => a + it.paquetes, 0),
-        kg: Math.round(suyos.reduce((a, it) => a + it.paquetes * it.tamKg, 0) * 1000) / 1000,
+        paquetes: aArmar.reduce((a, it) => a + it.paquetes, 0),
+        kg: Math.round(aArmar.reduce((a, it) => a + it.paquetes * it.tamKg, 0) * 1000) / 1000,
       };
     });
   }
@@ -338,6 +349,24 @@ export class PedidosFraccionService {
     return { ok: true };
   }
 
+  /**
+   * SIN STOCK (0174): fraccionado marca (o desmarca, si se equivocó) un renglón
+   * que no preparó, mientras el pedido siga abierto. La caja lo ve en su tira y
+   * en el ticket; «Listo» no lo asienta.
+   */
+  async sinStock(id: number, itemId: number, sinStock: boolean) {
+    await this.db.transaction(async (tx) => {
+      await this.deCaja(tx, id, ['pendiente', 'armando']);
+      const ahora = new Date();
+      const [it] = await tx.update(fraccionPedidoItems).set({ sinStockEn: sinStock ? ahora : null })
+        .where(and(eq(fraccionPedidoItems.id, itemId), eq(fraccionPedidoItems.pedidoId, id), isNull(fraccionPedidoItems.canceladoEn)))
+        .returning({ id: fraccionPedidoItems.id });
+      if (!it) throw new BadRequestException('Ese renglón no está en el pedido (o la caja lo canceló): actualizá la pantalla.');
+      await tx.update(fraccionPedidos).set({ actualizadoEn: ahora }).where(eq(fraccionPedidos.id, id));
+    });
+    return { ok: true };
+  }
+
   /** «No se puede»: con el motivo, que el cajero lee. */
   async rechazar(id: number, motivo: string, usuarioId: number | null) {
     const m = motivo.trim();
@@ -365,9 +394,10 @@ export class PedidosFraccionService {
       const ahora = new Date();
       const vivos = and(eq(fraccionPedidoItems.pedidoId, id), isNull(fraccionPedidoItems.canceladoEn));
       if (itemId) {
+        /* Lo que fraccionado ya marcó sin stock no se prepara: no hay nada que cancelar (0174). */
         const [it] = await tx.update(fraccionPedidoItems).set({ canceladoEn: ahora })
-          .where(and(vivos, eq(fraccionPedidoItems.id, itemId))).returning({ id: fraccionPedidoItems.id });
-        if (!it) throw new BadRequestException('Ese renglón ya no está en el pedido: actualizá la pantalla.');
+          .where(and(vivos, eq(fraccionPedidoItems.id, itemId), isNull(fraccionPedidoItems.sinStockEn))).returning({ id: fraccionPedidoItems.id });
+        if (!it) throw new BadRequestException('Ese renglón ya no está en el pedido (o fraccionado lo marcó sin stock): actualizá la pantalla.');
         const [queda] = await tx.select({ id: fraccionPedidoItems.id }).from(fraccionPedidoItems).where(vivos).limit(1);
         if (queda) {
           await tx.update(fraccionPedidos).set({ actualizadoEn: ahora }).where(eq(fraccionPedidos.id, id));
@@ -472,6 +502,11 @@ export class PedidosCajaController {
   @Post(':id/resolver-cancelado') @Permiso('fraccionar')
   resolverCancelado(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverCanceladoDto, @Auth() sesion: Sesion) {
     return this.svc.resolverCancelado(id, dto.itemIds, sesion?.usuarioId ?? null);
+  }
+
+  @Post(':id/sin-stock') @Permiso('fraccionar')
+  sinStock(@Param('id', ParseIntPipe) id: number, @Body() dto: SinStockDto) {
+    return this.svc.sinStock(id, dto.itemId, dto.sinStock);
   }
 
   @Post(':id/rechazar') @Permiso('fraccionar')

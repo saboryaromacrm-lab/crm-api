@@ -1219,6 +1219,13 @@
       "when": 1792035900000,
       "tag": "0173_tienda_minorista",
       "breakpoints": true
+    },
+    {
+      "idx": 174,
+      "version": "7",
+      "when": 1792036800000,
+      "tag": "0174_pedidos_caja_sin_stock",
+      "breakpoints": true
     }
   ]
 }

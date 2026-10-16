@@ -1353,6 +1353,8 @@ export const fraccionPedidoItems = pgTable('fraccion_pedido_items', {
   paquetes: integer('paquetes').notNull(),
   /** 0171: la caja canceló este renglón (no se borra: queda en el registro y «Listo» no lo arma). */
   canceladoEn: timestamp('cancelado_en', { withTimezone: true }),
+  /** 0174: fraccionado no lo preparó porque no hay stock (se desmarca mientras el pedido siga abierto). */
+  sinStockEn: timestamp('sin_stock_en', { withTimezone: true }),
 }, (t) => ({
   ixPedido: index('ix_fracc_pedido_items_pedido').on(t.pedidoId),
 }));
