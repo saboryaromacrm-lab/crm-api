@@ -1336,6 +1336,8 @@ export const fraccionPedidos = pgTable('fraccion_pedidos', {
   operadorId: integer('operador_id').references(() => fraccionOperadores.id, { onDelete: 'set null' }),
   motivo: text('motivo').notNull().default(''),
   vistoEn: timestamp('visto_en', { withTimezone: true }),
+  /** 0172: cancelado mientras se armaba → fraccionado decidió (asentó lo armado o «no armé nada»). */
+  cancelacionResueltaEn: timestamp('cancelacion_resuelta_en', { withTimezone: true }),
 }, (t) => ({
   ixEstado: index('ix_fracc_pedidos_estado').on(t.estado, t.creadoEn.desc()),
   ixCajaUsuario: index('ix_fracc_pedidos_caja_usuario').on(t.usuarioId, t.creadoEn.desc()).where(sql`${t.origen} = 'caja'`),

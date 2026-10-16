@@ -784,19 +784,21 @@ export class InventarioService {
   async opFraccionarRegistro(o: {
     sucursalId: number; usuarioId?: number; operadorId?: number; motivo?: string;
     dia?: string; turno?: 'manana' | 'tarde'; pedidoId?: number;
-    /** Sin renglones y con `pedidoId` (el «Listo» de la caja): los renglones vivos del pedido, leídos con su candado. */
+    /** Sin renglones y con `pedidoId` (la caja): los renglones del pedido, leídos con su candado. */
     items?: { productoId: number; presId: number; cant: number }[];
+    /** Caja (0172): de lo que la caja canceló, lo que se armó igual (ids de renglón). */
+    armadosCancelados?: number[];
   }) {
     // Antes de abrir la transacción: una fecha imposible no toca nada.
     const momento = this.momentoDeFraccionado(o.dia, o.turno);
     return this.db.transaction(async (tx) => {
       const sucId = o.sucursalId;
       // Primero el candado del pedido: dos cargas del mismo pedido, una sola pasa.
-      const delPedido = o.pedidoId ? await this.pedidoFraccionPendiente(tx, o.pedidoId, sucId, !o.items) : [];
+      const pedido = o.pedidoId ? await this.pedidoFraccionPendiente(tx, o.pedidoId, sucId, !o.items, o.armadosCancelados) : null;
       /* Renglones agrupados por producto y tamaño: el mismo paquete cargado
        * dos veces suma, no se registra dos veces. */
       const porProducto = new Map<number, Map<number, number>>();
-      for (const it of o.items ?? delPedido) {
+      for (const it of o.items ?? pedido?.renglones ?? []) {
         const q = Math.round(Number(it.cant) || 0);
         if (!(q > 0)) continue;
         const pid = Number(it.productoId);
@@ -851,10 +853,12 @@ export class InventarioService {
         origen: 'manual', sucursalId: sucId, operadorId, usuarioId: o.usuarioId,
         motivo: (o.motivo ?? '').trim(), items: renglones, fecha: momento.fecha, turno: momento.turno,
       });
-      if (o.pedidoId) {
-        await tx.update(fraccionPedidos).set({
-          estado: 'hecho', hechoEn: new Date(), hechoPor: o.usuarioId ?? null, fraccionamientoId: registroId,
-        }).where(eq(fraccionPedidos.id, o.pedidoId));
+      if (pedido) {
+        /* Cancelado por la caja y armado igual (0172): sigue cancelado (no hubo venta), con lo que entró al stock. */
+        await tx.update(fraccionPedidos).set(pedido.estado === 'cancelado'
+          ? { fraccionamientoId: registroId, cancelacionResueltaEn: new Date(), actualizadoEn: new Date() }
+          : { estado: 'hecho', hechoEn: new Date(), hechoPor: o.usuarioId ?? null, fraccionamientoId: registroId })
+          .where(eq(fraccionPedidos.id, o.pedidoId!));
       }
       const fotos = await Promise.all(ids.map((pid) => this.fotoProducto(tx, pid)));
       return {
@@ -871,26 +875,39 @@ export class InventarioService {
    * `pendiente` en la lista de la Distribuidora y `armando` en el de la caja
    * (0170: alguien ya lo tomó). Lo que se registra puede diferir de lo pedido
    * (se hizo lo que alcanzó): el pedido se cierra igual y la diferencia se lee
-   * del registro. Con `conRenglones` devuelve sus renglones vivos (el «Listo»
-   * de la caja, que registra lo pedido).
+   * del registro.
+   *
+   * Con `conRenglones` (la caja) devuelve qué registrar: los renglones vivos
+   * y, de los que la caja canceló, los que se armaron igual (`armados`, 0172).
+   * Si hay cancelados, decirlo es obligatorio: si no, lo armado quedaría fuera
+   * del stock. Un pedido cancelado entero mientras se armaba también se asienta
+   * así, una sola vez.
    */
-  private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number, conRenglones: boolean) {
+  private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number, conRenglones: boolean, armados?: number[]) {
     const [p] = await tx.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, pedidoId)).limit(1).for('update');
     const codigo = `PF${String(pedidoId).padStart(4, '0')}`;
     if (!p) throw new BadRequestException('Ese pedido de fraccionado ya no existe: actualizá la pantalla.');
-    if (p.estado !== (p.origen === 'caja' ? 'armando' : 'pendiente')) {
+    const sinResolver = p.origen === 'caja' && p.estado === 'cancelado' && p.tomadoEn && !p.cancelacionResueltaEn;
+    if (p.estado !== (p.origen === 'caja' ? 'armando' : 'pendiente') && !(sinResolver && conRenglones)) {
       throw new BadRequestException(p.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.`
-        : p.estado === 'cancelado' ? `${codigo} lo canceló la caja: no lo armes.` : `${codigo} ya está cerrado.`);
+        : sinResolver ? `${codigo} lo canceló la caja: asentá lo que armaste o marcá «No armé nada».`
+          : p.estado === 'cancelado' && !p.cancelacionResueltaEn ? `${codigo} lo canceló la caja: no lo armes.` : `${codigo} ya está cerrado.`);
     }
     if (p.sucursalId !== sucursalId) throw new BadRequestException(`${codigo} es de la Distribuidora: cargalo entrando con esa sucursal.`);
-    if (!conRenglones) return [];
-    // Los renglones vivos, ya con el candado: lo que la caja canceló (0171) no se arma.
-    const vivos = await tx.select().from(fraccionPedidoItems)
-      .where(and(eq(fraccionPedidoItems.pedidoId, pedidoId), isNull(fraccionPedidoItems.canceladoEn)));
-    if (vivos.some((it: any) => it.presentacionId == null)) {
+    if (!conRenglones) return { estado: p.estado, renglones: [] };
+    const todos = await tx.select().from(fraccionPedidoItems).where(eq(fraccionPedidoItems.pedidoId, pedidoId));
+    const cancelados = todos.filter((it: any) => it.canceladoEn);
+    if (cancelados.length && !armados) throw new BadRequestException(`Decí qué armaste igual de lo que la caja canceló en ${codigo}.`);
+    const elegidos = new Set(armados ?? []);
+    if ([...elegidos].some((id) => !cancelados.some((it: any) => it.id === id))) {
+      throw new BadRequestException(`Eso no está cancelado en ${codigo}: actualizá la pantalla.`);
+    }
+    const usar = todos.filter((it: any) => (!it.canceladoEn && p.estado === 'armando') || elegidos.has(it.id));
+    if (!usar.length) throw new BadRequestException(`Marcá lo que armaste de ${codigo}, o «No armé nada».`);
+    if (usar.some((it: any) => it.presentacionId == null)) {
       throw new BadRequestException(`Uno de los paquetes de ${codigo} ya no existe: marcalo como «No se puede».`);
     }
-    return vivos.map((it: any) => ({ productoId: it.productoId, presId: it.presentacionId, cant: it.paquetes }));
+    return { estado: p.estado, renglones: usar.map((it: any) => ({ productoId: it.productoId, presId: it.presentacionId, cant: it.paquetes })) };
   }
 
   /**

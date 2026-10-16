@@ -17,6 +17,10 @@
  *     que lo marca visto.
  *   · CANCELADO (0171): el cajero que lo pidió lo cancela entero o por renglón
  *     mientras no esté cerrado; lo cancelado queda marcado, no se borra.
+ *     Si ya lo estaban armando pudo quedar hecho (0172): fraccionado decide
+ *     qué armó igual y eso se asienta (entra al stock, sin venta). En «Listo»
+ *     dice qué armó de lo cancelado; un pedido cancelado entero queda en su
+ *     aviso hasta que asienta lo armado o marca «No armé nada».
  *
  * Lo fraccionado de verdad se lee del registro, no se copia. Solo existen en
  * la Distribuidora: la sucursal la pone el servidor.
@@ -42,8 +46,6 @@ import { InventarioService } from './inventario.service';
 const HECHOS_A_LA_VISTA = 30;
 /** El historial de la caja trae a lo sumo esto por consulta. */
 const HISTORIAL_MAX = 500;
-/** Cuánto sigue en el aviso de fraccionado lo que la caja canceló mientras se armaba. */
-const CANCELADO_A_LA_VISTA = '3 minutes';
 const FECHA = /^\d{4}-\d{2}-\d{2}$/;
 
 class RenglonPedidoDto {
@@ -65,6 +67,16 @@ class TomarDto {
 class CancelarDto {
   /** Sin renglón: el pedido entero. */
   @IsOptional() @IsInt() itemId?: number;
+}
+
+class ListoDto {
+  /** De lo que la caja canceló, lo que se armó igual (0172). Obligatorio si hay cancelados. */
+  @IsOptional() @IsArray() @ArrayMaxSize(1000) @IsInt({ each: true }) armadosCancelados?: number[];
+}
+
+class ResolverCanceladoDto {
+  /** Lo que se armó igual; vacío = «No armé nada». */
+  @IsArray() @ArrayMaxSize(1000) @IsInt({ each: true }) itemIds!: number[];
 }
 
 class RechazarDto {
@@ -125,20 +137,22 @@ export class PedidosFraccionService {
     const nombreOp = new Map(ops.map((o) => [o.id, o.nombre]));
     const fraccionado = new Map<string, number>();
     for (const x of ((hecho as any).rows ?? hecho) as any[]) fraccionado.set(`${x.reg}:${x.p}:${x.pr}`, Number(x.n));
+    /* Cuánto se fraccionó de cada renglón, si el pedido se asentó (hecho, o cancelado y armado igual). */
+    const conFraccionado = (c: any) => (it: (typeof items)[number]) => ({
+      ...it,
+      fraccionados: c.fraccionamiento_id ? (fraccionado.get(`${c.fraccionamiento_id}:${it.productoId}:${it.presentacionId}`) ?? 0) : null,
+    });
     return cab.map((c) => {
-      const suyos = items.filter((it) => it.pedidoId === c.id && !it.canceladoEn).map((it) => ({
-        ...it,
-        fraccionados: c.estado === 'hecho' ? (fraccionado.get(`${c.fraccionamiento_id}:${it.productoId}:${it.presentacionId}`) ?? 0) : null,
-      }));
+      const suyos = items.filter((it) => it.pedidoId === c.id && !it.canceladoEn).map(conFraccionado(c));
       return {
         id: c.id, codigo: codigoPedidoFraccion(c.id), origen: c.origen, estado: c.estado, observaciones: c.observaciones,
         creadoEn: c.creado_en, actualizadoEn: c.actualizado_en, usuario: nombreUsr.get(c.usuario_id) ?? null,
         hechoEn: c.hecho_en, hechoPor: nombreUsr.get(c.hecho_por) ?? null, fraccionamientoId: c.fraccionamiento_id,
         tomadoEn: c.tomado_en, tomadoPor: nombreUsr.get(c.tomado_por) ?? null,
         operadorId: c.operador_id, operador: nombreOp.get(c.operador_id) ?? null,
-        motivo: c.motivo, vistoEn: c.visto_en,
+        motivo: c.motivo, vistoEn: c.visto_en, cancelacionResueltaEn: c.cancelacion_resuelta_en,
         items: suyos,
-        cancelados: items.filter((it) => it.pedidoId === c.id && it.canceladoEn),
+        cancelados: items.filter((it) => it.pedidoId === c.id && it.canceladoEn).map(conFraccionado(c)),
         paquetes: suyos.reduce((a, it) => a + it.paquetes, 0),
         kg: Math.round(suyos.reduce((a, it) => a + it.paquetes * it.tamKg, 0) * 1000) / 1000,
       };
@@ -236,9 +250,9 @@ export class PedidosFraccionService {
 
   /**
    * Lo que fraccionado tiene que atender (el aviso): pendientes y armándose, y
-   * por unos minutos lo que la caja canceló cuando ya lo estaban armando (0171:
-   * para que no lo terminen). Fuera de la Distribuidora no aplica y el ERP deja
-   * de preguntar.
+   * lo que la caja canceló cuando ya lo estaban armando hasta que fraccionado
+   * decide qué armó igual (0172: si no, lo armado quedaría fuera del stock).
+   * Fuera de la Distribuidora no aplica y el ERP deja de preguntar.
    */
   async abiertos(sesion: Sesion) {
     const dist = await this.distribuidora();
@@ -247,7 +261,7 @@ export class PedidosFraccionService {
       SELECT * FROM fraccion_pedidos
        WHERE sucursal_id = ${dist.id} AND origen = 'caja'
          AND (estado IN ('pendiente', 'armando')
-              OR (estado = 'cancelado' AND tomado_en IS NOT NULL AND hecho_en > now() - ${CANCELADO_A_LA_VISTA}::interval))
+              OR (estado = 'cancelado' AND tomado_en IS NOT NULL AND cancelacion_resuelta_en IS NULL))
        ORDER BY creado_en`);
     return { aplica: true, pedidos: await this.armar(cab) };
   }
@@ -293,18 +307,35 @@ export class PedidosFraccionService {
   }
 
   /**
-   * «Listo»: registra el fraccionado de lo pedido con su operador. El registro
-   * toma el candado del pedido, lee sus renglones vivos (lo cancelado no se
-   * arma) y lo cierra en la misma transacción que mueve el stock: si no
-   * alcanza el granel no se mueve nada y el pedido sigue armándose.
+   * «Listo» y lo cancelado que se armó igual (0172): registra el fraccionado
+   * con el operador del pedido. El registro toma el candado, lee los renglones
+   * (los vivos y, de los cancelados, los de `armados`) y en la misma
+   * transacción que mueve el stock cierra el pedido —o, si la caja lo canceló
+   * entero, lo da por resuelto—. Si no alcanza el granel no se mueve nada.
    */
-  async listo(id: number, usuarioId: number | null) {
+  private async asentar(id: number, armados: number[] | undefined, usuarioId: number | null, nota: string) {
     const [c] = await this.db.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, id)).limit(1);
     if (!c || c.origen !== 'caja') throw new NotFoundException('Ese pedido de la caja no existe: actualizá la pantalla.');
     return this.inv.opFraccionarRegistro({
       sucursalId: c.sucursalId, usuarioId: usuarioId ?? undefined, operadorId: c.operadorId ?? undefined, pedidoId: id,
-      motivo: `Pedido de la caja ${codigoPedidoFraccion(id)}`,
+      motivo: `Pedido de la caja ${codigoPedidoFraccion(id)}${nota}`, armadosCancelados: armados,
     });
+  }
+
+  listo(id: number, armados: number[] | undefined, usuarioId: number | null) { return this.asentar(id, armados, usuarioId, ''); }
+
+  /**
+   * Cancelado entero mientras se armaba (0172): asienta lo que se armó igual
+   * (entra al stock, sin venta) o, sin nada, «No armé nada». Una sola vez.
+   */
+  async resolverCancelado(id: number, armados: number[], usuarioId: number | null) {
+    if (armados.length) return this.asentar(id, armados, usuarioId, ' (cancelado por la caja, armado igual)');
+    await this.db.transaction(async (tx) => {
+      const c = await this.deCaja(tx, id, ['cancelado']);
+      if (!c.tomadoEn || c.cancelacionResueltaEn) throw new BadRequestException(`${codigoPedidoFraccion(id)} ya está cerrado.`);
+      await tx.update(fraccionPedidos).set({ cancelacionResueltaEn: new Date(), actualizadoEn: new Date() }).where(eq(fraccionPedidos.id, id));
+    });
+    return { ok: true };
   }
 
   /** «No se puede»: con el motivo, que el cajero lee. */
@@ -325,7 +356,7 @@ export class PedidosFraccionService {
    * pedido entero, mientras no esté cerrado. Nada se borra: el renglón queda
    * con `cancelado_en`; sin renglones vivos, el pedido pasa a `cancelado` y ya
    * queda visto para el cajero (lo hizo él). Si lo estaban armando, el aviso
-   * de fraccionado lo muestra unos minutos para que no lo terminen.
+   * de fraccionado lo muestra hasta que decide qué armó igual (0172).
    */
   async cancelar(id: number, itemId: number | undefined, usuarioId: number) {
     return this.db.transaction(async (tx) => {
@@ -434,7 +465,14 @@ export class PedidosCajaController {
   }
 
   @Post(':id/listo') @Permiso('fraccionar')
-  listo(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.listo(id, sesion?.usuarioId ?? null); }
+  listo(@Param('id', ParseIntPipe) id: number, @Body() dto: ListoDto, @Auth() sesion: Sesion) {
+    return this.svc.listo(id, dto.armadosCancelados, sesion?.usuarioId ?? null);
+  }
+
+  @Post(':id/resolver-cancelado') @Permiso('fraccionar')
+  resolverCancelado(@Param('id', ParseIntPipe) id: number, @Body() dto: ResolverCanceladoDto, @Auth() sesion: Sesion) {
+    return this.svc.resolverCancelado(id, dto.itemIds, sesion?.usuarioId ?? null);
+  }
 
   @Post(':id/rechazar') @Permiso('fraccionar')
   rechazar(@Param('id', ParseIntPipe) id: number, @Body() dto: RechazarDto, @Auth() sesion: Sesion) {

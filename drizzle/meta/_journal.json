@@ -1205,6 +1205,13 @@
       "when": 1791863100000,
       "tag": "0171_pedidos_caja_cancelar",
       "breakpoints": true
+    },
+    {
+      "idx": 172,
+      "version": "7",
+      "when": 1791949500000,
+      "tag": "0172_pedidos_caja_cancelado_armado",
+      "breakpoints": true
     }
   ]
 }
