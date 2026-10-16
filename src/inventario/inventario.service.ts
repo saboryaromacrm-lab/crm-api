@@ -568,7 +568,7 @@ export class InventarioService {
    * el día que se instala). Con `obligatorio` en falso (la corrección) solo
    * se valida el que venga.
    */
-  private async operadorDeFraccion(tx: any, operadorId: number | null | undefined, sucursalId: number, obligatorio: boolean): Promise<number | null> {
+  async operadorDeFraccion(tx: any, operadorId: number | null | undefined, sucursalId: number, obligatorio: boolean): Promise<number | null> {
     if (operadorId) {
       const [op] = await tx.select().from(fraccionOperadores).where(eq(fraccionOperadores.id, operadorId)).limit(1);
       if (!op) throw new BadRequestException('Ese operador no existe.');
@@ -866,15 +866,19 @@ export class InventarioService {
 
   /**
    * EL PEDIDO DE FRACCIONADO QUE SE ESTÁ CARGANDO (0169), con candado: tiene
-   * que estar pendiente y ser de la sucursal donde se fracciona. Lo que se
-   * registra puede diferir de lo pedido (se hizo lo que alcanzó): el pedido se
-   * cierra igual y la diferencia se lee del registro.
+   * que estar abierto y ser de la sucursal donde se fracciona. Abierto es
+   * `pendiente` en la lista de la Distribuidora y `armando` en el de la caja
+   * (0170: alguien ya lo tomó). Lo que se registra puede diferir de lo pedido
+   * (se hizo lo que alcanzó): el pedido se cierra igual y la diferencia se lee
+   * del registro.
    */
   private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number) {
     const [p] = await tx.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, pedidoId)).limit(1).for('update');
     const codigo = `PF${String(pedidoId).padStart(4, '0')}`;
     if (!p) throw new BadRequestException('Ese pedido de fraccionado ya no existe: actualizá la pantalla.');
-    if (p.estado !== 'pendiente') throw new BadRequestException(`${codigo} ya se cargó como fraccionado.`);
+    if (p.estado !== (p.origen === 'caja' ? 'armando' : 'pendiente')) {
+      throw new BadRequestException(p.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.` : `${codigo} ya está cerrado.`);
+    }
     if (p.sucursalId !== sucursalId) throw new BadRequestException(`${codigo} es de la Distribuidora: cargalo entrando con esa sucursal.`);
   }
 

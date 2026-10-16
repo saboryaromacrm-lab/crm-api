@@ -1318,16 +1318,27 @@ export const fraccionamientoItems = pgTable('fraccionamiento_items', {
 export const fraccionPedidos = pgTable('fraccion_pedidos', {
   id: serial('id').primaryKey(),
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
-  estado: text('estado').$type<'pendiente' | 'hecho'>().notNull().default('pendiente'),
+  /** 0170: lo pide la caja (`caja`) o es la lista propia de la Distribuidora. */
+  origen: text('origen').$type<'distribuidora' | 'caja'>().notNull().default('distribuidora'),
+  /** `armando` y `rechazado` son solo de la caja (0170). */
+  estado: text('estado').$type<'pendiente' | 'armando' | 'hecho' | 'rechazado'>().notNull().default('pendiente'),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+  /** Cuándo y quién lo cerró: hecho o, en la caja, rechazado. */
   hechoEn: timestamp('hecho_en', { withTimezone: true }),
   hechoPor: integer('hecho_por').references(() => usuarios.id, { onDelete: 'set null' }),
   fraccionamientoId: integer('fraccionamiento_id').references(() => fraccionamientos.id, { onDelete: 'set null' }),
+  /** Caja (0170): quién lo tomó, con qué operador, el motivo del rechazo y cuándo el cajero vio cómo terminó. */
+  tomadoEn: timestamp('tomado_en', { withTimezone: true }),
+  tomadoPor: integer('tomado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  operadorId: integer('operador_id').references(() => fraccionOperadores.id, { onDelete: 'set null' }),
+  motivo: text('motivo').notNull().default(''),
+  vistoEn: timestamp('visto_en', { withTimezone: true }),
 }, (t) => ({
   ixEstado: index('ix_fracc_pedidos_estado').on(t.estado, t.creadoEn.desc()),
+  ixCajaUsuario: index('ix_fracc_pedidos_caja_usuario').on(t.usuarioId, t.creadoEn.desc()).where(sql`${t.origen} = 'caja'`),
 }));
 
 /** Qué paquete y cuántos. El tamaño se congela: si mañana se borra el paquete, el pedido sigue diciendo qué se pidió. */
