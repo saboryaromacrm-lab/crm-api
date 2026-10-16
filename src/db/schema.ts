@@ -3299,6 +3299,12 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   estado: estadoPagoProvEnum('estado').notNull().default('activo'),
   observaciones: text('observaciones').notNull().default(''),
+  /**
+   * EFECTIVO POR TRANSFERENCIA (0175): quién hizo el cambio. Se le dio efectivo
+   * y esa persona le transfirió al proveedor: el pago es por transferencia (lo
+   * que recibió el proveedor) pero la plata salió como efectivo. Null = no.
+   */
+  cambioPor: text('cambio_por'),
 }, (t) => ({
   ixProveedor: index('ix_proveedor_pagos_proveedor').on(t.proveedorId, t.estado),
   ixFecha: index('ix_proveedor_pagos_fecha').on(t.fecha),

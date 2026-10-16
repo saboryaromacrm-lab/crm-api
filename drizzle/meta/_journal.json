@@ -1226,6 +1226,13 @@
       "when": 1792036800000,
       "tag": "0174_pedidos_caja_sin_stock",
       "breakpoints": true
+    },
+    {
+      "idx": 175,
+      "version": "7",
+      "when": 1792037700000,
+      "tag": "0175_pago_efectivo_por_transferencia",
+      "breakpoints": true
     }
   ]
 }

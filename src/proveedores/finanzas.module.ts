@@ -818,6 +818,7 @@ export class FinanzasProveedorService {
         referencia: proveedorPagos.referencia,
         cajaSesionId: proveedorPagos.cajaSesionId,
         esFlete: proveedorPagos.esFlete,
+        cambioPor: proveedorPagos.cambioPor,
         usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
         sucursalNombre: sql<string>`coalesce(${sucursales.nombre}, '')`,
       }).from(proveedorPagos)
@@ -910,6 +911,8 @@ export class FinanzasProveedorService {
         debe: 0,
         haber: money(p.importe),
         esFlete: p.esFlete,
+        /* Efectivo por transferencia (0175): quién hizo el cambio. */
+        cambioPor: p.cambioPor,
         formas,
         /* El pago se puede ANULAR desde el mayor, y solo si no tiene nada
          * aplicado: `sinAplicar` es lo que la pantalla mira para no ofrecer un

@@ -33,7 +33,7 @@ import {
   ArrayMaxSize, IsArray, IsBoolean, IsBooleanString, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Matches, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
@@ -150,6 +150,12 @@ export class CrearPagoDto {
   fletes?: DescuentoFleteDto[];
   /** "Sí, es otro pago": la segunda confirmación ante un pago gemelo del día (409). */
   @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
+  /**
+   * EFECTIVO POR TRANSFERENCIA (0175): quién hizo el cambio. Va con un pago por
+   * transferencia de un solo medio, y la plata sale como EFECTIVO (del turno,
+   * si viene `cajaSesionId`).
+   */
+  @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
 }
 
 export class ImputarDto {
@@ -175,6 +181,8 @@ export class ListarPagosDto {
   @IsOptional() @IsBooleanString() sinAplicar?: string;
   /** Solo los fletes: es lo que responde "¿cuánto pagué de fletes este mes?". */
   @IsOptional() @IsBooleanString() esFlete?: string;
+  /** Solo el efectivo por transferencia (0175): «cuánto cambié y con quién». */
+  @IsOptional() @IsBooleanString() cambio?: string;
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
@@ -403,6 +411,7 @@ export class PagosProveedorService {
       usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
       estado: proveedorPagos.estado,
       observaciones: proveedorPagos.observaciones,
+      cambioPor: proveedorPagos.cambioPor,
     };
   }
 
@@ -428,6 +437,7 @@ export class PagosProveedorService {
     if (q.desde) conds.push(sql`${proveedorPagos.fecha} >= ${new Date(`${String(q.desde).slice(0, 10)}T00:00:00`).toISOString()}`);
     if (q.hasta) conds.push(sql`${proveedorPagos.fecha} <= ${new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`).toISOString()}`);
     if (q.esFlete === 'true' || q.esFlete === true) conds.push(eq(proveedorPagos.esFlete, true));
+    if (q.cambio === 'true' || q.cambio === true) conds.push(isNotNull(proveedorPagos.cambioPor));
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
       conds.push(eq(proveedorPagos.estado, 'activo'));
@@ -842,11 +852,18 @@ export class PagosProveedorService {
       }
     }
     const medio = (formas[0]?.medio ?? dto.medio ?? 'efectivo') as any;
+    /* EFECTIVO POR TRANSFERENCIA (0175): el proveedor recibe una transferencia
+     * que hizo otra persona a cambio de nuestro efectivo. */
+    const cambioPor = (dto.cambioPor ?? '').trim() || null;
+    if (cambioPor && (formas.length || medio !== 'transferencia')) {
+      throw new BadRequestException('El efectivo por transferencia es un pago de un solo medio, por transferencia.');
+    }
     /** Lo que sale del CAJÓN: la parte en efectivo del split — o todo, si el
-     *  pago es simple y en efectivo. Es lo único que el arqueo tiene que ver. */
+     *  pago es simple y en efectivo (también el efectivo que se cambió por la
+     *  transferencia). Es lo único que el arqueo tiene que ver. */
     const importeEfectivo = formas.length
       ? money(formas.filter((f) => f.medio === 'efectivo').reduce((a, f) => a + f.importe, 0))
-      : (medio === 'efectivo' ? importe : 0);
+      : (medio === 'efectivo' || cambioPor ? importe : 0);
     const id = await this.db.transaction(async (tx) => {
       let cajaMovimientoId: number | null = null;
       let cajaSesionId: number | null = null;
@@ -965,6 +982,7 @@ export class PagosProveedorService {
           importe: importeEfectivo,
           motivo: `${esFlete ? 'Flete a cuenta del proveedor' : 'Pago a proveedor'}`
             + `${nombreProv ? ` · ${nombreProv}` : ''}${concepto ? ` · ${concepto}` : ''}`
+            + (cambioPor ? ` · efectivo por transferencia (${cambioPor})` : '')
             + (formas.length && importeEfectivo < importe - EPS ? ` · efectivo de un pago mixto de ${importe.toFixed(2)}` : ''),
           usuarioId: dto.usuarioId ?? null,
         }).returning();
@@ -990,6 +1008,7 @@ export class PagosProveedorService {
         usuarioId: dto.usuarioId ?? null,
         estado: 'activo',
         observaciones: (dto.observaciones ?? '').trim(),
+        cambioPor,
       }).returning();
 
       // El split del pago, en la misma transacción que su cabecera.

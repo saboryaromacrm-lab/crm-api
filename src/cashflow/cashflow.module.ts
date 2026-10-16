@@ -162,7 +162,9 @@ class ImputacionCfDto {
 class PagoProveedorDto {
   @IsInt() proveedorId!: number;
   @IsIn(['mercaderia', 'gastos']) destino!: 'mercaderia' | 'gastos';
-  @IsIn(['efectivo', 'deposito']) medio!: 'efectivo' | 'deposito';
+  /** `transferencia` = efectivo por transferencia (0175): va siempre con `cambioPor`. */
+  @IsIn(['efectivo', 'deposito', 'transferencia']) medio!: 'efectivo' | 'deposito' | 'transferencia';
+  @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
   @IsNumber() @Min(0.01) @Max(MAX_IMPORTE) importe!: number;
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionCfDto) imputaciones?: ImputacionCfDto[];
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
@@ -775,7 +777,7 @@ export class CashflowService {
       select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto,
         m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia", cs.cierre as "cierreCaja",
         m.pago_id as "pagoId", m.gasto_id as "gastoId", u.nombre as usuario,
-        pr.nombre as proveedor, pp.medio, pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
+        pr.nombre as proveedor, pp.medio, pp.cambio_por as "cambioPor", pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
         m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo", ua.nombre as "anuladoPor"
       from cashflow_movimientos m
       left join cashflow_conceptos c on c.id = m.concepto_id
@@ -877,6 +879,10 @@ export class CashflowService {
     const prov = await this.proveedor(dto.proveedorId);
     const usuarioId = sesion?.usuarioId ?? null;
     const detalle = String(dto.detalle ?? '').trim();
+    /* Efectivo por transferencia (0175): sale efectivo y el proveedor recibe la transferencia de quien hizo el cambio. */
+    const cambioPor = String(dto.cambioPor ?? '').trim();
+    if (dto.medio === 'transferencia' && !cambioPor) throw new BadRequestException('Escribí quién hizo la transferencia (a quién le diste el efectivo).');
+    if (dto.medio !== 'transferencia' && cambioPor) throw new BadRequestException('Quién hizo el cambio va solo con «Efectivo por transferencia».');
     return this.db.transaction(async (tx) => {
       const [caja] = await tx.select().from(cashflowCaja).limit(1).for('update');
       if (!caja) throw new BadRequestException('Primero arrancá el Cash Flow con la fecha y el saldo inicial.');
@@ -893,10 +899,10 @@ export class CashflowService {
       const [m] = await tx.insert(cashflowMovimientos).values({
         fecha: instante, conceptoId: dto.conceptoId ?? null,
         tipo: 'egreso', origen: 'pago_proveedor', importe, usuarioId,
-        detalle: `Pago a ${prov.nombre} (${dto.medio === 'deposito' ? 'depósito' : 'efectivo'})${detalle ? ` · ${detalle}` : ''}`,
+        detalle: `Pago a ${prov.nombre} (${dto.medio === 'deposito' ? 'depósito' : cambioPor ? `efectivo por transferencia · ${cambioPor}` : 'efectivo'})${detalle ? ` · ${detalle}` : ''}`,
       }).returning();
       /* El pago de siempre. Si falla, esta transacción se deshace y el egreso no queda. */
-      const pago = await this.crearPago(prov, { ...dto, importe, fecha, detalle, imputaciones }, sesion);
+      const pago = await this.crearPago(prov, { ...dto, importe, fecha, detalle, imputaciones, cambioPor }, sesion);
       await tx.update(cashflowMovimientos).set({ pagoId: pago.id }).where(eq(cashflowMovimientos.id, m.id));
       return { ok: true, id: m.id, pagoId: pago.id, saldo: await this.saldo(tx) };
     });
@@ -910,8 +916,8 @@ export class CashflowService {
 
   /** El pago de siempre (`pagos.crear`): queda en la cuenta del proveedor, aplicado a lo tildado. */
   private crearPago(prov: { id: number }, p: {
-    destino: 'mercaderia' | 'gastos'; medio: 'efectivo' | 'deposito'; importe: number; fecha: string;
-    referencia?: string; detalle: string; imputaciones: ReturnType<typeof imputacionesDe>;
+    destino: 'mercaderia' | 'gastos'; medio: 'efectivo' | 'deposito' | 'transferencia'; importe: number; fecha: string;
+    referencia?: string; detalle: string; imputaciones: ReturnType<typeof imputacionesDe>; cambioPor?: string;
   }, sesion: Sesion): Promise<any> {
     return this.pagos.crear({
       proveedorId: prov.id, destino: p.destino, importe: p.importe, medio: p.medio, fecha: p.fecha,
@@ -919,6 +925,7 @@ export class CashflowService {
       concepto: `Cash Flow${p.detalle ? `: ${p.detalle}` : ''}`,
       usuarioId: sesion?.usuarioId ?? undefined,
       imputaciones: p.imputaciones.length ? p.imputaciones : undefined,
+      cambioPor: p.cambioPor || undefined,
     } as any, sesion.sucursalId, true);
   }
 
