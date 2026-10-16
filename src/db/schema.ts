@@ -2569,6 +2569,8 @@ export const presupuestos = pgTable('presupuestos', {
    * es el registro de qué dijo el cliente, con su teléfono del momento.
    */
   webCliente: jsonb('web_cliente'),
+  /** 0173: de qué modo de la tienda vino la orden web (null = no es del sitio). */
+  modoTienda: text('modo_tienda').$type<'mayorista' | 'minorista'>(),
   observaciones: text('observaciones').notNull().default(''),
   /** Totales CONGELADOS al cotizar: son la palabra dada al cliente. */
   subtotalNeto: doublePrecision('subtotal_neto').notNull().default(0),
@@ -2792,6 +2794,24 @@ export const tiendaSesiones = pgTable('tienda_sesiones', {
 }, (t) => ({
   ixAcceso: index('ix_tienda_sesiones_acceso').on(t.accesoId),
 }));
+
+/**
+ * EL COMPRADOR MINORISTA (0173): sin registro ni aprobación. Su teléfono (10
+ * dígitos, área + abonado) es la clave; nombre, apellido y dirección se guardan
+ * con cada pedido para que la próxima vez ponga el teléfono y ya tenga todo.
+ */
+export const tiendaCompradores = pgTable('tienda_compradores', {
+  id: serial('id').primaryKey(),
+  telefono: text('telefono').notNull().unique(),
+  nombre: text('nombre').notNull().default(''),
+  apellido: text('apellido').notNull().default(''),
+  direccion: text('direccion').notNull().default(''),
+  localidad: text('localidad').notNull().default(''),
+  referencia: text('referencia').notNull().default(''),
+  pedidos: integer('pedidos').notNull().default(0),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
 
 /* ============================================================================
  * GASTOS — lo que la empresa PAGA y no es mercadería

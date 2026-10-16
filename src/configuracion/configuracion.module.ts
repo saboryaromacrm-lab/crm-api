@@ -92,6 +92,14 @@ export const VENTAS_DEFAULTS = {
    */
   tiendaVistaLista: false as boolean,
   /**
+   * TIENDA MINORISTA (0173, 16/10/2026, pedido del dueño): la misma tienda con
+   * un modo Minorista a precio de mostrador (la lista base), sin registro ni
+   * compra mínima. Apagado, el sitio queda solo mayorista como antes.
+   */
+  tiendaMinoristaActiva: true as boolean,
+  /** Envío gratis en la tienda minorista desde este monto (0 = nunca es gratis: se coordina). */
+  tiendaMinoristaEnvioGratisDesde: 0 as number,
+  /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
    * precio se armó antes.
@@ -504,6 +512,7 @@ const REGLAS: Record<string, {
   'ventas.ctaCteLimiteDefault': { min: 0, max: 100_000_000 },
   'ventas.montoMinimoMayorista': { min: 0, max: 100_000_000 },
   'ventas.montoMinimoCamioneta': { min: 0, max: 100_000_000 },
+  'ventas.tiendaMinoristaEnvioGratisDesde': { min: 0, max: 100_000_000 },
   'ventas.listaBaseId': { min: 0, max: 1_000_000, entero: true },
   'ventas.topeSinIdentificar': { min: 0, max: 10_000_000_000 },
   'ventas.modalidadMontoId': { min: 0, max: 1_000_000, entero: true },

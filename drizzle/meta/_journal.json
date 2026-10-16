@@ -1212,6 +1212,13 @@
       "when": 1791949500000,
       "tag": "0172_pedidos_caja_cancelado_armado",
       "breakpoints": true
+    },
+    {
+      "idx": 173,
+      "version": "7",
+      "when": 1792035900000,
+      "tag": "0173_tienda_minorista",
+      "breakpoints": true
     }
   ]
 }

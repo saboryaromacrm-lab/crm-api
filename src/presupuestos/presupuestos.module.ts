@@ -34,6 +34,7 @@ import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService, stockSinControl } from '../inventario/inventario.service';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
+import { telefonoArgentino } from '../common/telefono';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -264,25 +265,29 @@ export class PresupuestosService {
    */
   async crearDesdeWeb(dto: {
     clienteId: number | null; sucursalId: number; entrega?: string; observaciones?: string;
+    /** De qué modo de la tienda vino (0173). */
+    modoTienda: 'mayorista' | 'minorista';
     items: any[];
     webCliente?: {
       nombre: string; apellido: string; telefono: string; dni: string;
       /** Solo con envío (cadete / camioneta): a dónde va el pedido. */
       direccion?: string; localidad?: string; referencia?: string;
+      /** Minorista: el envío salió gratis por el monto (0173). */
+      envioGratis?: boolean;
     };
-  }) {
+  }, tx: Database = this.db) {
     if (!dto?.sucursalId) throw new BadRequestException('Falta la sucursal.');
     if (!dto.clienteId && !dto.webCliente) throw new BadRequestException('Faltan los datos del cliente.');
     const { limpios, subtotalNeto, ivaTotal, total } = this.totales(dto.items);
     if (!limpios.length) throw new BadRequestException('El carrito está vacío.');
     const entrega = ENTREGAS.has(dto.entrega as string) ? dto.entrega : 'retiro';
-    return this.db.transaction(async (tx) => {
+    return tx.transaction(async (tx) => {
       const [p] = await tx.insert(presupuestos).values({
         clienteId: dto.clienteId ? Number(dto.clienteId) : null,
         sucursalId: Number(dto.sucursalId),
         usuarioId: null, vendedorId: null,
         estado: 'pendiente', origen: 'web', vencimiento: null,
-        webCliente: dto.webCliente ?? null,
+        webCliente: dto.webCliente ?? null, modoTienda: dto.modoTienda,
         entrega, observaciones: (dto.observaciones ?? '').trim(),
         subtotalNeto, ivaTotal, total,
       }).returning();
@@ -504,10 +509,16 @@ export class PresupuestosService {
       clienteId = c.id;
     } else if (!clienteId) {
       const dni = String(wc.dni ?? '').replace(/\D/g, '');
+      /* Minorista (0173): no hay DNI, el comprador es su teléfono; se busca la ficha
+       * con ese mismo número (los últimos 10 dígitos, escrito como esté). */
+      const tel = dni ? '' : telefonoArgentino(String(wc.telefono ?? ''));
       const [ya] = dni
         ? await this.db.select().from(clientes)
           .where(and(eq(clientes.tipoDoc, 'dni'), eq(clientes.numeroDoc, dni))).limit(1)
-        : [];
+        : tel
+          ? await this.db.select().from(clientes)
+            .where(sql`right(regexp_replace(${clientes.telefono}, '\\D', '', 'g'), 10) = ${tel}`).orderBy(clientes.id).limit(1)
+          : [];
       if (ya) {
         clienteId = ya.id;
       } else if (o?.crearCliente) {

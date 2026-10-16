@@ -21,21 +21,29 @@
  * (`X-Tienda-Sesion`, ver accesos.ts) el catálogo sale SIN NADA DE PLATA y el
  * pedido se rechaza. Se quita acá, en el servidor: ocultarlo en la pantalla y
  * mandarlo igual sería un precio oculto que se lee con F12.
+ *
+ * DOS MODOS, UNA TIENDA (0173, 16/10/2026, pedido del dueño). Lo de arriba es
+ * el modo MAYORISTA. El modo MINORISTA es la misma tienda a precio de mostrador
+ * (la lista base de la caja): precios a la vista de todos, sin compra mínima,
+ * sin registro —el comprador es su teléfono— y el envío puede ser gratis desde
+ * un monto. Cada modo arma su catálogo y lo guarda unos segundos (`CacheCorto`):
+ * cien visitantes son una sola armada.
  */
 import {
   BadRequestException, Body, Controller, Get, Headers, Inject, Injectable, Module,
-  NotFoundException, Param, ParseIntPipe, Post, Res, UnauthorizedException, UseGuards,
+  NotFoundException, Param, ParseIntPipe, Post, Query, Res, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
+import { CacheCorto } from './cache';
 import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
 import type { Response } from 'express';
-import { and, eq, gte, ne } from 'drizzle-orm';
+import { and, eq, gte, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, subcategorias, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
-  productoProveedores, productos, stock, sucursales, webEventos, webImagenes,
+  productoProveedores, productos, stock, sucursales, tiendaCompradores, webEventos, webImagenes,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import { ofertaAlcanza } from '../ventas/ventas.module';
@@ -64,6 +72,13 @@ const MAX_RENGLONES_PEDIDO = 100;
 
 /** Cabecera con el token del aparato que ingresó a la tienda (0155). */
 const SESION = 'x-tienda-sesion';
+
+/** Los dos modos de la tienda (0173). */
+type Modo = 'mayorista' | 'minorista';
+/** Cuánto vive el catálogo armado: un precio nuevo tarda a lo sumo esto en verse. */
+const CATALOGO_TTL_MS = 15_000;
+/** Topes de los datos del comprador minorista (el `maxLength` del checkout no protege al POST directo). */
+const MAX_NOMBRE = 60;
 
 /**
  * EL CATÁLOGO DEL QUE NO INGRESÓ (0155): el mismo, sin nada de plata —precios,
@@ -121,6 +136,8 @@ function precioConOferta(o: any, precioFinal: number): number | null {
 /** Formas de entrega que el sitio ofrece; cualquier otra cosa cae a retiro. */
 const ENTREGAS_TIENDA = ['retiro', 'cadete', 'camioneta'] as const;
 type EntregaTienda = (typeof ENTREGAS_TIENDA)[number];
+/** En el modo minorista: retiro en el local o envío a domicilio (por dentro, el cadete). */
+const ENTREGAS_MINORISTA: Record<string, EntregaTienda> = { retiro: 'retiro', envio: 'cadete' };
 
 /** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */
 const MAX_CALLE = 120;
@@ -148,8 +165,18 @@ export function direccionDeEntrega(entrega: EntregaTienda, cruda: any): {
   return { direccion, localidad, referencia };
 }
 
+/** El catálogo armado y, aparte, lo que solo usa el pedido para validar stock (no se publica). */
+type Armado = {
+  catalogo: any;
+  pozos: Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number>; unidades?: number }>;
+  listaDeOpcion: Map<string, { id: number; nombre: string }>;
+};
+
 @Injectable()
 export class TiendaService {
+  /** Un catálogo armado por modo, vivo `CATALOGO_TTL_MS`. */
+  private readonly cache = new CacheCorto<Armado>(CATALOGO_TTL_MS);
+
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly listas: ListasService,
@@ -167,31 +194,41 @@ export class TiendaService {
     return cualquiera;
   }
 
+  /** El modo que se va a servir: minorista solo si está encendido en el ERP; cualquier otra cosa, mayorista. */
+  private async modoVigente(pedido?: string): Promise<Modo> {
+    if (pedido !== 'minorista') return 'mayorista';
+    const cfg = await this.cfg.get('ventas');
+    return cfg.tiendaMinoristaActiva === false ? 'mayorista' : 'minorista';
+  }
+
+  /** El catálogo armado del modo, de la caché (o armado ahora si no hay copia). */
+  private armado(modo: Modo) { return this.cache.get(modo, () => this.armarCatalogo(modo)); }
+
   /**
-   * El catálogo PÚBLICO del sitio, sin los datos internos de stock. Con sesión
-   * válida, con precios y los datos del cliente para el checkout; sin ella, sin
-   * nada de plata (`sinPrecios`).
+   * El catálogo PÚBLICO del sitio, sin los datos internos de stock.
+   *   · Minorista: siempre con precios, sin cliente (el comprador se identifica al pedir).
+   *   · Mayorista: con sesión válida, con precios y los datos del cliente para
+   *     el checkout; sin ella, sin nada de plata (`sinPrecios`).
    */
-  async catalogo(token?: string) {
+  async catalogo(token?: string, modoPedido?: string) {
+    const modo = await this.modoVigente(modoPedido);
+    if (modo === 'minorista') return { ...(await this.armado('minorista')).catalogo, conPrecios: true, cliente: null };
     const [completo, s] = await Promise.all([this.catalogoCompleto(), this.accesos.sesion(token)]);
     return s ? { ...completo, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(completo);
   }
 
-  /** El catálogo CON precios, tal cual lo ve un cliente habilitado: el de Tienda online del ERP (`GET /web/catalogo`). */
+  /** El catálogo mayorista CON precios, tal cual lo ve un cliente habilitado: el de Tienda online del ERP (`GET /web/catalogo`). */
   async catalogoCompleto() {
-    return { ...(await this.armarCatalogo()).catalogo, conPrecios: true, cliente: null };
+    return { ...(await this.armado('mayorista')).catalogo, conPrecios: true, cliente: null };
   }
 
   /**
-   * El catálogo y, aparte, el POZO de cada granel (granel suelto utilizable y
-   * paquetes armados), que solo usa el pedido para validar el stock entre
-   * opciones del mismo producto. El pozo no se publica.
+   * El catálogo del modo y, aparte, el POZO de cada granel (granel suelto
+   * utilizable y paquetes armados), que solo usa el pedido para validar el
+   * stock entre opciones del mismo producto. El pozo no se publica.
    */
-  private async armarCatalogo(): Promise<{
-    catalogo: any;
-    pozos: Map<number, { sinTope: boolean; granelKg: number; armados: Map<number, number>; unidades?: number }>;
-    listaDeOpcion: Map<string, { id: number; nombre: string }>;
-  }> {
+  private async armarCatalogo(modo: Modo): Promise<Armado> {
+    const minorista = modo === 'minorista';
     const suc = await this.sucursalTienda();
     const desdeReingreso = new Date(Date.now() - DIAS_REINGRESO * 86400000);
     const [prods, provs, filas, petiq, ms, cs, ets, existencias, cat, cfg, ofertasActivas, ingresosRecientes, imgs, web, subs, press] = await Promise.all([
@@ -240,18 +277,6 @@ export class TiendaService {
       return v ? `tienda/imagenes/${tipo}/${refId}?v=${v}` : '';
     };
 
-    // Ofertas de vidriera vigentes: solo mecánicas de UN producto (combo/ticket no aplican al catálogo).
-    /*
-     * `sin listas` es la traducción EXACTA del viejo `!soloPrecioBase` (0065):
-     * el sitio publica las que corren en TODAS las listas, que son exactamente
-     * las mismas que publicaba antes del cambio. Se dejó igual a propósito
-     * (decisión del dueño, 15/8/2026), pero merece una segunda mirada: el
-     * precio que muestra el sitio ES el de mostrador, así que una promo acotada
-     * a esa lista debería verse acá y hoy no se ve. Está en Pendientes.
-     */
-    const ofertasWeb = ofertasActivas.filter((o: any) =>
-      !String(o.listas ?? '').trim() && o.tipo !== 'combo' && o.tipo !== 'ticket'
-      && ofertaVigente(o, suc?.id ?? null));
     const reingresados = new Set(ingresosRecientes.map((m: any) => m.productoId));
 
     const nombreMarca = new Map(ms.map((m) => [m.id, m.nombre]));
@@ -278,21 +303,40 @@ export class TiendaService {
 
     const activas = (cat.listas ?? []).filter((l: any) => l.activa);
     /*
-     * LA TIENDA ES LA MODALIDAD MAYORISTA, CON TODAS SUS LISTAS (3/10/2026,
+     * LA TIENDA MAYORISTA ES LA MODALIDAD MAYORISTA, CON TODAS SUS LISTAS (3/10/2026,
      * pedido del dueño: «tiene que mostrar sí o sí la llamada Mayorista, y
      * dentro de esa las que tienen creadas»). La modalidad es la configurada
      * para el mínimo por monto o, si no hay, la que se llama «Mayorista». La
      * «lista de la tienda» es la primera de esa modalidad por orden; ya no
      * decide qué se publica (eso lo deciden todas las listas de la modalidad),
      * solo cuál gana cuando dos venden igual.
+     *
+     * LA MINORISTA (0173) es la lista base de la caja —el precio de mostrador—
+     * y nada más. Sin lista base configurada, la primera que NO sea de la
+     * modalidad mayorista: un precio de distribuidora nunca se publica como minorista.
      */
     const modalidades = (cat.modalidades ?? []).filter((m: any) => m.activa !== false);
     const conListas = (m: any) => !!m && activas.some((l: any) => l.modalidadId === m.id);
-    const modalidadTienda = [modalidades.find((m: any) => m.id === cfg.modalidadMontoId), modalidades.find((m: any) => /mayorista/i.test(String(m.nombre)))]
+    const modalidadMayorista = [modalidades.find((m: any) => m.id === cfg.modalidadMontoId), modalidades.find((m: any) => /mayorista/i.test(String(m.nombre)))]
       .find(conListas) ?? null;
-    const listaTienda = (modalidadTienda ? activas.find((l: any) => l.modalidadId === modalidadTienda.id) : null)
-      ?? activas.find((l: any) => l.id === cfg.listaBaseId)
-      ?? activas[0] ?? null;
+    const listaBase = activas.find((l: any) => l.id === cfg.listaBaseId)
+      ?? activas.find((l: any) => l.modalidadId !== modalidadMayorista?.id) ?? null;
+    const listaTienda = minorista ? listaBase
+      : (modalidadMayorista ? activas.find((l: any) => l.modalidadId === modalidadMayorista.id) : null) ?? listaBase ?? activas[0] ?? null;
+
+    // Ofertas de vidriera vigentes: solo mecánicas de UN producto (combo/ticket no aplican al catálogo).
+    /*
+     * Mayorista: `sin listas` es la traducción EXACTA del viejo `!soloPrecioBase`
+     * (0065): publica las que corren en TODAS las listas (decisión del dueño,
+     * 15/8/2026). Minorista: además las acotadas a la lista base, que es la que
+     * cobra — son exactamente las promos que ve el mostrador.
+     */
+    const corre = (o: any) => {
+      const listasOferta = String(o.listas ?? '').split(',').map((x: string) => x.trim()).filter(Boolean);
+      return !listasOferta.length || (minorista && !!listaTienda && listasOferta.includes(String(listaTienda.id)));
+    };
+    const ofertasWeb = ofertasActivas.filter((o: any) =>
+      corre(o) && o.tipo !== 'combo' && o.tipo !== 'ticket' && ofertaVigente(o, suc?.id ?? null));
 
     /**
      * Contenido editable del sitio (módulo Web): slides de la portada, logo,
@@ -319,16 +363,37 @@ export class TiendaService {
       },
     };
 
-    const vacio = {
-      sucursalId: suc?.id ?? null, listaId: null, listaNombre: '', montoMinimo: 0,
-      montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
-      envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
+    /** Lo que es del modo, no del catálogo: mínimos, entregas, el modo mismo. */
+    const reglasModo = minorista
+      ? { modo, montoMinimo: 0, montoMinimoCamioneta: 0, envioCamionetaActivo: false, reglasMarca: [] as any[] }
+      : {
+        modo,
+        /** 0 = sin mínimo por monto configurado (solo rigen los de marca/producto, si hay). */
+        montoMinimo: Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0,
+        /** Piso EXTRA si la entrega es el envío sin costo (la camioneta; 0 = sin piso). */
+        montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
+        /** El envío sin costo se ofrece (Ventas › Configuración › Tienda online). */
+        envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
+        reglasMarca: (cat.reglasMarca ?? [])
+          .filter((r: any) => r.activa && r.unidadesMinimas > 0)
+          .map((r: any) => ({ marcaId: r.marcaId, marca: r.marca, unidadesMinimas: r.unidadesMinimas })),
+      };
+    const comun = {
+      sucursalId: suc?.id ?? null,
+      ...reglasModo,
+      /** El modo minorista existe (0173): con él, el sitio ofrece elegir modo. */
+      minoristaActiva: cfg.tiendaMinoristaActiva !== false,
+      /** Minorista: envío gratis desde este monto (0 = se coordina). */
+      envioGratisDesde: minorista && Number(cfg.tiendaMinoristaEnvioGratisDesde) > 0 ? Number(cfg.tiendaMinoristaEnvioGratisDesde) : 0,
+      /** Catálogo sin fotos: la tienda lista los productos en vez de mostrar tarjetas. */
       vistaLista: cfg.tiendaVistaLista === true,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
-      categorias: [], marcas: [], etiquetas: [], reglasMarca: [], items: [],
       sitio,
     };
+    const vacio = { ...comun, listaId: null, listaNombre: '', categorias: [], marcas: [], etiquetas: [], items: [] };
     if (!listaTienda) return { catalogo: vacio, pozos: new Map(), listaDeOpcion: new Map() };
+    /** El mínimo de compra de una fila, en el modo: el minorista no tiene mínimos. */
+    const minimo = (n: number) => (minorista ? 0 : n);
 
     /*
      * PRE-ÍNDICE de las tablas hijas, un solo pase cada una. Sin esto, adentro
@@ -347,7 +412,7 @@ export class TiendaService {
      * venden IGUAL (mismas unidades) gana la primera, así una lista «por 1»
      * más barata —la de un cliente con contrato— no se publica para todos.
      */
-    const listasGranel = activas
+    const listasGranel = minorista ? [listaTienda] : activas
       .filter((l: any) => l.modalidadId === listaTienda.modalidadId)
       .sort((a: any, b: any) => (a.id === listaTienda.id ? -1 : b.id === listaTienda.id ? 1 : 0)
         || (a.orden ?? 0) - (b.orden ?? 0) || (a.numero ?? 0) - (b.numero ?? 0) || a.id - b.id);
@@ -355,16 +420,15 @@ export class TiendaService {
     /*
      * EL PRECIO MINORISTA, PARA DECIR CUÁNTO SE AHORRA (3/10/2026, pedido del
      * dueño): la lista base de la caja —el precio de mostrador—, la misma regla
-     * que el catálogo del POS. Solo si es de otra modalidad que la tienda (si la
-     * base fuera la mayorista, no hay contra qué comparar).
+     * que el catálogo del POS. Solo en el modo mayorista y si es de otra
+     * modalidad que la tienda (si la base fuera la mayorista, no hay contra qué comparar).
      */
-    const listaMinorista = activas.find((l: any) => l.id === cfg.listaBaseId) ?? activas[0] ?? null;
-    const comparaMinorista = !!listaMinorista && listaMinorista.modalidadId !== listaTienda.modalidadId;
+    const comparaMinorista = !minorista && !!listaBase && listaBase.modalidadId !== listaTienda.modalidadId;
     const filaMinoristaProducto = new Map<number, any>();
     const filaMinoristaPres = new Map<number, any>();
     if (comparaMinorista) {
       for (const f of filas) {
-        if (f.listaId !== listaMinorista.id) continue;
+        if (f.listaId !== listaBase.id) continue;
         if (f.presentacionId == null) filaMinoristaProducto.set(f.productoId, f);
         else filaMinoristaPres.set(f.presentacionId, f);
       }
@@ -503,7 +567,7 @@ export class TiendaService {
               kgPorUnidad: f.n, paquetesPorUnidad: f.n, unidadesStock: f.n,
               grupo: 'e', grupoEtiqueta: formasE.length === 1 ? forma : '', forma,
               precio: f.pv.finalFormato, precioKg: cu, precioPaquete: cu, ahorroPct: pct >= 1 ? pct : 0,
-              unidadesMinimas: (Number(f.fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(f.fila.unidadesMinimas) / f.n - 1e-9) : 0,
+              unidadesMinimas: minimo((Number(f.fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(f.fila.unidadesMinimas) / f.n - 1e-9) : 0),
               enStock: sinTope || (disponible ?? 0) >= 1,
               disponible,
               oferta: ofertaDe(null, f.pv.finalUnitario, f.n),
@@ -536,7 +600,7 @@ export class TiendaService {
           unidad: 'u',
           precio: pv.finalUnitario,
           /** Mínimo de compra PROPIO del producto (0 = sin mínimo). */
-          unidadesMinimas: filaTienda.unidadesMinimas || 0,
+          unidadesMinimas: minimo(filaTienda.unidadesMinimas || 0),
           enStock: disponibleWeb,
           disponible: disponibleParaWeb,
           oferta: ofertaDe(null, pv.finalUnitario, 1),
@@ -576,6 +640,9 @@ export class TiendaService {
         for (const { fila, lista } of filasGranelProducto.get(p.id) ?? []) {
           const kgBolsa = r3(Number(fila.unidades) || 1);
           if (!(kgBolsa > 0) || vistos.has(kgBolsa)) continue;
+          /* Minorista: la fila de mostrador que vende «por 1» es el granel SUELTO,
+           * por kilo, que el sitio no vende; la bolsa cerrada es la que vende por N kg. */
+          if (minorista && kgBolsa <= 1) continue;
           const pv = precioVentaFila(costoNeto, fila, opts);
           if (!(pv.finalUnitario > 0)) continue;
           vistos.add(kgBolsa);
@@ -589,7 +656,7 @@ export class TiendaService {
             /** Lo que se cobra por bolsa, y el kilo de referencia. */
             precio: pv.finalFormato, precioKg: pv.finalUnitario, precioPaquete: pv.finalFormato, ahorroPct: 0,
             /** El mínimo del formato viene en kilos: en bolsas, redondeado para arriba. */
-            unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / kgBolsa - 1e-9) : 0,
+            unidadesMinimas: minimo((Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / kgBolsa - 1e-9) : 0),
             enStock: sinTope || (disponible ?? 0) >= 1,
             disponible,
             oferta: ofertaDe(null, pv.finalUnitario, kgBolsa),
@@ -621,7 +688,7 @@ export class TiendaService {
             grupo: `s${pres.id}`, grupoEtiqueta: tam, forma: porCaja > 1 ? bolsaN : 'Por unidad',
             precio: pv.finalFormato, precioKg: money(pv.finalFormato / (pres.tamKg * porCaja)),
             precioPaquete: money(pv.finalFormato / porCaja),
-            unidadesMinimas: (Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0,
+            unidadesMinimas: minimo((Number(fila.unidadesMinimas) || 0) > 0 ? Math.ceil(Number(fila.unidadesMinimas) / porCaja - 1e-9) : 0),
             enStock: sinTope || (disponible ?? 0) >= 1,
             disponible,
             oferta: ofertaDe(pres.id, pv.finalUnitario, porCaja),
@@ -712,18 +779,9 @@ export class TiendaService {
     const porNombre = (a: any, b: any) => a.nombre.localeCompare(b.nombre, 'es');
 
     const publico = {
-      sucursalId: suc?.id ?? null,
+      ...comun,
       listaId: listaTienda.id,
       listaNombre: listaTienda.nombre,
-      /** 0 = sin mínimo por monto configurado (solo rigen los de marca/producto, si hay). */
-      montoMinimo: Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0,
-      /** Piso EXTRA si la entrega es el envío sin costo (la camioneta; 0 = sin piso). */
-      montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
-      /** El envío sin costo se ofrece (Ventas › Configuración › Tienda online). */
-      envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
-      /** Catálogo sin fotos: la tienda lista los productos en vez de mostrar tarjetas. */
-      vistaLista: cfg.tiendaVistaLista === true,
-      presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
       categorias: [...catMap.values()].sort(porNombre)
         .map((c) => ({ ...c, imagenUrl: urlImagen('categoria', c.id) })),
       /** Las subcategorías con productos publicados, con su categoría: el menú las cuelga debajo de cada una. */
@@ -732,11 +790,7 @@ export class TiendaService {
       marcas: [...marcaMap.values()].sort(porNombre)
         .map((m) => ({ ...m, imagenUrl: urlImagen('marca', m.id) })),
       etiquetas: [...etiqMap.values()].sort(porNombre),
-      reglasMarca: (cat.reglasMarca ?? [])
-        .filter((r: any) => r.activa && r.unidadesMinimas > 0)
-        .map((r: any) => ({ marcaId: r.marcaId, marca: r.marca, unidadesMinimas: r.unidadesMinimas })),
       items,
-      sitio,
     };
     return { catalogo: publico, pozos, listaDeOpcion };
   }
@@ -776,27 +830,14 @@ export class TiendaService {
   }
 
   /**
-   * Alta de un pedido del sitio. Recotiza TODO server-side (nunca confía en lo
-   * que mandó el navegador), valida el mínimo de compra y crea el presupuesto.
+   * EL CARRITO, COTIZADO POR EL SERVIDOR (nunca confía en lo que mandó el
+   * navegador): resuelve cada renglón contra el catálogo del modo, valida el
+   * stock por opción y entre opciones del mismo granel, y arma los renglones
+   * del presupuesto. Lo comparten los dos modos; los mínimos y el envío sin
+   * costo son del mayorista y van en `pedido`.
    */
-  async pedido(dto: any, token?: string) {
-    /* Compra solo el habilitado (0155): quién es sale de la SESIÓN, no del body. */
-    const s = await this.accesos.sesion(token);
-    if (!s) throw new UnauthorizedException('Para comprar, ingresá con tu DNI.');
-    const carritoIn: any[] = Array.isArray(dto?.items) ? dto.items : [];
+  private async cotizar(modo: Modo, carritoIn: any[]) {
     if (!carritoIn.length) throw new BadRequestException('El carrito está vacío.');
-
-    /* El WhatsApp de ESTE pedido (puede cambiarlo; su acceso no se toca). Área + abonado = 10 dígitos. */
-    const telCrudo = String(dto?.cliente?.telefono ?? '').trim();
-    const telefono = telCrudo ? telefonoArgentino(telCrudo) : s.whatsapp;
-    if (!telefono) {
-      throw new BadRequestException('El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
-    }
-
-    const entrega: EntregaTienda = ENTREGAS_TIENDA.includes(dto?.entrega) ? dto.entrega : 'retiro';
-    // Se valida ANTES de cotizar: si falta la dirección no hay para qué tocar el catálogo.
-    const domicilio = direccionDeEntrega(entrega, dto?.direccion);
-
     /*
      * El techo va ANTES de tocar la base: el body admite 4 MB, y con
      * `{"productoId":1,"cantidad":1}` repetido eso son ~110.000 renglones
@@ -806,8 +847,7 @@ export class TiendaService {
     if (carritoIn.length > MAX_RENGLONES_PEDIDO) {
       throw new BadRequestException(`Un pedido no puede tener más de ${MAX_RENGLONES_PEDIDO} renglones.`);
     }
-
-    const { catalogo: cat, pozos, listaDeOpcion } = await this.armarCatalogo();
+    const { catalogo: cat, pozos, listaDeOpcion } = await this.armado(modo);
     const porId = new Map<number, any>(cat.items.map((i: any): [number, any] => [i.id, i]));
 
     /*
@@ -920,6 +960,59 @@ export class TiendaService {
     const precioEfectivo = (r: Renglon) => de(r).oferta?.precioOferta ?? de(r).precio;
     const total = resueltos.reduce((a, r) => a + r.cantidad * precioEfectivo(r), 0);
 
+    /*
+     * EL RENGLÓN DEL PEDIDO, EN LA UNIDAD DEL STOCK: la bolsa viaja en KILOS
+     * (2 bolsas de 10 kg = 20 kg del producto, a precio por kilo) y el paquete
+     * en PAQUETES (una caja de 6 = 6 paquetes, a precio por paquete). Así la
+     * reserva, el fraccionado al confirmar y el cierre en la caja trabajan con
+     * lo que ya conocen. El presupuesto guarda el NETO por unidad y el
+     * descuento como PORCENTAJE (una oferta 'porcentaje' queda auditada como tal).
+     */
+    const items = resueltos.map((r) => {
+      const iva = r.prod.iva ?? 21;
+      const x = de(r);
+      const unidadesStock = r.v ? (r.v.unidadesStock ?? (r.v.presentacionId == null ? r.v.kgPorUnidad : (r.v.paquetesPorUnidad || 1))) : 1;
+      const esPorcentaje = x.oferta?.tipo === 'porcentaje' && x.oferta.precioOferta != null;
+      const precioCompra = esPorcentaje ? x.precio : precioEfectivo(r);
+      const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio)) : 0;
+      /* La lista de la opción (la caja de 5 puede ser Mayorista 2): con esa se cotizó y con esa cierra la caja. */
+      const lista = listaDeOpcion.get(`${r.prod.id}:${r.v ? r.v.clave : ''}`) ?? null;
+      return {
+        productoId: r.prod.id, presentacionId: r.v?.presentacionId ?? null,
+        nombre: r.prod.nombre,
+        detalle: r.v ? r.v.etiqueta : 'Unidad',
+        cantidad: r3(r.cantidad * unidadesStock),
+        /* Sin cortar a 2 decimales: el total del presupuesto se suma con este número y
+         * tiene que dar EXACTO lo que el cliente vio (la caja de 6 daba 2 centavos menos). */
+        precioLista: Math.round((precioCompra / unidadesStock / (1 + iva / 100)) * 1e6) / 1e6,
+        descuento, iva, lista: lista?.nombre ?? cat.listaNombre, listaId: lista?.id ?? cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
+      };
+    });
+    return { cat, resueltos, de, nombreDe, total, items };
+  }
+
+  /**
+   * Alta de un pedido MAYORISTA. Recotiza TODO server-side, valida el mínimo
+   * de compra y el envío sin costo, y crea el presupuesto.
+   */
+  async pedido(dto: any, token?: string) {
+    /* Compra solo el habilitado (0155): quién es sale de la SESIÓN, no del body. */
+    const s = await this.accesos.sesion(token);
+    if (!s) throw new UnauthorizedException('Para comprar, ingresá con tu DNI.');
+
+    /* El WhatsApp de ESTE pedido (puede cambiarlo; su acceso no se toca). Área + abonado = 10 dígitos. */
+    const telCrudo = String(dto?.cliente?.telefono ?? '').trim();
+    const telefono = telCrudo ? telefonoArgentino(telCrudo) : s.whatsapp;
+    if (!telefono) {
+      throw new BadRequestException('El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
+    }
+
+    const entrega: EntregaTienda = ENTREGAS_TIENDA.includes(dto?.entrega) ? dto.entrega : 'retiro';
+    // Se valida ANTES de cotizar: si falta la dirección no hay para qué tocar el catálogo.
+    const domicilio = direccionDeEntrega(entrega, dto?.direccion);
+
+    const { cat, resueltos, de, nombreDe, total, items } = await this.cotizar('mayorista', Array.isArray(dto?.items) ? dto.items : []);
+
     // Gate de compra mínima: por MONTO o por CANTIDAD (marca / producto) — no
     // cambia el precio, solo habilita finalizar el pedido (igual que el sitio real).
     // Las cantidades se cuentan en unidades de compra: bolsas, paquetes, cajas o unidades.
@@ -963,39 +1056,10 @@ export class TiendaService {
       );
     }
 
-    /*
-     * EL RENGLÓN DEL PEDIDO, EN LA UNIDAD DEL STOCK: la bolsa viaja en KILOS
-     * (2 bolsas de 10 kg = 20 kg del producto, a precio por kilo) y el paquete
-     * en PAQUETES (una caja de 6 = 6 paquetes, a precio por paquete). Así la
-     * reserva, el fraccionado al confirmar y el cierre en la caja trabajan con
-     * lo que ya conocen. El presupuesto guarda el NETO por unidad y el
-     * descuento como PORCENTAJE (una oferta 'porcentaje' queda auditada como tal).
-     */
-    const items = resueltos.map((r) => {
-      const iva = r.prod.iva ?? 21;
-      const x = de(r);
-      const unidadesStock = r.v ? (r.v.unidadesStock ?? (r.v.presentacionId == null ? r.v.kgPorUnidad : (r.v.paquetesPorUnidad || 1))) : 1;
-      const esPorcentaje = x.oferta?.tipo === 'porcentaje' && x.oferta.precioOferta != null;
-      const precioCompra = esPorcentaje ? x.precio : precioEfectivo(r);
-      const descuento = esPorcentaje ? money(100 * (1 - x.oferta.precioOferta / x.precio)) : 0;
-      /* La lista de la opción (la caja de 5 puede ser Mayorista 2): con esa se cotizó y con esa cierra la caja. */
-      const lista = listaDeOpcion.get(`${r.prod.id}:${r.v ? r.v.clave : ''}`) ?? null;
-      return {
-        productoId: r.prod.id, presentacionId: r.v?.presentacionId ?? null,
-        nombre: r.prod.nombre,
-        detalle: r.v ? r.v.etiqueta : 'Unidad',
-        cantidad: r3(r.cantidad * unidadesStock),
-        /* Sin cortar a 2 decimales: el total del presupuesto se suma con este número y
-         * tiene que dar EXACTO lo que el cliente vio (la caja de 6 daba 2 centavos menos). */
-        precioLista: Math.round((precioCompra / unidadesStock / (1 + iva / 100)) * 1e6) / 1e6,
-        descuento, iva, lista: lista?.nombre ?? cat.listaNombre, listaId: lista?.id ?? cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
-      };
-    });
-
     /* El cliente es el de su acceso (su ficha se creó al habilitarlo y NO se toca): el WhatsApp
      * y la dirección de este pedido viajan en `webCliente`, que es lo que muestra la orden. */
     return this.presupuestos.crearDesdeWeb({
-      clienteId: s.clienteId, sucursalId: cat.sucursalId,
+      clienteId: s.clienteId, sucursalId: cat.sucursalId, modoTienda: 'mayorista',
       // Topes de largo del lado del servidor: el `maxLength` del checkout vive
       // en el navegador y no protege al `POST` directo. Un pedido con 3 MB de
       // texto en observaciones vuelve inusable la bandeja de Órdenes al pintarla.
@@ -1009,10 +1073,68 @@ export class TiendaService {
       items,
     });
   }
+
+  /* ============================ MODO MINORISTA (0173) ============================ */
+
+  /**
+   * El comprador minorista por su teléfono (10 dígitos): nombre, apellido y
+   * dirección guardados en su último pedido, para que no los escriba de nuevo.
+   * Sin pedidos anteriores, `null`.
+   */
+  async buscarComprador(dto: any) {
+    const telefono = telefonoArgentino(String(dto?.telefono ?? ''));
+    if (!telefono) throw new BadRequestException('El WhatsApp va con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
+    const [c] = await this.db.select({
+      nombre: tiendaCompradores.nombre, apellido: tiendaCompradores.apellido, direccion: tiendaCompradores.direccion,
+      localidad: tiendaCompradores.localidad, referencia: tiendaCompradores.referencia,
+    }).from(tiendaCompradores).where(eq(tiendaCompradores.telefono, telefono)).limit(1);
+    return { comprador: c ?? null };
+  }
+
+  /**
+   * Alta de un pedido MINORISTA: sin sesión ni aprobación, sin mínimos. Quién
+   * compra viene en el body (teléfono, nombre, apellido); el envío a domicilio
+   * es gratis desde el monto configurado y si no, se coordina. El comprador
+   * queda guardado por su teléfono con lo último que escribió.
+   */
+  async pedidoMinorista(dto: any) {
+    if ((await this.modoVigente('minorista')) !== 'minorista') {
+      throw new BadRequestException('La compra minorista no está disponible por ahora.');
+    }
+    const telefono = telefonoArgentino(String(dto?.telefono ?? ''));
+    if (!telefono) {
+      throw new BadRequestException('El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
+    }
+    const nombre = String(dto?.nombre ?? '').trim().slice(0, MAX_NOMBRE);
+    const apellido = String(dto?.apellido ?? '').trim().slice(0, MAX_NOMBRE);
+    if (nombre.length < 2 || apellido.length < 2) throw new BadRequestException('Escribí tu nombre y tu apellido.');
+
+    const entrega = ENTREGAS_MINORISTA[String(dto?.entrega ?? '')] ?? 'retiro';
+    const domicilio = direccionDeEntrega(entrega, dto?.direccion);
+
+    const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
+    const envioGratis = entrega === 'cadete' && cat.envioGratisDesde > 0 && total >= cat.envioGratisDesde;
+
+    return this.db.transaction(async (tx) => {
+      /* Lo último que escribió manda; con retiro no hay dirección y la guardada no se pisa. */
+      const datos = { nombre, apellido, ...(domicilio ?? {}) };
+      await tx.insert(tiendaCompradores).values({ telefono, ...datos, pedidos: 1 })
+        .onConflictDoUpdate({
+          target: tiendaCompradores.telefono,
+          set: { ...datos, pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date() },
+        });
+      return this.presupuestos.crearDesdeWeb({
+        clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
+        entrega, observaciones: String(dto?.observaciones ?? '').slice(0, 500),
+        webCliente: { nombre, apellido, telefono, dni: '', ...(domicilio ?? {}), ...(envioGratis ? { envioGratis: true } : {}) },
+        items,
+      }, tx);
+    });
+  }
 }
 
 /**
- * Los CUATRO endpoints públicos del sistema — los únicos pensados para recibir
+ * Los endpoints públicos del sistema — los únicos pensados para recibir
  * internet directo. Cada uno con su cupo por IP (ver rate-limit.guard.ts);
  * el resto de la API no se limita: el ERP le pega todo el día desde la red local.
  */
@@ -1022,13 +1144,23 @@ export class TiendaService {
 export class TiendaController {
   constructor(private readonly svc: TiendaService, private readonly accesos: AccesosTiendaService) {}
 
+  /** `?modo=minorista` pide el catálogo minorista (0173); cualquier otra cosa, el mayorista. */
   @Get('catalogo')
   @RateLimit('catalogo')
-  catalogo(@Headers(SESION) token?: string) { return this.svc.catalogo(token); }
+  catalogo(@Query('modo') modo?: string, @Headers(SESION) token?: string) { return this.svc.catalogo(token, modo); }
 
   @Post('pedidos')
   @RateLimit('pedidos')
   pedido(@Body() body: any, @Headers(SESION) token?: string) { return this.svc.pedido(body ?? {}, token); }
+
+  /* Modo minorista (0173). POST y no GET: el teléfono no queda escrito en la dirección ni en los registros. */
+  @Post('minorista/comprador')
+  @RateLimit('comprador')
+  comprador(@Body() body: any) { return this.svc.buscarComprador(body ?? {}); }
+
+  @Post('minorista/pedidos')
+  @RateLimit('pedidos')
+  pedidoMinorista(@Body() body: any) { return this.svc.pedidoMinorista(body ?? {}); }
 
   /* Ingreso a la tienda (0155). POST y no GET: el DNI no queda escrito en la dirección ni en los registros. */
   @Post('registro')
