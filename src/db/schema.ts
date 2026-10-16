@@ -1320,13 +1320,13 @@ export const fraccionPedidos = pgTable('fraccion_pedidos', {
   sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
   /** 0170: lo pide la caja (`caja`) o es la lista propia de la Distribuidora. */
   origen: text('origen').$type<'distribuidora' | 'caja'>().notNull().default('distribuidora'),
-  /** `armando` y `rechazado` son solo de la caja (0170). */
-  estado: text('estado').$type<'pendiente' | 'armando' | 'hecho' | 'rechazado'>().notNull().default('pendiente'),
+  /** `armando`, `rechazado` y `cancelado` (0171) son solo de la caja (0170). */
+  estado: text('estado').$type<'pendiente' | 'armando' | 'hecho' | 'rechazado' | 'cancelado'>().notNull().default('pendiente'),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
-  /** Cuándo y quién lo cerró: hecho o, en la caja, rechazado. */
+  /** Cuándo y quién lo cerró: hecho o, en la caja, rechazado o cancelado. */
   hechoEn: timestamp('hecho_en', { withTimezone: true }),
   hechoPor: integer('hecho_por').references(() => usuarios.id, { onDelete: 'set null' }),
   fraccionamientoId: integer('fraccionamiento_id').references(() => fraccionamientos.id, { onDelete: 'set null' }),
@@ -1349,6 +1349,8 @@ export const fraccionPedidoItems = pgTable('fraccion_pedido_items', {
   presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
   tamKg: doublePrecision('tam_kg').notNull(),
   paquetes: integer('paquetes').notNull(),
+  /** 0171: la caja canceló este renglón (no se borra: queda en el registro y «Listo» no lo arma). */
+  canceladoEn: timestamp('cancelado_en', { withTimezone: true }),
 }, (t) => ({
   ixPedido: index('ix_fracc_pedido_items_pedido').on(t.pedidoId),
 }));

@@ -15,6 +15,8 @@
  *   · HECHO: «Listo» registra el fraccionado con ese operador, todo junto.
  *   · RECHAZADO: «No se puede», con el motivo. El cajero ve cómo terminó hasta
  *     que lo marca visto.
+ *   · CANCELADO (0171): el cajero que lo pidió lo cancela entero o por renglón
+ *     mientras no esté cerrado; lo cancelado queda marcado, no se borra.
  *
  * Lo fraccionado de verdad se lee del registro, no se copia. Solo existen en
  * la Distribuidora: la sucursal la pone el servidor.
@@ -27,7 +29,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize, ArrayNotEmpty, IsArray, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -40,6 +42,8 @@ import { InventarioService } from './inventario.service';
 const HECHOS_A_LA_VISTA = 30;
 /** El historial de la caja trae a lo sumo esto por consulta. */
 const HISTORIAL_MAX = 500;
+/** Cuánto sigue en el aviso de fraccionado lo que la caja canceló mientras se armaba. */
+const CANCELADO_A_LA_VISTA = '3 minutes';
 const FECHA = /^\d{4}-\d{2}-\d{2}$/;
 
 class RenglonPedidoDto {
@@ -56,6 +60,11 @@ class PedidoFraccionDto {
 
 class TomarDto {
   @IsOptional() @IsInt() operadorId?: number;
+}
+
+class CancelarDto {
+  /** Sin renglón: el pedido entero. */
+  @IsOptional() @IsInt() itemId?: number;
 }
 
 class RechazarDto {
@@ -82,7 +91,8 @@ export class PedidosFraccionService {
   /**
    * Las cabeceras (filas crudas de `fraccion_pedidos`) con sus renglones, los
    * nombres de quién pidió, tomó y cerró, el operador y, en los hechos, cuánto
-   * se fraccionó de cada renglón.
+   * se fraccionó de cada renglón. Lo que la caja canceló (0171) va aparte, en
+   * `cancelados`: no cuenta en los totales ni se arma.
    */
   private async armar(cab: any[]) {
     if (!cab.length) return [];
@@ -94,7 +104,7 @@ export class PedidosFraccionService {
       this.db.select({
         id: fraccionPedidoItems.id, pedidoId: fraccionPedidoItems.pedidoId, productoId: fraccionPedidoItems.productoId,
         presentacionId: fraccionPedidoItems.presentacionId, tamKg: fraccionPedidoItems.tamKg, paquetes: fraccionPedidoItems.paquetes,
-        nombre: productos.nombre,
+        canceladoEn: fraccionPedidoItems.canceladoEn, nombre: productos.nombre,
       }).from(fraccionPedidoItems).innerJoin(productos, eq(productos.id, fraccionPedidoItems.productoId))
         .where(inArray(fraccionPedidoItems.pedidoId, ids)).orderBy(productos.nombre, desc(fraccionPedidoItems.tamKg)),
       regs.length
@@ -116,7 +126,7 @@ export class PedidosFraccionService {
     const fraccionado = new Map<string, number>();
     for (const x of ((hecho as any).rows ?? hecho) as any[]) fraccionado.set(`${x.reg}:${x.p}:${x.pr}`, Number(x.n));
     return cab.map((c) => {
-      const suyos = items.filter((it) => it.pedidoId === c.id).map((it) => ({
+      const suyos = items.filter((it) => it.pedidoId === c.id && !it.canceladoEn).map((it) => ({
         ...it,
         fraccionados: c.estado === 'hecho' ? (fraccionado.get(`${c.fraccionamiento_id}:${it.productoId}:${it.presentacionId}`) ?? 0) : null,
       }));
@@ -128,6 +138,7 @@ export class PedidosFraccionService {
         operadorId: c.operador_id, operador: nombreOp.get(c.operador_id) ?? null,
         motivo: c.motivo, vistoEn: c.visto_en,
         items: suyos,
+        cancelados: items.filter((it) => it.pedidoId === c.id && it.canceladoEn),
         paquetes: suyos.reduce((a, it) => a + it.paquetes, 0),
         kg: Math.round(suyos.reduce((a, it) => a + it.paquetes * it.tamKg, 0) * 1000) / 1000,
       };
@@ -224,15 +235,19 @@ export class PedidosFraccionService {
   }
 
   /**
-   * Lo que fraccionado tiene que atender (el aviso): pendientes y armándose.
-   * Fuera de la Distribuidora no aplica y el ERP deja de preguntar.
+   * Lo que fraccionado tiene que atender (el aviso): pendientes y armándose, y
+   * por unos minutos lo que la caja canceló cuando ya lo estaban armando (0171:
+   * para que no lo terminen). Fuera de la Distribuidora no aplica y el ERP deja
+   * de preguntar.
    */
   async abiertos(sesion: Sesion) {
     const dist = await this.distribuidora();
     if (sesion.sucursalId !== dist.id) return { aplica: false, pedidos: [] };
     const cab = await this.filas(sql`
       SELECT * FROM fraccion_pedidos
-       WHERE sucursal_id = ${dist.id} AND origen = 'caja' AND estado IN ('pendiente', 'armando')
+       WHERE sucursal_id = ${dist.id} AND origen = 'caja'
+         AND (estado IN ('pendiente', 'armando')
+              OR (estado = 'cancelado' AND tomado_en IS NOT NULL AND hecho_en > now() - ${CANCELADO_A_LA_VISTA}::interval))
        ORDER BY creado_en`);
     return { aplica: true, pedidos: await this.armar(cab) };
   }
@@ -259,7 +274,8 @@ export class PedidosFraccionService {
           : [];
         throw new BadRequestException(`${codigo} ya lo está armando ${op?.nombre ?? 'otro'}.`);
       }
-      throw new BadRequestException(c.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.` : `${codigo} ya está cerrado.`);
+      throw new BadRequestException(c.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.`
+        : c.estado === 'cancelado' ? `${codigo} lo canceló la caja.` : `${codigo} ya está cerrado.`);
     }
     return c;
   }
@@ -278,20 +294,16 @@ export class PedidosFraccionService {
 
   /**
    * «Listo»: registra el fraccionado de lo pedido con su operador. El registro
-   * toma el candado del pedido y lo cierra en la misma transacción que mueve el
-   * stock: si no alcanza el granel no se mueve nada y el pedido sigue armándose.
+   * toma el candado del pedido, lee sus renglones vivos (lo cancelado no se
+   * arma) y lo cierra en la misma transacción que mueve el stock: si no
+   * alcanza el granel no se mueve nada y el pedido sigue armándose.
    */
   async listo(id: number, usuarioId: number | null) {
     const [c] = await this.db.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, id)).limit(1);
     if (!c || c.origen !== 'caja') throw new NotFoundException('Ese pedido de la caja no existe: actualizá la pantalla.');
-    const items = await this.db.select().from(fraccionPedidoItems).where(eq(fraccionPedidoItems.pedidoId, id));
-    if (items.some((it) => it.presentacionId == null)) {
-      throw new BadRequestException('Uno de los paquetes pedidos ya no existe: marcalo como «No se puede».');
-    }
     return this.inv.opFraccionarRegistro({
       sucursalId: c.sucursalId, usuarioId: usuarioId ?? undefined, operadorId: c.operadorId ?? undefined, pedidoId: id,
       motivo: `Pedido de la caja ${codigoPedidoFraccion(id)}`,
-      items: items.map((it) => ({ productoId: it.productoId, presId: it.presentacionId!, cant: it.paquetes })),
     });
   }
 
@@ -306,6 +318,38 @@ export class PedidosFraccionService {
       }).where(eq(fraccionPedidos.id, id));
     });
     return { ok: true };
+  }
+
+  /**
+   * CANCELAR (0171): el cajero que lo pidió saca un renglón (`itemId`) o el
+   * pedido entero, mientras no esté cerrado. Nada se borra: el renglón queda
+   * con `cancelado_en`; sin renglones vivos, el pedido pasa a `cancelado` y ya
+   * queda visto para el cajero (lo hizo él). Si lo estaban armando, el aviso
+   * de fraccionado lo muestra unos minutos para que no lo terminen.
+   */
+  async cancelar(id: number, itemId: number | undefined, usuarioId: number) {
+    return this.db.transaction(async (tx) => {
+      const c = await this.deCaja(tx, id, ['pendiente', 'armando']);
+      if (c.usuarioId !== usuarioId) throw new ForbiddenException('Lo cancela el cajero que lo pidió.');
+      const ahora = new Date();
+      const vivos = and(eq(fraccionPedidoItems.pedidoId, id), isNull(fraccionPedidoItems.canceladoEn));
+      if (itemId) {
+        const [it] = await tx.update(fraccionPedidoItems).set({ canceladoEn: ahora })
+          .where(and(vivos, eq(fraccionPedidoItems.id, itemId))).returning({ id: fraccionPedidoItems.id });
+        if (!it) throw new BadRequestException('Ese renglón ya no está en el pedido: actualizá la pantalla.');
+        const [queda] = await tx.select({ id: fraccionPedidoItems.id }).from(fraccionPedidoItems).where(vivos).limit(1);
+        if (queda) {
+          await tx.update(fraccionPedidos).set({ actualizadoEn: ahora }).where(eq(fraccionPedidos.id, id));
+          return { ok: true, pedidoCancelado: false };
+        }
+      } else {
+        await tx.update(fraccionPedidoItems).set({ canceladoEn: ahora }).where(vivos);
+      }
+      await tx.update(fraccionPedidos).set({
+        estado: 'cancelado', motivo: 'Cancelado por la caja', hechoEn: ahora, hechoPor: usuarioId, vistoEn: ahora, actualizadoEn: ahora,
+      }).where(eq(fraccionPedidos.id, id));
+      return { ok: true, pedidoCancelado: true };
+    });
   }
 
   /** El cajero ya vio cómo terminó: se le deja de mostrar. Solo los suyos. */
@@ -375,6 +419,11 @@ export class PedidosCajaController {
 
   @Post(':id/visto') @Permiso('ventas.pos')
   visto(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.visto(id, sesion.usuarioId); }
+
+  @Post(':id/cancelar') @Permiso('ventas.pos')
+  cancelar(@Param('id', ParseIntPipe) id: number, @Body() dto: CancelarDto, @Auth() sesion: Sesion) {
+    return this.svc.cancelar(id, dto.itemId, sesion.usuarioId);
+  }
 
   @Get('abiertos') @Permiso('fraccionar')
   abiertos(@Auth() sesion: Sesion) { return this.svc.abiertos(sesion); }

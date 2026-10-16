@@ -9,7 +9,7 @@ import {
   comprobantes, facturaLecturas, pedidosCafeteria, vencimientos, enviosCafeteria, envioCafeteriaItems,
   marcas, categorias, subcategorias, etiquetas, productoEtiquetas,
   conteos, conteoItems, ventas, clientes,
-  fraccionOperadores, fraccionamientos, fraccionamientoItems, fraccionPedidos,
+  fraccionOperadores, fraccionamientos, fraccionamientoItems, fraccionPedidos, fraccionPedidoItems,
 } from '../db/schema';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
@@ -784,18 +784,19 @@ export class InventarioService {
   async opFraccionarRegistro(o: {
     sucursalId: number; usuarioId?: number; operadorId?: number; motivo?: string;
     dia?: string; turno?: 'manana' | 'tarde'; pedidoId?: number;
-    items: { productoId: number; presId: number; cant: number }[];
+    /** Sin renglones y con `pedidoId` (el «Listo» de la caja): los renglones vivos del pedido, leídos con su candado. */
+    items?: { productoId: number; presId: number; cant: number }[];
   }) {
     // Antes de abrir la transacción: una fecha imposible no toca nada.
     const momento = this.momentoDeFraccionado(o.dia, o.turno);
     return this.db.transaction(async (tx) => {
       const sucId = o.sucursalId;
       // Primero el candado del pedido: dos cargas del mismo pedido, una sola pasa.
-      if (o.pedidoId) await this.pedidoFraccionPendiente(tx, o.pedidoId, sucId);
+      const delPedido = o.pedidoId ? await this.pedidoFraccionPendiente(tx, o.pedidoId, sucId, !o.items) : [];
       /* Renglones agrupados por producto y tamaño: el mismo paquete cargado
        * dos veces suma, no se registra dos veces. */
       const porProducto = new Map<number, Map<number, number>>();
-      for (const it of o.items || []) {
+      for (const it of o.items ?? delPedido) {
         const q = Math.round(Number(it.cant) || 0);
         if (!(q > 0)) continue;
         const pid = Number(it.productoId);
@@ -870,16 +871,26 @@ export class InventarioService {
    * `pendiente` en la lista de la Distribuidora y `armando` en el de la caja
    * (0170: alguien ya lo tomó). Lo que se registra puede diferir de lo pedido
    * (se hizo lo que alcanzó): el pedido se cierra igual y la diferencia se lee
-   * del registro.
+   * del registro. Con `conRenglones` devuelve sus renglones vivos (el «Listo»
+   * de la caja, que registra lo pedido).
    */
-  private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number) {
+  private async pedidoFraccionPendiente(tx: any, pedidoId: number, sucursalId: number, conRenglones: boolean) {
     const [p] = await tx.select().from(fraccionPedidos).where(eq(fraccionPedidos.id, pedidoId)).limit(1).for('update');
     const codigo = `PF${String(pedidoId).padStart(4, '0')}`;
     if (!p) throw new BadRequestException('Ese pedido de fraccionado ya no existe: actualizá la pantalla.');
     if (p.estado !== (p.origen === 'caja' ? 'armando' : 'pendiente')) {
-      throw new BadRequestException(p.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.` : `${codigo} ya está cerrado.`);
+      throw new BadRequestException(p.estado === 'pendiente' ? `${codigo} todavía no lo tomó nadie.`
+        : p.estado === 'cancelado' ? `${codigo} lo canceló la caja: no lo armes.` : `${codigo} ya está cerrado.`);
     }
     if (p.sucursalId !== sucursalId) throw new BadRequestException(`${codigo} es de la Distribuidora: cargalo entrando con esa sucursal.`);
+    if (!conRenglones) return [];
+    // Los renglones vivos, ya con el candado: lo que la caja canceló (0171) no se arma.
+    const vivos = await tx.select().from(fraccionPedidoItems)
+      .where(and(eq(fraccionPedidoItems.pedidoId, pedidoId), isNull(fraccionPedidoItems.canceladoEn)));
+    if (vivos.some((it: any) => it.presentacionId == null)) {
+      throw new BadRequestException(`Uno de los paquetes de ${codigo} ya no existe: marcalo como «No se puede».`);
+    }
+    return vivos.map((it: any) => ({ productoId: it.productoId, presId: it.presentacionId, cant: it.paquetes }));
   }
 
   /**

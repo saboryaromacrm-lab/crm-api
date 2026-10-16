@@ -1198,6 +1198,13 @@
       "when": 1791776700000,
       "tag": "0170_pedidos_fraccion_caja",
       "breakpoints": true
+    },
+    {
+      "idx": 171,
+      "version": "7",
+      "when": 1791863100000,
+      "tag": "0171_pedidos_caja_cancelar",
+      "breakpoints": true
     }
   ]
 }
