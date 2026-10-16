@@ -97,6 +97,14 @@ function contarBilletes(billetesIn: unknown, otrosIn: unknown) {
   if (otros < 0 || otros > MAX_IMPORTE) throw new BadRequestException('Las monedas y otros no son un importe válido.');
   return { billetes, otros, contado: money(suma + otros) };
 }
+/**
+ * UN DEPÓSITO SE PUEDE APLICAR A UN PROVEEDOR (16/10/2026, pedido del dueño).
+ * Se reconoce por el nombre del concepto (decisión del dueño): todo concepto de
+ * egreso que diga «depósito», con o sin tilde.
+ */
+export const esConceptoDeposito = (nombre: unknown) =>
+  String(nombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().includes('deposito');
+
 const TIPOS = ['ingreso', 'egreso'] as const;
 const CLASES = ['gasto', 'movimiento'] as const;
 /** Más de esto abierta, la caja de un local se avisa como olvidada. */
@@ -160,7 +168,29 @@ class PagoProveedorDto {
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
   @IsOptional() @IsString() fecha?: string;
+  /** El depósito cargado desde «Sacar plata» (16/10/2026): el egreso queda con su concepto. */
+  @IsOptional() @IsInt() conceptoId?: number;
   @IsBoolean() confirmado!: boolean;
+}
+/** Un depósito ya cargado que se aplica a un proveedor: el importe y la fecha son los del depósito. */
+class AplicarDepositoDto {
+  @IsInt() proveedorId!: number;
+  @IsIn(['mercaderia', 'gastos']) destino!: 'mercaderia' | 'gastos';
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionCfDto) imputaciones?: ImputacionCfDto[];
+  @IsOptional() @IsString() @MaxLength(200) referencia?: string;
+  @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  @IsBoolean() confirmado!: boolean;
+}
+/** Las imputaciones del pago: solo las del destino elegido y con importe; nunca más que el pago. */
+function imputacionesDe(dto: { destino: 'mercaderia' | 'gastos'; imputaciones?: ImputacionCfDto[] }, importe: number) {
+  const imputaciones = (dto.imputaciones ?? []).map((i) => ({
+    comprobanteId: dto.destino === 'mercaderia' ? i.comprobanteId : undefined,
+    gastoId: dto.destino === 'gastos' ? i.gastoId : undefined,
+    importe: money(i.importe),
+  })).filter((i) => (i.comprobanteId || i.gastoId) && i.importe > 0);
+  const aplicado = money(imputaciones.reduce((a, i) => a + i.importe, 0));
+  if (aplicado > importe + 0.009) throw new BadRequestException(`Lo aplicado a documentos (${aplicado.toLocaleString('es-AR')}) supera el importe del pago (${importe.toLocaleString('es-AR')}).`);
+  return imputaciones;
 }
 /** «Contar mi caja»: los billetes por denominación (+ monedas y otros) y si la diferencia se ajusta en el libro. */
 class ConteoDto {
@@ -843,38 +873,82 @@ export class CashflowService {
     const fecha = dto.fecha ?? hoyAr();
     if (!esDia(fecha)) throw new BadRequestException('La fecha tiene que ser un día válido.');
     if (fecha > hoyAr()) throw new BadRequestException('La fecha no puede ser futura.');
-    const imputaciones = (dto.imputaciones ?? []).map((i) => ({
-      comprobanteId: dto.destino === 'mercaderia' ? i.comprobanteId : undefined,
-      gastoId: dto.destino === 'gastos' ? i.gastoId : undefined,
-      importe: money(i.importe),
-    })).filter((i) => (i.comprobanteId || i.gastoId) && i.importe > 0);
-    const aplicado = money(imputaciones.reduce((a, i) => a + i.importe, 0));
-    if (aplicado > importe + 0.009) throw new BadRequestException(`Lo aplicado a documentos (${aplicado.toLocaleString('es-AR')}) supera el importe del pago (${importe.toLocaleString('es-AR')}).`);
-    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
-    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    const imputaciones = imputacionesDe(dto, importe);
+    const prov = await this.proveedor(dto.proveedorId);
     const usuarioId = sesion?.usuarioId ?? null;
     const detalle = String(dto.detalle ?? '').trim();
     return this.db.transaction(async (tx) => {
       const [caja] = await tx.select().from(cashflowCaja).limit(1).for('update');
       if (!caja) throw new BadRequestException('Primero arrancá el Cash Flow con la fecha y el saldo inicial.');
       if (fecha < caja.fechaInicio) throw new BadRequestException(`La fecha es anterior al arranque del Cash Flow (${caja.fechaInicio}).`);
+      /* El depósito cargado desde «Sacar plata» se queda con su concepto (16/10/2026). */
+      if (dto.conceptoId != null) {
+        const [c] = await tx.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, dto.conceptoId)).limit(1);
+        if (!c || c.tipo !== 'egreso' || !c.activo || !esConceptoDeposito(c.nombre) || dto.medio !== 'deposito') {
+          throw new BadRequestException('Solo un concepto de depósito (activo) se aplica a un proveedor, y como depósito.');
+        }
+      }
       const instante = instanteDe(fecha);
       await this.exigirEfectivo(tx, fecha, instante, importe, 'el pago');
       const [m] = await tx.insert(cashflowMovimientos).values({
-        fecha: instante,
+        fecha: instante, conceptoId: dto.conceptoId ?? null,
         tipo: 'egreso', origen: 'pago_proveedor', importe, usuarioId,
         detalle: `Pago a ${prov.nombre} (${dto.medio === 'deposito' ? 'depósito' : 'efectivo'})${detalle ? ` · ${detalle}` : ''}`,
       }).returning();
       /* El pago de siempre. Si falla, esta transacción se deshace y el egreso no queda. */
-      const pago: any = await this.pagos.crear({
-        proveedorId: prov.id, destino: dto.destino, importe, medio: dto.medio, fecha,
-        referencia: String(dto.referencia ?? '').trim() || undefined,
-        concepto: `Cash Flow${detalle ? `: ${detalle}` : ''}`,
-        usuarioId: usuarioId ?? undefined,
-        imputaciones: imputaciones.length ? imputaciones : undefined,
-      } as any, sesion.sucursalId, true);
+      const pago = await this.crearPago(prov, { ...dto, importe, fecha, detalle, imputaciones }, sesion);
       await tx.update(cashflowMovimientos).set({ pagoId: pago.id }).where(eq(cashflowMovimientos.id, m.id));
       return { ok: true, id: m.id, pagoId: pago.id, saldo: await this.saldo(tx) };
+    });
+  }
+
+  private async proveedor(id: number) {
+    const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, id)).limit(1);
+    if (!prov) throw new NotFoundException('Ese proveedor no existe.');
+    return prov;
+  }
+
+  /** El pago de siempre (`pagos.crear`): queda en la cuenta del proveedor, aplicado a lo tildado. */
+  private crearPago(prov: { id: number }, p: {
+    destino: 'mercaderia' | 'gastos'; medio: 'efectivo' | 'deposito'; importe: number; fecha: string;
+    referencia?: string; detalle: string; imputaciones: ReturnType<typeof imputacionesDe>;
+  }, sesion: Sesion): Promise<any> {
+    return this.pagos.crear({
+      proveedorId: prov.id, destino: p.destino, importe: p.importe, medio: p.medio, fecha: p.fecha,
+      referencia: String(p.referencia ?? '').trim() || undefined,
+      concepto: `Cash Flow${p.detalle ? `: ${p.detalle}` : ''}`,
+      usuarioId: sesion?.usuarioId ?? undefined,
+      imputaciones: p.imputaciones.length ? p.imputaciones : undefined,
+    } as any, sesion.sucursalId, true);
+  }
+
+  /**
+   * UN DEPÓSITO YA CARGADO SE APLICA A UN PROVEEDOR (16/10/2026, pedido del
+   * dueño). La plata ya salió de la caja: no se vuelve a sacar. Se crea el pago
+   * (depósito, con el importe y el día del egreso, aplicado a lo tildado; lo que
+   * sobra queda a cuenta) y el egreso pasa a ser ese pago: anularlo después lo
+   * desaplica y lo anula en la cuenta del proveedor, como cualquier pago.
+   */
+  async aplicarDeposito(id: number, dto: AplicarDepositoDto, sesion: Sesion) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá el pago.');
+    const prov = await this.proveedor(dto.proveedorId);
+    const detalle = String(dto.detalle ?? '').trim();
+    return this.db.transaction(async (tx) => {
+      await tx.select({ id: cashflowCaja.id }).from(cashflowCaja).limit(1).for('update');
+      const [m] = await tx.select().from(cashflowMovimientos).where(eq(cashflowMovimientos.id, id)).limit(1).for('update');
+      if (!m) throw new NotFoundException('Ese movimiento no existe.');
+      if (m.anuladoEn) throw new BadRequestException('Ese movimiento está anulado.');
+      if (m.origen !== 'concepto' || m.tipo !== 'egreso' || !m.conceptoId) throw new BadRequestException('Ese movimiento ya no es un depósito suelto: actualizá la pantalla.');
+      const [c] = await tx.select({ nombre: cashflowConceptos.nombre }).from(cashflowConceptos).where(eq(cashflowConceptos.id, m.conceptoId)).limit(1);
+      if (!esConceptoDeposito(c?.nombre)) throw new BadRequestException('Ese egreso no es un depósito: solo se aplican a un proveedor los conceptos que dicen «depósito».');
+      const importe = money(m.importe);
+      const imputaciones = imputacionesDe(dto, importe);
+      const pago = await this.crearPago(prov, { ...dto, medio: 'deposito', importe, fecha: diaAr(m.fecha), detalle, imputaciones }, sesion);
+      await tx.update(cashflowMovimientos).set({
+        origen: 'pago_proveedor', pagoId: pago.id,
+        detalle: [`Pago a ${prov.nombre} (depósito)`, m.detalle, detalle].filter(Boolean).join(' · '),
+      }).where(eq(cashflowMovimientos.id, id));
+      return { ok: true, id, pagoId: pago.id, saldo: await this.saldo(tx) };
     });
   }
 
@@ -970,6 +1044,10 @@ export class CashflowController {
   @Get('proveedores/:id/pendientes') pendientes(@Param('id', ParseIntPipe) id: number, @Query('destino') destino?: string) { return this.svc.pendientesDe(id, destino); }
   @Get('gasto-categorias') gastoCategorias() { return this.svc.gastoCategorias(); }
   @Post('pagos') pagar(@Body() dto: PagoProveedorDto, @Auth() s: Sesion) { return this.svc.pagarProveedor(dto, s); }
+  @Post('movimientos/:id/aplicar-proveedor')
+  aplicarDeposito(@Param('id', ParseIntPipe) id: number, @Body() dto: AplicarDepositoDto, @Auth() s: Sesion) {
+    return this.svc.aplicarDeposito(id, dto, s);
+  }
   @Post('movimientos/:id/anular')
   anularMovimiento(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularDto, @Auth() s: Sesion) {
     return this.svc.anularMovimiento(id, dto, s?.usuarioId ?? null);
