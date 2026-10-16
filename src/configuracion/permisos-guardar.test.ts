@@ -12,6 +12,12 @@ test('las llaves de stock: ventas o almacén', () => {
   assert.deepEqual(permisosParaGuardar('ventas', { permitirStockNegativo: true, controlStockEnteros: true }), ['ventas.configuracion', 'almacen.configuracion']);
 });
 
+test('las llaves de la tienda online: ventas o la tienda (16/10/2026)', () => {
+  assert.deepEqual(permisosParaGuardar('ventas', { tiendaMinoristaActiva: false, envioCamionetaActivo: true }), ['ventas.configuracion', 'web.configuracion']);
+  assert.deepEqual(permisosParaGuardar('ventas', { tiendaVistaLista: true, montoMinimoMayorista: 1 }), ['ventas.configuracion'], 'la compra mínima es de la caja');
+  assert.deepEqual(permisosParaGuardar('ventas', { tiendaVistaLista: true, controlStockGranel: false }), ['ventas.configuracion'], 'mezcla de grupos: solo ventas');
+});
+
 test('cualquier otra llave mezclada: solo ventas', () => {
   assert.deepEqual(permisosParaGuardar('ventas', { controlStockGranel: false, cajaObligatoria: false }), ['ventas.configuracion']);
   assert.deepEqual(permisosParaGuardar('ventas', { overrideListaRequiereAdmin: true }), ['ventas.configuracion']);

@@ -372,7 +372,7 @@ export class TiendaService {
         montoMinimo: Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0,
         /** Piso EXTRA si la entrega es el envío sin costo (la camioneta; 0 = sin piso). */
         montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
-        /** El envío sin costo se ofrece (Ventas › Configuración › Tienda online). */
+        /** El envío sin costo se ofrece (Tienda online › Configuración › Tienda mayorista). */
         envioCamionetaActivo: cfg.envioCamionetaActivo !== false,
         reglasMarca: (cat.reglasMarca ?? [])
           .filter((r: any) => r.activa && r.unidadesMinimas > 0)

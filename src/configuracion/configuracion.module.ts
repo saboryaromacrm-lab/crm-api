@@ -776,17 +776,25 @@ const DUENO_DE_AREA: Record<string, string[]> = {
 };
 
 /**
- * LAS LLAVES DE STOCK viven en la config de ventas (las lee la caja) pero se
- * manejan desde Almacén › Configuración (3/10/2026, pedido del dueño). Un
- * guardado que toca SOLO estas llaves lo puede hacer también quien tiene
- * `almacen.configuracion`; si trae cualquier otra, vuelve a pedir la de ventas.
+ * LLAVES DE LA CONFIG DE VENTAS QUE SE MANEJAN DESDE OTRO MÓDULO. Viven en la
+ * config de ventas (las leen la caja o la tienda) pero tienen su pantalla en
+ * otro lado. Un guardado que toca SOLO las llaves de un grupo lo puede hacer
+ * también quien tiene el permiso de ese grupo; si mezcla cualquier otra,
+ * vuelve a pedir la de ventas.
+ *   · Stock → Almacén › Configuración (3/10/2026).
+ *   · Tienda online → Tienda online › Configuración (16/10/2026, pedido del dueño:
+ *     «que esté concentrado todo ahí»).
  */
-const LLAVES_STOCK = new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']);
+const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
+  [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde']), 'web.configuracion'],
+];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];
   if (!base || clave !== 'ventas') return base;
   const keys = body && typeof body === 'object' ? Object.keys(body) : [];
-  return keys.length > 0 && keys.every((k) => LLAVES_STOCK.has(k)) ? [...base, 'almacen.configuracion'] : base;
+  const grupo = keys.length ? LLAVES_DE_OTRO_MODULO.find(([llaves]) => keys.every((k) => llaves.has(k))) : undefined;
+  return grupo ? [...base, grupo[1]] : base;
 }
 
 @Controller('configuracion')
