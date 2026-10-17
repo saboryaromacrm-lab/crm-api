@@ -16,6 +16,9 @@
  *   · NUNCA de más: un pago no puede superar lo que le falta a la cuenta. Si
  *     el cliente transfirió de más en la vida real, el dueño sube el importe
  *     de la cuenta (acción explícita, con nombre y hora) — no se "acepta".
+ *     Salvo la cuenta que «puede pasarse del monto» (0177): ahí un pago puede
+ *     superar lo que falta, ese pago la cierra, y lo de más queda a favor en
+ *     la cuenta corriente del proveedor (el espejo es por el total).
  *   · EL MÍNIMO DEL PROVEEDOR ("menos de $50.000 no"): cada pago lo respeta,
  *     salvo el que CIERRA la cuenta — el resto final es lo que es.
  *   · La cuenta se toma con candado (FOR UPDATE) al recibir un pago: dos
@@ -65,6 +68,8 @@ export class CrearCuentaDto {
   @IsOptional() @IsBoolean() prioritaria?: boolean;
   /** Solo se ofrece en ventas (o recibos) desde este total; 0 = siempre. */
   @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) ventaMinima?: number;
+  /** Acepta un pago que supere lo que falta (0177): ese pago la cierra. */
+  @IsOptional() @IsBoolean() puedePasarse?: boolean;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** Lo pone el AutorInterceptor con el usuario de la sesión. */
   @IsOptional() @IsInt() usuarioId?: number;
@@ -90,6 +95,7 @@ export class EditarCuentaDto {
   @IsOptional() @IsBoolean() enviado?: boolean;
   @IsOptional() @IsBoolean() corte?: boolean;
   @IsOptional() @IsNumber() @Min(0) @Max(1_000_000_000) ventaMinima?: number;
+  @IsOptional() @IsBoolean() puedePasarse?: boolean;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** Solo mientras la cuenta no tenga historia. */
   @IsOptional() @IsString() @MaxLength(120) titular?: string;
@@ -141,6 +147,7 @@ export class CuentasDisponiblesService {
       fecha: cuentasDisponibles.fecha,
       prioritaria: cuentasDisponibles.prioritaria,
       ventaMinima: cuentasDisponibles.ventaMinima,
+      puedePasarse: cuentasDisponibles.puedePasarse,
       enviado: cuentasDisponibles.enviado,
       corte: cuentasDisponibles.corte,
       corteEn: cuentasDisponibles.corteEn,
@@ -160,14 +167,18 @@ export class CuentasDisponiblesService {
   /** Lo derivado, en un solo lugar: el estado y los avisos salen de las sumas. */
   private decorar(r: any) {
     const pagado = money(Number(r.pagado));
-    const falta = money(r.importe - pagado);
+    /* Lo que falta nunca es negativo: lo que entró de más (solo en una cuenta
+     * que «puede pasarse», 0177) se dice aparte, como `pasado`. */
+    const saldo = money(r.importe - pagado);
+    const falta = Math.max(0, saldo);
+    const pasado = Math.max(0, -saldo);
     const cant = Number(r.cant);
     const historia = Number(r.historia);
     const estado = r.corte ? 'cortada' : falta <= EPS ? 'cubierta' : 'abierta';
     const minimo = money(Number(r.minimo));
     return {
       ...r,
-      pagado, falta, cant, historia, estado, minimo,
+      pagado, falta, pasado, cant, historia, estado, minimo,
       /* Aviso para el dueño: lo que queda ya no alcanza el piso del proveedor,
        * así que solo se cubre con UNA transferencia por el resto exacto. */
       restoBajoMinimo: estado === 'abierta' && minimo > 0 && falta < minimo - EPS,
@@ -223,6 +234,7 @@ export class CuentasDisponiblesService {
         titular: d.titular, cbuAlias: d.cbuAlias,
         importe: d.importe, pagado: d.pagado, falta: d.falta, minimo: d.minimo,
         ventaMinima: money(Number(d.ventaMinima)), prioritaria: d.prioritaria, fecha: d.fecha,
+        puedePasarse: d.puedePasarse,
       };
     });
   }
@@ -293,6 +305,7 @@ export class CuentasDisponiblesService {
         fecha: fechaDe(dto.fecha) ?? new Date(),
         prioritaria: dto.prioritaria === true,
         ventaMinima: money(dto.ventaMinima ?? 0),
+        puedePasarse: dto.puedePasarse === true,
         observaciones: (dto.observaciones ?? '').trim(),
         usuarioId: dto.usuarioId ?? null,
       }).returning({ id: cuentasDisponibles.id });
@@ -308,12 +321,14 @@ export class CuentasDisponiblesService {
       const { pagado, historia } = await this.sumas(tx, id);
 
       const set: Record<string, any> = {};
-      if (dto.importe !== undefined) {
+      /* Solo si cambia: una cuenta que se pasó (0177) tiene más pagado que su
+       * importe, y guardarla con el mismo importe no la tiene que frenar. */
+      if (dto.importe !== undefined && Math.abs(money(dto.importe) - money(c.importe)) > EPS) {
         const nuevo = money(dto.importe);
         // Nunca por debajo de lo que ya entró: eso sería borrar transferencias reales.
         if (nuevo < pagado - EPS) {
           throw new BadRequestException(
-            `No se puede bajar a $${nuevo.toFixed(2)}: la cuenta ya tiene $${pagado.toFixed(2)} transferidos.`,
+            `El importe no puede quedar en $${nuevo.toFixed(2)}: la cuenta ya tiene $${pagado.toFixed(2)} transferidos.`,
           );
         }
         set.importe = nuevo;
@@ -333,6 +348,16 @@ export class CuentasDisponiblesService {
       if (dto.fecha !== undefined) set.fecha = fechaDe(dto.fecha);
       if (dto.prioritaria !== undefined) set.prioritaria = dto.prioritaria;
       if (dto.ventaMinima !== undefined) set.ventaMinima = money(dto.ventaMinima);
+      if (dto.puedePasarse !== undefined && dto.puedePasarse !== c.puedePasarse) {
+        /* Ya recibió de más: sacarle el tilde dejaría una cuenta «nunca de
+         * más» con más plata que su importe. */
+        if (!dto.puedePasarse && pagado > money(set.importe ?? c.importe) + EPS) {
+          throw new BadRequestException(
+            `Esta cuenta ya recibió $${pagado.toFixed(2)} de $${money(set.importe ?? c.importe).toFixed(2)}: quedó pasada y el tilde no se puede sacar.`,
+          );
+        }
+        set.puedePasarse = dto.puedePasarse;
+      }
       if (dto.enviado !== undefined) set.enviado = dto.enviado;
       if (dto.corte !== undefined && dto.corte !== c.corte) {
         set.corte = dto.corte;
@@ -405,18 +430,19 @@ export class CuentasDisponiblesService {
     if (falta <= EPS) {
       throw new BadRequestException(`La cuenta de ${quien} ya está cubierta: elegí otra.`);
     }
-    if (importe > falta + EPS) {
+    if (!c.puedePasarse && importe > falta + EPS) {
       throw new BadRequestException(
         `A la cuenta de ${quien} le faltan $${falta.toFixed(2)} y se están cargando $${importe.toFixed(2)}: `
         + 'no puede recibir de más. Cargá el resto en otra cuenta o en otro medio.',
       );
     }
-    const cierra = Math.abs(importe - falta) <= EPS;
+    /* Cierra la cuenta: el resto exacto o, si puede pasarse (0177), más. */
+    const cierra = importe >= falta - EPS;
     const minimo = money(Number(prov.minimo));
     if (!cierra && minimo > 0 && importe < minimo - EPS) {
       throw new BadRequestException(
         `${prov.nombre} no recibe transferencias menores a $${minimo.toFixed(2)}. `
-        + `Cargá al menos ese importe, o cubrí el resto completo ($${falta.toFixed(2)}).`,
+        + `Cargá al menos ese importe, o cubrí el resto ($${falta.toFixed(2)}${c.puedePasarse ? ' o más' : ''}).`,
       );
     }
 
@@ -449,7 +475,7 @@ export class CuentasDisponiblesService {
 
     return {
       referencia: `${prov.nombre} · ${c.titular} · ${c.cbuAlias}`,
-      falta: money(falta - importe),
+      falta: Math.max(0, money(falta - importe)),
       cierra,
     };
   }
@@ -458,7 +484,8 @@ export class CuentasDisponiblesService {
    * PAGO PROPIO (0151, 9/10/2026, pedido del dueño): Sabor y Aroma transfiere
    * desde SU cuenta a la cuenta disponible del proveedor, sin pasar por la caja.
    * Mismas reglas que una transferencia de cliente —candado, cortada, cubierta,
-   * no pasarse del resto— salvo el mínimo del proveedor (ese es para no recibir
+   * no pasarse del resto salvo la cuenta que puede (0177)— salvo el mínimo
+   * del proveedor (ese es para no recibir
    * transferencias chiquitas de clientes; el dueño paga lo que decide). Lleva su
    * espejo en la cuenta corriente del proveedor, como cualquier pago.
    */
@@ -483,7 +510,7 @@ export class CuentasDisponiblesService {
       const { pagado } = await this.sumas(tx, c.id);
       const falta = money(c.importe - pagado);
       if (falta <= EPS) throw new BadRequestException(`La cuenta de ${quien} ya está cubierta.`);
-      if (importe > falta + EPS) {
+      if (!c.puedePasarse && importe > falta + EPS) {
         const pesos = (n: number) => `$${n.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
         throw new BadRequestException(`A la cuenta de ${quien} le faltan ${pesos(falta)}: no se puede pagar ${pesos(importe)}. Si hace falta más, subí el importe a cubrir.`);
       }

@@ -3736,6 +3736,12 @@ export const cuentasDisponibles = pgTable('cuentas_disponibles', {
   ventaMinima: doublePrecision('venta_minima').notNull().default(0),
   /** La estrella: se ofrece primero al cobrar. */
   prioritaria: boolean('prioritaria').notNull().default(false),
+  /**
+   * PUEDE PASARSE DEL MONTO (0177, 17/10/2026, pedido del dueño): acepta un
+   * pago aunque supere lo que falta; ese pago la cierra y lo de más queda a
+   * favor en la cuenta corriente del proveedor.
+   */
+  puedePasarse: boolean('puede_pasarse').notNull().default(false),
   /** Ya se le mandó el resumen de transferencias al proveedor. */
   enviado: boolean('enviado').notNull().default(false),
   /** Cerrada aunque no esté completa: deja de ofrecerse al cobrar. */
