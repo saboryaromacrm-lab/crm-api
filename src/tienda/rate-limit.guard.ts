@@ -47,12 +47,6 @@ export const REGLAS = {
   /* Ingreso a la tienda (0155): el DNI solo abre la puerta, así que el cupo es lo que frena probar DNI ajenos de a montones. */
   registro: { max: 5, ventanaMs: 10 * 60_000, aviso: 'Demasiados pedidos de ingreso seguidos: esperá unos minutos y probá de nuevo.' },
   ingreso: { max: 10, ventanaMs: 10 * 60_000, aviso: 'Demasiados intentos de ingreso: esperá unos minutos y probá de nuevo.' },
-  /**
-   * Buscar el comprador minorista por teléfono (0173): devuelve nombre y
-   * dirección, así que es estricto para que no sirva para recorrer teléfonos
-   * ajenos. Un cliente real busca el suyo una o dos veces.
-   */
-  comprador: { max: 8, ventanaMs: 10 * 60_000, aviso: 'Demasiadas búsquedas seguidas: esperá unos minutos y probá de nuevo.' },
   /** Telemetría: el navegador manda un lote cada 15 s como máximo — 40 sobra. */
   eventos: { max: 40, ventanaMs: 10 * 60_000, aviso: 'Demasiadas peticiones.' },
   /** Navegación normal + freno al scraping grosero. */

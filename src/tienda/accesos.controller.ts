@@ -3,7 +3,7 @@
  * Accesos a la tienda. Llave `ventas.accesos_tienda` (admin por migración;
  * superadmin por el comodín).
  */
-import { Controller, Get, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { AccesosTiendaService } from './accesos';
 
@@ -18,6 +18,15 @@ export class AccesosTiendaController {
   /** El contador del globito y del cartel de arriba. */
   @Get('pendientes')
   pendientes() { return this.svc.pendientes(); }
+
+  /** Los compradores de la tienda minorista (0178). */
+  @Get('minoristas')
+  minoristas(@Query('q') q?: string) { return this.svc.minoristas(q); }
+
+  @Post('minoristas/:id/bloqueo')
+  bloqueoMinorista(@Param('id', ParseIntPipe) id: number, @Body() body: { bloqueado?: boolean }) {
+    return this.svc.bloquearMinorista(id, body?.bloqueado === true);
+  }
 
   @Post(':id/habilitar')
   habilitar(@Param('id', ParseIntPipe) id: number, @Auth() s: Sesion) { return this.svc.habilitar(id, s.usuarioId); }

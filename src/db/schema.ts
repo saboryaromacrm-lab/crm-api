@@ -2796,17 +2796,20 @@ export const tiendaAccesos = pgTable('tienda_accesos', {
 /** El aparato que ingresó a la tienda (0155): solo el HASH del token; vence a los 90 días sin uso. */
 export const tiendaSesiones = pgTable('tienda_sesiones', {
   tokenHash: text('token_hash').primaryKey(),
-  accesoId: integer('acceso_id').notNull().references(() => tiendaAccesos.id, { onDelete: 'cascade' }),
+  /** De UN acceso mayorista o de UN comprador minorista (0178), nunca de los dos (CHECK en la migración). */
+  accesoId: integer('acceso_id').references(() => tiendaAccesos.id, { onDelete: 'cascade' }),
+  compradorId: integer('comprador_id').references((): any => tiendaCompradores.id, { onDelete: 'cascade' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   expiraEn: timestamp('expira_en', { withTimezone: true }).notNull(),
 }, (t) => ({
   ixAcceso: index('ix_tienda_sesiones_acceso').on(t.accesoId),
+  ixComprador: index('ix_tienda_sesiones_comprador').on(t.compradorId),
 }));
 
 /**
- * EL COMPRADOR MINORISTA (0173): sin registro ni aprobación. Su teléfono (10
- * dígitos, área + abonado) es la clave; nombre, apellido y dirección se guardan
- * con cada pedido para que la próxima vez ponga el teléfono y ya tenga todo.
+ * EL COMPRADOR MINORISTA (0173): su teléfono (10 dígitos, área + abonado) es la
+ * clave. Desde 0178 ingresa con él para ver precios y comprar: se registra con
+ * nombre, apellido y dirección y entra en el momento; el ERP lo puede bloquear.
  */
 export const tiendaCompradores = pgTable('tienda_compradores', {
   id: serial('id').primaryKey(),
@@ -2817,6 +2820,9 @@ export const tiendaCompradores = pgTable('tienda_compradores', {
   localidad: text('localidad').notNull().default(''),
   referencia: text('referencia').notNull().default(''),
   pedidos: integer('pedidos').notNull().default(0),
+  /** Bloqueado desde el ERP (0178): no entra y se le cierran las sesiones. */
+  bloqueado: boolean('bloqueado').notNull().default(false),
+  ultimoIngreso: timestamp('ultimo_ingreso', { withTimezone: true }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });

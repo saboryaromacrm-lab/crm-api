@@ -24,9 +24,9 @@
  *
  * DOS MODOS, UNA TIENDA (0173, 16/10/2026, pedido del dueño). Lo de arriba es
  * el modo MAYORISTA. El modo MINORISTA es la misma tienda a precio de mostrador
- * (la lista base de la caja): precios a la vista de todos, sin compra mínima,
- * sin registro —el comprador es su teléfono— y el envío puede ser gratis desde
- * un monto. Cada modo arma su catálogo y lo guarda unos segundos (`CacheCorto`):
+ * (la lista base de la caja): sin compra mínima, el comprador es su WhatsApp
+ * —desde 0178 ingresa con él para ver precios (`X-Tienda-Sesion-Min`, ver
+ * accesos.ts)— y el envío puede ser gratis desde un monto. Cada modo arma su catálogo y lo guarda unos segundos (`CacheCorto`):
  * cien visitantes son una sola armada.
  */
 import {
@@ -73,13 +73,13 @@ const MAX_RENGLONES_PEDIDO = 100;
 
 /** Cabecera con el token del aparato que ingresó a la tienda (0155). */
 const SESION = 'x-tienda-sesion';
+/** La del comprador minorista (0178): otra cookie, otra cabecera — una sesión no abre el otro modo. */
+const SESION_MIN = 'x-tienda-sesion-min';
 
 /** Los dos modos de la tienda (0173). */
 type Modo = 'mayorista' | 'minorista';
 /** Cuánto vive el catálogo armado: un precio nuevo tarda a lo sumo esto en verse. */
 const CATALOGO_TTL_MS = 15_000;
-/** Topes de los datos del comprador minorista (el `maxLength` del checkout no protege al POST directo). */
-const MAX_NOMBRE = 60;
 
 /**
  * EL CATÁLOGO DEL QUE NO INGRESÓ (0155): el mismo, sin nada de plata —precios,
@@ -211,9 +211,14 @@ export class TiendaService {
    *   · Mayorista: con sesión válida, con precios y los datos del cliente para
    *     el checkout; sin ella, sin nada de plata (`sinPrecios`).
    */
-  async catalogo(token?: string, modoPedido?: string) {
+  async catalogo(token?: string, modoPedido?: string, tokenMin?: string) {
     const modo = await this.modoVigente(modoPedido);
-    if (modo === 'minorista') return { ...(await this.armado('minorista')).catalogo, conPrecios: true, cliente: null };
+    if (modo === 'minorista') {
+      /* También con ingreso (0178): sin sesión minorista, sin nada de plata, como la mayorista. */
+      const [arm, c] = await Promise.all([this.armado('minorista'), this.accesos.sesionMinorista(tokenMin)]);
+      const cat = { ...arm.catalogo, conPrecios: true, cliente: null };
+      return c ? { ...cat, comprador: this.accesos.datosMinorista(c) } : sinPrecios(cat);
+    }
     const [completo, s] = await Promise.all([this.catalogoCompleto(), this.accesos.sesion(token)]);
     return s ? { ...completo, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(completo);
   }
@@ -1118,56 +1123,37 @@ export class TiendaService {
   /* ============================ MODO MINORISTA (0173) ============================ */
 
   /**
-   * El comprador minorista por su teléfono (10 dígitos): nombre, apellido y
-   * dirección guardados en su último pedido, para que no los escriba de nuevo.
-   * Sin pedidos anteriores, `null`.
+   * Alta de un pedido MINORISTA: sin mínimos, y desde 0178 solo con ingreso.
+   * Quién compra sale de la SESIÓN (WhatsApp, nombre y apellido), no del body.
+   * El envío va a su dirección guardada (`direccion.guardada`, que el navegador
+   * ve a medias) o a una que escribe, que pasa a ser la guardada. Es gratis
+   * desde el monto configurado; si no, se coordina.
    */
-  async buscarComprador(dto: any) {
-    const telefono = telefonoArgentino(String(dto?.telefono ?? ''));
-    if (!telefono) throw new BadRequestException('El WhatsApp va con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
-    const [c] = await this.db.select({
-      nombre: tiendaCompradores.nombre, apellido: tiendaCompradores.apellido, direccion: tiendaCompradores.direccion,
-      localidad: tiendaCompradores.localidad, referencia: tiendaCompradores.referencia,
-    }).from(tiendaCompradores).where(eq(tiendaCompradores.telefono, telefono)).limit(1);
-    return { comprador: c ?? null };
-  }
-
-  /**
-   * Alta de un pedido MINORISTA: sin sesión ni aprobación, sin mínimos. Quién
-   * compra viene en el body (teléfono, nombre, apellido); el envío a domicilio
-   * es gratis desde el monto configurado y si no, se coordina. El comprador
-   * queda guardado por su teléfono con lo último que escribió.
-   */
-  async pedidoMinorista(dto: any) {
+  async pedidoMinorista(dto: any, tokenMin?: string) {
     if ((await this.modoVigente('minorista')) !== 'minorista') {
       throw new BadRequestException('La compra minorista no está disponible por ahora.');
     }
-    const telefono = telefonoArgentino(String(dto?.telefono ?? ''));
-    if (!telefono) {
-      throw new BadRequestException('El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 dígitos en total (ej: 370 4123456).');
-    }
-    const nombre = String(dto?.nombre ?? '').trim().slice(0, MAX_NOMBRE);
-    const apellido = String(dto?.apellido ?? '').trim().slice(0, MAX_NOMBRE);
-    if (nombre.length < 2 || apellido.length < 2) throw new BadRequestException('Escribí tu nombre y tu apellido.');
+    const c = await this.accesos.sesionMinorista(tokenMin);
+    if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
 
     const entrega = ENTREGAS_MINORISTA[String(dto?.entrega ?? '')] ?? 'retiro';
-    const domicilio = direccionDeEntrega(entrega, dto?.direccion);
+    const guardada = entrega !== 'retiro' && dto?.direccion?.guardada === true;
+    if (guardada && !c.direccion) throw new BadRequestException('No tenemos tu dirección guardada: escribila para el envío.');
+    const nueva = guardada ? null : direccionDeEntrega(entrega, dto?.direccion);
+    const domicilio = guardada ? { direccion: c.direccion, localidad: c.localidad, referencia: c.referencia } : nueva;
 
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
     const envioGratis = entrega === 'cadete' && cat.envioGratisDesde > 0 && total >= cat.envioGratisDesde;
 
     return this.db.transaction(async (tx) => {
-      /* Lo último que escribió manda; con retiro no hay dirección y la guardada no se pisa. */
-      const datos = { nombre, apellido, ...(domicilio ?? {}) };
-      await tx.insert(tiendaCompradores).values({ telefono, ...datos, pedidos: 1 })
-        .onConflictDoUpdate({
-          target: tiendaCompradores.telefono,
-          set: { ...datos, pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date() },
-        });
+      /* La dirección que escribió para ESTE envío pasa a ser la guardada; con retiro no se toca. */
+      await tx.update(tiendaCompradores)
+        .set({ ...(nueva ?? {}), pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date() })
+        .where(eq(tiendaCompradores.id, c.id));
       return this.presupuestos.crearDesdeWeb({
         clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
         entrega, observaciones: String(dto?.observaciones ?? '').slice(0, 500),
-        webCliente: { nombre, apellido, telefono, dni: '', ...(domicilio ?? {}), ...(envioGratis ? { envioGratis: true } : {}) },
+        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...(envioGratis ? { envioGratis: true } : {}) },
         items,
       }, tx);
     });
@@ -1188,20 +1174,27 @@ export class TiendaController {
   /** `?modo=minorista` pide el catálogo minorista (0173); cualquier otra cosa, el mayorista. */
   @Get('catalogo')
   @RateLimit('catalogo')
-  catalogo(@Query('modo') modo?: string, @Headers(SESION) token?: string) { return this.svc.catalogo(token, modo); }
+  catalogo(@Query('modo') modo?: string, @Headers(SESION) token?: string, @Headers(SESION_MIN) tokenMin?: string) {
+    return this.svc.catalogo(token, modo, tokenMin);
+  }
 
   @Post('pedidos')
   @RateLimit('pedidos')
   pedido(@Body() body: any, @Headers(SESION) token?: string) { return this.svc.pedido(body ?? {}, token); }
 
   /* Modo minorista (0173). POST y no GET: el teléfono no queda escrito en la dirección ni en los registros. */
-  @Post('minorista/comprador')
-  @RateLimit('comprador')
-  comprador(@Body() body: any) { return this.svc.buscarComprador(body ?? {}); }
-
   @Post('minorista/pedidos')
   @RateLimit('pedidos')
-  pedidoMinorista(@Body() body: any) { return this.svc.pedidoMinorista(body ?? {}); }
+  pedidoMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string) { return this.svc.pedidoMinorista(body ?? {}, tokenMin); }
+
+  /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
+  @Post('minorista/registro')
+  @RateLimit('registro')
+  registroMinorista(@Body() body: any) { return this.accesos.registrarMinorista(body ?? {}); }
+
+  @Post('minorista/ingresar')
+  @RateLimit('ingreso')
+  ingresarMinorista(@Body() body: any) { return this.accesos.ingresarMinorista(body ?? {}); }
 
   /* Ingreso a la tienda (0155). POST y no GET: el DNI no queda escrito en la dirección ni en los registros. */
   @Post('registro')

@@ -14,12 +14,19 @@
  *      90 días sin uso y se renueva solo mientras se use.
  *
  * Sin sesión válida el catálogo sale sin precios y el pedido se rechaza.
+ *
+ * LA MINORISTA TAMBIÉN (0178, 17/10/2026, decisión del dueño): el comprador
+ * minorista ingresa con su WHATSAPP. Se registra con nombre, apellido y
+ * dirección y entra en el momento (sin aprobación); el que ya había comprado
+ * entra directo. Sus sesiones son las mismas de arriba, pero de un comprador:
+ * una sesión minorista no abre la mayorista ni al revés. Como el número solo
+ * abre la puerta, lo guardado de la dirección viaja A MEDIAS (`direccionOculta`).
  */
 import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { clientes, presupuestos, tiendaAccesos, tiendaSesiones, usuarios } from '../db/schema';
+import { clientes, presupuestos, tiendaAccesos, tiendaCompradores, tiendaSesiones, usuarios } from '../db/schema';
 import { telefonoArgentino } from '../common/telefono';
 import { cuitValido } from '../arca/padron';
 import { ClientesService } from '../clientes/clientes.module';
@@ -37,6 +44,24 @@ export const dniDe = (v: unknown) => {
 };
 const texto = (v: unknown, max: number) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 const hashDe = (token: string) => createHash('sha256').update(token).digest('hex');
+/** El hash de un token con forma de token, o null (no se consulta la base por cualquier cosa). */
+const hashValido = (token: unknown) => {
+  const t = String(token ?? '');
+  return t.length < 20 || t.length > 100 ? null : hashDe(t);
+};
+const MSG_WHATSAPP = 'El WhatsApp está incompleto: escribilo con el código de área, sin 0 ni 15 — 10 números en total (ej: 370 4123456).';
+
+/**
+ * La dirección A MEDIAS (0178, decisión del dueño): cualquiera que escriba un
+ * WhatsApp ajeno entra como esa persona, así que lo guardado no se muestra
+ * entero. Los primeros 10 caracteres y «…» (la mitad, si es más corta).
+ */
+export function direccionOculta(d: string): string {
+  const t = String(d ?? '').trim();
+  if (!t) return '';
+  const ver = t.length > 10 ? 10 : Math.ceil(t.length / 2);
+  return `${t.slice(0, ver).trimEnd()}…`;
+}
 
 /** Lo que la tienda sabe de quien ingresó (lo usan el catálogo y el pedido). */
 export type SesionTienda = {
@@ -48,6 +73,13 @@ export type EstadoIngreso =
   | { estado: 'pendiente' | 'bloqueado' | 'sin_registro' };
 
 type Acceso = typeof tiendaAccesos.$inferSelect;
+/** El comprador minorista que ingresó (0178): lo usan el catálogo y el pedido. */
+export type Comprador = typeof tiendaCompradores.$inferSelect;
+/** `completar`: ya compró pero le faltan datos (nombre, apellido o dirección): se los pide una vez. */
+export type EstadoMinorista =
+  | { estado: 'habilitado'; token: string; nombre: string }
+  | { estado: 'sin_registro' | 'completar' | 'bloqueado' };
+const incompleto = (c: Comprador) => !c.nombre || !c.apellido || !c.direccion;
 
 @Injectable()
 export class AccesosTiendaService {
@@ -95,24 +127,42 @@ export class AccesosTiendaService {
   /** Habilitado → token nuevo para este aparato. Los demás estados, sin datos de nadie. */
   private async respuesta(a: Acceso): Promise<EstadoIngreso> {
     if (a.estado !== 'habilitado') return { estado: a.estado };
+    const token = await this.abrirSesion({ accesoId: a.id }, (tx, ahora) =>
+      tx.update(tiendaAccesos).set({ ultimoIngreso: ahora }).where(eq(tiendaAccesos.id, a.id)));
+    return { estado: 'habilitado', token, nombre: a.nombre };
+  }
+
+  /**
+   * Un token nuevo para este aparato, de un acceso o de un comprador, y lo que
+   * haya que anotar en la misma transacción (el último ingreso).
+   */
+  private async abrirSesion(quien: { accesoId: number } | { compradorId: number }, anotar: (tx: any, ahora: Date) => Promise<unknown>) {
     const token = randomBytes(32).toString('base64url');
     const ahora = new Date();
     await this.db.transaction(async (tx) => {
       // De paso se barren los aparatos vencidos de todos: la tabla no crece sin techo.
       await tx.delete(tiendaSesiones).where(lt(tiendaSesiones.expiraEn, ahora));
-      await tx.insert(tiendaSesiones).values({
-        tokenHash: hashDe(token), accesoId: a.id, expiraEn: new Date(ahora.getTime() + DIAS_SESION * DIA_MS),
-      });
-      await tx.update(tiendaAccesos).set({ ultimoIngreso: ahora }).where(eq(tiendaAccesos.id, a.id));
+      await tx.insert(tiendaSesiones).values({ tokenHash: hashDe(token), ...quien, expiraEn: new Date(ahora.getTime() + DIAS_SESION * DIA_MS) });
+      await anotar(tx, ahora);
     });
-    return { estado: 'habilitado', token, nombre: a.nombre };
+    return token;
+  }
+
+  /** ¿Sigue vigente? Y si le queda poco, se renueva (una escritura cada ~10 días de uso). */
+  private async vigente(h: string, expiraEn: Date) {
+    const ahora = Date.now();
+    if (expiraEn.getTime() <= ahora) return false;
+    if (expiraEn.getTime() - ahora < RENOVAR_DIAS * DIA_MS) {
+      await this.db.update(tiendaSesiones).set({ expiraEn: new Date(ahora + DIAS_SESION * DIA_MS) })
+        .where(eq(tiendaSesiones.tokenHash, h));
+    }
+    return true;
   }
 
   /** La sesión de un token, o null (vencida, inexistente o el acceso ya no está habilitado). */
   async sesion(token: unknown): Promise<SesionTienda | null> {
-    const t = String(token ?? '');
-    if (t.length < 20 || t.length > 100) return null;
-    const h = hashDe(t);
+    const h = hashValido(token);
+    if (!h) return null;
     const [r] = await this.db.select({
       expiraEn: tiendaSesiones.expiraEn, accesoId: tiendaAccesos.id, dni: tiendaAccesos.dni, nombre: tiendaAccesos.nombre,
       whatsapp: tiendaAccesos.whatsapp, localidad: tiendaAccesos.localidad, clienteId: tiendaAccesos.clienteId,
@@ -120,14 +170,68 @@ export class AccesosTiendaService {
       .innerJoin(tiendaAccesos, eq(tiendaAccesos.id, tiendaSesiones.accesoId))
       .where(and(eq(tiendaSesiones.tokenHash, h), eq(tiendaAccesos.estado, 'habilitado')))
       .limit(1);
-    const ahora = Date.now();
-    if (!r || r.expiraEn.getTime() <= ahora) return null;
-    if (r.expiraEn.getTime() - ahora < RENOVAR_DIAS * DIA_MS) {
-      await this.db.update(tiendaSesiones).set({ expiraEn: new Date(ahora + DIAS_SESION * DIA_MS) })
-        .where(eq(tiendaSesiones.tokenHash, h));
-    }
+    if (!r || !(await this.vigente(h, r.expiraEn))) return null;
     const { expiraEn: _, ...s } = r;
     return s;
+  }
+
+  /* ========================= la tienda minorista (0178) ========================= */
+
+  /** Entrar con el WhatsApp. */
+  async ingresarMinorista(dto: any): Promise<EstadoMinorista> {
+    const telefono = telefonoArgentino(dto?.telefono);
+    if (!telefono) throw new BadRequestException(MSG_WHATSAPP);
+    const [c] = await this.db.select().from(tiendaCompradores).where(eq(tiendaCompradores.telefono, telefono)).limit(1);
+    return c ? this.respuestaMinorista(c) : { estado: 'sin_registro' };
+  }
+
+  /**
+   * Registrarse (o completar lo que le falta al que ya compró) y entrar. Lo ya
+   * guardado NO se pisa: con un WhatsApp ajeno no se le cambia el nombre ni la
+   * dirección a nadie; solo se completa lo vacío.
+   */
+  async registrarMinorista(dto: any): Promise<EstadoMinorista> {
+    const telefono = telefonoArgentino(dto?.telefono);
+    if (!telefono) throw new BadRequestException(MSG_WHATSAPP);
+    const nombre = texto(dto?.nombre, 60);
+    const apellido = texto(dto?.apellido, 60);
+    if (nombre.length < 2 || apellido.length < 2) throw new BadRequestException('Escribí tu nombre y tu apellido.');
+    const direccion = texto(dto?.direccion, 120);
+    if (direccion.length < 5) throw new BadRequestException('Escribí tu dirección: calle, número y barrio.');
+    /* `onConflictDoNothing`: dos registros juntos con el mismo número dejan UNA fila. */
+    await this.db.insert(tiendaCompradores).values({ telefono, nombre, apellido, direccion })
+      .onConflictDoNothing({ target: tiendaCompradores.telefono });
+    let [c] = await this.db.select().from(tiendaCompradores).where(eq(tiendaCompradores.telefono, telefono)).limit(1);
+    const faltan = { ...(c.nombre ? {} : { nombre }), ...(c.apellido ? {} : { apellido }), ...(c.direccion ? {} : { direccion }) };
+    if (Object.keys(faltan).length) {
+      [c] = await this.db.update(tiendaCompradores).set({ ...faltan, actualizadoEn: new Date() })
+        .where(eq(tiendaCompradores.id, c.id)).returning();
+    }
+    return this.respuestaMinorista(c);
+  }
+
+  private async respuestaMinorista(c: Comprador): Promise<EstadoMinorista> {
+    if (c.bloqueado) return { estado: 'bloqueado' };
+    if (incompleto(c)) return { estado: 'completar' };
+    const token = await this.abrirSesion({ compradorId: c.id }, (tx, ahora) =>
+      tx.update(tiendaCompradores).set({ ultimoIngreso: ahora }).where(eq(tiendaCompradores.id, c.id)));
+    return { estado: 'habilitado', token, nombre: c.nombre };
+  }
+
+  /** El comprador de un token minorista, o null (vencido, inexistente, bloqueado, o el token es de un mayorista). */
+  async sesionMinorista(token: unknown): Promise<Comprador | null> {
+    const h = hashValido(token);
+    if (!h) return null;
+    const [r] = await this.db.select({ expiraEn: tiendaSesiones.expiraEn, c: tiendaCompradores }).from(tiendaSesiones)
+      .innerJoin(tiendaCompradores, eq(tiendaCompradores.id, tiendaSesiones.compradorId))
+      .where(and(eq(tiendaSesiones.tokenHash, h), eq(tiendaCompradores.bloqueado, false)))
+      .limit(1);
+    return r && (await this.vigente(h, r.expiraEn)) ? r.c : null;
+  }
+
+  /** Lo que ve la tienda de quien ingresó: el nombre, la inicial del apellido, su WhatsApp y la dirección a medias. */
+  datosMinorista(c: Comprador) {
+    return { nombre: c.nombre, inicial: c.apellido.charAt(0).toUpperCase(), telefono: c.telefono, direccion: direccionOculta(c.direccion) };
   }
 
   async salir(token: unknown) {
@@ -233,6 +337,33 @@ export class AccesosTiendaService {
         .set({ estado: 'bloqueado', resueltoEn: new Date(), resueltoPor: usuarioId })
         .where(eq(tiendaAccesos.id, id)).returning();
       await tx.delete(tiendaSesiones).where(eq(tiendaSesiones.accesoId, id));
+      return r;
+    });
+  }
+
+  /** Los compradores minoristas (0178), los últimos en entrar primero; `q` busca por nombre, apellido o WhatsApp. */
+  async minoristas(q?: string) {
+    const t = texto(q, 60);
+    const digitos = t.replace(/\D/g, '');
+    const filtro = t ? sql`(${tiendaCompradores.nombre} || ' ' || ${tiendaCompradores.apellido}) ilike ${`%${t}%`}${
+      digitos ? sql` or ${tiendaCompradores.telefono} like ${`%${digitos}%`}` : sql``}` : undefined;
+    return this.db.select({
+      id: tiendaCompradores.id, telefono: tiendaCompradores.telefono, nombre: tiendaCompradores.nombre,
+      apellido: tiendaCompradores.apellido, direccion: tiendaCompradores.direccion, localidad: tiendaCompradores.localidad,
+      pedidos: tiendaCompradores.pedidos, bloqueado: tiendaCompradores.bloqueado,
+      ultimoIngreso: tiendaCompradores.ultimoIngreso, creadoEn: tiendaCompradores.creadoEn,
+    }).from(tiendaCompradores).where(filtro)
+      .orderBy(desc(sql`coalesce(${tiendaCompradores.ultimoIngreso}, ${tiendaCompradores.creadoEn})`))
+      .limit(500);
+  }
+
+  /** Bloquear (se le cierran las sesiones abiertas) o desbloquear a un comprador minorista. */
+  async bloquearMinorista(id: number, bloqueado: boolean) {
+    return this.db.transaction(async (tx) => {
+      const [r] = await tx.update(tiendaCompradores).set({ bloqueado, actualizadoEn: new Date() })
+        .where(eq(tiendaCompradores.id, id)).returning();
+      if (!r) throw new NotFoundException('Ese comprador ya no existe.');
+      if (bloqueado) await tx.delete(tiendaSesiones).where(eq(tiendaSesiones.compradorId, id));
       return r;
     });
   }

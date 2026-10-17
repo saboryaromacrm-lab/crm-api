@@ -93,8 +93,8 @@ export const VENTAS_DEFAULTS = {
   tiendaVistaLista: false as boolean,
   /**
    * TIENDA MINORISTA (0173, 16/10/2026, pedido del dueño): la misma tienda con
-   * un modo Minorista a precio de mostrador (la lista base), sin registro ni
-   * compra mínima. Apagado, el sitio queda solo mayorista como antes.
+   * un modo Minorista a precio de mostrador (la lista base), sin compra mínima;
+   * desde 0178 se ingresa con el WhatsApp. Apagado, el sitio queda solo mayorista.
    */
   tiendaMinoristaActiva: true as boolean,
   /** Envío gratis en la tienda minorista desde este monto (0 = nunca es gratis: se coordina). */
@@ -355,10 +355,10 @@ export const WEB_DEFAULTS = {
    * beneficios y el cierre. Las fotos del hero son las de los productos
    * destacados (con imagen); el envío gratis es un sello solo si está puesto.
    */
-  minAvisos: ['🌿 Productos naturales, sin TACC y orgánicos', '🛒 Sin mínimo de compra ni registro: solo tu WhatsApp', '🚚 Retiro en el local o envío a domicilio'] as string[],
+  minAvisos: ['🌿 Productos naturales, sin TACC y orgánicos', '🛒 Sin mínimo de compra: ingresás con tu WhatsApp', '🚚 Retiro en el local o envío a domicilio'] as string[],
   minHeroEyebrow: 'Dietética · Formosa' as string,
   minHeroTitulo: 'Lo natural, al precio de la góndola.' as string,
-  minHeroTexto: 'Elegí, pedí y te lo llevás o te lo llevamos. Sin mínimo de compra, sin registro: solo tu WhatsApp.' as string,
+  minHeroTexto: 'Elegí, pedí y te lo llevás o te lo llevamos. Sin mínimo de compra: ingresás solo con tu WhatsApp.' as string,
   minHeroCta1: 'Ver las NutriOfertas' as string,
   minHeroCta1Url: '/#ofertas' as string,
   minHeroCta2: 'Ir a la tienda' as string,
