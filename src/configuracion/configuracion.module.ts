@@ -348,6 +348,31 @@ export const WEB_DEFAULTS = {
   popupEtiqueta: '🍃 Bienvenido' as string,
   popupTitulo: 'Ahorrá hasta 30% en tu compra comprando por mayor' as string,
   popupTexto: 'Armá tu pedido cuando quieras, las 24 horas. Coordinamos el pago y la entrega por WhatsApp, igual que siempre.' as string,
+  /*
+   * LA PORTADA MINORISTA (17/10/2026, pedido del dueño: «que todo sea
+   * configurable»). Lo que no sale del catálogo: los avisos que rotan en la
+   * barra de arriba, el título y los botones del hero, los sellos, los tres
+   * beneficios y el cierre. Las fotos del hero son las de los productos
+   * destacados (con imagen); el envío gratis es un sello solo si está puesto.
+   */
+  minAvisos: ['🌿 Productos naturales, sin TACC y orgánicos', '🛒 Sin mínimo de compra ni registro: solo tu WhatsApp', '🚚 Retiro en el local o envío a domicilio'] as string[],
+  minHeroEyebrow: 'Dietética · Formosa' as string,
+  minHeroTitulo: 'Lo natural, al precio de la góndola.' as string,
+  minHeroTexto: 'Elegí, pedí y te lo llevás o te lo llevamos. Sin mínimo de compra, sin registro: solo tu WhatsApp.' as string,
+  minHeroCta1: 'Ver las ofertas' as string,
+  minHeroCta1Url: '/#ofertas' as string,
+  minHeroCta2: 'Ir a la tienda' as string,
+  minHeroCta2Url: '/tienda' as string,
+  minSellos: ['Sin TACC', '100 % natural', 'Sin mínimo de compra'] as string[],
+  minBeneficiosTitulo: '¿Por qué comprar en Sabor y Aroma?' as string,
+  minBeneficios: [
+    { icono: '🌿', titulo: 'Natural de verdad', texto: 'Frutos secos, semillas, harinas y más, elegidos uno por uno.' },
+    { icono: '🏷️', titulo: 'Precio de góndola', texto: 'El mismo precio que en el local, con ofertas todas las semanas.' },
+    { icono: '🚚', titulo: 'Lo retirás o te lo llevamos', texto: 'Pedís por la tienda y coordinamos la entrega por WhatsApp.' },
+  ] as Array<Record<string, any>>,
+  minCierreTitulo: '¿Tenés una duda? Te ayudamos.' as string,
+  minCierreTexto: 'Escribinos por WhatsApp y te asesoramos con tu pedido.' as string,
+  minCierreCta: 'Escribir por WhatsApp' as string,
   slides: [
     {
       id: 1,
@@ -485,6 +510,8 @@ function saneadorPlantilla(campo: keyof typeof ESQUEMA_PLANTILLA) {
 const REGLAS: Record<string, {
   valores?: number[]; opciones?: string[]; min?: number; max?: number;
   entero?: boolean; texto?: (v: string) => string;
+  /** Una lista (de textos o de ítems): cuántos como mucho y el largo de cada texto. */
+  lista?: { max: number; largo: number };
 }> = {
   /* Impresión: cada documento solo acepta los formatos de SU mundo. */
   'impresion.ticketPos': { opciones: FORMATOS_PAPEL },
@@ -532,6 +559,22 @@ const REGLAS: Record<string, {
   'web.popupEtiqueta': { texto: (v: string) => String(v ?? '').trim().slice(0, 40) },
   'web.popupTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 90) },
   'web.popupTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 400) },
+  /* La portada minorista (17/10/2026): topes para que entre en el celular; los botones enlazan solo dentro del sitio. */
+  'web.minAvisos': { lista: { max: 5, largo: 90 } },
+  'web.minHeroEyebrow': { texto: (v: string) => String(v ?? '').trim().slice(0, 50) },
+  'web.minHeroTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 80) },
+  'web.minHeroTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 220) },
+  'web.minHeroCta1': { texto: (v: string) => String(v ?? '').trim().slice(0, 30) },
+  /* `rutaInterna` se define más abajo: se la llama al momento, no al armar la tabla. */
+  'web.minHeroCta1Url': { texto: (v: string) => rutaInterna(v) },
+  'web.minHeroCta2': { texto: (v: string) => String(v ?? '').trim().slice(0, 30) },
+  'web.minHeroCta2Url': { texto: (v: string) => rutaInterna(v) },
+  'web.minSellos': { lista: { max: 4, largo: 24 } },
+  'web.minBeneficiosTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 70) },
+  'web.minBeneficios': { lista: { max: 3, largo: 120 } },
+  'web.minCierreTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 70) },
+  'web.minCierreTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 160) },
+  'web.minCierreCta': { texto: (v: string) => String(v ?? '').trim().slice(0, 30) },
 };
 
 /**
@@ -577,6 +620,12 @@ function aplicarRegla(clave: string, campo: string, valor: any, porDefecto: any)
     return r.opciones.includes(s) ? s : porDefecto;
   }
   if (r.texto) return r.texto(String(valor ?? ''));
+  if (r.lista) {
+    const corto = (s: unknown) => String(s ?? '').trim().slice(0, r.lista!.largo);
+    return (Array.isArray(valor) ? valor : []).slice(0, r.lista.max).map((x: any) => (typeof x === 'string'
+      ? corto(x)
+      : Object.fromEntries(Object.entries(x ?? {}).map(([k, v]) => [k, typeof v === 'string' ? corto(v) : v]))));
+  }
   let n = Number(valor);
   if (!Number.isFinite(n)) return porDefecto;
   if (r.valores) return r.valores.includes(n) ? n : porDefecto;

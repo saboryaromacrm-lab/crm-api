@@ -361,6 +361,18 @@ export class TiendaService {
         titulo: String(web.popupTitulo ?? ''),
         texto: String(web.popupTexto ?? ''),
       },
+      /** La portada minorista (17/10/2026): sus textos, editables en Tienda online › Configuración › Tienda minorista. */
+      minorista: {
+        avisos: web.minAvisos as string[],
+        hero: {
+          eyebrow: String(web.minHeroEyebrow ?? ''), titulo: String(web.minHeroTitulo ?? ''), texto: String(web.minHeroTexto ?? ''),
+          cta1: { texto: String(web.minHeroCta1 ?? ''), url: String(web.minHeroCta1Url ?? '/') },
+          cta2: { texto: String(web.minHeroCta2 ?? ''), url: String(web.minHeroCta2Url ?? '/') },
+        },
+        sellos: web.minSellos as string[],
+        beneficios: { titulo: String(web.minBeneficiosTitulo ?? ''), items: web.minBeneficios as Array<{ icono: string; titulo: string; texto: string }> },
+        cierre: { titulo: String(web.minCierreTitulo ?? ''), texto: String(web.minCierreTexto ?? ''), cta: String(web.minCierreCta ?? '') },
+      },
     };
 
     /** Lo que es del modo, no del catálogo: mínimos, entregas, el modo mismo. */
