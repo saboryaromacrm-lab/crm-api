@@ -375,13 +375,15 @@ export class TiendaService {
       },
     };
 
+    /** La compra mínima mayorista (0 = sin mínimo por monto): la regla del modo y, en los dos, lo que dice el cartel de elegir modo. */
+    const minimoMayorista = Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0;
     /** Lo que es del modo, no del catálogo: mínimos, entregas, el modo mismo. */
     const reglasModo = minorista
       ? { modo, montoMinimo: 0, montoMinimoCamioneta: 0, envioCamionetaActivo: false, reglasMarca: [] as any[] }
       : {
         modo,
         /** 0 = sin mínimo por monto configurado (solo rigen los de marca/producto, si hay). */
-        montoMinimo: Number(cfg.montoMinimoMayorista) > 0 ? Number(cfg.montoMinimoMayorista) : 0,
+        montoMinimo: minimoMayorista,
         /** Piso EXTRA si la entrega es el envío sin costo (la camioneta; 0 = sin piso). */
         montoMinimoCamioneta: Number(cfg.montoMinimoCamioneta) > 0 ? Number(cfg.montoMinimoCamioneta) : 0,
         /** El envío sin costo se ofrece (Tienda online › Configuración › Tienda mayorista). */
@@ -395,6 +397,8 @@ export class TiendaService {
       ...reglasModo,
       /** El modo minorista existe (0173): con él, el sitio ofrece elegir modo. */
       minoristaActiva: cfg.tiendaMinoristaActiva !== false,
+      /** El cartel de elegir modo dice desde cuánto compra el mayorista (17/10/2026), aunque se esté en minorista. */
+      minimoMayorista,
       /** Minorista: envío gratis desde este monto (0 = se coordina). */
       envioGratisDesde: minorista && Number(cfg.tiendaMinoristaEnvioGratisDesde) > 0 ? Number(cfg.tiendaMinoristaEnvioGratisDesde) : 0,
       /** Catálogo sin fotos: la tienda lista los productos en vez de mostrar tarjetas. */
