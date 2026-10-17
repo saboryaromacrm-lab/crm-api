@@ -359,7 +359,7 @@ export const WEB_DEFAULTS = {
   minHeroEyebrow: 'Dietética · Formosa' as string,
   minHeroTitulo: 'Lo natural, al precio de la góndola.' as string,
   minHeroTexto: 'Elegí, pedí y te lo llevás o te lo llevamos. Sin mínimo de compra, sin registro: solo tu WhatsApp.' as string,
-  minHeroCta1: 'Ver las ofertas' as string,
+  minHeroCta1: 'Ver las NutriOfertas' as string,
   minHeroCta1Url: '/#ofertas' as string,
   minHeroCta2: 'Ir a la tienda' as string,
   minHeroCta2Url: '/tienda' as string,
@@ -367,7 +367,7 @@ export const WEB_DEFAULTS = {
   minBeneficiosTitulo: '¿Por qué comprar en Sabor y Aroma?' as string,
   minBeneficios: [
     { icono: '🌿', titulo: 'Natural de verdad', texto: 'Frutos secos, semillas, harinas y más, elegidos uno por uno.' },
-    { icono: '🏷️', titulo: 'Precio de góndola', texto: 'El mismo precio que en el local, con ofertas todas las semanas.' },
+    { icono: '🏷️', titulo: 'Precio de góndola', texto: 'El mismo precio que en el local, con NutriOfertas todas las semanas.' },
     { icono: '🚚', titulo: 'Lo retirás o te lo llevamos', texto: 'Pedís por la tienda y coordinamos la entrega por WhatsApp.' },
   ] as Array<Record<string, any>>,
   minCierreTitulo: '¿Tenés una duda? Te ayudamos.' as string,
