@@ -2312,6 +2312,7 @@ export class CafeteriaService {
       id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra, puntoVenta: comprobantes.puntoVenta,
       numero: comprobantes.numero, fecha: comprobantes.fecha, proveedor: proveedores.nombre,
       sucursal: sucursales.nombre, subtotalNeto: comprobantes.subtotalNeto, total: comprobantes.total,
+      percepcionesTotal: comprobantes.percepcionesTotal,
       netoCafeteria: comprobantes.netoCafeteria, finalCafeteria: comprobantes.finalCafeteria,
       cuentaFecha: comprobantes.cuentaFecha,
     };
@@ -2337,7 +2338,7 @@ export class CafeteriaService {
         nombre: productos.nombre, codigoPropio: productos.codigoPropio, tipoProd: productos.tipo,
         tamKg: presentaciones.tamKg, cantidad: comprobanteItems.cantidad,
         costoUnitario: comprobanteItems.costoUnitario, descuento: comprobanteItems.descuento,
-        subtotal: comprobanteItems.subtotal,
+        subtotal: comprobanteItems.subtotal, iva: comprobanteItems.iva,
       }).from(comprobanteItems)
         .innerJoin(productos, eq(productos.id, comprobanteItems.productoId))
         .leftJoin(presentaciones, eq(presentaciones.id, comprobanteItems.presentacionId))
@@ -2353,22 +2354,43 @@ export class CafeteriaService {
     const unidadDe = (it: any) => (it.tamKg != null ? 'paq.' : (it.tipoProd === 'granel' ? 'kg' : 'u.'));
     /* La NC resta; el resto suma. Lo mismo que la cuenta (`cuenta.ts`). */
     const signoDe = (tipo: string) => (tipo === 'nota_credito' ? -1 : 1);
-    const armar = (d: any, signo: number) => ({
-      id: d.id, tipo: d.tipo, letra: d.letra, puntoVenta: d.puntoVenta, numero: d.numero, fecha: d.fecha,
-      proveedor: d.proveedor, sucursal: d.sucursal ?? '',
-      neto: r2(signo * Number(d.netoCafeteria)),
+    const armar = (d: any, signo: number) => {
+      const neto = r2(signo * Number(d.netoCafeteria));
       /** Lo que entra a su cuenta: el total del papel de su parte (o lo firmado sin IVA). */
-      cuenta: r2(signo * segunCorte(corte, d.cuentaFecha ?? d.fecha, Number(d.netoCafeteria), Number(d.finalCafeteria))),
-      subtotalNeto: r2(signo * Number(d.subtotalNeto)),
-      /** Toda la factura es de Coffit: su parte es el neto entero. */
-      todo: Math.abs(Number(d.netoCafeteria) - Number(d.subtotalNeto)) < 0.02,
-      items: (porDoc.get(d.id) ?? []).map((it) => ({
-        productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio || '',
-        unidad: unidadDe(it), cantidad: r3(signo * Number(it.cantidad)),
-        costoUnitario: r2(Number(it.costoUnitario)), descuento: Number(it.descuento) || 0,
-        subtotal: r2(signo * Number(it.subtotal)),
-      })),
-    });
+      const cuenta = r2(signo * segunCorte(corte, d.cuentaFecha ?? d.fecha, Number(d.netoCafeteria), Number(d.finalCafeteria)));
+      const filas = porDoc.get(d.id) ?? [];
+      /*
+       * LO DE CADA RENGLÓN A SU CUENTA (17/10/2026, pedido del dueño: «Coffit
+       * paga precio final» también en el detalle). Se reparte la cuenta del
+       * papel según lo que pesa cada renglón con su IVA y su parte de las
+       * percepciones; el último se lleva el redondeo, así la suma da exacta.
+       * Si la cuenta es el neto (X, B, C, o lo firmado sin IVA), pesa el neto.
+       */
+      const perc = Number(d.subtotalNeto) > 0 ? Number(d.percepcionesTotal) / Number(d.subtotalNeto) : 0;
+      const conIva = Math.abs(cuenta - neto) >= 0.01;
+      const pesos = filas.map((it) => Number(it.subtotal) * (conIva ? 1 + (Number(it.iva) || 0) / 100 + perc : 1));
+      const totalPesos = pesos.reduce((a, x) => a + x, 0);
+      let repartido = 0;
+      const items = filas.map((it, i) => {
+        const subtotal = r2(signo * Number(it.subtotal));
+        const aCuenta = i === filas.length - 1 ? r2(cuenta - repartido) : r2(cuenta * (totalPesos ? pesos[i] / totalPesos : 0));
+        repartido = r2(repartido + aCuenta);
+        return {
+          productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio || '',
+          unidad: unidadDe(it), cantidad: r3(signo * Number(it.cantidad)),
+          costoUnitario: r2(Number(it.costoUnitario)), descuento: Number(it.descuento) || 0,
+          iva: Number(it.iva) || 0, subtotal, aCuenta,
+        };
+      });
+      return {
+        id: d.id, tipo: d.tipo, letra: d.letra, puntoVenta: d.puntoVenta, numero: d.numero, fecha: d.fecha,
+        proveedor: d.proveedor, sucursal: d.sucursal ?? '', neto, cuenta,
+        subtotalNeto: r2(signo * Number(d.subtotalNeto)),
+        /** Toda la factura es de Coffit: su parte es el neto entero. */
+        todo: Math.abs(Number(d.netoCafeteria) - Number(d.subtotalNeto)) < 0.02,
+        items,
+      };
+    };
     const documentos = docs.map((d) => armar(d, signoDe(d.tipo)));
 
     /* Por artículo: cuánto se compró de cada cosa en el período. */
@@ -2378,20 +2400,22 @@ export class CafeteriaService {
         const k = `${it.productoId}|${it.unidad}`;
         let a = porArt.get(k);
         if (!a) {
-          a = { productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio, unidad: it.unidad, cantidad: 0, neto: 0, documentos: new Set<number>() };
+          a = { productoId: it.productoId, nombre: it.nombre, codigoPropio: it.codigoPropio, unidad: it.unidad, cantidad: 0, neto: 0, aCuenta: 0, documentos: new Set<number>() };
           porArt.set(k, a);
         }
         a.cantidad += it.cantidad;
         a.neto += it.subtotal;
+        a.aCuenta += it.aCuenta;
         a.documentos.add(d.id);
       }
     }
+    /* El costo promedio es el que paga Coffit: a precio final. */
     const articulos = [...porArt.values()].map((a) => ({
       productoId: a.productoId, nombre: a.nombre, codigoPropio: a.codigoPropio, unidad: a.unidad,
-      cantidad: r3(a.cantidad), neto: r2(a.neto),
-      costoPromedio: Math.abs(a.cantidad) > 1e-9 ? r2(a.neto / a.cantidad) : 0,
+      cantidad: r3(a.cantidad), neto: r2(a.neto), aCuenta: r2(a.aCuenta),
+      costoPromedio: Math.abs(a.cantidad) > 1e-9 ? r2(a.aCuenta / a.cantidad) : 0,
       documentos: a.documentos.size,
-    })).sort((x, y) => y.neto - x.neto);
+    })).sort((x, y) => y.aCuenta - x.aCuenta);
 
     return {
       documentos,
