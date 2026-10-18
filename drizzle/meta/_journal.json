@@ -1261,6 +1261,13 @@
       "when": 1792041300000,
       "tag": "0179_web_eventos_modo",
       "breakpoints": true
+    },
+    {
+      "idx": 180,
+      "version": "7",
+      "when": 1792042200000,
+      "tag": "0180_ofertas_en_tienda",
+      "breakpoints": true
     }
   ]
 }

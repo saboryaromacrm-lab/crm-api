@@ -2618,9 +2618,12 @@ export const presupuestoItems = pgTable('presupuesto_items', {
    */
   listaId: integer('lista_id').references(() => listasVenta.id, { onDelete: 'set null' }),
   ofertaNombre: text('oferta_nombre').notNull().default(''),
+  /** La oferta que cotizó el renglón, por id (0180): el nombre de al lado puede repetirse. */
+  ofertaId: integer('oferta_id').references(() => ofertas.id, { onDelete: 'set null' }),
   motivo: text('motivo').notNull().default(''),
 }, (t) => ({
   ixPresupuesto: index('ix_presupuesto_items_presupuesto').on(t.presupuestoId),
+  ixOferta: index('ix_presupuesto_items_oferta').on(t.ofertaId).where(sql`oferta_id is not null`),
 }));
 
 /* ---------------- Imágenes del sitio web ---------------- */
@@ -2763,11 +2766,14 @@ export const webEventos = pgTable('web_eventos', {
   tipo: text('tipo').notNull(),
   ruta: text('ruta').notNull().default(''),
   productoId: integer('producto_id'),
+  /** Con qué oferta estaba publicado el producto en ese momento (0180); lo pone el servidor. Sin FK: la oferta se puede borrar. */
+  ofertaId: integer('oferta_id'),
   segundos: doublePrecision('segundos').notNull().default(0),
 }, (t) => ({
   ixFecha: index('ix_web_eventos_fecha').on(t.fecha),
   ixModoFecha: index('ix_web_eventos_modo_fecha').on(t.modo, t.fecha),
   ixProducto: index('ix_web_eventos_producto').on(t.productoId),
+  ixOferta: index('ix_web_eventos_oferta').on(t.ofertaId).where(sql`oferta_id is not null`),
 }));
 
 /**

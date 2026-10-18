@@ -840,15 +840,19 @@ export class TiendaService {
     const sesion = String(dto?.sesion ?? '').slice(0, 64);
     /* El modo lo dice el navegador (0179); cualquier otra cosa cuenta como mayorista. */
     const modo: Modo = dto?.modo === 'minorista' ? 'minorista' : 'mayorista';
-    const filas = (Array.isArray(dto?.eventos) ? dto.eventos : [])
-      .slice(0, 200)
-      .filter((e: any) => TIPOS.has(e?.tipo))
+    const crudos = (Array.isArray(dto?.eventos) ? dto.eventos : []).slice(0, 200).filter((e: any) => TIPOS.has(e?.tipo));
+    /* Con qué oferta estaba publicado cada producto (0180): del catálogo armado del modo, no de lo que diga el navegador. */
+    const ofertaDe = crudos.some((e: any) => Number(e.productoId) > 0)
+      ? new Map<number, number>((await this.armado(modo)).catalogo.items.filter((i: any) => i.oferta).map((i: any): [number, number] => [i.id, i.oferta.id]))
+      : new Map<number, number>();
+    const filas = crudos
       .map((e: any) => ({
         sesion,
         modo,
         tipo: String(e.tipo),
         ruta: String(e.ruta ?? '').slice(0, 200),
         productoId: Number(e.productoId) > 0 ? Number(e.productoId) : null,
+        ofertaId: ofertaDe.get(Number(e.productoId)) ?? null,
         // Tope de 10 minutos por evento: una pestaña olvidada no es interés.
         segundos: Math.min(Math.max(Number(e.segundos) || 0, 0), 600),
       }));
@@ -1035,7 +1039,8 @@ export class TiendaService {
         /* Sin cortar a 2 decimales: el total del presupuesto se suma con este número y
          * tiene que dar EXACTO lo que el cliente vio (la caja de 6 daba 2 centavos menos). */
         precioLista: Math.round((precioCompra / unidadesStock / (1 + iva / 100)) * 1e6) / 1e6,
-        descuento, iva, lista: lista?.nombre ?? cat.listaNombre, listaId: lista?.id ?? cat.listaId ?? null, ofertaNombre: x.oferta?.nombre ?? '',
+        descuento, iva, lista: lista?.nombre ?? cat.listaNombre, listaId: lista?.id ?? cat.listaId ?? null,
+        ofertaNombre: x.oferta?.nombre ?? '', ofertaId: x.oferta?.id ?? null,
       };
     });
     return { cat, resueltos, de, nombreDe, total, items };

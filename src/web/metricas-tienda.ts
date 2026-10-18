@@ -10,6 +10,8 @@
  *                          sus renglones para productos, categorías y marcas.
  *   · `tienda_accesos` / `tienda_compradores` / `tienda_sesiones` — los
  *                          clientes de cada modo y sus ingresos.
+ *   · las OFERTAS (0180): qué oferta cotizó cada renglón y con qué oferta
+ *                          estaba publicado cada producto mirado o cargado.
  *
  * Son consultas AGREGADAS en Postgres (GROUP BY sobre los índices por modo y
  * fecha), nunca "bajar todo y contar en Node": tardan lo mismo con un mes que
@@ -231,6 +233,79 @@ export class MetricasTiendaService {
     };
   }
 
+  /**
+   * LAS OFERTAS, CÓMO LAS RECIBE LA TIENDA (0180): por cada oferta con
+   * movimiento en el período, cuánto se miró, se cargó y se pidió con ella, la
+   * plata y el descuento que se dio. Y lo que importa para saber si funcionó:
+   * las unidades por día de SUS productos ahora contra el período anterior
+   * (con o sin oferta): si la oferta mueve, ese número sube.
+   */
+  private async ofertas(f: FiltroTienda) {
+    const importe = sql`i.cantidad * i.precio_lista * (1 - i.descuento / 100) * (1 + i.iva / 100)`;
+    const descuento = sql`i.cantidad * i.precio_lista * (i.descuento / 100) * (1 + i.iva / 100)`;
+    const pedidosVivos = sql`select id from presupuestos where ${this.pedidos(f)} and estado <> 'cancelado'`;
+    const dias = diasDe(f.desde, f.hasta);
+    const antes = { ...f, desde: sumarDias(f.desde, -dias), hasta: sumarDias(f.desde, -1) };
+    const pedidosVivosAntes = sql`select id from presupuestos where ${this.pedidos(antes)} and estado <> 'cancelado'`;
+    const conOferta = sql`exists (select 1 from presupuesto_items i where i.presupuesto_id = p.id and i.oferta_id is not null)`;
+    const [ev, pe, [tot]] = await Promise.all([
+      this.q(sql`select oferta_id, count(*) filter (where tipo = 'vista_producto') as vistas,
+          coalesce(sum(segundos) filter (where tipo = 'vista_producto'), 0) as segundos,
+          count(*) filter (where tipo = 'agregar_carrito') as carrito,
+          count(distinct sesion) filter (where tipo = 'agregar_carrito') as ses_carrito
+        from web_eventos where ${this.eventos(f)} and oferta_id is not null group by 1`),
+      this.q(sql`select i.oferta_id, count(distinct i.presupuesto_id) as pedidos, coalesce(sum(i.cantidad), 0) as unidades,
+          coalesce(sum(${importe}), 0) as total, coalesce(sum(${descuento}), 0) as descuento,
+          count(distinct i.producto_id) as productos,
+          count(distinct coalesce(p.cliente_id::text, p.web_cliente->>'telefono', p.web_cliente->>'dni', '')) as compradores
+        from presupuesto_items i join presupuestos p on p.id = i.presupuesto_id
+        where i.presupuesto_id in (${pedidosVivos}) and i.oferta_id is not null group by 1`),
+      this.q(sql`select count(*) as pedidos, count(*) filter (where ${conOferta}) as con_oferta,
+          coalesce(sum(total) filter (where ${conOferta}), 0) as total_con_oferta
+        from presupuestos p where ${this.pedidos(f)} and estado <> 'cancelado'`),
+    ]);
+    const resumen = {
+      pedidos: N(tot?.pedidos), conOferta: N(tot?.con_oferta), totalConOferta: r2(N(tot?.total_con_oferta)),
+      pctConOferta: pct(N(tot?.con_oferta), N(tot?.pedidos)),
+    };
+    const ids = [...new Set([...ev.map((r) => N(r.oferta_id)), ...pe.map((r) => N(r.oferta_id))])];
+    if (!ids.length) return { ...resumen, descuentoTotal: 0, lista: [] };
+    /* Las unidades por día de los productos de cada oferta, ahora y antes (con o sin oferta): el movimiento que generó. */
+    const productosDe = sql`(select distinct oferta_id, producto_id from presupuesto_items where oferta_id in ${ids}) x`;
+    const [datos, ahoraProd, antesProd, vistasAntes] = await Promise.all([
+      this.q(sql`select o.id, o.nombre, o.tipo, o.porcentaje, o.precio, o.lleva, o.paga, o.activa, o.desde, o.hasta from ofertas o where o.id in ${ids}`),
+      this.q(sql`select x.oferta_id, coalesce(sum(i.cantidad), 0) as unidades from presupuesto_items i join ${productosDe} on x.producto_id = i.producto_id
+        where i.presupuesto_id in (${pedidosVivos}) group by 1`),
+      this.q(sql`select x.oferta_id, coalesce(sum(i.cantidad), 0) as unidades from presupuesto_items i join ${productosDe} on x.producto_id = i.producto_id
+        where i.presupuesto_id in (${pedidosVivosAntes}) group by 1`),
+      this.q(sql`select x.oferta_id, count(*) as vistas from web_eventos e
+        join (select distinct oferta_id, producto_id from web_eventos where oferta_id in ${ids} and producto_id is not null) x on x.producto_id = e.producto_id
+        where ${this.eventos(antes)} and e.tipo = 'vista_producto' group by 1`),
+    ]);
+    const m = (rs: any[], k: string) => new Map(rs.map((r) => [N(r.oferta_id), N(r[k])]));
+    const e = new Map(ev.map((r) => [N(r.oferta_id), r])); const p = new Map(pe.map((r) => [N(r.oferta_id), r]));
+    const uAhora = m(ahoraProd, 'unidades'); const uAntes = m(antesProd, 'unidades'); const vAntes = m(vistasAntes, 'vistas');
+    const porDia = (v: number) => r2(v / dias);
+    const hoy = new Date();
+    const lista = datos.map((o) => {
+      const id = N(o.id); const x = e.get(id); const y = p.get(id);
+      const vistas = N(x?.vistas); const carrito = N(x?.carrito); const pedidos = N(y?.pedidos);
+      const estado = !o.activa ? 'inactiva' : o.desde && hoy < new Date(o.desde) ? 'programada' : o.hasta && hoy > new Date(o.hasta) ? 'vencida' : 'vigente';
+      return {
+        id, nombre: String(o.nombre), tipo: String(o.tipo), estado, desde: o.desde, hasta: o.hasta,
+        parametros: { porcentaje: N(o.porcentaje), precio: N(o.precio), lleva: N(o.lleva), paga: N(o.paga) },
+        vistas, segundosProm: vistas ? r2(N(x?.segundos) / vistas) : 0, carrito, sesionesCarrito: N(x?.ses_carrito),
+        pedidos, unidades: r2(N(y?.unidades)), total: r2(N(y?.total)), descuento: r2(N(y?.descuento)),
+        productos: N(y?.productos), compradores: N(y?.compradores),
+        pctCarrito: pct(carrito, vistas), pctPedido: pct(pedidos, vistas),
+        /** Sus productos: unidades (y vistas) por día, ahora contra el período anterior. */
+        unidadesDia: cmp(porDia(uAhora.get(id) ?? 0), porDia(uAntes.get(id) ?? 0)),
+        vistasDia: cmp(porDia(vistas), porDia(vAntes.get(id) ?? 0)),
+      };
+    }).sort((a, b) => b.total - a.total || b.vistas - a.vistas);
+    return { ...resumen, descuentoTotal: r2(lista.reduce((a, o) => a + o.descuento, 0)), lista };
+  }
+
   /** Qué se mira, qué se carga y qué se pide: por producto, categoría y marca. */
   private async productos(f: FiltroTienda) {
     /* El importe del renglón como se cotizó: neto × (1 − desc) × (1 + IVA). */
@@ -282,8 +357,8 @@ export class MetricasTiendaService {
   async metricas(f: FiltroTienda) {
     const dias = diasDe(f.desde, f.hasta);
     const antes: FiltroTienda = { ...f, desde: sumarDias(f.desde, -dias), hasta: sumarDias(f.desde, -1) };
-    const [ahora, previo, serie, trafico, pedidos, clientes, productos] = await Promise.all([
-      this.sumas(f), this.sumas(antes), this.serie(f), this.trafico(f), this.detallePedidos(f), this.clientes(f), this.productos(f),
+    const [ahora, previo, serie, trafico, pedidos, clientes, productos, ofertas] = await Promise.all([
+      this.sumas(f), this.sumas(antes), this.serie(f), this.trafico(f), this.detallePedidos(f), this.clientes(f), this.productos(f), this.ofertas(f),
     ]);
     return {
       periodo: { modo: f.modo, desde: f.desde, hasta: f.hasta, paso: f.paso, dias, antes: { desde: antes.desde, hasta: antes.hasta } },
@@ -312,7 +387,7 @@ export class MetricasTiendaService {
         tasaCancelacion: pct(ahora.cancelados, ahora.pedidos),
         tasaCierre: pct(ahora.cerrados, ahora.vivos),
       },
-      serie, trafico, pedidos, clientes, productos,
+      serie, trafico, pedidos, clientes, productos, ofertas,
     };
   }
 }

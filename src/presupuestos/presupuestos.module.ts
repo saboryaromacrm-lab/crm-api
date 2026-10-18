@@ -68,6 +68,8 @@ class PresupuestoItemDto {
   /** El ID de la lista con la que se cotiza (0060): es lo que el POS verifica al cerrar. */
   @IsOptional() @IsInt() listaId?: number | null;
   @IsOptional() @IsString() @MaxLength(120) ofertaNombre?: string;
+  /** La oferta que cotizó el renglón (0180); la pone la tienda. */
+  @IsOptional() @IsInt() ofertaId?: number | null;
 }
 
 class CrearPresupuestoDto {
@@ -171,7 +173,7 @@ export class PresupuestosService {
          * nombre para el papel; este es el que el sistema puede verificar cuando
          * el pedido se cierra en el POS. */
         listaId: it.listaId ? Number(it.listaId) : null,
-        ofertaNombre: String(it.ofertaNombre ?? ''), motivo: '',
+        ofertaNombre: String(it.ofertaNombre ?? ''), ofertaId: it.ofertaId ? Number(it.ofertaId) : null, motivo: '',
       };
     }).filter((it: any) => it.productoId && it.cantidad > 0);
     return { limpios, subtotalNeto: money(neto), ivaTotal: money(iva), total: money(neto + iva) };
