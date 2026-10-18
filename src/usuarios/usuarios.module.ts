@@ -203,7 +203,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'web.productos', nombre: 'Productos del sitio' },
       { clave: 'web.ofertas', nombre: 'Ofertas del sitio' },
       { clave: 'web.contenido', nombre: 'Contenido (banners e imágenes)' },
-      { clave: 'web.estadisticas', nombre: 'Estadísticas del sitio' },
+      { clave: 'web.estadisticas', nombre: 'Métricas de la tienda online (mayorista y minorista)' },
       { clave: 'web.configuracion', nombre: 'Configuración de la tienda online (mayorista, minorista, logo, contacto, redes)' },
       /* La llave conserva el nombre con que nació en 0155 (ya grabada en los roles). */
       { clave: 'ventas.accesos_tienda', nombre: 'Accesos a la tienda (habilitar o bloquear a quien pide comprar mayorista)' },

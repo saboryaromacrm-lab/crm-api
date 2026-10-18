@@ -19,14 +19,15 @@ import {
   Logger, Module, NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Patch,
   Post, Query,
 } from '@nestjs/common';
-import { and, eq, gte, inArray, isNull, lt, ne } from 'drizzle-orm';
+import { and, eq, isNull, lt } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { TiendaModule, TiendaService } from '../tienda/tienda.module';
 import { tienePermiso } from '../auth/auth.guard';
+import { MetricasTiendaService, filtroTienda } from './metricas-tienda';
 import { MIMES_IMAGEN, mimeReal } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, configuracion, marcas, presupuestoItems, presupuestos, productos, stock,
+  categorias, configuracion, marcas, productos, stock,
   sucursales, webEventos, webImagenes,
 } from '../db/schema';
 
@@ -242,114 +243,6 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
     return { ok: true };
   }
 
-  /**
-   * Estadísticas del sitio, agregadas para el panel: visitas y sesiones por
-   * día, y el ranking de productos (vistas, SEGUNDOS promedio en pantalla,
-   * agregados al carrito y unidades pedidas). "Lo pedido" sale de los
-   * presupuestos con origen web no cancelados — el interés que terminó en
-   * plata, no un contador aparte que pueda discrepar.
-   */
-  async estadisticas(dias: number) {
-    const n = Math.min(Math.max(Number(dias) || 30, 1), 365);
-    const desde = new Date(Date.now() - n * 86400000);
-    desde.setHours(0, 0, 0, 0);
-
-    const [evs, prods, pedidosWeb] = await Promise.all([
-      this.db.select().from(webEventos).where(gte(webEventos.fecha, desde)),
-      this.db.select({ id: productos.id, nombre: productos.nombre }).from(productos),
-      this.db.select().from(presupuestos)
-        .where(and(eq(presupuestos.origen, 'web'), gte(presupuestos.fecha, desde), ne(presupuestos.estado, 'cancelado'))),
-    ]);
-
-    /*
-     * Los renglones SOLO de los pedidos del período, no toda la tabla hija
-     * histórica: a los dos años de operación, bajar `presupuesto_items` entera
-     * para cruzarla contra un puñado de pedidos web tira la pantalla sola.
-     */
-    const idsPeriodo = pedidosWeb.map((p) => p.id);
-    const items = idsPeriodo.length
-      ? await this.db.select().from(presupuestoItems).where(inArray(presupuestoItems.presupuestoId, idsPeriodo))
-      : [];
-
-    /* Serie por día (con los días sin tráfico en cero: el gráfico no miente saltándolos). */
-    const claveDia = (d: Date) => d.toISOString().slice(0, 10);
-    const porDia = new Map<string, { fecha: string; vistas: number; sesiones: Set<string> }>();
-    for (let i = 0; i <= n; i++) {
-      const d = new Date(desde.getTime() + i * 86400000);
-      if (d.getTime() > Date.now()) break;
-      porDia.set(claveDia(d), { fecha: claveDia(d), vistas: 0, sesiones: new Set() });
-    }
-
-    const sesiones = new Set<string>();
-    const porProducto = new Map<number, { vistas: number; segundos: number; carrito: number }>();
-    /* Términos de búsqueda: agrupados sin mayúsculas ni acentos, mostrando el
-     * primer texto tal como se tipeó. Lo que se busca y no se encuentra es la
-     * lista de compras del catálogo. */
-    const busquedas = new Map<string, { termino: string; veces: number }>();
-    const normBusqueda = (v: string) => v.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '').trim();
-    for (const e of evs) {
-      if (e.sesion) sesiones.add(e.sesion);
-      const dia = porDia.get(claveDia(new Date(e.fecha)));
-      if (e.tipo === 'vista_pagina') {
-        if (dia) { dia.vistas += 1; if (e.sesion) dia.sesiones.add(e.sesion); }
-        continue;
-      }
-      if (e.tipo === 'busqueda') {
-        const termino = String(e.ruta ?? '').trim().slice(0, 60);
-        if (!termino) continue;
-        const clave = normBusqueda(termino);
-        const acc = busquedas.get(clave) ?? { termino, veces: 0 };
-        acc.veces += 1;
-        busquedas.set(clave, acc);
-        continue;
-      }
-      if (!e.productoId) continue;
-      const p = porProducto.get(e.productoId) ?? { vistas: 0, segundos: 0, carrito: 0 };
-      if (e.tipo === 'vista_producto') { p.vistas += 1; p.segundos += e.segundos; }
-      if (e.tipo === 'agregar_carrito') p.carrito += 1;
-      porProducto.set(e.productoId, p);
-    }
-
-    /* Lo efectivamente pedido por la web en el período. */
-    const idsPedidos = new Set(pedidosWeb.map((p) => p.id));
-    const pedidoPorProducto = new Map<number, { unidades: number; pedidos: number }>();
-    for (const it of items) {
-      if (!idsPedidos.has(it.presupuestoId)) continue;
-      const acc = pedidoPorProducto.get(it.productoId) ?? { unidades: 0, pedidos: 0 };
-      acc.unidades += it.cantidad;
-      acc.pedidos += 1;
-      pedidoPorProducto.set(it.productoId, acc);
-    }
-
-    const nombreDe = new Map(prods.map((p) => [p.id, p.nombre]));
-    const idsTodos = new Set([...porProducto.keys(), ...pedidoPorProducto.keys()]);
-    const ranking = [...idsTodos].map((id) => {
-      const ev = porProducto.get(id) ?? { vistas: 0, segundos: 0, carrito: 0 };
-      const pe = pedidoPorProducto.get(id) ?? { unidades: 0, pedidos: 0 };
-      return {
-        id,
-        nombre: nombreDe.get(id) ?? `Producto #${id}`,
-        vistas: ev.vistas,
-        segundosProm: ev.vistas ? Math.round((ev.segundos / ev.vistas) * 10) / 10 : 0,
-        carrito: ev.carrito,
-        pedidos: pe.pedidos,
-        unidades: Math.round(pe.unidades * 100) / 100,
-      };
-    }).sort((a, b) => b.vistas - a.vistas || b.unidades - a.unidades);
-
-    const totalVistas = [...porDia.values()].reduce((a, d) => a + d.vistas, 0);
-    return {
-      dias: n,
-      vistas: totalVistas,
-      sesiones: sesiones.size,
-      pedidos: pedidosWeb.length,
-      /** Pedidos / sesiones: cuántas visitas terminan en un pedido. */
-      conversion: sesiones.size ? Math.round((pedidosWeb.length / sesiones.size) * 1000) / 10 : 0,
-      porDia: [...porDia.values()].map((d) => ({ fecha: d.fecha, vistas: d.vistas, sesiones: d.sesiones.size })),
-      productos: ranking,
-      busquedas: [...busquedas.values()].sort((a, b) => b.veces - a.veces).slice(0, 20),
-    };
-  }
 }
 
 /**
@@ -361,7 +254,7 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
  */
 @Controller('web')
 export class WebController {
-  constructor(private readonly svc: WebService, private readonly tienda: TiendaService) {}
+  constructor(private readonly svc: WebService, private readonly tienda: TiendaService, private readonly metricasTienda: MetricasTiendaService) {}
 
   /**
    * Lo que ve un cliente habilitado, CON precios (0155): el público
@@ -372,11 +265,10 @@ export class WebController {
   @Permiso('web.productos', 'web.ofertas', 'web.contenido', 'web.estadisticas', 'web.configuracion')
   catalogo() { return this.tienda.catalogoCompleto(); }
 
-  @Get('estadisticas')
+  /** Tienda online › Métricas (0179): por modo y período, con el período anterior para comparar. */
+  @Get('metricas')
   @Permiso('web.estadisticas')
-  estadisticas(@Query('dias') dias?: string) {
-    return this.svc.estadisticas(dias ? Number(dias) : 30);
-  }
+  metricas(@Query() q: Record<string, any>) { return this.metricasTienda.metricas(filtroTienda(q)); }
 
   @Get('productos')
   @Permiso('web.productos')
@@ -415,7 +307,7 @@ export class WebController {
 @Module({
   imports: [TiendaModule],
   controllers: [WebController],
-  providers: [WebService],
+  providers: [WebService, MetricasTiendaService],
 })
 export class WebModule {}
 

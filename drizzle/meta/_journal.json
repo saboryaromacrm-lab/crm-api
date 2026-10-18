@@ -1254,6 +1254,13 @@
       "when": 1792040400000,
       "tag": "0178_tienda_ingreso_minorista",
       "breakpoints": true
+    },
+    {
+      "idx": 179,
+      "version": "7",
+      "when": 1792041300000,
+      "tag": "0179_web_eventos_modo",
+      "breakpoints": true
     }
   ]
 }

@@ -2757,12 +2757,16 @@ export const webEventos = pgTable('web_eventos', {
   id: serial('id').primaryKey(),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   sesion: text('sesion').notNull().default(''),
+  /** En qué modo de la tienda pasó (0179): las métricas van separadas por modo. */
+  modo: text('modo').$type<'mayorista' | 'minorista'>().notNull().default('mayorista'),
+  /** vista_pagina · vista_producto · agregar_carrito · busqueda · pedido (0179: el pedido enviado, para el embudo). */
   tipo: text('tipo').notNull(),
   ruta: text('ruta').notNull().default(''),
   productoId: integer('producto_id'),
   segundos: doublePrecision('segundos').notNull().default(0),
 }, (t) => ({
   ixFecha: index('ix_web_eventos_fecha').on(t.fecha),
+  ixModoFecha: index('ix_web_eventos_modo_fecha').on(t.modo, t.fecha),
   ixProducto: index('ix_web_eventos_producto').on(t.productoId),
 }));
 

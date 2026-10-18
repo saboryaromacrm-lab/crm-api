@@ -834,14 +834,18 @@ export class TiendaService {
    */
   async eventos(dto: any) {
     // 'busqueda': el término va en `ruta` — qué busca la gente (y no encuentra)
-    // es la lista de compras del catálogo.
-    const TIPOS = new Set(['vista_pagina', 'vista_producto', 'agregar_carrito', 'busqueda']);
+    // es la lista de compras del catálogo. 'pedido': el pedido que se mandó
+    // (0179), para cerrar el embudo por sesión.
+    const TIPOS = new Set(['vista_pagina', 'vista_producto', 'agregar_carrito', 'busqueda', 'pedido']);
     const sesion = String(dto?.sesion ?? '').slice(0, 64);
+    /* El modo lo dice el navegador (0179); cualquier otra cosa cuenta como mayorista. */
+    const modo: Modo = dto?.modo === 'minorista' ? 'minorista' : 'mayorista';
     const filas = (Array.isArray(dto?.eventos) ? dto.eventos : [])
       .slice(0, 200)
       .filter((e: any) => TIPOS.has(e?.tipo))
       .map((e: any) => ({
         sesion,
+        modo,
         tipo: String(e.tipo),
         ruta: String(e.ruta ?? '').slice(0, 200),
         productoId: Number(e.productoId) > 0 ? Number(e.productoId) : null,
