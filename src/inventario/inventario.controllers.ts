@@ -277,6 +277,9 @@ export class StockController {
   }
 }
 
+/** Cuándo arrancó este proceso de la API: entra en el ETag del bootstrap (ver `parte`). */
+const ARRANQUE = Date.now().toString(36);
+
 @Controller('bootstrap')
 export class BootstrapController {
   constructor(private readonly inv: InventarioService) {}
@@ -335,9 +338,16 @@ export class BootstrapController {
     return this.parte(req, res, 'stock', 'todos', () => this.inv.bootstrapStock());
   }
 
+  /*
+   * EL ETAG TAMBIÉN LLEVA EL ARRANQUE DE LA API (19/10/2026). La versión dice
+   * si cambiaron los DATOS; si cambia el CÓDIGO (un campo nuevo, como la foto
+   * del producto), la versión puede ser la misma y el navegador seguía usando
+   * su copia vieja — sin el campo — hasta que alguien tocara el catálogo. Con
+   * el arranque, después de cada deploy cada equipo baja una vez y listo.
+   */
   private async parte(req: any, res: any, nombre: 'base' | 'catalogo' | 'stock', variante: string, armar: () => Promise<unknown>) {
     const v = await this.inv.versiones();
-    const etag = `"inv-${nombre}-${v[nombre]}-${variante}"`;
+    const etag = `"inv-${nombre}-${v[nombre]}-${variante}-${ARRANQUE}"`;
     res.setHeader('ETag', etag);
     res.setHeader('Cache-Control', 'private, no-cache');
     // `If-None-Match` puede traer varios, separados por coma.

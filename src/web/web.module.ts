@@ -5,7 +5,6 @@
  * formato de venta): administra la CARA del sitio. Sus mutaciones son pocas a
  * propósito:
  *
- *   - `destacado` del producto → el carrusel "Destacados" de la portada.
  *   - Imágenes: foto de producto, imagen de categoría, logo de marca y banner
  *     (tabla `web_imagenes`; el sitio las recibe como URL versionada).
  *   - Los TEXTOS del sitio (hero) van por la configuración general
@@ -13,13 +12,19 @@
  *
  * Qué productos están en el sitio no se decide acá: es la regla de la lista
  * Mayorista que aplica `TiendaService.catalogo()`.
+ *
+ * LO DE CADA PRODUCTO PARA LA TIENDA VIVE EN COMPRAS › PRODUCTOS (19/10/2026,
+ * pedido del dueño): la foto (con la llave de esa sección), el destacado y el
+ * mínimo web (`PATCH /productos/:id/tienda`) y cómo se ve en cada tienda
+ * (`GET /web/productos/:id`). Ya no hay «Productos del sitio».
  */
+import { rutaImagen } from './ruta-imagen';
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable,
-  Logger, Module, NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Patch,
+  Logger, Module, NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe,
   Post, Query,
 } from '@nestjs/common';
-import { and, eq, isNull, lt } from 'drizzle-orm';
+import { and, eq, lt } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { TiendaModule, TiendaService } from '../tienda/tienda.module';
 import { tienePermiso } from '../auth/auth.guard';
@@ -27,8 +32,7 @@ import { MetricasTiendaService, filtroTienda } from './metricas-tienda';
 import { MIMES_IMAGEN, mimeReal } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, configuracion, marcas, productos, stock,
-  sucursales, webEventos, webImagenes,
+  categorias, configuracion, marcas, productos, webEventos, webImagenes,
 } from '../db/schema';
 
 /**
@@ -45,7 +49,8 @@ import {
  * dos se derivan de este mapa — agregar un tipo nuevo acá las actualiza juntas.
  */
 const PERMISO_DE_IMAGEN: Record<string, string> = {
-  producto: 'web.productos',
+  /* La foto del producto se carga en Compras › Productos (19/10/2026). */
+  producto: 'compras.productos',
   categoria: 'web.contenido',
   marca: 'web.contenido',
   banner: 'web.contenido',
@@ -100,56 +105,6 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
       // La purga jamás voltea la API: si falla, se reintenta en la próxima vuelta.
       this.log.warn(`No se pudo purgar la telemetría: ${e?.message ?? e}`);
     }
-  }
-
-  /** Lo editable del producto desde el módulo Web: `destacado` y el piso de stock online. */
-  async editarProducto(id: number, o: { destacado?: boolean; webStockMin?: number }) {
-    const patch: any = {};
-    if (o.destacado != null) patch.destacado = !!o.destacado;
-    if (o.webStockMin != null) {
-      const n = Number(o.webStockMin);
-      if (!Number.isFinite(n) || n < 0) throw new BadRequestException('El mínimo web no puede ser negativo.');
-      patch.webStockMin = n;
-    }
-    if (!Object.keys(patch).length) throw new BadRequestException('Nada para cambiar.');
-    const [p] = await this.db.update(productos).set(patch)
-      .where(eq(productos.id, id)).returning();
-    if (!p) throw new NotFoundException('Producto inexistente.');
-    return { ok: true, destacado: p.destacado, webStockMin: p.webStockMin };
-  }
-
-  /**
-   * Vista ADMIN de los productos del sitio: el stock real de la Distribuidora
-   * y el piso configurado. Va por acá y no por el catálogo público a
-   * propósito — la cantidad exacta de stock no es dato para el visitante.
-   */
-  async productosAdmin() {
-    const [dist] = await this.db.select().from(sucursales).where(eq(sucursales.tipo, 'distribuidora')).limit(1);
-    const [prods, existencias] = await Promise.all([
-      /* Los códigos viajan para la subida de fotos EN LOTE (25/8): el panel
-       * empareja cada archivo con su producto por el nombre del archivo, y el
-       * código de barras es el emparejado infalible. El catálogo público no
-       * los trae — y no tiene por qué: esto es del panel, con su permiso. */
-      this.db.select({
-        id: productos.id,
-        webStockMin: productos.webStockMin,
-        codigoBarras: productos.codigoBarras,
-        codigoPropio: productos.codigoPropio,
-      }).from(productos),
-      dist
-        ? this.db.select().from(stock)
-          .where(and(eq(stock.sucursalId, dist.id), eq(stock.estado, 'disponible'), isNull(stock.presentacionId)))
-        : Promise.resolve([] as any[]),
-    ]);
-    const disp = new Map<number, number>();
-    for (const s of existencias) disp.set(s.productoId, (disp.get(s.productoId) ?? 0) + s.cantidad);
-    return prods.map((p) => ({
-      id: p.id,
-      webStockMin: p.webStockMin,
-      stockDisp: Math.round((disp.get(p.id) ?? 0) * 100) / 100,
-      codigoBarras: p.codigoBarras || '',
-      codigoPropio: p.codigoPropio || '',
-    }));
   }
 
   /**
@@ -233,7 +188,7 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
         set: { mime: real, data: limpio, actualizadoEn: new Date() },
       })
       .returning({ tipo: webImagenes.tipo, refId: webImagenes.refId, actualizadoEn: webImagenes.actualizadoEn });
-    return { ok: true, url: `tienda/imagenes/${img.tipo}/${img.refId}?v=${new Date(img.actualizadoEn).getTime()}` };
+    return { ok: true, url: rutaImagen(img.tipo, img.refId, img.actualizadoEn) };
   }
 
   async borrarImagen(tipo: string, refId: number, sesion: Sesion) {
@@ -262,7 +217,7 @@ export class WebController {
    * ingresa a la tienda. Lo pide la página entera, así que alcanza cualquier sección.
    */
   @Get('catalogo')
-  @Permiso('web.productos', 'web.ofertas', 'web.contenido', 'web.estadisticas', 'web.configuracion')
+  @Permiso('web.ofertas', 'web.contenido', 'web.estadisticas', 'web.configuracion')
   catalogo() { return this.tienda.catalogoCompleto(); }
 
   /** Tienda online › Métricas (0179): por modo y período, con el período anterior para comparar. */
@@ -270,15 +225,10 @@ export class WebController {
   @Permiso('web.estadisticas')
   metricas(@Query() q: Record<string, any>) { return this.metricasTienda.metricas(filtroTienda(q)); }
 
-  @Get('productos')
-  @Permiso('web.productos')
-  productos() { return this.svc.productosAdmin(); }
-
-  @Patch('productos/:id')
-  @Permiso('web.productos')
-  producto(@Param('id', ParseIntPipe) id: number, @Body() body: any) {
-    return this.svc.editarProducto(id, body ?? {});
-  }
+  /** Cómo se ve un producto en cada tienda (Compras › Productos › pestaña Tienda online). */
+  @Get('productos/:id')
+  @Permiso('compras.productos')
+  vistaProducto(@Param('id', ParseIntPipe) id: number) { return this.tienda.vistaProducto(id); }
 
   /* El piso: alguna de las tres. Cuál corresponde depende del `tipo`, y eso lo
    * exige el servicio con el mismo mapa del que sale esta lista. */

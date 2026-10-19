@@ -58,6 +58,7 @@ import { AccesosTiendaController } from './accesos.controller';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
+import { rutaImagen } from '../web/ruta-imagen';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
@@ -223,6 +224,23 @@ export class TiendaService {
     return s ? { ...completo, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(completo);
   }
 
+  /**
+   * CÓMO SE VE UN PRODUCTO EN CADA TIENDA (19/10/2026, Compras › Productos ›
+   * Tienda online): del mismo catálogo armado que ve el cliente, así que la
+   * regla de publicación no se escribe dos veces. null = no está en esa tienda.
+   */
+  async vistaProducto(id: number) {
+    const [may, min] = await Promise.all([this.armado('mayorista'), this.armado('minorista')]);
+    const vista = (arm: Armado) => {
+      const it = arm.catalogo.items.find((x: any) => x.id === id);
+      return it ? {
+        precio: it.precio, unidad: it.unidad, enStock: !!it.enStock,
+        opciones: it.variantes?.length ?? 0, oferta: it.oferta?.badge ?? null,
+      } : null;
+    };
+    return { mayorista: vista(may), minorista: vista(min) };
+  }
+
   /** El catálogo mayorista CON precios, tal cual lo ve un cliente habilitado: el de Tienda online del ERP (`GET /web/catalogo`). */
   async catalogoCompleto() {
     return { ...(await this.armado('mayorista')).catalogo, conPrecios: true, cliente: null };
@@ -277,11 +295,11 @@ export class TiendaService {
       this.db.select({ id: presentaciones.id, productoId: presentaciones.productoId, tamKg: presentaciones.tamKg }).from(presentaciones),
     ]);
 
-    /** URL de una imagen subida en el módulo Web ('' si no hay). `?v=` rompe el caché al re-subir. */
-    const imgMap = new Map(imgs.map((i) => [`${i.tipo}:${i.refId}`, new Date(i.actualizadoEn).getTime()]));
+    /** URL de una imagen subida ('' si no hay): `rutaImagen`, la misma regla que el ERP. */
+    const imgMap = new Map(imgs.map((i) => [`${i.tipo}:${i.refId}`, i.actualizadoEn]));
     const urlImagen = (tipo: string, refId: number) => {
       const v = imgMap.get(`${tipo}:${refId}`);
-      return v ? `tienda/imagenes/${tipo}/${refId}?v=${v}` : '';
+      return v ? rutaImagen(tipo, refId, v) : '';
     };
 
     const reingresados = new Set(ingresosRecientes.map((m: any) => m.productoId));

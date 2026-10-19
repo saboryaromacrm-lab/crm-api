@@ -200,7 +200,7 @@ export const CATALOGO_PERMISOS = [
     grupo: 'Web',
     modulo: 'web',
     secciones: [
-      { clave: 'web.productos', nombre: 'Productos del sitio' },
+      /* «Productos del sitio» ya no existe (19/10/2026): la foto, el destacado y el mínimo web son de Compras › Productos. */
       { clave: 'web.ofertas', nombre: 'Ofertas del sitio' },
       { clave: 'web.contenido', nombre: 'Contenido (banners e imágenes)' },
       { clave: 'web.estadisticas', nombre: 'Métricas de la tienda online (mayorista y minorista)' },

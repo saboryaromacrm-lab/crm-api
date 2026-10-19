@@ -3,6 +3,7 @@ import { and, asc, eq, getTableColumns, gte, inArray, isNotNull, isNull, lte, ne
 import { fechaLocal } from '../common/documentos';
 import { agruparPor, grupo } from '../common/agrupar';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { fotoDeProducto, fotosDeProductos } from '../web/ruta-imagen';
 import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
@@ -3494,7 +3495,7 @@ export class InventarioService {
    * "a costo". `costosOcultos` le avisa a la pantalla que no lo recalcule.
    */
   async bootstrapCatalogo(verCostos = true, ocultarUnitario = false) {
-    const [prods, pres, provCostos, formatos, listasCat, ms, cs, ss, es, pes] = await Promise.all([
+    const [prods, pres, provCostos, formatos, listasCat, ms, cs, ss, es, pes, fotos] = await Promise.all([
       this.db.select().from(productos),
       this.db.select().from(presentaciones),
       this.db.select().from(productoProveedores),
@@ -3505,6 +3506,8 @@ export class InventarioService {
       this.db.select().from(subcategorias),
       this.db.select().from(etiquetas),
       this.db.select().from(productoEtiquetas),
+      /* La foto de la tienda (19/10/2026): se ve y se carga en Compras › Productos. */
+      fotosDeProductos(this.db),
     ]);
     const cfgVentas = await this.cfg.get('ventas');
     const redondeo = cfgVentas.redondeoPrecio;
@@ -3603,6 +3606,7 @@ export class InventarioService {
         subcategoria: nSubcategoria.get(p.subcategoriaId as number) ?? '',
         etiquetas: misEtq,
         etiquetasNombres: misEtq.map((id) => nEtiqueta.get(id)).filter(Boolean),
+        fotoUrl: fotoDeProducto(p, fotos),
         costoNeto: cn,
         /* Cada paquete con SU formato de venta. `precio` null = todavía no tiene
          * ninguna lista cargada, que no es lo mismo que valer cero. */

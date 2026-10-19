@@ -20,9 +20,10 @@ import {
   categorias, coffitMovimientos, comprobanteItems, envioCafeteriaItems, etiquetas, incidencias, listasVenta, marcas,
   modalidadesVenta, movimientos, pedidoCafeteriaItems, presentaciones, presupuestoItems, productoEtiquetas, productoListas,
   productoProveedorCostos, productoProveedores, productos, proveedores, stock, subcategorias, sucursales,
-  transferenciaItems, vencimientos, ventaItems, webImagenes,
+  transferenciaItems, vencimientos, ventaItems,
 } from '../db/schema';
 import { sincronizarProveedorCoffit } from './proveedorCoffit';
+import { fotoDeProducto, fotosDeProductos } from '../web/ruta-imagen';
 import {
   costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, formatoDeCosto,
   precioVentaFila, type OpcionesPrecio,
@@ -172,6 +173,11 @@ class CartelDto {
 class ControlStockDto {
   @IsIn([true, false, null], { message: 'El control de stock es «controlar», «no controlar» o «como la configuración general».' })
   controlStock!: boolean | null;
+}
+/** Lo de la tienda del producto (19/10/2026): lo que no viene, no se toca. */
+class TiendaProductoDto {
+  @IsOptional() @IsBoolean() destacado?: boolean;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000) webStockMin?: number;
 }
 
 /**
@@ -338,12 +344,8 @@ export class ProductosService {
       this.cfg.get('ventas'),
       this.listas.catalogo(),
       this.catalogoPlano(),
-      /* QUÉ PRODUCTOS TIENEN FOTO (4/10/2026, filtro «con / sin imagen» del
-       * catálogo). Solo el id: la foto en sí (base64) NO se lee acá — pesa. */
-      this.db.select({ refId: webImagenes.refId }).from(webImagenes)
-        .where(and(eq(webImagenes.tipo, 'producto'), filtro(webImagenes.refId))),
+      fotosDeProductos(this.db, solo ?? undefined),
     ]);
-    const conFoto = new Set(fotos.map((f) => f.refId));
 
     const activas = cat.listas.filter((l: any) => l.activa);
     const porListaId = new Map(activas.map((l: any) => [l.id, l]));
@@ -430,7 +432,8 @@ export class ProductosService {
         subcategoria: cats.subcategoria.get(prod.subcategoriaId) ?? '',
         etiquetas: misEtq,
         etiquetasNombres: misEtq.map((id: number) => cats.etiqueta.get(id)).filter(Boolean),
-        tieneImagen: conFoto.has(prod.id),
+        /** La foto de la tienda: la subida manda, la URL externa es el plan B (igual que el sitio). '' = sin foto. */
+        fotoUrl: fotoDeProducto(prod, fotos),
         costoNeto,
         /*
          * Cada paquete con SU formato de venta y su costo derivado. `precio` es
@@ -702,6 +705,30 @@ export class ProductosService {
    * transacción: este dato decide si la caja frena una venta. Cambiarlo al
    * mismo valor no escribe nada.
    */
+  /**
+   * LO DE LA TIENDA DEL PRODUCTO (19/10/2026, antes en Tienda online ›
+   * Productos del sitio): `destacado` arma el carrusel de la portada y
+   * `webStockMin` es el piso de stock para la venta online. Queda en la
+   * auditoría de la ficha, como el control de stock.
+   */
+  async cambiarTienda(id: number, dto: TiendaProductoDto, usuarioId: number | null) {
+    if (dto.destacado == null && dto.webStockMin == null) throw new BadRequestException('Nada para cambiar.');
+    return this.db.transaction(async (tx) => {
+      const [p] = await tx.select({ id: productos.id, nombre: productos.nombre, destacado: productos.destacado, webStockMin: productos.webStockMin })
+        .from(productos).where(eq(productos.id, id)).for('update');
+      if (!p) throw new NotFoundException('Producto inexistente.');
+      const nuevo = { destacado: dto.destacado ?? p.destacado, webStockMin: dto.webStockMin ?? p.webStockMin };
+      const cambios: CambioAuditado[] = [];
+      if (nuevo.destacado !== p.destacado) cambios.push({ entidad: 'producto', entidadId: id, ambito: 'Ficha', detalle: p.nombre, campo: 'Destacado en la tienda', antes: p.destacado ? 'Sí' : 'No', despues: nuevo.destacado ? 'Sí' : 'No', usuarioId });
+      if (nuevo.webStockMin !== p.webStockMin) cambios.push({ entidad: 'producto', entidadId: id, ambito: 'Ficha', detalle: p.nombre, campo: 'Mínimo web', antes: String(p.webStockMin), despues: String(nuevo.webStockMin), usuarioId });
+      if (cambios.length) {
+        await tx.update(productos).set(nuevo).where(eq(productos.id, id));
+        await this.audit.registrar(cambios, tx);
+      }
+      return { id, ...nuevo };
+    });
+  }
+
   async cambiarControlStock(id: number, valor: boolean | null, usuarioId: number | null) {
     return this.db.transaction(async (tx) => {
       const [p] = await tx.select({ id: productos.id, nombre: productos.nombre, controlStock: productos.controlStock })
@@ -2750,6 +2777,12 @@ export class ProductosController {
   @Permiso('compras.productos', 'ventas.cambios', 'ventas.carteles')
   @Patch(':id/cartel') cartel(@Param('id', ParseIntPipe) id: number, @Body() dto: CartelDto) {
     return this.svc.guardarCartel(id, dto);
+  }
+  /** Lo de la tienda (19/10/2026): destacado y mínimo web, con la llave de la ficha. */
+  @Permiso('compras.productos')
+  @Patch(':id/tienda')
+  tienda(@Param('id', ParseIntPipe) id: number, @Body() dto: TiendaProductoDto, @Auth() sesion: Sesion) {
+    return this.svc.cambiarTienda(id, dto, sesion?.usuarioId ?? null);
   }
   /** El control de stock del producto (0129): misma llave que editar la ficha. */
   @Permiso('compras.productos')
