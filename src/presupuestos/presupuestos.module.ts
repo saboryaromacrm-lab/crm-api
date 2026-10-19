@@ -27,6 +27,7 @@ import {
 } from 'class-validator';
 import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion } from '../auth/auth.guard';
 import { clientes, fraccionOperadores, presupuestoItems, presupuestos, productos, stock } from '../db/schema';
@@ -186,16 +187,7 @@ export class PresupuestosService {
    * cobrar, con el cliente adelante.
    */
   private async validarCotizables(items: Array<{ productoId: number }>) {
-    const ids = [...new Set(items.map((it) => it.productoId))];
-    if (!ids.length) return;
-    const [p] = await this.db.select({ nombre: productos.nombre }).from(productos)
-      .where(and(inArray(productos.id, ids), eq(productos.soloCafeteria, true))).limit(1);
-    if (p) {
-      throw new BadRequestException(
-        `${p.nombre} es de uso exclusivo de Coffit: no se vende en el mostrador y no se puede presupuestar. `
-        + 'Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
-      );
-    }
+    await exigirNoExclusivoCoffit(this.db, items.map((it) => it.productoId), 'presupuestar');
   }
 
   private async getRow(id: number) {

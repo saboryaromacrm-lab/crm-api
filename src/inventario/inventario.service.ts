@@ -3,6 +3,7 @@ import { and, asc, eq, getTableColumns, gte, inArray, isNotNull, isNull, lte, ne
 import { fechaLocal } from '../common/documentos';
 import { agruparPor, grupo } from '../common/agrupar';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   productos, presentaciones, productoProveedores, productoListas, listasVenta, proveedores, roles, sucursales, usuarios,
   stock, movimientos, transferencias, transferenciaItems, transferenciaHist, incidencias, stockControlado,
@@ -807,6 +808,7 @@ export class InventarioService {
         porProducto.set(pid, m);
       }
       if (!porProducto.size) throw new BadRequestException('Agregá al menos un paquete a fraccionar.');
+      await exigirNoExclusivoCoffit(tx, [...porProducto.keys()], 'fraccionar');
       const operadorId = await this.operadorDeFraccion(tx, o.operadorId, sucId, true);
 
       const ids = [...porProducto.keys()].sort((a, b) => a - b);
@@ -1667,6 +1669,7 @@ export class InventarioService {
       if (!origen.activa || !destino.activa) throw new BadRequestException(`${(!origen.activa ? origen : destino).nombre} está desactivada: el local cerró. Elegí otro.`);
       const items = (o.items || []).filter((it: any) => Number(it.cantidad) > 0);
       if (!items.length) throw new BadRequestException('Agregá al menos un ítem con cantidad.');
+      await exigirNoExclusivoCoffit(tx, items.map((it: any) => it.productoId), 'pedir entre sucursales');
 
       const [t] = await tx.insert(transferencias).values({
         codigo: '', origenId: origen.id, destinoId: destino.id, usuarioId: o.usuarioId ?? null,
@@ -1941,6 +1944,7 @@ export class InventarioService {
           : [],
       ]);
       const existe = new Set(prods.map((p: any) => p.id));
+      await exigirNoExclusivoCoffit(tx, [...existe] as number[], 'pedir entre sucursales');
       const prodDe = new Map<number, any>(prods.map((p: any): [number, any] => [p.id, p]));
       const duenoDePres = new Map<number, number>(press.map((p: any): [number, number] => [p.id, p.productoId]));
 
@@ -2127,6 +2131,7 @@ export class InventarioService {
       const t = await this.transferEnPreparacion(tx, id, soloSuc);
       const prod = await this.getProducto(tx, o.productoId);
       if (!prod) throw new BadRequestException('Producto inválido.');
+      await exigirNoExclusivoCoffit(tx, [prod.id], 'pedir entre sucursales');
       /* El paquete tiene que ser DE ESTE producto (25/9/2026), igual que al armar
        * el pedido y al registrar un fraccionado. Sin esto se podía agregar
        * "Lentejas" con el paquete de 1 kg de Arroz, y al confirmar la lista se
@@ -3771,6 +3776,8 @@ export class InventarioService {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext('conteos:' || ${o.sucursalId}::text))`);
       const conds: any[] = [];
       if (!o.incluirArchivados) conds.push(ne(productos.estado, 'archivado' as any));
+      /* Lo de uso exclusivo de Coffit no se controla acá: se ajusta en Almacén › Coffit (exclusivoCoffit.ts). */
+      conds.push(eq(productos.soloCafeteria, false));
       if (marcaIds.length) conds.push(inArray(productos.marcaId, marcaIds));
       if (o.categoriaId) conds.push(eq(productos.categoriaId, o.categoriaId));
       if (o.tipo) conds.push(eq(productos.tipo, o.tipo));

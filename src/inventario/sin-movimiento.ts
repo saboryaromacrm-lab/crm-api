@@ -144,7 +144,8 @@ export async function productosSinMovimiento(db: Database, f: FiltroSinMovimient
 
   const filas = filasQuietas.map(({ x, venta, pase, desde }) => {
     const p = prodDe.get(Number(x.producto_id));
-    if (!p) return null;
+    /* Lo de uso exclusivo de Coffit no es mercadería parada de Sabor y Aroma (exclusivoCoffit.ts). */
+    if (!p || p.soloCafeteria) return null;
     const granel = p.tipo === 'granel';
     let suelto = 0; let paquetes = 0; let base = 0; let valor = 0;
     for (const [presId, cant] of x.filas as [number | null, number][]) {
@@ -163,7 +164,7 @@ export async function productosSinMovimiento(db: Database, f: FiltroSinMovimient
       productoId: p.id as number, nombre: p.nombre as string, codigo: (p.codigoPropio || p.codigoBarras || '') as string,
       /* Marca, categoría y local van por id: los nombres viajan UNA vez abajo (con miles de renglones, pesa). */
       marcaId: (p.marcaId ?? 0) as number, categoriaId: (p.categoriaId ?? 0) as number,
-      granel, deCoffit: !!p.soloCafeteria, sucursalId,
+      granel, sucursalId,
       /** Stock en unidad base (kg el granel, unidades lo entero) y, en granel, cómo está. */
       stock: r3(base), suelto: r3(suelto), paquetes: r3(paquetes),
       valor: f.verCosto ? r2(valor) : null,

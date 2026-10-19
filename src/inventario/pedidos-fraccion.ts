@@ -40,6 +40,7 @@ import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   fraccionOperadores, fraccionPedidoItems, fraccionPedidos, presentaciones, productos, sucursales, usuarios,
 } from '../db/schema';
@@ -200,6 +201,7 @@ export class PedidosFraccionService {
       if (p.tipo !== 'granel') throw new BadRequestException(`${p.nombre} no es a granel: no se fracciona.`);
       if (p.estado === 'archivado') throw new BadRequestException(`${p.nombre} está archivado: no se fracciona.`);
     }
+    await exigirNoExclusivoCoffit(tx, press.map((p: any) => p.productoId), 'pedir a fraccionado');
     return press.map((p: any) => ({ productoId: p.productoId, presentacionId: p.id, tamKg: Number(p.tamKg), paquetes: porPres.get(p.id)! }));
   }
 

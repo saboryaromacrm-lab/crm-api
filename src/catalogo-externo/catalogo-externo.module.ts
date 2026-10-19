@@ -111,7 +111,8 @@ export class CatalogoExternoService {
     }));
 
     const lista = productos
-      .filter((p: any) => p.estado !== 'archivado')
+      /* Ni archivados ni lo de uso exclusivo de Coffit (19/10/2026, exclusivoCoffit.ts). */
+      .filter((p: any) => p.estado !== 'archivado' && !p.soloCafeteria)
       .map((p: any) => ({
         id: p.id,
         nombre: p.nombre,

@@ -19,6 +19,7 @@ import {
 } from 'class-validator';
 import { asc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import { Permiso } from '../auth/auth.decoradores';
 import { ofertaAlcances, ofertaComponentes, ofertas, ventaItems } from '../db/schema';
 
@@ -204,6 +205,11 @@ export class OfertasService {
   }
 
   private async escribirHijas(tx: any, ofertaId: number, alcances: any[], componentes: any[]) {
+    /* Lo de uso exclusivo de Coffit no se vende: tampoco va en oferta (19/10/2026). */
+    await exigirNoExclusivoCoffit(tx, [
+      ...alcances.filter((a) => a.tipo === 'producto').map((a) => a.refId),
+      ...componentes.map((c) => c.productoId),
+    ], 'poner en oferta');
     // Nadie referencia estas filas: reemplazarlas enteras es seguro acá.
     await tx.delete(ofertaAlcances).where(eq(ofertaAlcances.ofertaId, ofertaId));
     await tx.delete(ofertaComponentes).where(eq(ofertaComponentes.ofertaId, ofertaId));

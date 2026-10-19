@@ -243,7 +243,8 @@ export class TiendaService {
        * ofreciendo mientras tenga stock — el `webStockMin` ya lo saca de la web
        * cuando conviene guardar lo último para el mostrador. */
       this.db.select().from(productos)
-        .where(ne(productos.estado, 'archivado')).orderBy(productos.nombre),
+        /* Lo de uso exclusivo de Coffit no se publica nunca (19/10/2026, exclusivoCoffit.ts). */
+        .where(and(ne(productos.estado, 'archivado'), eq(productos.soloCafeteria, false))).orderBy(productos.nombre),
       this.db.select().from(productoProveedores),
       this.db.select().from(productoListas),
       this.db.select().from(productoEtiquetas),

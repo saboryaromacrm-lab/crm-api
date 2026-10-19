@@ -27,6 +27,7 @@ import {
 } from 'class-validator';
 import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, notInArray, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   cajaMovimientos, cajaSesiones,
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
@@ -1503,9 +1504,11 @@ export class VentasService {
     const [prods, provs, formatos, cat, press, existencias, sucs, cfg, ms, cs, etiqs, ofs, etiqCat, provCat] = await Promise.all([
       /* Sin los ARCHIVADOS: fuera de catálogo es fuera de la caja. El
        * DISCONTINUADO sí viaja — dejó de comprarse, pero lo que hay en góndola
-       * se vende hasta agotar (para eso son dos estados y no un interruptor). */
+       * se vende hasta agotar (para eso son dos estados y no un interruptor).
+       * Lo de USO EXCLUSIVO DE COFFIT tampoco (19/10/2026): para la caja no
+       * existe (exclusivoCoffit.ts). */
       this.db.select().from(productos)
-        .where(ne(productos.estado, 'archivado')).orderBy(productos.nombre),
+        .where(and(ne(productos.estado, 'archivado'), eq(productos.soloCafeteria, false))).orderBy(productos.nombre),
       this.db.select().from(productoProveedores),
       this.db.select().from(productoListas),
       this.listas.catalogo(),
@@ -1703,10 +1706,6 @@ export class VentasService {
         /** Lo que sale la bolsa cerrada, para mostrarlo sin recalcularlo. */
         precioBolsa: bolsaKg > 0 ? money(filaBase!.finalFormato) : 0,
         tipo: p.tipo,
-        /* Uso exclusivo de Cafetería (0089): viaja al POS para MOSTRARSE
-         * bloqueado con su motivo — esconderlo haría que un código escaneado
-         * "no exista", que parece un error. El candado real está en la venta. */
-        soloCafeteria: p.soloCafeteria,
         unidad: p.tipo === 'granel' ? 'kg' : 'u',
         fraccionable: p.tipo === 'granel',   // admite cantidad decimal
         /*
@@ -1782,9 +1781,6 @@ export class VentasService {
           stockLibre: stockSinControl(cfg, p),   // el paquete sigue a su producto
           detalle: pres.tamKg < 1 ? `${Math.round(pres.tamKg * 1000)} g` : `${pres.tamKg} kg`,
           tipo: p.tipo,
-          // El paquete hereda la exclusividad de la madre: si el granel es de
-          // la Cafetería, sus fraccionados tampoco van al mostrador.
-          soloCafeteria: p.soloCafeteria,
           unidad: 'u',
           fraccionable: false,
           iva: p.iva,
@@ -3489,15 +3485,15 @@ export class VentasService {
    * porque el catálogo se cachea al abrir la caja: un producto archivado en el
    * medio del turno seguiría estando en la pantalla del cajero.
    *
-   * El USO EXCLUSIVO DE CAFETERÍA (0089) es el mismo candado con otro motivo:
+   * El USO EXCLUSIVO DE COFFIT (0089) es el mismo candado con otro motivo:
    * mercadería que la distribuidora guarda para Coffit y no va al mostrador.
-   * Sale solo por el envío de Almacén › Cafetería, que no pasa por acá.
+   * Sale solo por el envío de Almacén › Coffit, que no pasa por acá.
    */
   private async validarEstadoVendible(items: Array<{ productoId: number }>) {
     const ids = [...new Set((items ?? []).map((it) => it.productoId))];
     if (!ids.length) return;
     const filas = await this.db
-      .select({ nombre: productos.nombre, estado: productos.estado, soloCafeteria: productos.soloCafeteria })
+      .select({ nombre: productos.nombre, estado: productos.estado })
       .from(productos).where(inArray(productos.id, ids));
     const archivado = filas.find((f) => f.estado === 'archivado');
     if (archivado) {
@@ -3505,13 +3501,7 @@ export class VentasService {
         `${archivado.nombre} está archivado: ya no se vende. Si volvió a entrar, reactivalo en Compras › Productos.`,
       );
     }
-    const deCafeteria = filas.find((f) => f.soloCafeteria);
-    if (deCafeteria) {
-      throw new BadRequestException(
-        `${deCafeteria.nombre} es de uso exclusivo de Coffit: no se vende en el mostrador. `
-        + 'Sale por el envío de Almacén › Coffit. Si tiene que empezar a venderse, destildá la marca en su ficha (Compras › Productos).',
-      );
-    }
+    await exigirNoExclusivoCoffit(this.db, ids, 'vender');
   }
 
   /**
