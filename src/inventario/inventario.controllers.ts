@@ -53,7 +53,7 @@ import { datosBajosStock } from './bajos-stock';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { eq, sql } from 'drizzle-orm';
 import {
-  productos as productosT, sucursales as sucursalesT, ultimoPedidoProveedor, usuarios as usuariosT,
+  productos as productosT, proveedores as proveedoresT, sucursales as sucursalesT, ultimoPedidoProveedor, usuarios as usuariosT,
 } from '../db/schema';
 
 /*
@@ -861,6 +861,10 @@ export class BajosStockController {
 class UltimoPedidoDto {
   @IsString() @MaxLength(8000) texto!: string;
 }
+/** Los recordatorios del proveedor (0181): vacío la borra. */
+class NotaPedidoDto {
+  @IsString() @MaxLength(2000) texto!: string;
+}
 
 /**
  * EL ÚLTIMO PEDIDO DE LA ORDEN DE PEDIDO (0165, 13/10/2026): el mensaje que se
@@ -872,14 +876,37 @@ class UltimoPedidoDto {
 export class OrdenPedidoController {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
+  /** Al elegir el proveedor: su pedido anterior (0165) y sus recordatorios (0181), en una sola vuelta. */
   @Get('ultimo/:proveedorId')
   async ultimo(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
-    const [p] = await this.db.select({
-      texto: ultimoPedidoProveedor.texto, fecha: ultimoPedidoProveedor.fecha, usuario: usuariosT.nombre,
-    }).from(ultimoPedidoProveedor)
-      .leftJoin(usuariosT, eq(usuariosT.id, ultimoPedidoProveedor.usuarioId))
-      .where(eq(ultimoPedidoProveedor.proveedorId, proveedorId)).limit(1);
-    return { pedido: p ?? null };
+    const [[p], nota] = await Promise.all([
+      this.db.select({
+        texto: ultimoPedidoProveedor.texto, fecha: ultimoPedidoProveedor.fecha, usuario: usuariosT.nombre,
+      }).from(ultimoPedidoProveedor)
+        .leftJoin(usuariosT, eq(usuariosT.id, ultimoPedidoProveedor.usuarioId))
+        .where(eq(ultimoPedidoProveedor.proveedorId, proveedorId)).limit(1),
+      this.nota(proveedorId),
+    ]);
+    return { pedido: p ?? null, nota };
+  }
+
+  /** Los recordatorios del proveedor, o null si no tiene. */
+  private async nota(proveedorId: number) {
+    const [n] = await this.db.select({
+      texto: proveedoresT.notaPedido, fecha: proveedoresT.notaPedidoEn, usuario: usuariosT.nombre,
+    }).from(proveedoresT)
+      .leftJoin(usuariosT, eq(usuariosT.id, proveedoresT.notaPedidoPor))
+      .where(eq(proveedoresT.id, proveedorId)).limit(1);
+    return n?.texto ? n : null;
+  }
+
+  @Put('nota/:proveedorId')
+  async guardarNota(@Param('proveedorId', ParseIntPipe) proveedorId: number, @Body() dto: NotaPedidoDto, @Auth() sesion: Sesion) {
+    const [r] = await this.db.update(proveedoresT)
+      .set({ notaPedido: dto.texto.trim(), notaPedidoEn: new Date(), notaPedidoPor: sesion?.usuarioId ?? null })
+      .where(eq(proveedoresT.id, proveedorId)).returning({ id: proveedoresT.id });
+    if (!r) throw new BadRequestException('Ese proveedor no existe.');
+    return { nota: await this.nota(proveedorId) };
   }
 
   @Put('ultimo/:proveedorId')

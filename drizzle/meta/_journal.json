@@ -1268,6 +1268,13 @@
       "when": 1792042200000,
       "tag": "0180_ofertas_en_tienda",
       "breakpoints": true
+    },
+    {
+      "idx": 181,
+      "version": "7",
+      "when": 1792128600000,
+      "tag": "0181_nota_pedido_proveedor",
+      "breakpoints": true
     }
   ]
 }

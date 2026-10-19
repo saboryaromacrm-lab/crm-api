@@ -246,6 +246,14 @@ export const proveedores = pgTable('proveedores', {
    */
   productosEsperados: integer('productos_esperados').notNull().default(0),
   migracionLista: boolean('migracion_lista').notNull().default(false),
+  /**
+   * RECORDATORIOS PARA EL PEDIDO (0181, 19/10/2026): una nota libre por
+   * proveedor que se ve siempre en la orden de pedido («mínimo 3 bultos», «no
+   * manda los martes»), con quién y cuándo la cambió. Vacía = sin nota.
+   */
+  notaPedido: text('nota_pedido').notNull().default(''),
+  notaPedidoEn: timestamp('nota_pedido_en', { withTimezone: true }),
+  notaPedidoPor: integer('nota_pedido_por').references((): AnyPgColumn => usuarios.id, { onDelete: 'set null' }),
 });
 
 /**
