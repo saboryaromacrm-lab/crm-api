@@ -268,6 +268,8 @@ export const CATALOGO_PERMISOS = [
        * no una preferencia de la máquina. */
       { clave: 'sistema.terminales', nombre: 'Equipos (terminales)' },
       { clave: 'sistema.respaldos', nombre: 'Respaldos' },
+      /* Los feriados de Formosa y qué hace cada sucursal (0182): administración; también les llega el aviso. */
+      { clave: 'sistema.feriados', nombre: 'Feriados' },
     ],
     acciones: [],
   },

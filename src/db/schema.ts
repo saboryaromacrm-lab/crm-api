@@ -21,6 +21,7 @@ import {
   uniqueIndex,
   date,
   bigint,
+  primaryKey,
   type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -4024,3 +4025,35 @@ export const facturasIaConfig = pgTable('facturas_ia_config', {
   leerAlSubir: boolean('leer_al_subir').notNull().default(true),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });
+
+/* ---------------- Feriados (0182) ---------------- */
+/**
+ * LOS FERIADOS DE FORMOSA CAPITAL (19/10/2026, pedido del dueño): Sistema ›
+ * Feriados. Nacionales, provinciales y municipales; `tipo` dice si es feriado
+ * o día no laborable. Único por fecha + nombre (dos pueden caer el mismo día:
+ * Malvinas y Jueves Santo en 2026). Ver `feriados/feriados.module.ts`.
+ */
+export const feriados = pgTable('feriados', {
+  id: serial('id').primaryKey(),
+  fecha: date('fecha').notNull(),
+  nombre: text('nombre').notNull(),
+  /** 'feriado' | 'no_laborable' */
+  tipo: text('tipo').notNull(),
+  /** 'nacional' | 'provincial' | 'municipal' */
+  alcance: text('alcance').notNull(),
+  observaciones: text('observaciones').notNull().default(''),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoPor: integer('actualizado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  uqFechaNombre: uniqueIndex('uq_feriados_fecha_nombre').on(t.fecha, t.nombre),
+}));
+/** Qué hace cada sucursal ese feriado: abre o no, en qué horario, y una nota. Sin fila = sin definir. */
+export const feriadoSucursales = pgTable('feriado_sucursales', {
+  feriadoId: integer('feriado_id').notNull().references(() => feriados.id, { onDelete: 'cascade' }),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  abre: boolean('abre').notNull(),
+  horario: text('horario').notNull().default(''),
+  nota: text('nota').notNull().default(''),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.feriadoId, t.sucursalId] }),
+}));

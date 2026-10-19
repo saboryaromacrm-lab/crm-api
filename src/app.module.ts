@@ -37,6 +37,7 @@ import { RespaldosModule } from './respaldos/respaldos.module';
 import { RespaldoDriveModule } from './respaldos/drive.service';
 import { MetricasModule } from './metricas/metricas.module';
 import { RetirosModule } from './retiros/retiros.module';
+import { FeriadosModule } from './feriados/feriados.module';
 import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IngredientesModule } from './cafeteria/ingredientes.module';
@@ -57,6 +58,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     CashflowModule,
     ResultadosModule,
     RetirosModule,
+    FeriadosModule,
     IngredientesModule,
     InventarioModule,
     ComprobantesModule,
