@@ -40,6 +40,8 @@ import {
   gastos, proveedorImputaciones, proveedorPagos, proveedores, sucursales,
 } from '../db/schema';
 import { DENOMINACIONES } from '../caja/caja.module';
+import { TURNO_TARDE_DESDE } from '../inventario/inventario.service';
+import { type EstadoTurno, estadoTurno } from './planilla';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
@@ -76,6 +78,20 @@ const diaVisible = (p: string) => `${p.slice(8, 10)}/${p.slice(5, 7)}/${p.slice(
  * día (hora argentina, sin horario de verano): así lo que entró ese día ya
  * cuenta y lo que entró después no. El arranque va al COMIENZO de su día.
  */
+/**
+ * QUIÉN ES EL CAJERO DE UN TURNO: el que firmó el cierre por envío; si no hay,
+ * el que abrió. Los joins van juntos (alias `cs` = caja_sesiones) y se leen
+ * con `coalesce(uc.nombre, ua.nombre, '')`: Sobres y la planilla del día dicen
+ * el mismo nombre.
+ */
+const CAJERO_DEL_TURNO = sql`
+  left join usuarios ua on ua.id = cs.usuario_id
+  left join lateral (
+    select cc.usuario_id from caja_controles cc
+    where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1
+  ) cx on true
+  left join usuarios uc on uc.id = cx.usuario_id`;
+
 const instanteDe = (dia: string) => (dia === hoyAr() ? new Date() : new Date(`${dia}T23:59:59-03:00`));
 const inicioDelDia = (dia: string) => new Date(`${dia}T00:00:00-03:00`);
 
@@ -562,12 +578,7 @@ export class CashflowService {
         coalesce(pl.total, 0) as "pagosLocal", coalesce(pl.detalle, '[]'::json) as "pagosLocalDetalle"
       from caja_sesiones cs
       join sucursales su on su.id = cs.sucursal_id
-      left join usuarios ua on ua.id = cs.usuario_id
-      left join lateral (
-        select cc.usuario_id from caja_controles cc
-        where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1
-      ) cx on true
-      left join usuarios uc on uc.id = cx.usuario_id
+      ${CAJERO_DEL_TURNO}
       left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
       left join usuarios up on up.id = s.controlado_por
       left join lateral (
@@ -583,6 +594,75 @@ export class CashflowService {
       enviado: money(x.enviado), contado: x.contado == null ? null : money(x.contado), otrosContados: money(x.otrosContados),
       diferencia: x.diferencia == null ? null : money(x.diferencia), pagosLocal: money(x.pagosLocal),
     }));
+  }
+
+  /**
+   * LA PLANILLA DEL DÍA (19/10/2026, pedido del dueño): cada local activo con
+   * sus turnos de caja de ese día y en qué quedó cada uno (`estadoTurno`). Un
+   * local sin turno ese día figura «sin caja». Un turno abierto de un día
+   * anterior aparece también en los días siguientes, hasta hoy: es justo el
+   * que hay que ver. Dos consultas (locales y turnos), sin N+1.
+   */
+  async planilla(diaIn?: string) {
+    const hoy = hoyAr();
+    const dia = esDia(diaIn) ? diaIn : hoy;
+    if (dia > hoy) throw new BadRequestException('La planilla es de hoy para atrás.');
+    const [caja, sucs, r] = await Promise.all([
+      this.caja(),
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales)
+        .where(eq(sucursales.activa, true)).orderBy(asc(sucursales.nombre)),
+      this.db.execute(sql`
+        select cs.id, cs.sucursal_id as "sucursalId", cs.estado, cs.apertura, cs.cierre,
+          (cs.apertura at time zone ${ZONA})::date::text as "aperturaDia",
+          (cs.cierre at time zone ${ZONA})::date::text as "cierreDia",
+          extract(hour from cs.apertura at time zone ${ZONA}) < ${TURNO_TARDE_DESDE} as manana,
+          coalesce(cs.envio_efectivo, 0) as envio, cs.fondo_queda as "fondoQueda", cs.diferencia as "diferenciaCajero",
+          coalesce(uc.nombre, ua.nombre, '') as cajero,
+          s.id as "sobreId", s.contado, s.diferencia as "diferenciaSobre", coalesce(s.descartado, false) as descartado,
+          s.controlado_en as "controladoEn",
+          exists (select 1 from cajas_a_controlar ac where ac.caja_sesion_id = cs.id and ac.resuelta_en is null) as "aControlar"
+        from caja_sesiones cs
+        ${CAJERO_DEL_TURNO}
+        left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
+        where (${desdeDia('cs.apertura', dia)} and ${hastaDia('cs.apertura', dia)})
+          or (cs.estado = 'abierta' and ${hastaDia('cs.apertura', dia)})
+        order by cs.apertura`),
+    ]);
+    const fechaInicio = caja?.fechaInicio ?? null;
+    /* Instantes en ISO: el formato de la base («2026-10-18 08:05:00-03») no lo lee cualquier navegador de celular. */
+    const iso = (v: unknown) => (v ? new Date(v as string).toISOString() : null);
+    const turnosDe = new Map<number, any[]>();
+    for (const x of r.rows as any[]) {
+      const envio = money(x.envio);
+      const t = {
+        id: Number(x.id), estado: estadoTurno({ ...x, envio }, fechaInicio),
+        turno: x.manana ? 'mañana' : 'tarde', apertura: iso(x.apertura), cierre: iso(x.cierre),
+        /** Abierta desde un día anterior: el cierre olvidado. */
+        deOtroDia: x.aperturaDia !== dia ? x.aperturaDia : null,
+        cajero: x.cajero, envio, fondoQueda: x.fondoQueda == null ? null : money(x.fondoQueda),
+        diferenciaCajero: x.estado === 'cerrada' ? money(x.diferenciaCajero) : null,
+        contado: x.contado == null ? null : money(x.contado),
+        diferenciaSobre: x.diferenciaSobre == null ? null : money(x.diferenciaSobre),
+        controladoEn: iso(x.controladoEn), aControlar: !!x.aControlar,
+      };
+      const l = turnosDe.get(Number(x.sucursalId));
+      if (l) l.push(t); else turnosDe.set(Number(x.sucursalId), [t]);
+    }
+    const locales = sucs.map((su) => ({ ...su, turnos: turnosDe.get(su.id) ?? [] }));
+    const todos = locales.flatMap((l) => l.turnos);
+    const cuenta = (e: EstadoTurno) => todos.filter((t) => t.estado === e);
+    const sinRendir = cuenta('sin_rendir');
+    return {
+      dia, hoy, cashflowDesde: fechaInicio, locales,
+      resumen: {
+        abiertas: cuenta('abierta').length,
+        /** De esas, las abiertas desde un día anterior: el cierre olvidado. */
+        olvidadas: cuenta('abierta').filter((t) => t.deOtroDia).length,
+        sinRendir: sinRendir.length, sinRendirTotal: money(sinRendir.reduce((a, t) => a + t.envio, 0)),
+        rendidas: cuenta('rendida').length + cuenta('no_corresponde').length,
+        sinCaja: locales.filter((l) => !l.turnos.length).length,
+      },
+    };
   }
 
   /**
@@ -1017,6 +1097,7 @@ export class CashflowController {
   @Put('inicio') inicio(@Body() dto: InicioDto, @Auth() s: Sesion) { return this.svc.inicio(dto, s?.usuarioId ?? null); }
 
   @Get('sobres') sobres(@Query() q: any) { return this.svc.sobres(q ?? {}); }
+  @Get('planilla') planilla(@Query('dia') dia?: string) { return this.svc.planilla(dia); }
   @Post('sobres/:cajaSesionId/controlar')
   controlar(@Param('cajaSesionId', ParseIntPipe) id: number, @Body() dto: ControlarSobreDto, @Auth() s: Sesion) {
     return this.svc.controlar(id, dto, s?.usuarioId ?? null);

@@ -44,7 +44,8 @@ const TIPOS_MOV: Record<string, { label: string; dir: number }> = {
 };
 
 /** Fraccionado (0102): la mañana va hasta las 14; de ahí en adelante, la tarde. */
-const TURNO_TARDE_DESDE = 14;
+/** Desde esta hora (argentina) es turno tarde: el fraccionado y la planilla de cajas del Cash Flow. */
+export const TURNO_TARDE_DESDE = 14;
 /** Cuánto para atrás se puede asentar un fraccionado que se olvidó cargar. */
 const DIAS_ASENTAR_ATRAS = 30;
 
