@@ -2842,7 +2842,41 @@ export const tiendaCompradores = pgTable('tienda_compradores', {
   /** Bloqueado desde el ERP (0178): no entra y se le cierran las sesiones. */
   bloqueado: boolean('bloqueado').notNull().default(false),
   ultimoIngreso: timestamp('ultimo_ingreso', { withTimezone: true }),
+  /** Dónde recibe (0185), marcado en el mapa del checkout: con él se sabe su barrio. El navegador no lo ve. */
+  lat: doublePrecision('lat'),
+  lng: doublePrecision('lng'),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * LOS BARRIOS DEL ENVÍO MINORISTA (0185): el contorno que dibuja el dueño en
+ * Tienda online › Configuración y su costo de envío (null = sin costo propio).
+ */
+export const barrios = pgTable('barrios', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  /** [[lat, lng], …], al menos 3 puntos. */
+  poligono: jsonb('poligono').$type<[number, number][]>().notNull(),
+  costoEnvio: doublePrecision('costo_envio'),
+  activo: boolean('activo').notNull().default(true),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Las promos por barrio (0185): envío gratis, envío a precio fijo o descuento %, por días y fechas. */
+export const barrioPromos = pgTable('barrio_promos', {
+  id: serial('id').primaryKey(),
+  barrioIds: jsonb('barrio_ids').$type<number[]>().notNull().default([]),
+  /** 'envio_gratis' | 'envio_fijo' | 'descuento' */
+  tipo: text('tipo').notNull(),
+  /** $ del envío (envio_fijo) o % (descuento); 0 en envio_gratis. */
+  valor: doublePrecision('valor').notNull().default(0),
+  /** Días de la semana (0 = domingo); vacío = todos. */
+  dias: jsonb('dias').$type<number[]>().notNull().default([]),
+  desde: date('desde'),
+  hasta: date('hasta'),
+  minimo: doublePrecision('minimo').notNull().default(0),
+  activa: boolean('activa').notNull().default(true),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });
 

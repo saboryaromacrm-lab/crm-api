@@ -1930,11 +1930,16 @@ export class VentasService {
    * del cliente, cualquiera invocaría el presupuesto ajeno para llevarse su
    * precio; sin la del estado, valdría un borrador que se escribe solo; y sin la
    * del vencimiento, un precio de hace un año seguiría vigente para siempre.
+   *
+   * `descuento`: el del BARRIO de un pedido de la tienda (0185) — lo calculó el
+   * servidor con las promos del dueño, así que no pasa por el tope a mano de la
+   * cajera. Solo en renglones sin oferta: el % de una oferta lo vuelve a poner
+   * el motor de la caja y no es un descuento a mano.
    */
   private async congeladosDePresupuesto(
     presupuestoId: number | undefined, clienteId: number, sucursalId?: number | null,
   ) {
-    const vacio = new Map<string, { precioLista: number; listaId: number | null }>();
+    const vacio = new Map<string, { precioLista: number; listaId: number | null; descuento: number }>();
     if (!presupuestoId) return vacio;
 
     const [pre] = await this.db.select().from(presupuestos)
@@ -1968,6 +1973,7 @@ export class VentasService {
       vacio.set(`${r.productoId}:${r.presentacionId ?? ''}`, {
         precioLista: money(r.precioLista),
         listaId: r.listaId ?? null,
+        descuento: pre.origen === 'web' && !r.ofertaId ? Number(r.descuento) || 0 : 0,
       });
     }
     return vacio;
@@ -2064,7 +2070,7 @@ export class VentasService {
     cliente: { id: number; descuento?: number | null },
     config: any,
     puedePisarPrecio: boolean,
-    congelados: Map<string, { precioLista: number; listaId: number | null }> = new Map(),
+    congelados: Map<string, { precioLista: number; listaId: number | null; descuento: number }> = new Map(),
     descuentosPorLista: Map<number, DescuentoResuelto> = new Map(),
     sucursalId: number | null = null,
     /**
@@ -2374,6 +2380,7 @@ export class VentasService {
       const permitido = Math.max(
         descuentoManual.tope, Number(cliente.descuento) || 0,
         descuentoManual.yaAutorizados?.get(`${prod.id}|${presId ?? ''}`) ?? 0,
+        congelado?.descuento ?? 0,
       );
       if (desc > permitido + 1e-9 && !puedePisarPrecio) {
         throw new BadRequestException(descuentoManual.tope > 0

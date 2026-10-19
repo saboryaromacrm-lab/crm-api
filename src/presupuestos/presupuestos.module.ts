@@ -266,8 +266,10 @@ export class PresupuestosService {
       nombre: string; apellido: string; telefono: string; dni: string;
       /** Solo con envío (cadete / camioneta): a dónde va el pedido. */
       direccion?: string; localidad?: string; referencia?: string;
-      /** Minorista: el envío salió gratis por el monto (0173). */
+      /** Minorista: el envío salió gratis (por el monto, 0173, o por el barrio, 0185). */
       envioGratis?: boolean;
+      /** Minorista (0185): el barrio del punto marcado en el mapa, el punto, el costo del envío (0 = gratis; sin dato = se coordina) y el % del barrio. */
+      barrio?: string; ubicacion?: { lat: number; lng: number }; envio?: number; descuentoBarrio?: number;
     };
   }, tx: Database = this.db) {
     if (!dto?.sucursalId) throw new BadRequestException('Falta la sucursal.');

@@ -49,6 +49,8 @@ export const REGLAS = {
   ingreso: { max: 10, ventanaMs: 10 * 60_000, aviso: 'Demasiados intentos de ingreso: esperá unos minutos y probá de nuevo.' },
   /** Telemetría: el navegador manda un lote cada 15 s como máximo — 40 sobra. */
   eventos: { max: 40, ventanaMs: 10 * 60_000, aviso: 'Demasiadas peticiones.' },
+  /** El costo del envío (0185): el checkout lo pide cada vez que se mueve el punto del mapa. */
+  envio: { max: 30, ventanaMs: 60_000, aviso: 'Demasiadas consultas del envío: esperá un momento.' },
   /** Navegación normal + freno al scraping grosero. */
   catalogo: { max: 60, ventanaMs: 60_000, aviso: 'Demasiadas peticiones: esperá un momento.' },
   /** Una portada carga 20+ imágenes de un saque: muy holgado. */

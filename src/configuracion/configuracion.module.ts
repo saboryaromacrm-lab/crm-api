@@ -100,6 +100,13 @@ export const VENTAS_DEFAULTS = {
   /** Envío gratis en la tienda minorista desde este monto (0 = nunca es gratis: se coordina). */
   tiendaMinoristaEnvioGratisDesde: 0 as number,
   /**
+   * La clave de Google Maps del navegador (0185): con ella el checkout minorista
+   * pide la ubicación en el mapa y el ERP dibuja los barrios. Es pública por
+   * diseño (viaja a cada navegador) y se protege en Google Cloud restringiéndola
+   * a los dominios de la tienda y del ERP. Vacía = sin mapa: como antes.
+   */
+  tiendaMinoristaMapsKey: '' as string,
+  /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
    * precio se armó antes.
@@ -540,6 +547,8 @@ const REGLAS: Record<string, {
   'ventas.montoMinimoMayorista': { min: 0, max: 100_000_000 },
   'ventas.montoMinimoCamioneta': { min: 0, max: 100_000_000 },
   'ventas.tiendaMinoristaEnvioGratisDesde': { min: 0, max: 100_000_000 },
+  /* Una clave de Google son letras, números, «-» y «_»: cualquier otra cosa (espacios, comillas) se descarta. */
+  'ventas.tiendaMinoristaMapsKey': { texto: (v: string) => (/^[\w-]{1,100}$/.test(String(v ?? '').trim()) ? String(v).trim() : '') },
   'ventas.listaBaseId': { min: 0, max: 1_000_000, entero: true },
   'ventas.topeSinIdentificar': { min: 0, max: 10_000_000_000 },
   'ventas.modalidadMontoId': { min: 0, max: 1_000_000, entero: true },
@@ -681,7 +690,7 @@ const NORMALIZADORES: Record<string, (v: string) => string> = { ctaUrl: rutaInte
  * vacío vuelve al default —un número de WhatsApp en blanco rompe el sitio—,
  * pero en estos vacío quiere decir «no mostrar esa línea».
  */
-const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto']);
+const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto', 'ventas.tiendaMinoristaMapsKey']);
 
 /**
  * Limpia un ítem de un array de objetos contra su plantilla (el primer
@@ -836,7 +845,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  */
 const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
   [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde']), 'web.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey']), 'web.configuracion'],
 ];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];

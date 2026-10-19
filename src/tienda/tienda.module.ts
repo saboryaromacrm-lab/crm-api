@@ -53,12 +53,14 @@ import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { PresupuestosModule } from '../presupuestos/presupuestos.module';
 import { ClientesModule } from '../clientes/clientes.module';
-import { AccesosTiendaService } from './accesos';
+import { AccesosTiendaService, type Comprador } from './accesos';
 import { AccesosTiendaController } from './accesos.controller';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
 import { rutaImagen } from '../web/ruta-imagen';
+import { BarriosModule, BarriosService } from './barrios/barrios.module';
+import { describirPromo, puntoValido } from './barrios/reglas';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
@@ -141,6 +143,13 @@ type EntregaTienda = (typeof ENTREGAS_TIENDA)[number];
 /** En el modo minorista: retiro en el local o envío a domicilio (por dentro, el cadete). */
 const ENTREGAS_MINORISTA: Record<string, EntregaTienda> = { retiro: 'retiro', envio: 'cadete' };
 
+/** El descuento del barrio (0185) va en los renglones SIN oferta: uno en oferta ya tiene su beneficio y no se suman, como en la caja. */
+const conDescuentoBarrio = (items: any[], pct: number) => (pct > 0 ? items.map((it) => (it.ofertaId ? it : { ...it, descuento: pct })) : items);
+/** Cuánto descuenta ese %, en pesos finales. */
+const montoDescuento = (items: any[], pct: number) => money(
+  items.filter((it) => !it.ofertaId).reduce((s, it) => s + it.cantidad * it.precioLista * (1 + it.iva / 100), 0) * pct / 100,
+);
+
 /** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */
 const MAX_CALLE = 120;
 const MAX_LOCALIDAD = 80;
@@ -186,6 +195,7 @@ export class TiendaService {
     private readonly presupuestos: PresupuestosService,
     private readonly ofertasSvc: OfertasService,
     private readonly accesos: AccesosTiendaService,
+    private readonly barrios: BarriosService,
   ) {}
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
@@ -387,7 +397,8 @@ export class TiendaService {
       },
       /** La portada minorista (17/10/2026): sus textos, editables en Tienda online › Configuración › Tienda minorista. */
       minorista: {
-        avisos: web.minAvisos as string[],
+        /* Las promos por barrio de hoy van primero (0185): «🚚 Hoy: Envío gratis a Independencia». */
+        avisos: [...(minorista ? await this.barrios.avisosDeHoy() : []), ...(web.minAvisos as string[])],
         hero: {
           eyebrow: String(web.minHeroEyebrow ?? ''), titulo: String(web.minHeroTitulo ?? ''), texto: String(web.minHeroTexto ?? ''),
           cta1: { texto: String(web.minHeroCta1 ?? ''), url: String(web.minHeroCta1Url ?? '/') },
@@ -425,6 +436,8 @@ export class TiendaService {
       minimoMayorista,
       /** Minorista: envío gratis desde este monto (0 = se coordina). */
       envioGratisDesde: minorista && Number(cfg.tiendaMinoristaEnvioGratisDesde) > 0 ? Number(cfg.tiendaMinoristaEnvioGratisDesde) : 0,
+      /** Minorista (0185): la clave de Google Maps del navegador; vacía = el checkout sin mapa, como antes. */
+      mapsKey: minorista ? String(cfg.tiendaMinoristaMapsKey ?? '') : '',
       /** Catálogo sin fotos: la tienda lista los productos en vez de mostrar tarjetas. */
       vistaLista: cfg.tiendaVistaLista === true,
       presupuestoValidezDias: Number(cfg.presupuestoValidezDias) || 7,
@@ -1154,8 +1167,10 @@ export class TiendaService {
    * Alta de un pedido MINORISTA: sin mínimos, y desde 0178 solo con ingreso.
    * Quién compra sale de la SESIÓN (WhatsApp, nombre y apellido), no del body.
    * El envío va a su dirección guardada (`direccion.guardada`, que el navegador
-   * ve a medias) o a una que escribe, que pasa a ser la guardada. Es gratis
-   * desde el monto configurado; si no, se coordina.
+   * ve a medias) o a una que escribe, que pasa a ser la guardada. El envío
+   * sale de su barrio (0185): el punto que marcó en el mapa decide el costo, las
+   * promos y el descuento; sin punto o fuera de todo barrio, la regla general
+   * (gratis desde el monto configurado; si no, se coordina).
    */
   async pedidoMinorista(dto: any, tokenMin?: string) {
     if ((await this.modoVigente('minorista')) !== 'minorista') {
@@ -1171,20 +1186,74 @@ export class TiendaService {
     const domicilio = guardada ? { direccion: c.direccion, localidad: c.localidad, referencia: c.referencia } : nueva;
 
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
-    const envioGratis = entrega === 'cadete' && cat.envioGratisDesde > 0 && total >= cat.envioGratisDesde;
+    const zona = entrega === 'cadete' ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
+    /* Lo del envío queda en la orden: el barrio y el punto (para el cadete), el costo (0 = gratis) y el descuento del barrio. */
+    const envio = zona ? {
+      ...(zona.barrio ? { barrio: zona.barrio.nombre } : {}),
+      ...(zona.punto ? { ubicacion: zona.punto } : {}),
+      ...(zona.envio != null ? { envio: zona.envio } : {}),
+      ...(zona.envio === 0 ? { envioGratis: true } : {}),
+      ...(zona.descuentoPct > 0 ? { descuentoBarrio: zona.descuentoPct } : {}),
+    } : {};
 
     return this.db.transaction(async (tx) => {
-      /* La dirección que escribió para ESTE envío pasa a ser la guardada; con retiro no se toca. */
+      /*
+       * La dirección que escribió para ESTE envío pasa a ser la guardada, con su
+       * punto (o sin punto, si no lo marcó). La guardada de antes del mapa se
+       * queda con el punto que marcó ahora. Con retiro no se toca.
+       */
+      const punto = zona?.punto ? { lat: zona.punto.lat, lng: zona.punto.lng } : { lat: null, lng: null };
       await tx.update(tiendaCompradores)
-        .set({ ...(nueva ?? {}), pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date() })
+        .set({
+          ...(nueva ? { ...nueva, ...punto } : guardada && c.lat == null && zona?.punto ? punto : {}),
+          pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date(),
+        })
         .where(eq(tiendaCompradores.id, c.id));
-      return this.presupuestos.crearDesdeWeb({
+      const creado = await this.presupuestos.crearDesdeWeb({
         clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
         entrega, observaciones: String(dto?.observaciones ?? '').slice(0, 500),
-        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...(envioGratis ? { envioGratis: true } : {}) },
-        items,
+        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio },
+        items: conDescuentoBarrio(items, zona?.descuentoPct ?? 0),
       }, tx);
+      /* `total` es la mercadería; el envío va aparte (null = se coordina), como en la orden. */
+      return { ...creado, envio: zona?.envio ?? null };
     });
+  }
+
+  /**
+   * LO QUE SALE RECIBIR EN CASA (0185), para el checkout: el barrio del punto
+   * marcado (o de la dirección guardada), el costo del envío, el descuento del
+   * barrio, las promos que se usan y la que está cerca. Misma cuenta que el
+   * alta del pedido: lo que ve el cliente es lo que se le cobra.
+   */
+  async envioMinorista(dto: any, tokenMin?: string) {
+    const c = await this.accesos.sesionMinorista(tokenMin);
+    if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
+    const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
+    const zona = await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde);
+    const descuento = montoDescuento(items, zona.descuentoPct);
+    return {
+      /** Si hay punto (marcado ahora o el de la dirección guardada): sin él no hay barrio. */
+      conPunto: !!zona.punto,
+      barrio: zona.barrio?.nombre ?? null,
+      envio: zona.envio,
+      descuentoPct: zona.descuentoPct,
+      descuento,
+      promos: zona.aplicadas.map((p) => describirPromo(p, zona.nombreDe)),
+      proxima: zona.proxima ? { texto: describirPromo(zona.proxima.promo, zona.nombreDe), faltan: money(zona.proxima.faltan) } : null,
+      subtotal: total,
+      total: money(total - descuento + (zona.envio ?? 0)),
+    };
+  }
+
+  /**
+   * El barrio del envío y sus condiciones: el punto marcado en el mapa o, a la
+   * dirección guardada, el de ella — y si es de antes del mapa y no tiene, el
+   * que marque ahora.
+   */
+  private async zonaDeEnvio(c: Comprador, dto: any, subtotal: number, gratisDesde: number) {
+    const punto = (dto?.direccion?.guardada === true ? puntoValido({ lat: c.lat, lng: c.lng }) : null) ?? puntoValido(dto?.ubicacion);
+    return { punto, ...(await this.barrios.condicionesPara(punto, subtotal, gratisDesde)) };
   }
 }
 
@@ -1214,6 +1283,11 @@ export class TiendaController {
   @Post('minorista/pedidos')
   @RateLimit('pedidos')
   pedidoMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string) { return this.svc.pedidoMinorista(body ?? {}, tokenMin); }
+
+  /* Cuánto sale recibir en casa (0185): el checkout la pide al marcar el punto en el mapa. */
+  @Post('minorista/envio')
+  @RateLimit('envio')
+  envioMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string) { return this.svc.envioMinorista(body ?? {}, tokenMin); }
 
   /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
   @Post('minorista/registro')
@@ -1288,7 +1362,7 @@ export class TiendaController {
 }
 
 @Module({
-  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule],
+  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule, BarriosModule],
   controllers: [TiendaController, AccesosTiendaController],
   providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard],
   exports: [TiendaService],
