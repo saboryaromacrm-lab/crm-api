@@ -21,6 +21,9 @@
  * candado. Sin permitir negativo: un retiro no inventa stock.
  *
  * Lo registra cualquiera que cobra en el POS (decisión del dueño: sin PIN).
+ * También sin abrir el POS (19/10/2026, pedido del dueño): el acceso directo
+ * «Retiro de mercadería» del inicio llama a este mismo `crear`, y un
+ * administrador elige de qué sucursal sale (`sucursalId`); el resto, la suya.
  * Queda firmado y a la vista en Gerencia › Auditoría. Anularlo devuelve el
  * stock (jefes). Marcar a un cliente es solo del superadmin.
  */
@@ -35,7 +38,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import {
-  auditoria, clientes, presentaciones, productoProveedores, productos, retiroItems, retiros,
+  auditoria, clientes, presentaciones, productoProveedores, productos, retiroItems, retiros, sucursales,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
@@ -60,6 +63,8 @@ class CrearRetiroDto {
   @IsOptional() @IsInt() borradorId?: number;
   /** El relevo de caja (0088): firma quien está parado en el POS. */
   @IsOptional() @IsInt() operadorId?: number;
+  /** De qué sucursal sale (el acceso directo): solo la usa un administrador; el resto retira de la suya. */
+  @IsOptional() @IsInt() sucursalId?: number;
   @IsBoolean() confirmado!: boolean;
 }
 class AnularRetiroDto {
@@ -79,8 +84,11 @@ export class RetirosService {
 
   async crear(dto: CrearRetiroDto, sesion: Sesion) {
     if (dto.confirmado !== true) throw new BadRequestException('Confirmá el retiro.');
-    const sucursalId = sucursalDeOperacion(sesion);
+    const sucursalId = sucursalDeOperacion(sesion, dto.sucursalId);
     if (!sucursalId) throw new BadRequestException('Tu sesión no tiene sucursal: volvé a entrar eligiéndola.');
+    const [suc] = await this.db.select({ activa: sucursales.activa, nombre: sucursales.nombre }).from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
+    if (!suc) throw new BadRequestException('Esa sucursal no existe.');
+    if (!suc.activa) throw new BadRequestException(`${suc.nombre} está desactivada: el retiro sale de otra sucursal.`);
     const items = dto.items.map((it) => ({ productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: Number(it.cantidad) }));
     await this.ventas.validarRenglonesMostrador(items);
     const autor = await resolverOperador(this.db, dto.operadorId, sesion?.usuarioId);
