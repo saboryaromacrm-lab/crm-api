@@ -37,13 +37,14 @@ import {
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, movimientos, ofertas, presentaciones, productoEtiquetas, productoProveedores, productos,
+  categorias, movimientos, ofertas, presentaciones, productoProveedores, productos,
   sucursales, usuarios, vencimientoSesiones, vencimientos,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { costoNetoEntry, escalaPaquete, formatoDeCosto } from '../inventario/pricing';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
+import { alcanzaProducto, cubreSucursal, estadoOferta, productosParaAlcance } from '../ofertas/alcance';
 import { ConfiguracionModule } from '../configuracion/configuracion.module';
 import { ListasModule } from '../listas/listas.module';
 import { DIAS } from './dias';
@@ -51,59 +52,6 @@ import { MECANICAS, RANGOS_REGLA, type Mecanica, type RangoRegla } from './regla
 import { ReglasVencimientoService } from './reglas.service';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
-
-/* ---------------- Alcance y vigencia de una oferta (lado servidor) ----------------
- *
- * Las MISMAS tres reglas que el motor del POS aplica en la caja
- * (dashboard/modules/ventas/domain/ofertas.js). Están acá porque el cruce
- * oferta ↔ vencimiento se resuelve en la base y no puede opinar distinto que la
- * caja: si el motor dice que la oferta alcanza al producto, este aviso también.
- */
-
-/**
- * ¿El alcance de la oferta llega a ESTE registro? Varias filas = unión.
- *
- * `presId` distingue el paquete fraccionado de su madre (0054): los cuatro
- * alcances de siempre se resuelven con datos de la madre y el paquete los
- * heredaría todos, así que al paquete solo lo alcanzan si la oferta tiene el
- * tilde `incluyeFraccionados`. El alcance `presentacion` es al revés: apunta a
- * un paquete y NO alcanza al granel suelto.
- */
-function alcanzaProducto(
-  o: any,
-  p: { id: number; marcaId: number | null; categoriaId: number | null; etiquetas: number[] },
-  presId: number | null = null,
-) {
-  // El de ticket alcanza al total del ticket, no a productos.
-  if (o.tipo === 'ticket') return false;
-  // El del combo son sus componentes (no usa filas de alcance).
-  if (o.tipo === 'combo') return (o.componentes ?? []).some((c: any) => c.productoId === p.id);
-  return (o.alcances ?? []).some((a: any) => {
-    if (a.tipo === 'presentacion') return presId != null && a.refId === presId;
-    if (presId != null && !o.incluyeFraccionados) return false;
-    switch (a.tipo) {
-      case 'producto': return a.refId === p.id;
-      case 'marca': return a.refId === p.marcaId;
-      case 'categoria': return a.refId === p.categoriaId;
-      case 'etiqueta': return p.etiquetas.includes(a.refId);
-      default: return false;
-    }
-  });
-}
-
-/** '' = todas las sucursales; si no, la lista CSV manda. */
-function cubreSucursal(o: any, sucursalId: number) {
-  const ids = String(o.sucursales || '').split(',').map((x) => x.trim()).filter(Boolean);
-  return !ids.length || ids.includes(String(sucursalId));
-}
-
-/** Estado calculado, igual que el panel de Ventas: por qué (no) está corriendo. */
-function estadoOferta(o: any, ahora: Date) {
-  if (!o.activa) return 'inactiva';
-  if (o.desde && ahora < new Date(o.desde)) return 'programada';
-  if (o.hasta && ahora > new Date(o.hasta)) return 'vencida';
-  return 'vigente';
-}
 
 class ItemControlDto {
   @IsInt() productoId!: number;
@@ -481,7 +429,7 @@ export class VencimientosService {
     const oferta = todas.find((x: any) => x.id === o.ofertaId);
     if (!oferta) throw new NotFoundException('Oferta inexistente.');
 
-    const prod = (await this.productosParaAlcance([reg.productoId]))[0];
+    const prod = (await productosParaAlcance(this.db, [reg.productoId]))[0];
     if (!prod || !alcanzaProducto(oferta, prod, reg.presentacionId)) {
       throw new BadRequestException(
         `La oferta «${oferta.nombre}» no alcanza a ${reg.nombre}: sin eso el registro figuraría en oferta y en la caja no descontaría nada.`,
@@ -497,21 +445,6 @@ export class VencimientosService {
     return { registro: out, oferta: { ...oferta, porVencer: true } };
   }
 
-  /** Productos con lo necesario para resolver los cuatro alcances de una oferta. */
-  private async productosParaAlcance(ids?: number[]) {
-    const base = this.db.select({
-      id: productos.id, nombre: productos.nombre, estado: productos.estado,
-      marcaId: productos.marcaId, categoriaId: productos.categoriaId,
-    }).from(productos);
-    const filas = ids ? await base.where(inArray(productos.id, ids)) : await base;
-    if (!filas.length) return [];
-    const etqs = await this.db.select().from(productoEtiquetas)
-      .where(inArray(productoEtiquetas.productoId, filas.map((p) => p.id)));
-    return filas.map((p) => ({
-      ...p,
-      etiquetas: etqs.filter((e) => e.productoId === p.id).map((e) => e.etiquetaId),
-    }));
-  }
 
   /**
    * EL CRUCE: qué mercadería vigilada está (o debería estar) en oferta.
@@ -529,7 +462,7 @@ export class VencimientosService {
     const ahora = new Date();
     const [todas, prods, abiertos] = await Promise.all([
       this.ofertas.listar(),
-      this.productosParaAlcance(),
+      productosParaAlcance(this.db),
       this.db.select({ v: vencimientos, dias: DIAS }).from(vencimientos)
         .where(and(eq(vencimientos.procesado, false), soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined))
         .orderBy(asc(vencimientos.fechaVencimiento), asc(vencimientos.id)),

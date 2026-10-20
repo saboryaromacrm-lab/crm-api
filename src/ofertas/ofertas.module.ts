@@ -11,8 +11,8 @@
  * mecánica, porque la respuesta es un dato, no dos ifs en dos lados.
  */
 import {
-  Body, Controller, Delete, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Patch, Post,
+  Body, Controller, Delete, Get, Inject, Injectable, Logger, Module, BadRequestException,
+  NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Patch, Post,
 } from '@nestjs/common';
 import {
   IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString,
@@ -21,7 +21,10 @@ import { asc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
-import { ofertaAlcances, ofertaComponentes, ofertas, usuarios, ventaItems } from '../db/schema';
+import { ofertaAlcances, ofertaComponentes, ofertaStockInicial, ofertas, stock, usuarios, ventaItems } from '../db/schema';
+import { MARGEN_AL_EMPEZAR_MS, alcanzaProducto, cubreSucursal, estadoOferta, inicioOferta, productosParaAlcance } from './alcance';
+/** El reloj de las fotos: las programadas se fotografían en la primera vuelta después de arrancar. */
+const CADA_MS_FOTO = 10 * 60_000;
 
 export const TIPOS_OFERTA = [
   'porcentaje', 'precio_fijo', 'nxm', 'segunda_unidad', 'pack', 'combo', 'ticket',
@@ -110,8 +113,93 @@ class UpsertOfertaDto {
 }
 
 @Injectable()
-export class OfertasService {
+export class OfertasService implements OnModuleInit, OnModuleDestroy {
+  private readonly log = new Logger('Ofertas');
+  private reloj: ReturnType<typeof setInterval> | null = null;
+
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+
+  onModuleInit() {
+    if (process.env.NODE_ENV === 'test' || process.env.OFERTAS_FOTO === '0') return;
+    const tic = () => { void this.fotografiarStock().catch((e) => this.log.warn(`foto del stock: ${(e as Error).message}`)); };
+    const primero = setTimeout(tic, 60_000);
+    primero.unref();
+    this.reloj = setInterval(tic, CADA_MS_FOTO);
+    this.reloj.unref();
+  }
+
+  onModuleDestroy() {
+    if (this.reloj) clearInterval(this.reloj);
+  }
+
+  /**
+   * LA FOTO DEL STOCK AL EMPEZAR (0189): el disponible de cada artículo que la
+   * oferta alcanza, en cada sucursal donde corre. Con eso Métricas dice «empezó
+   * con 40, se vendieron 28 con la oferta». Se toma UNA vez por artículo y
+   * sucursal (lo ya fotografiado no se pisa).
+   *
+   *   · sin `ids` (el reloj): las vigentes que todavía no tienen foto
+   *     (`foto_stock_en` nulo) —las programadas que arrancaron, y las que ya
+   *     corrían antes de la 0189—;
+   *   · con `ids` (al crear o editar): además completa lo que se sumó al alcance.
+   *
+   * La de ticket no alcanza artículos: no lleva foto.
+   */
+  async fotografiarStock(ids?: number[]) {
+    const ahora = new Date();
+    const vigentes = (await this.listar()).filter((o) => o.tipo !== 'ticket'
+      && (!ids || ids.includes(o.id)) && estadoOferta(o, ahora) === 'vigente');
+    if (!vigentes.length) return 0;
+    const aTomar = ids ? vigentes : vigentes.filter((o) => !o.fotoStockEn);
+    if (!aTomar.length) return 0;
+    const hechas = await this.db.select({
+      ofertaId: ofertaStockInicial.ofertaId, productoId: ofertaStockInicial.productoId,
+      presentacionId: ofertaStockInicial.presentacionId, sucursalId: ofertaStockInicial.sucursalId,
+    }).from(ofertaStockInicial).where(inArray(ofertaStockInicial.ofertaId, aTomar.map((o) => o.id)));
+
+    const clave = (o: number, p: number, pr: number, s: number) => `${o}|${p}|${pr}|${s}`;
+    const ya = new Set(hechas.map((h) => clave(h.ofertaId, h.productoId, h.presentacionId, h.sucursalId)));
+    const [prods, filas] = await Promise.all([
+      productosParaAlcance(this.db),
+      this.db.select({ productoId: stock.productoId, presentacionId: stock.presentacionId, sucursalId: stock.sucursalId, cantidad: stock.cantidad })
+        .from(stock).where(eq(stock.estado, 'disponible')),
+    ]);
+    const porId = new Map(prods.map((p) => [p.id, p]));
+    const nuevas = new Map<string, typeof ofertaStockInicial.$inferInsert>();
+    for (const o of aTomar) {
+      const inicio = inicioOferta(o);
+      const alEmpezar = !!inicio && ahora.getTime() - inicio.getTime() <= MARGEN_AL_EMPEZAR_MS;
+      for (const f of filas) {
+        const prod = porId.get(f.productoId);
+        if (!prod || !cubreSucursal(o, f.sucursalId) || !alcanzaProducto(o, prod, f.presentacionId)) continue;
+        const k = clave(o.id, f.productoId, f.presentacionId ?? 0, f.sucursalId);
+        if (ya.has(k)) continue;
+        const previa = nuevas.get(k);
+        if (previa) previa.cantidad = (previa.cantidad ?? 0) + f.cantidad;
+        else {
+          nuevas.set(k, {
+            ofertaId: o.id, productoId: f.productoId, presentacionId: f.presentacionId ?? 0, sucursalId: f.sucursalId,
+            cantidad: f.cantidad, tomadoEn: ahora, alEmpezar,
+          });
+        }
+      }
+    }
+    const lote = [...nuevas.values()];
+    await this.db.transaction(async (tx) => {
+      for (let i = 0; i < lote.length; i += 500) {
+        await tx.insert(ofertaStockInicial).values(lote.slice(i, i + 500)).onConflictDoNothing();
+      }
+      /* Sacada, aunque no haya dado filas: «empezó sin stock» no es «no hay foto». */
+      const sinMarca = aTomar.filter((o) => !o.fotoStockEn).map((o) => o.id);
+      if (sinMarca.length) await tx.update(ofertas).set({ fotoStockEn: ahora }).where(inArray(ofertas.id, sinMarca));
+    });
+    return lote.length;
+  }
+
+  /** Después de guardar: la foto no frena ni hace fallar el alta (el reloj la reintenta). */
+  private async fotoDe(id: number) {
+    await this.fotografiarStock([id]).catch((e) => this.log.warn(`foto del stock de la oferta ${id}: ${(e as Error).message}`));
+  }
 
   /** Todas, con alcances, componentes y el nombre de quien la creó. El panel filtra en memoria. */
   async listar() {
@@ -227,21 +315,26 @@ export class OfertasService {
    */
   async crear(dto: UpsertOfertaDto, usuarioId: number | null = null, auto = false) {
     const { fila, alcances, componentes } = this.normalizar(dto);
-    return this.db.transaction(async (tx) => {
+    const creada = await this.db.transaction(async (tx) => {
       const [o] = await tx.insert(ofertas).values({ ...fila, creadoPor: usuarioId, autoVencimiento: auto }).returning();
       await this.escribirHijas(tx, o.id, alcances, componentes);
       return o;
     });
+    await this.fotoDe(creada.id);
+    return creada;
   }
 
   async editar(id: number, dto: UpsertOfertaDto, auto = false) {
     const { fila, alcances, componentes } = this.normalizar(dto);
-    return this.db.transaction(async (tx) => {
+    const editada = await this.db.transaction(async (tx) => {
       const [o] = await tx.update(ofertas).set({ ...fila, autoVencimiento: auto }).where(eq(ofertas.id, id)).returning();
       if (!o) throw new NotFoundException('Oferta inexistente.');
       await this.escribirHijas(tx, id, alcances, componentes);
       return o;
     });
+    /* Lo que se sumó al alcance se fotografía ahora (ya no «al empezar»). */
+    await this.fotoDe(id);
+    return editada;
   }
 
   /** Atada a un registro de vencimiento: es por vencimiento (0187). */

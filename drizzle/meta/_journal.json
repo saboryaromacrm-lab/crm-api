@@ -1324,6 +1324,13 @@
       "when": 1792483200000,
       "tag": "0188_reglas_vencimiento",
       "breakpoints": true
+    },
+    {
+      "idx": 189,
+      "version": "7",
+      "when": 1792486800000,
+      "tag": "0189_metricas_ofertas",
+      "breakpoints": true
     }
   ]
 }

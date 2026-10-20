@@ -48,6 +48,7 @@ import { reporteProductos } from './productos';
 import { reporteStock } from './stock';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
+import { reporteOfertas } from './ofertas';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
 export const PERMISO_METRICAS = 'gerencia.metricas';
@@ -130,6 +131,9 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   private paso(v?: string): Paso { return (v && v in PASOS ? v : 'dia') as Paso; }
 
   ventas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteVentas(c, f, this.paso(q.paso))); }
+
+  /** Ofertas y descuentos (0189): del precio de lista a la venta neta, y si cada oferta es rentable. */
+  ofertas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteOfertas(c, f)); }
 
   /** Resultados IVA (3/10/2026): facturado contra sin factura y la posición de IVA mes a mes. */
   iva(q: any) {
@@ -344,6 +348,7 @@ export class MetricasController {
   @Get('comparar') comparar(@Query() q: any) { return this.svc.comparar(q); }
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
   @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
+  @Get('ofertas') ofertas(@Query() q: any) { return this.svc.ofertas(q); }
 
   /** El botón «Sincronizar»: por defecto, hoy y ayer (un instante). */
   @Post('sincronizar')

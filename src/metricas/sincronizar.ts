@@ -44,7 +44,7 @@ const VALIDA = `v.estado IN ('confirmada', 'pendiente_cae')`;
 const TABLAS_DIA = [
   'metricas_venta_prod_dia', 'metricas_venta_dia', 'metricas_venta_hora',
   'metricas_venta_cliente_dia', 'metricas_venta_pago_dia', 'metricas_compra_prov_dia',
-  'metricas_venta_mezcla_dia',
+  'metricas_venta_mezcla_dia', 'metricas_descuento_dia', 'metricas_oferta_dia',
 ] as const;
 
 /** Las sentencias que rearman un rango, en orden. Cada una es un INSERT ... SELECT: nada se trae a Node. */
@@ -120,6 +120,66 @@ const REARMAR: string[] = [
      JOIN venta_pagos vp ON vp.venta_id = v.id
    WHERE ${VALIDA} AND ${RANGO('v.fecha')}
    GROUP BY 1, 2, 3`,
+
+  /*
+   * DE LA VENTA A PRECIO DE LISTA A LA VENTA NETA (0189), renglón por renglón y
+   * todo neto (sin IVA), con el mismo cálculo que `calcularTotales` de Ventas:
+   *   lista       cantidad × precio de lista
+   *   precio      cantidad × (lista − precio cobrado): el precio cambiado a mano
+   *   nombrado    el % de un descuento con nombre (Efectivo, Empleados…), por descuento
+   *   cliente     el % del cliente o puesto a mano (sin nombre)
+   *   neto        lo que quedó (la oferta sale de metricas_oferta_dia)
+   *   costeado / costo   para la ganancia, solo con costo congelado
+   *   extra       los cargos aparte del ticket (envío, recargo por cuotas)
+   * Lo que no cierra entre lista y neto es el redondeo al centavo de cada renglón.
+   */
+  `INSERT INTO metricas_descuento_dia (dia, sucursal_id, concepto, ref_id, nombre, importe, renglones)
+   SELECT t.dia, t.sucursal_id, t.concepto, t.ref_id, max(t.nombre), sum(t.importe), sum(t.renglon)::int
+   FROM (
+     SELECT ${DIA('v.fecha')} AS dia, coalesce(v.sucursal_id, 0) AS sucursal_id, x.concepto, x.ref_id, x.nombre,
+       x.importe * ${SIGNO} AS importe, CASE WHEN ${NOTA} THEN 0 ELSE 1 END AS renglon
+     FROM ventas v
+       JOIN venta_items vi ON vi.venta_id = v.id
+       CROSS JOIN LATERAL (VALUES
+         ('lista', 0, '', vi.cantidad * vi.precio_lista),
+         ('precio', 0, '', vi.cantidad * (vi.precio_lista - vi.precio_unitario)),
+         (CASE WHEN vi.descuento_id IS NULL THEN 'cliente' ELSE 'nombrado' END, coalesce(vi.descuento_id, 0),
+           vi.descuento_nombre, vi.cantidad * vi.precio_unitario * vi.descuento / 100),
+         ('neto', 0, '', vi.subtotal),
+         ('costeado', 0, '', CASE WHEN vi.costo_unitario IS NOT NULL THEN vi.subtotal ELSE 0 END),
+         ('costo', 0, '', coalesce(vi.cantidad * vi.costo_unitario, 0))
+       ) AS x(concepto, ref_id, nombre, importe)
+     WHERE ${VALIDA} AND ${RANGO('v.fecha')} AND x.importe <> 0
+     UNION ALL
+     SELECT ${DIA('v.fecha')}, coalesce(v.sucursal_id, 0), 'extra', 0, '', e.importe * ${SIGNO}, CASE WHEN ${NOTA} THEN 0 ELSE 1 END
+     FROM ventas v
+       JOIN venta_extras e ON e.venta_id = v.id
+     WHERE ${VALIDA} AND ${RANGO('v.fecha')}
+   ) t
+   GROUP BY 1, 2, 3, 4`,
+
+  /*
+   * LO VENDIDO CON CADA OFERTA (0189), por artículo y sucursal: unidades, neto,
+   * costo y lo que la oferta descontó (neto). `descuento_costeado` es el de los
+   * renglones con costo: con eso «la ganancia a precio normal» no mezcla
+   * renglones sin costo. Una oferta borrada (no pasa: usada, se desactiva) iría a 0.
+   */
+  `INSERT INTO metricas_oferta_dia
+     (dia, sucursal_id, oferta_id, producto_id, presentacion_id, unidades, venta_neta, venta_costeada, costo,
+      descuento, descuento_costeado, renglones, sin_costo)
+   SELECT ${DIA('v.fecha')}, coalesce(v.sucursal_id, 0), coalesce(vi.oferta_id, 0), vi.producto_id, coalesce(vi.presentacion_id, 0),
+     sum(vi.cantidad * ${SIGNO}),
+     sum(vi.subtotal * ${SIGNO}),
+     coalesce(sum(vi.subtotal * ${SIGNO}) FILTER (WHERE vi.costo_unitario IS NOT NULL), 0),
+     coalesce(sum(vi.cantidad * vi.costo_unitario * ${SIGNO}), 0),
+     sum(vi.oferta_descuento * ${SIGNO}),
+     coalesce(sum(vi.oferta_descuento * ${SIGNO}) FILTER (WHERE vi.costo_unitario IS NOT NULL), 0),
+     count(*) FILTER (WHERE NOT ${NOTA}),
+     count(*) FILTER (WHERE vi.costo_unitario IS NULL AND NOT ${NOTA})
+   FROM ventas v
+     JOIN venta_items vi ON vi.venta_id = v.id
+   WHERE ${VALIDA} AND ${RANGO('v.fecha')} AND (vi.oferta_id IS NOT NULL OR vi.oferta_descuento <> 0)
+   GROUP BY 1, 2, 3, 4, 5`,
 
   // Lo que se le compra a cada proveedor (la NC resta, la ND suma; el remito no es compra hasta facturarse).
   `INSERT INTO metricas_compra_prov_dia (dia, proveedor_id, neto, iva, total, comprobantes)
@@ -200,4 +260,6 @@ export const CUENTAS = `SELECT
   (SELECT count(*)::int FROM metricas_venta_cliente_dia) AS cliente_dia,
   (SELECT count(*)::int FROM metricas_venta_pago_dia) AS pago_dia,
   (SELECT count(*)::int FROM metricas_compra_prov_dia) AS compra_prov_dia,
-  (SELECT count(*)::int FROM metricas_venta_mezcla_dia) AS mezcla_dia`;
+  (SELECT count(*)::int FROM metricas_venta_mezcla_dia) AS mezcla_dia,
+  (SELECT count(*)::int FROM metricas_descuento_dia) AS descuento_dia,
+  (SELECT count(*)::int FROM metricas_oferta_dia) AS oferta_dia`;

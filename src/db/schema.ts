@@ -1146,6 +1146,8 @@ export const ofertas = pgTable('ofertas', {
    * sistema no la vuelve a tocar (salvo «Volver a la regla»).
    */
   autoVencimiento: boolean('auto_vencimiento').notNull().default(false),
+  /** Cuándo se sacó la foto del stock al empezar (0189), aunque no haya dado filas. Null = todavía no. */
+  fotoStockEn: timestamp('foto_stock_en', { withTimezone: true }),
   /** Quién la creó y cuándo (0187). Nulos en las anteriores: no se registraba. */
   creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).defaultNow(),
@@ -3526,6 +3528,25 @@ export const vencimientos = pgTable('vencimientos', {
   ixSucursal: index('ix_vencimientos_sucursal').on(t.sucursalId),
   ixProducto: index('ix_vencimientos_producto').on(t.productoId),
   ixProcesado: index('ix_vencimientos_procesado').on(t.procesado),
+}));
+
+/**
+ * LA FOTO DEL STOCK AL EMPEZAR UNA OFERTA (0189): el disponible de cada
+ * artículo que alcanza, en cada sucursal donde corre. La toma `OfertasService`
+ * al crearla (o al arrancar, si era programada) y Métricas la compara con lo
+ * vendido con la oferta. `presentacionId` 0 = el producto suelto.
+ */
+export const ofertaStockInicial = pgTable('oferta_stock_inicial', {
+  ofertaId: integer('oferta_id').notNull().references(() => ofertas.id, { onDelete: 'cascade' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  presentacionId: integer('presentacion_id').notNull().default(0),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'cascade' }),
+  cantidad: doublePrecision('cantidad').notNull().default(0),
+  tomadoEn: timestamp('tomado_en', { withTimezone: true }).notNull().defaultNow(),
+  /** Tomada apenas arrancó la oferta; si no, la oferta ya venía corriendo. */
+  alEmpezar: boolean('al_empezar').notNull().default(false),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.ofertaId, t.productoId, t.presentacionId, t.sucursalId] }),
 }));
 
 /**
