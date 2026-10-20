@@ -12,7 +12,8 @@
  *     nunca baja de costo × (1 + IVA). Ojo: NO es «markup 0 sobre la base del
  *     precio» —con parte sin factura esa base no lleva el IVA que se absorbe,
  *     y vender a ese precio pierde justo ese IVA—;
- *   · «costo + 5 %» es ganar el 5 % sobre ese costo real.
+ *   · «costo + 5 %» es ganar el 5 % sobre ese costo real; «al costo» (costo + 0)
+ *     deja el neto en el costo, redondeado para arriba al paso de góndola.
  *
  * UN PRECIO PARA TODOS EN «%» Y «COSTO + %»: la oferta es de precio fijo. Un
  * % sobre CADA lista bajaría además el precio mayorista —que ya es bajo— y lo
@@ -43,7 +44,8 @@ export const REGLAS_DE_FABRICA: Regla[] = [
   { rango: 'vigente', mecanica: 'ninguna', valor: 0, lleva: 0, paga: 0 },
   { rango: 'd30', mecanica: 'descuento', valor: 25, lleva: 0, paga: 0 },
   { rango: 'd15', mecanica: 'descuento', valor: 40, lleva: 0, paga: 0 },
-  { rango: 'd7', mecanica: 'costo', valor: 5, lleva: 0, paga: 0 },
+  /* «Al costo» (20/10/2026, corrección del dueño: antes costo + 5 %). */
+  { rango: 'd7', mecanica: 'costo', valor: 0, lleva: 0, paga: 0 },
 ];
 
 /** El rango de un registro según los días que le quedan: mismos cortes que el panel. */

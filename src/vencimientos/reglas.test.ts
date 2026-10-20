@@ -48,6 +48,16 @@ test('costo + 5 %: gana el 5 % sobre el costo real', () => {
   assert.equal(exacto.precio, 1270.5);
 });
 
+test('al costo (costo + 0): el neto queda justo en el costo, nunca debajo', () => {
+  const p: any = proponer(regla({ rango: 'd7', mecanica: 'costo', valor: 0 }), art());
+  assert.equal(p.precio, 1210);                              // 1000 × 1,21
+  assert.deepEqual(p.listas, [1, 2, 3]);
+  assert.equal(de(p, 1).ganancia, 0);
+  const conRedondeo: any = proponer(regla({ rango: 'd7', mecanica: 'costo', valor: 0 }), art({ costoReal: 1003 }));
+  assert.equal(conRedondeo.precio, 1220);                    // 1213,63 → para ARRIBA al paso de $10
+  assert.ok(de(conRedondeo, 1).ganancia >= 0);
+});
+
 test('3×2: cada lista con su precio; no corre donde queda debajo del costo', () => {
   const p: any = proponer(regla({ mecanica: 'nxm', lleva: 3, paga: 2 }), art());
   assert.equal(p.tipo, 'nxm');
