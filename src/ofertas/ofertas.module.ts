@@ -17,11 +17,11 @@ import {
 import {
   IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString,
 } from 'class-validator';
-import { asc, eq, inArray, sql } from 'drizzle-orm';
+import { asc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
-import { Permiso } from '../auth/auth.decoradores';
-import { ofertaAlcances, ofertaComponentes, ofertas, ventaItems } from '../db/schema';
+import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { ofertaAlcances, ofertaComponentes, ofertas, usuarios, ventaItems } from '../db/schema';
 
 export const TIPOS_OFERTA = [
   'porcentaje', 'precio_fijo', 'nxm', 'segunda_unidad', 'pack', 'combo', 'ticket',
@@ -103,6 +103,8 @@ class UpsertOfertaDto {
   /** El alcance por la madre alcanza también a sus paquetes fraccionados. */
   @IsOptional() @IsBoolean() incluyeFraccionados?: boolean;
   @IsOptional() @IsBoolean() activa?: boolean;
+  /** Para rematar mercadería por vencer (0187). */
+  @IsOptional() @IsBoolean() porVencer?: boolean;
   @IsOptional() @IsArray() alcances?: AlcanceDto[];
   @IsOptional() @IsArray() componentes?: ComponenteDto[];
 }
@@ -111,10 +113,11 @@ class UpsertOfertaDto {
 export class OfertasService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  /** Todas, con alcances y componentes anidados. El panel filtra en memoria. */
+  /** Todas, con alcances, componentes y el nombre de quien la creó. El panel filtra en memoria. */
   async listar() {
     const [os, als, comps] = await Promise.all([
-      this.db.select().from(ofertas).orderBy(asc(ofertas.id)),
+      this.db.select({ ...getTableColumns(ofertas), creadoPorNombre: usuarios.nombre })
+        .from(ofertas).leftJoin(usuarios, eq(usuarios.id, ofertas.creadoPor)).orderBy(asc(ofertas.id)),
       this.db.select().from(ofertaAlcances),
       this.db.select().from(ofertaComponentes),
     ]);
@@ -172,6 +175,7 @@ export class OfertasService {
       listas: this.idsCsv(dto.listas),
       incluyeFraccionados: dto.incluyeFraccionados ?? false,
       activa: dto.activa ?? true,
+      porVencer: dto.porVencer ?? false,
     };
     const error = regla.check(o);
     if (error) throw new BadRequestException(error);
@@ -217,10 +221,10 @@ export class OfertasService {
     if (componentes.length) await tx.insert(ofertaComponentes).values(componentes.map((c) => ({ ...c, ofertaId })));
   }
 
-  async crear(dto: UpsertOfertaDto) {
+  async crear(dto: UpsertOfertaDto, usuarioId: number | null = null) {
     const { fila, alcances, componentes } = this.normalizar(dto);
     return this.db.transaction(async (tx) => {
-      const [o] = await tx.insert(ofertas).values(fila).returning();
+      const [o] = await tx.insert(ofertas).values({ ...fila, creadoPor: usuarioId }).returning();
       await this.escribirHijas(tx, o.id, alcances, componentes);
       return o;
     });
@@ -234,6 +238,11 @@ export class OfertasService {
       await this.escribirHijas(tx, id, alcances, componentes);
       return o;
     });
+  }
+
+  /** Atada a un registro de vencimiento: es por vencimiento (0187). */
+  async marcarPorVencer(id: number) {
+    await this.db.update(ofertas).set({ porVencer: true }).where(eq(ofertas.id, id));
   }
 
   /** Usada en ventas → se desactiva (el ticket viejo la referencia). */
@@ -274,7 +283,7 @@ export class OfertasController {
   @Get() listar() { return this.svc.listar(); }
 
   @Post() @Permiso('ventas.ofertas', 'ofertas')
-  crear(@Body() dto: UpsertOfertaDto) { return this.svc.crear(dto); }
+  crear(@Body() dto: UpsertOfertaDto, @Auth() sesion: Sesion) { return this.svc.crear(dto, sesion.usuarioId); }
 
   @Patch(':id') @Permiso('ventas.ofertas', 'ofertas')
   editar(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertOfertaDto) {

@@ -1134,6 +1134,15 @@ export const ofertas = pgTable('ofertas', {
    */
   incluyeFraccionados: boolean('incluye_fraccionados').notNull().default(false),
   activa: boolean('activa').notNull().default(true),
+  /**
+   * OFERTA POR VENCIMIENTO (0187, 20/10/2026): para rematar mercadería por
+   * vencer. Se marca sola al armarla desde Almacén › Vencimientos y se puede
+   * tildar a mano; Ventas › Ofertas filtra por esto.
+   */
+  porVencer: boolean('por_vencer').notNull().default(false),
+  /** Quién la creó y cuándo (0187). Nulos en las anteriores: no se registraba. */
+  creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).defaultNow(),
 });
 
 /** A qué artículos alcanza. Varias filas = unión (cualquiera la habilita). */

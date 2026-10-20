@@ -1310,6 +1310,13 @@
       "when": 1792310400000,
       "tag": "0186_imagen_compartir",
       "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1792396800000,
+      "tag": "0187_ofertas_creador_por_vencer",
+      "breakpoints": true
     }
   ]
 }

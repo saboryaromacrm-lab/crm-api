@@ -421,6 +421,8 @@ export class VencimientosService {
          * regalar margen sin salvar nada. */
         sucursales: String(v.sucursalId),
         activa: true,
+        /* Marcada por vencimiento (0187): Ventas › Ofertas la filtra así. */
+        porVencer: true,
         listas: listaBaseId ? String(listaBaseId) : '',
         /*
          * El alcance apunta a LO QUE VENCE. Si el registro es de un paquete
@@ -469,7 +471,9 @@ export class VencimientosService {
     if (reg.ofertaId === o.ofertaId) return { registro: reg, oferta };
     const [out] = await this.db.update(vencimientos).set({ ofertaId: o.ofertaId })
       .where(eq(vencimientos.id, id)).returning();
-    return { registro: out, oferta };
+    /* Atada a un vencimiento, es por vencimiento aunque se haya destildado al crearla (0187). */
+    if (!oferta.porVencer) await this.ofertas.marcarPorVencer(o.ofertaId);
+    return { registro: out, oferta: { ...oferta, porVencer: true } };
   }
 
   /** Productos con lo necesario para resolver los cuatro alcances de una oferta. */
