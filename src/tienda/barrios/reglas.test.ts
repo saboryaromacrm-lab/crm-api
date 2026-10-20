@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { barrioDe, condiciones, dentro, describirPromo, diaDeSemana, poligonoValido, puntoValido, vigente, type Barrio, type PromoBarrio } from './reglas';
+import { barrioDe, condiciones, dentro, describirCuando, describirPromo, diaDeSemana, poligonoValido, puntoValido, vigente, type Barrio, type PromoBarrio } from './reglas';
 
 /* Un cuadrado de ~1 km en Formosa y una «L» (cóncava) al lado. */
 const CUADRADO: [number, number][] = [[-26.18, -58.18], [-26.18, -58.17], [-26.19, -58.17], [-26.19, -58.18]];
@@ -80,4 +80,12 @@ test('describirPromo: en palabras del cliente', () => {
   assert.equal(describirPromo(promo({ barrioIds: [1, 2, 3], tipo: 'envio_fijo', valor: 1500, minimo: 20000 }), nombres),
     'Envío a $1.500 a Independencia, San Miguel y Centro en compras desde $20.000');
   assert.equal(describirPromo(promo({ barrioIds: [1, 2], tipo: 'descuento', valor: 10 }), nombres), '10% de descuento en Independencia y San Miguel');
+});
+
+test('describirCuando: días de lunes a domingo y fechas', () => {
+  assert.equal(describirCuando(promo({})), 'Todos los días');
+  assert.equal(describirCuando(promo({ dias: [4, 2] })), 'Los martes y jueves');
+  assert.equal(describirCuando(promo({ dias: [0, 1] })), 'Los lunes y domingos', 'el domingo va al final');
+  assert.equal(describirCuando(promo({ dias: [6], desde: '2026-11-01', hasta: '2026-11-07' })), 'Los sábados · del 01/11 al 07/11');
+  assert.equal(describirCuando(promo({ hasta: '2026-12-24' })), 'Todos los días · hasta el 24/12');
 });

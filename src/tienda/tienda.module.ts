@@ -372,6 +372,8 @@ export class TiendaService {
       .filter((o: any) => o.tipo !== 'combo' && o.tipo !== 'ticket' && ofertaVigente(o, suc?.id ?? null))
       .map((o: any) => ({ ...o, listasSet: new Set(String(o.listas ?? '').split(',').map((x: string) => Number(x.trim())).filter(Boolean)) }));
 
+    /** Minorista (0185): los avisos de las promos de hoy y el cartel de envío gratis por barrio. */
+    const barriosPortada = minorista ? await this.barrios.portada() : null;
     /**
      * Contenido editable del sitio (módulo Web): slides de la portada, logo,
      * favicon y los datos de contacto/redes del footer.
@@ -398,7 +400,9 @@ export class TiendaService {
       /** La portada minorista (17/10/2026): sus textos, editables en Tienda online › Configuración › Tienda minorista. */
       minorista: {
         /* Las promos por barrio de hoy van primero (0185): «🚚 Hoy: Envío gratis a Independencia». */
-        avisos: [...(minorista ? await this.barrios.avisosDeHoy() : []), ...(web.minAvisos as string[])],
+        avisos: [...(barriosPortada?.avisos ?? []), ...(web.minAvisos as string[])],
+        /** El cartel de envío gratis por barrio (0185): vacío = no se muestra. */
+        enviosGratis: barriosPortada?.enviosGratis ?? [],
         hero: {
           eyebrow: String(web.minHeroEyebrow ?? ''), titulo: String(web.minHeroTitulo ?? ''), texto: String(web.minHeroTexto ?? ''),
           cta1: { texto: String(web.minHeroCta1 ?? ''), url: String(web.minHeroCta1Url ?? '/') },

@@ -77,6 +77,20 @@ export function describirPromo(p: PromoBarrio, nombreDe: Map<number, string>): s
   return p.minimo > 0 ? `${que} en compras desde ${pesos(p.minimo)}` : que;
 }
 
+/** De lunes a domingo, como se lee una semana (0 = domingo). */
+const SEMANA = [1, 2, 3, 4, 5, 6, 0];
+const NOMBRE_DIA = ['domingos', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábados'];
+const fechaCorta = (iso: string) => iso.split('-').reverse().slice(0, 2).join('/');
+
+/** Cuándo rige, en palabras: «Todos los días», «Los martes y jueves · del 01/11 al 07/11». */
+export function describirCuando(p: PromoBarrio): string {
+  const nombres = SEMANA.filter((d) => p.dias.includes(d)).map((d) => NOMBRE_DIA[d]);
+  const dias = nombres.length ? `Los ${enumerar(nombres)}` : 'Todos los días';
+  const rango = p.desde && p.hasta ? `del ${fechaCorta(p.desde)} al ${fechaCorta(p.hasta)}`
+    : p.desde ? `desde el ${fechaCorta(p.desde)}` : p.hasta ? `hasta el ${fechaCorta(p.hasta)}` : '';
+  return rango ? `${dias} · ${rango}` : dias;
+}
+
 /** Lo que paga el cliente por recibir en ese barrio, hoy, con ese subtotal. */
 export interface Condiciones {
   /** Costo del envío; 0 = gratis; null = sin costo definido (se coordina por WhatsApp). */

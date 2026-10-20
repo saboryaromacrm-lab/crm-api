@@ -5,7 +5,8 @@
  * minorista (de a uno, cuando hace falta), con su costo de envío, y las promos
  * por barrio («Envío gratis a Independencia los martes»). La cuenta vive en
  * `reglas.ts`; acá, guardar y leer. La tienda pregunta con `condicionesPara`
- * (cotización del checkout y alta del pedido) y `avisosDeHoy` (la portada).
+ * (cotización del checkout y alta del pedido) y `portada` (los avisos y el
+ * cartel de envío gratis).
  */
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
@@ -18,7 +19,7 @@ import { DRIZZLE, Database } from '../../db/drizzle';
 import { barrioPromos, barrios } from '../../db/schema';
 import { hoyAr } from '../../cafeteria/cuenta';
 import {
-  MAX_PUNTOS, MIN_PUNTOS, TIPOS_PROMO, barrioDe, condiciones, describirPromo, poligonoValido, vigente,
+  MAX_PUNTOS, MIN_PUNTOS, TIPOS_PROMO, barrioDe, condiciones, describirCuando, describirPromo, poligonoValido, vigente,
   type Barrio, type Punto, type PromoBarrio, type TipoPromo,
 } from './reglas';
 
@@ -46,6 +47,9 @@ class PromoDto {
 }
 
 /** Fila de la base → la forma de las reglas. */
+/** Una línea del cartel de envío gratis de la portada: a qué barrios, cuándo y desde qué compra. */
+export interface EnvioGratis { barrios: string[]; cuando: string; hoy: boolean; minimo: number }
+
 const comoPromo = (p: typeof barrioPromos.$inferSelect): PromoBarrio => ({
   id: p.id, barrioIds: p.barrioIds, tipo: p.tipo as TipoPromo, valor: p.valor, dias: p.dias,
   desde: p.desde, hasta: p.hasta, minimo: p.minimo, activa: p.activa,
@@ -55,14 +59,17 @@ const comoPromo = (p: typeof barrioPromos.$inferSelect): PromoBarrio => ({
 export class BarriosService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  /** Todo, para la pantalla del ERP: cada promo con su texto, el mismo que ve el cliente. */
+  /** Todo, para la pantalla del ERP: cada promo con su texto y cuándo rige, lo mismo que ve el cliente. */
   async listar() {
     const [bs, ps] = await Promise.all([
       this.db.select().from(barrios).orderBy(asc(barrios.nombre)),
       this.db.select().from(barrioPromos).orderBy(asc(barrioPromos.id)),
     ]);
     const nombreDe = new Map(bs.map((b) => [b.id, b.nombre]));
-    return { barrios: bs, promos: ps.map((p) => ({ ...comoPromo(p), texto: describirPromo(comoPromo(p), nombreDe) })) };
+    return {
+      barrios: bs,
+      promos: ps.map(comoPromo).map((p) => ({ ...p, texto: describirPromo(p, nombreDe), cuando: describirCuando(p) })),
+    };
   }
 
   /** Lo que rige para la tienda: los barrios activos y las promos activas. Dos tablas chicas, dos consultas. */
@@ -82,13 +89,32 @@ export class BarriosService {
     return { barrio, nombreDe, ...condiciones(barrio, promos, subtotal, gratisDesde, hoyAr()) };
   }
 
-  /** Las promos que rigen hoy, en palabras del cliente, para los avisos de la portada. */
-  async avisosDeHoy(): Promise<string[]> {
-    const { promos, nombreDe } = await this.vigentes();
+  /**
+   * LO DE LA PORTADA MINORISTA, de una sola lectura: los avisos de arriba (las
+   * promos que rigen hoy) y el cartel de envío gratis (los barrios que siempre
+   * lo tienen, y las promos de envío gratis de hoy y de los próximos días;
+   * hoy primero). Solo barrios activos.
+   */
+  async portada(): Promise<{ avisos: string[]; enviosGratis: EnvioGratis[] }> {
+    const { barrios: lista, promos, nombreDe } = await this.vigentes();
     const hoy = hoyAr();
-    return promos
-      .filter((p) => vigente(p, hoy) && p.barrioIds.some((id) => nombreDe.has(id)))
-      .map((p) => `${p.tipo === 'descuento' ? '🏷️' : '🚚'} Hoy: ${describirPromo(p, nombreDe)}`);
+    const conBarrios = promos
+      .map((p) => ({ p, nombres: p.barrioIds.map((id) => nombreDe.get(id)).filter((n): n is string => !!n) }))
+      .filter((x) => x.nombres.length);
+    const avisos = conBarrios
+      .filter(({ p }) => vigente(p, hoy))
+      .map(({ p }) => `${p.tipo === 'descuento' ? '🏷️' : '🚚'} Hoy: ${describirPromo(p, nombreDe)}`);
+    const siempre = lista.filter((b) => b.costoEnvio === 0).map((b) => b.nombre);
+    const enviosGratis: EnvioGratis[] = [
+      ...(siempre.length ? [{ barrios: siempre, cuando: 'Siempre', hoy: true, minimo: 0 }] : []),
+      ...conBarrios
+        .filter(({ p }) => p.tipo === 'envio_gratis' && (!p.hasta || p.hasta >= hoy))
+        .map(({ p, nombres }) => {
+          const esHoy = vigente(p, hoy);
+          return { barrios: nombres, cuando: esHoy ? 'Hoy' : describirCuando(p), hoy: esHoy, minimo: p.minimo };
+        }),
+    ].sort((a, b) => Number(b.hoy) - Number(a.hoy));
+    return { avisos, enviosGratis };
   }
 
   async guardarBarrio(id: number | null, dto: BarrioDto) {
