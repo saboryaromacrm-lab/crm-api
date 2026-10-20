@@ -1140,6 +1140,12 @@ export const ofertas = pgTable('ofertas', {
    * tildar a mano; Ventas › Ofertas filtra por esto.
    */
   porVencer: boolean('por_vencer').notNull().default(false),
+  /**
+   * LA MANEJAN LAS REGLAS DE VENCIMIENTO (0188): la armó el sistema con la regla
+   * del rango y la escala solo. Si una persona la edita, pasa a manual y el
+   * sistema no la vuelve a tocar (salvo «Volver a la regla»).
+   */
+  autoVencimiento: boolean('auto_vencimiento').notNull().default(false),
   /** Quién la creó y cuándo (0187). Nulos en las anteriores: no se registraba. */
   creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).defaultNow(),
@@ -3521,6 +3527,21 @@ export const vencimientos = pgTable('vencimientos', {
   ixProducto: index('ix_vencimientos_producto').on(t.productoId),
   ixProcesado: index('ix_vencimientos_procesado').on(t.procesado),
 }));
+
+/**
+ * LAS REGLAS DE OFERTA POR RANGO (0188): una fila por rango (`vigente` = +30,
+ * `d30`, `d15`, `d7`). La cuenta y la validación viven en
+ * `vencimientos/reglas.ts`; la base solo asegura lo que no puede faltar.
+ */
+export const vencimientoReglas = pgTable('vencimiento_reglas', {
+  rango: text('rango').primaryKey(),
+  mecanica: text('mecanica').notNull(),
+  valor: doublePrecision('valor').notNull().default(0),
+  lleva: integer('lleva').notNull().default(0),
+  paga: integer('paga').notNull().default(0),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
 
 /* ---------------- Configuración (clave → JSON) ---------------- */
 /**

@@ -221,19 +221,23 @@ export class OfertasService {
     if (componentes.length) await tx.insert(ofertaComponentes).values(componentes.map((c) => ({ ...c, ofertaId })));
   }
 
-  async crear(dto: UpsertOfertaDto, usuarioId: number | null = null) {
+  /**
+   * `auto` (0188): la arma la regla de vencimiento. Desde la pantalla siempre
+   * es `false`: lo que crea o edita una persona es manual y la regla no lo toca.
+   */
+  async crear(dto: UpsertOfertaDto, usuarioId: number | null = null, auto = false) {
     const { fila, alcances, componentes } = this.normalizar(dto);
     return this.db.transaction(async (tx) => {
-      const [o] = await tx.insert(ofertas).values({ ...fila, creadoPor: usuarioId }).returning();
+      const [o] = await tx.insert(ofertas).values({ ...fila, creadoPor: usuarioId, autoVencimiento: auto }).returning();
       await this.escribirHijas(tx, o.id, alcances, componentes);
       return o;
     });
   }
 
-  async editar(id: number, dto: UpsertOfertaDto) {
+  async editar(id: number, dto: UpsertOfertaDto, auto = false) {
     const { fila, alcances, componentes } = this.normalizar(dto);
     return this.db.transaction(async (tx) => {
-      const [o] = await tx.update(ofertas).set(fila).where(eq(ofertas.id, id)).returning();
+      const [o] = await tx.update(ofertas).set({ ...fila, autoVencimiento: auto }).where(eq(ofertas.id, id)).returning();
       if (!o) throw new NotFoundException('Oferta inexistente.');
       await this.escribirHijas(tx, id, alcances, componentes);
       return o;

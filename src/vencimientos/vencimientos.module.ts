@@ -27,29 +27,30 @@
  * CURRENT_DATE del server en UTC — a la noche UTC ya es "mañana" y los
  * vencidos se adelantarían un día.
  */
-import { Body, Controller, Delete, Get, Inject, Injectable, Module, Param, ParseIntPipe, Post, Put, Query, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Injectable, Logger, Module, Param, ParseIntPipe, Post, Put, Query, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, ValidateNested,
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  categorias, configuracion, movimientos, presentaciones, productoEtiquetas, productoProveedores, productos,
+  categorias, movimientos, ofertas, presentaciones, productoEtiquetas, productoProveedores, productos,
   sucursales, usuarios, vencimientoSesiones, vencimientos,
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costoNetoEntry, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
+import { costoNetoEntry, escalaPaquete, formatoDeCosto } from '../inventario/pricing';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
+import { ConfiguracionModule } from '../configuracion/configuracion.module';
+import { ListasModule } from '../listas/listas.module';
+import { DIAS } from './dias';
+import { MECANICAS, RANGOS_REGLA, type Mecanica, type RangoRegla } from './reglas';
+import { ReglasVencimientoService } from './reglas.service';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
-
-/** Día "para vencer" contra el calendario argentino, no el UTC del server. */
-const HOY_AR = sql`(now() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date`;
-const DIAS = sql<number>`(${vencimientos.fechaVencimiento} - ${HOY_AR})`;
 
 /* ---------------- Alcance y vigencia de una oferta (lado servidor) ----------------
  *
@@ -140,16 +141,37 @@ class VincularOfertaDto {
   @IsInt() ofertaId!: number;
 }
 
-/** El descuento que se propone en el borrador; lo decide quien arma la oferta. */
-const PCT_SUGERIDO = 25;
+class ReglaDto {
+  @IsIn(RANGOS_REGLA as unknown as string[]) rango!: RangoRegla;
+  @IsIn(MECANICAS as unknown as string[]) mecanica!: Mecanica;
+  @IsOptional() @IsNumber() valor!: number;
+  @IsOptional() @IsInt() lleva!: number;
+  @IsOptional() @IsInt() paga!: number;
+}
+
+class GuardarReglasDto {
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(RANGOS_REGLA.length) @ValidateNested({ each: true }) @Type(() => ReglaDto)
+  reglas!: ReglaDto[];
+}
 
 @Injectable()
 export class VencimientosService {
+  private readonly log = new Logger('Vencimientos');
+
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly inv: InventarioService,
     private readonly ofertas: OfertasService,
+    private readonly reglas: ReglasVencimientoService,
   ) {}
+
+  /**
+   * Las reglas se aplican apenas cambia un registro (0188); si algo falla, el
+   * registro igual quedó guardado y el reloj de cada hora lo vuelve a intentar.
+   */
+  private async aplicarReglas(ids: number[]) {
+    await this.reglas.aplicar(ids).catch((e) => this.log.warn(`reglas de vencimiento: ${(e as Error).message}`));
+  }
 
   /* ---------------- Valuación (patrón cafetería, costo del formato activo) ---------------- */
   /*
@@ -199,7 +221,7 @@ export class VencimientosService {
 
   /* ============================ EL CONTROL ============================ */
   async crearSesion(o: CrearSesionDto) {
-    return this.db.transaction(async (tx) => {
+    const r = await this.db.transaction(async (tx) => {
       const [suc] = await tx.select().from(sucursales).where(eq(sucursales.id, o.sucursalId)).limit(1);
       if (!suc) throw new BadRequestException('Sucursal inválida.');
       for (const it of o.items) {
@@ -243,9 +265,11 @@ export class VencimientosService {
           usuarioId: o.usuarioId ?? null,
         };
       });
-      const regs = await tx.insert(vencimientos).values(filas).returning();
-      return { sesionId: sesion.id, registros: regs.length, unidades: r2(unidades) };
+      const regs = await tx.insert(vencimientos).values(filas).returning({ id: vencimientos.id });
+      return { sesionId: sesion.id, ids: regs.map((x) => x.id), unidades: r2(unidades) };
     });
+    await this.aplicarReglas(r.ids);
+    return { sesionId: r.sesionId, registros: r.ids.length, unidades: r.unidades };
   }
 
   /* ============================ EL LISTADO ============================ */
@@ -258,10 +282,13 @@ export class VencimientosService {
     const rows = await this.db.select({
       v: vencimientos,
       diasParaVencer: DIAS,
+      /* La maneja la regla del rango (0188) o la armó una persona: la lista lo marca. */
+      ofertaAuto: ofertas.autoVencimiento,
     }).from(vencimientos)
+      .leftJoin(ofertas, eq(ofertas.id, vencimientos.ofertaId))
       .where(soloSuc ? eq(vencimientos.sucursalId, soloSuc) : undefined)
       .orderBy(asc(vencimientos.fechaVencimiento), asc(vencimientos.id));
-    return rows.map((r) => ({ ...r.v, diasParaVencer: Number(r.diasParaVencer) }));
+    return rows.map((r) => ({ ...r.v, diasParaVencer: Number(r.diasParaVencer), ofertaAuto: !!r.ofertaAuto }));
   }
 
   /** El registro tiene que ser de MI sucursal, salvo el jefe (`null`). */
@@ -285,6 +312,8 @@ export class VencimientosService {
     if (o.observaciones !== undefined) patch.observaciones = o.observaciones.trim();
     if (!Object.keys(patch).length) return reg;
     const [out] = await this.db.update(vencimientos).set(patch).where(eq(vencimientos.id, id)).returning();
+    /* Otra fecha es otro rango y otro `hasta`: la oferta automática se ajusta ya. */
+    if (patch.fechaVencimiento && patch.fechaVencimiento !== reg.fechaVencimiento) await this.aplicarReglas([id]);
     return out;
   }
 
@@ -294,6 +323,7 @@ export class VencimientosService {
     this.exigirMio(reg, soloSuc);
     if (reg.procesado) throw new BadRequestException('Ya se procesó: dejó pérdida real asentada y no se borra.');
     await this.db.delete(vencimientos).where(eq(vencimientos.id, id));
+    await this.reglas.soltarOferta(reg.ofertaId);
     return { ok: true };
   }
 
@@ -305,7 +335,7 @@ export class VencimientosService {
    * personas procesando lo mismo, una sola gana.
    */
   async procesar(id: number, o: ProcesarDto, soloSuc?: number | null) {
-    return this.db.transaction(async (tx) => {
+    const out = await this.db.transaction(async (tx) => {
       const [reg] = await tx.select().from(vencimientos).where(eq(vencimientos.id, id)).limit(1).for('update');
       if (!reg) throw new NotFoundException('Registro inexistente.');
       // Dar de baja lo vencido de OTRA sucursal era posible con solo el id.
@@ -350,6 +380,9 @@ export class VencimientosService {
       }).where(eq(vencimientos.id, id)).returning();
       return { ...out, perdidas, perdidaReal: r2(perdidas * reg.costoUnitario) };
     });
+    /* Procesado, su oferta automática ya no tiene qué rematar. */
+    await this.reglas.soltarOferta(out.ofertaId);
+    return out;
   }
 
   /* ============================ LA OFERTA ============================ */
@@ -381,16 +414,14 @@ export class VencimientosService {
       .from(sucursales).where(eq(sucursales.id, v.sucursalId)).limit(1);
 
     /*
-     * El borrador arranca acotado a la LISTA BASE —el precio de mostrador—, que
-     * es lo que hacía el viejo `soloPrecioBase: true` antes de la 0065. Rematar
-     * lo que vence no es motivo para bajarle además el precio a un mayorista,
-     * que ya tiene el suyo. Si no hay lista base configurada, va sin acotar
-     * (corre en todas) y el dueño lo ajusta en el formulario: el borrador se
-     * edita antes de guardarse.
+     * EL BORRADOR SALE DE LA REGLA DEL RANGO (0188): mecánica, precio y listas
+     * calculados con la misma cuenta que el escalado (`reglas.ts`), nunca por
+     * debajo del costo real. El formulario deja tocar todo antes de guardar;
+     * lo guardado así es manual y la regla no lo vuelve a tocar.
      */
-    const [cfgVentas] = await this.db.select({ valor: configuracion.valor })
-      .from(configuracion).where(eq(configuracion.clave, 'ventas')).limit(1);
-    const listaBaseId = Number((cfgVentas?.valor as any)?.listaBaseId) || 0;
+    const { propuesta: p } = await this.reglas.propuestaPara(v, Number(reg.dias));
+    if (!p?.hay) throw new BadRequestException(p?.motivo ?? 'No se pudo cotizar el producto.');
+    const regla = this.reglas.dtoOferta(v, p);
 
     return {
       registro: {
@@ -411,19 +442,9 @@ export class VencimientosService {
       /* Con la forma EXACTA de una oferta (sin id): el formulario lo carga como
        * carga cualquier oferta para editar, y no necesita un camino aparte. */
       borrador: {
-        nombre: `Por vencer · ${v.nombre}`,
-        tipo: 'porcentaje',
-        porcentaje: PCT_SUGERIDO,
-        /* Hasta el día del vencimiento INCLUSIVE: pasada esa fecha la promo se
-         * apaga sola, así el descuento nunca sobrevive a la mercadería. */
+        ...regla,
+        /* El formulario trabaja con la fecha sola (le pone el fin del día al guardar). */
         hasta: v.fechaVencimiento,
-        /* Solo donde está el lote: rematar en una sucursal que no lo tiene es
-         * regalar margen sin salvar nada. */
-        sucursales: String(v.sucursalId),
-        activa: true,
-        /* Marcada por vencimiento (0187): Ventas › Ofertas la filtra así. */
-        porVencer: true,
-        listas: listaBaseId ? String(listaBaseId) : '',
         /*
          * El alcance apunta a LO QUE VENCE. Si el registro es de un paquete
          * fraccionado, la oferta va al paquete (alcance `presentacion`, 0054) y
@@ -902,9 +923,24 @@ export class VencimientosService {
 @Controller('vencimientos')
 @Permiso('almacen.vencimientos')
 export class VencimientosController {
-  constructor(private readonly svc: VencimientosService) {}
+  constructor(private readonly svc: VencimientosService, private readonly reglas: ReglasVencimientoService) {}
 
   /* Las rutas fijas van ANTES de las de `:id`: 'ofertas' no es un id. */
+  /* Reglas por rango (0188): verlas y la rentabilidad, cualquiera con vencimientos;
+   * cambiarlas o aplicarlas cambia precios en la caja, así que pide la llave de ofertas. */
+  @Get('reglas') reglasPanel(@Auth() sesion: Sesion) { return this.reglas.panel(soloSuSucursal(sesion)); }
+  @Put('reglas')
+  @Permiso('ventas.ofertas', 'ofertas')
+  async guardarReglas(@Body() dto: GuardarReglasDto, @Auth() sesion: Sesion) {
+    const aplicado = await this.reglas.guardar(dto.reglas, sesion.usuarioId);
+    return { aplicado, ...(await this.reglas.panel(soloSuSucursal(sesion))) };
+  }
+  @Post('reglas/aplicar')
+  @Permiso('ventas.ofertas', 'ofertas')
+  async aplicarReglas(@Auth() sesion: Sesion) {
+    const aplicado = await this.reglas.aplicar();
+    return { aplicado, ...(await this.reglas.panel(soloSuSucursal(sesion))) };
+  }
   /* Cada sucursal ve lo suyo; el jefe, todo (27/9/2026). El filtro sale de la
    * SESIÓN, nunca de la query. */
   @Get() list(@Auth() sesion: Sesion) { return this.svc.list(soloSuSucursal(sesion)); }
@@ -940,14 +976,17 @@ export class VencimientosController {
      * «vencido» se podía firmar a nombre de cualquiera. */
     return this.svc.procesar(id, { ...dto, usuarioId: sesion.usuarioId }, soloSuSucursal(sesion));
   }
+  @Post(':id/volver-a-regla')
+  @Permiso('ventas.ofertas', 'ofertas')
+  volverARegla(@Param('id', ParseIntPipe) id: number) { return this.reglas.volverARegla(id); }
   @Post(':id/vincular-oferta') vincularOferta(@Param('id', ParseIntPipe) id: number, @Body() dto: VincularOfertaDto, @Auth() sesion: Sesion) {
     return this.svc.vincularOferta(id, dto, soloSuSucursal(sesion));
   }
 }
 
 @Module({
-  imports: [InventarioModule, OfertasModule],
-  providers: [VencimientosService],
+  imports: [InventarioModule, OfertasModule, ConfiguracionModule, ListasModule],
+  providers: [VencimientosService, ReglasVencimientoService],
   controllers: [VencimientosController],
 })
 export class VencimientosModule {}
