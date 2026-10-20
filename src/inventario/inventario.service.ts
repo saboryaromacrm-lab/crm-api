@@ -3301,11 +3301,12 @@ export class InventarioService {
    * con sus filtros y un techo duro: la tabla crece para siempre.
    */
   async listMovimientos(q: {
-    productoId?: number; sucursalId?: number; tipo?: string;
+    productoId?: number; productoIds?: number[]; sucursalId?: number; tipo?: string;
     desde?: string; hasta?: string; limit?: number;
   } = {}) {
     const conds: any[] = [];
     if (q.productoId) conds.push(eq(movimientos.productoId, Number(q.productoId)));
+    if (q.productoIds?.length) conds.push(inArray(movimientos.productoId, q.productoIds));
     if (q.sucursalId) conds.push(eq(movimientos.sucursalId, Number(q.sucursalId)));
     if (q.tipo) conds.push(eq(movimientos.tipo, q.tipo as any));
     /* Mismo criterio que el libro del almacén: `fechaLocal` para el desde (un

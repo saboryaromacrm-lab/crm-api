@@ -370,6 +370,8 @@ export class MovimientosController {
   list(
     @Auth() sesion: Sesion,
     @Query('productoId') productoId?: string,
+    /** Varios productos (CSV): lo que encuentra el buscador del historial (20/10/2026). */
+    @Query('productoIds') productoIds?: string,
     @Query('sucursalId') sucursalId?: string,
     @Query('tipo') tipo?: string,
     @Query('desde') desde?: string,
@@ -379,6 +381,7 @@ export class MovimientosController {
     const mia = soloSuSucursal(sesion);
     return this.inv.listMovimientos({
       productoId: productoId ? Number(productoId) : undefined,
+      productoIds: productoIds ? productoIds.split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 500) : undefined,
       // El que no es jefe ve el movimiento de SU local: con el filtro libre se
       // reconstruía la operación completa de todas las sucursales.
       sucursalId: mia ?? (sucursalId ? Number(sucursalId) : undefined),
