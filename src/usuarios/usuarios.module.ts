@@ -92,7 +92,7 @@ export const CATALOGO_PERMISOS = [
       { clave: 'ventas.pos', nombre: 'Punto de venta' },
       { clave: 'ventas.listado', nombre: 'Ventas (listado de tickets del POS)' },
       { clave: 'ventas.variaciones', nombre: 'Variaciones (cuánto subió o bajó lo vendido)' },
-      { clave: 'ventas.ordenes', nombre: 'Órdenes web (bandeja de pedidos del sitio)' },
+      { clave: 'ventas.ordenes', nombre: 'Pedidos online (bandeja de pedidos de la tienda)' },
       { clave: 'ventas.presupuestos', nombre: 'Presupuestos' },
       { clave: 'ventas.clientes', nombre: 'Clientes' },
       { clave: 'ventas.cobranzas', nombre: 'Cobranzas' },

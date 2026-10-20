@@ -114,6 +114,12 @@ export const VENTAS_DEFAULTS = {
    */
   tiendaMinoristaMapsKey: '' as string,
   /**
+   * El WhatsApp del cadete (20/10/2026): Ventas › Pedidos online le pide el
+   * viaje con un botón, con los datos del cliente ya escritos. Solo dígitos;
+   * vacío = el botón avisa que falta cargarlo. No viaja a la tienda.
+   */
+  tiendaCadeteWhatsapp: '' as string,
+  /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
    * precio se armó antes.
@@ -585,6 +591,7 @@ const REGLAS: Record<string, {
   'ventas.tiendaMinoristaEnvioGratisDesde': { min: 0, max: 100_000_000 },
   /* Una clave de Google son letras, números, «-» y «_»: cualquier otra cosa (espacios, comillas) se descarta. */
   'ventas.tiendaMinoristaMapsKey': { texto: (v: string) => (/^[\w-]{1,100}$/.test(String(v ?? '').trim()) ? String(v).trim() : '') },
+  'ventas.tiendaCadeteWhatsapp': { texto: (v: string) => String(v ?? '').replace(/\D/g, '').slice(0, 15) },
   'ventas.listaBaseId': { min: 0, max: 1_000_000, entero: true },
   'ventas.topeSinIdentificar': { min: 0, max: 10_000_000_000 },
   'ventas.modalidadMontoId': { min: 0, max: 1_000_000, entero: true },
@@ -765,7 +772,7 @@ const PLANTILLAS: Record<string, Record<string, any>> = {
  * vacío vuelve al default —un número de WhatsApp en blanco rompe el sitio—,
  * pero en estos vacío quiere decir «no mostrar esa línea».
  */
-const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto', 'ventas.tiendaMinoristaMapsKey']);
+const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto', 'ventas.tiendaMinoristaMapsKey', 'ventas.tiendaCadeteWhatsapp']);
 
 /**
  * Limpia un ítem de un array de objetos contra su plantilla (el primer
@@ -920,7 +927,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  */
 const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
   [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica']), 'web.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp']), 'web.configuracion'],
 ];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];
