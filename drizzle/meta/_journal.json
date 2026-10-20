@@ -1303,6 +1303,13 @@
       "when": 1792224000000,
       "tag": "0185_barrios_envio",
       "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1792310400000,
+      "tag": "0186_imagen_compartir",
+      "breakpoints": true
     }
   ]
 }

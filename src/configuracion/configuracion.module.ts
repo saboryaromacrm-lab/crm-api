@@ -387,6 +387,21 @@ export const WEB_DEFAULTS = {
   minCierreTitulo: '¿Tenés una duda? Te ayudamos.' as string,
   minCierreTexto: 'Escribinos por WhatsApp y te asesoramos con tu pedido.' as string,
   minCierreCta: 'Escribir por WhatsApp' as string,
+  /*
+   * LO QUE VE GOOGLE Y LO QUE SE VE AL COMPARTIR EL LINK (20/10/2026, pedido
+   * del dueño): el título y la descripción del sitio en los buscadores y en la
+   * vista previa de WhatsApp o Facebook. La imagen para compartir se sube
+   * aparte (`web_imagenes` tipo 'compartir', 0186).
+   */
+  seoTitulo: 'Sabor y Aroma · Dietética saludable en Formosa' as string,
+  seoDescripcion: 'Productos naturales, sin TACC y orgánicos en Formosa. Comprá online por menor o por mayor: retirás en el local o te lo llevamos.' as string,
+  /*
+   * LOS LOCALES (20/10/2026): dirección, teléfono y el horario de cada día
+   * («08:00-13:00, 17:00-21:00»; vacío = cerrado). Salen en el pie del sitio y
+   * en la ficha de comercio que lee Google. Sin locales, no se muestra nada.
+   * Sus campos están en PLANTILLAS (el default vacío no trae ítem de muestra).
+   */
+  locales: [] as Array<Record<string, any>>,
   slides: [
     {
       id: 1,
@@ -591,6 +606,10 @@ const REGLAS: Record<string, {
   'web.minCierreTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 70) },
   'web.minCierreTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 160) },
   'web.minCierreCta': { texto: (v: string) => String(v ?? '').trim().slice(0, 30) },
+  /* Google corta el título en ~60 letras y la descripción en ~160: más largo no se ve. */
+  'web.seoTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 70) },
+  'web.seoDescripcion': { texto: (v: string) => String(v ?? '').trim().slice(0, 170) },
+  'web.locales': { lista: { max: 6, largo: 120 } },
 };
 
 /**
@@ -689,8 +708,41 @@ const rutaInterna = (v: string): string => {
   } catch { return '/'; }
 };
 
-/** Campos de un ítem que se saben más que texto libre. Hoy solo el `ctaUrl`. */
-const NORMALIZADORES: Record<string, (v: string) => string> = { ctaUrl: rutaInterna };
+/**
+ * EL HORARIO DE UN DÍA: hasta tres tramos «HH:MM-HH:MM» separados por coma;
+ * vacío = cerrado. El ERP lo arma con relojes, pero un PUT a mano no: se
+ * toman las horas de a pares (también «8 a 13 y 17 a 21») y lo que no es una
+ * hora válida, o un tramo que termina antes de empezar, deja el día cerrado o
+ * fuera ese tramo — nunca llega a Google un horario inventado.
+ */
+export const DIAS_SEMANA = ['lun', 'mar', 'mie', 'jue', 'vie', 'sab', 'dom'] as const;
+function horarioDelDia(v: string): string {
+  const horas = [...String(v ?? '').matchAll(/(\d{1,2})(?:[:.h](\d{2}))?/g)]
+    .map(([, h, m = '00']) => (Number(h) <= 24 && Number(m) < 60 ? `${h.padStart(2, '0')}:${m}` : ''));
+  if (horas.some((h) => !h)) return '';
+  const tramos: string[] = [];
+  for (let i = 0; i + 1 < horas.length && tramos.length < 3; i += 2) {
+    if (horas[i] < horas[i + 1]) tramos.push(`${horas[i]}-${horas[i + 1]}`);
+  }
+  return tramos.join(', ');
+}
+
+/** Campos de un ítem que se saben más que texto libre: el `ctaUrl` de un slide y los días de un local. */
+const NORMALIZADORES: Record<string, (v: string) => string> = {
+  ctaUrl: rutaInterna,
+  ...Object.fromEntries(DIAS_SEMANA.map((d) => [d, horarioDelDia])),
+};
+
+/**
+ * La plantilla de los arrays de objetos cuyo default es VACÍO (`área.campo`):
+ * el resto usa su primer ítem de muestra (los slides, los beneficios).
+ */
+const PLANTILLAS: Record<string, Record<string, any>> = {
+  'web.locales': {
+    nombre: '', direccion: '', localidad: '', telefono: '',
+    ...Object.fromEntries(DIAS_SEMANA.map((d) => [d, ''])),
+  },
+};
 
 /**
  * Textos que SÍ pueden guardarse vacíos (`área.campo`). Por defecto un texto
@@ -737,7 +789,7 @@ function sanitize(defaults: Record<string, any>, raw: any, clave = ''): Record<s
   for (const [k, def] of Object.entries(defaults)) {
     const v = src[k];
     if (Array.isArray(def)) {
-      const template = def[0];
+      const template = PLANTILLAS[`${clave}.${k}`] ?? def[0];
       if (template && typeof template === 'object') {
         // Array de OBJETOS (p. ej. los slides): cada ítem se limpia contra la
         // plantilla. Si no se guardó nunca, valen los defaults completos.

@@ -2643,7 +2643,7 @@ export const presupuestoItems = pgTable('presupuesto_items', {
  * sirve por `GET /tienda/imagenes/:tipo/:refId` — el catálogo público solo
  * lleva la URL, nunca los bytes.
  */
-export const tipoImagenWebEnum = pgEnum('tipo_imagen_web', ['producto', 'categoria', 'marca', 'banner', 'logo', 'favicon']);
+export const tipoImagenWebEnum = pgEnum('tipo_imagen_web', ['producto', 'categoria', 'marca', 'banner', 'logo', 'favicon', 'compartir']);
 
 export const webImagenes = pgTable('web_imagenes', {
   id: serial('id').primaryKey(),

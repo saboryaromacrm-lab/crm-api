@@ -54,10 +54,14 @@ const PERMISO_DE_IMAGEN: Record<string, string> = {
   categoria: 'web.contenido',
   marca: 'web.contenido',
   banner: 'web.contenido',
-  // 'logo' y 'favicon' usan refId 1: hay uno solo de cada uno.
+  // Los únicos (IMAGENES_UNICAS) usan refId 1: hay uno solo de cada uno.
   logo: 'web.configuracion',
   favicon: 'web.configuracion',
+  /* La que se ve al compartir el link del sitio (WhatsApp, Facebook) — 0186. */
+  compartir: 'web.configuracion',
 };
+/** Imágenes de las que hay una sola en todo el sitio: cuelgan siempre del refId 1. */
+const IMAGENES_UNICAS = new Set(['logo', 'favicon', 'compartir']);
 /** El piso del decorador: las claves del mapa, sin repetir. */
 const PERMISOS_IMAGEN = [...new Set(Object.values(PERMISO_DE_IMAGEN))];
 /** Tope generoso para fotos de catálogo; el banner es la imagen más grande. */
@@ -137,12 +141,12 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
    * El `refId` al que se cuelga la imagen tiene que EXISTIR. Sin esto, un
    * `POST /web/imagenes/producto/$i` en un `for` de 1 a 5000 dejaba miles de
    * filas de 800 KB colgadas de productos inexistentes, que engordan cada
-   * backup para siempre. `logo` y `favicon` son únicos: hay uno solo de cada
-   * uno, así que su `refId` es SIEMPRE 1 (y no `logo/2`, `logo/3`… basura).
+   * backup para siempre. Las únicas (logo, favicon, compartir): hay una sola
+   * de cada una, así que su `refId` es SIEMPRE 1 (y no `logo/2`, `logo/3`… basura).
    * Devuelve el `refId` ya resuelto.
    */
   private async resolverRefId(tipo: string, refId: number): Promise<number> {
-    if (tipo === 'logo' || tipo === 'favicon') return 1;
+    if (IMAGENES_UNICAS.has(tipo)) return 1;
     const existe = async (tabla: any) =>
       (await this.db.select({ id: tabla.id }).from(tabla).where(eq(tabla.id, refId)).limit(1)).length > 0;
     if (tipo === 'producto' && await existe(productos)) return refId;

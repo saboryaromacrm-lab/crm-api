@@ -44,7 +44,7 @@ import { and, eq, gte, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, subcategorias, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
-  productoProveedores, productos, stock, sucursales, tiendaCompradores, webEventos, webImagenes,
+  productoProveedores, productos, stock, sucursales, tiendaCompradores, tipoImagenWebEnum, webEventos, webImagenes,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import { ofertaAlcanza } from '../ventas/ventas.module';
@@ -261,8 +261,8 @@ export class TiendaService {
     const { modo, v } = await this.modoVigente(modoPedido, previa);
     /* Ninguna tienda abierta para quien pide: solo lo necesario para la página de «Próximamente». */
     if (!modo) {
-      const { logoUrl, contacto } = (await this.armado('mayorista')).catalogo.sitio;
-      return { cerrada: true, sitio: { logoUrl, contacto } };
+      const { logoUrl, contacto, seo } = (await this.armado('mayorista')).catalogo.sitio;
+      return { cerrada: true, sitio: { logoUrl, contacto, seo } };
     }
     /* Lo que depende de quien mira va encima del catálogo compartido: si elige modo y si ve una tienda en preparación. */
     const deQuienMira = { minoristaActiva: v.ve.mayorista && v.ve.minorista, vistaPrevia: !v.publica[modo] };
@@ -433,6 +433,14 @@ export class TiendaService {
         instagram: String(web.redInstagram ?? ''),
         facebook: String(web.redFacebook ?? ''),
       },
+      /** Lo que ven Google y quien recibe el link (20/10/2026): Tienda online › Configuración › General. */
+      seo: {
+        titulo: String(web.seoTitulo ?? ''),
+        descripcion: String(web.seoDescripcion ?? ''),
+        imagenUrl: urlImagen('compartir', 1),
+      },
+      /** Los locales con su horario por día ('' = cerrado): el pie del sitio y la ficha de comercio para Google. */
+      locales: (web.locales as Array<Record<string, string>>).filter((l) => l.nombre || l.direccion),
       /** El cartel de bienvenida (3/10/2026): editable en Web › Configuración del sitio. */
       popup: {
         activo: web.popupActivo !== false,
@@ -937,9 +945,9 @@ export class TiendaService {
     return { ok: true, n: filas.length };
   }
 
-  /** Imagen subida en el módulo Web ('producto' | 'categoria' | 'marca' | 'banner'). */
+  /** Una imagen subida del sitio, de cualquiera de los tipos de la tabla. */
   async imagen(tipo: string, refId: number) {
-    if (!['producto', 'categoria', 'marca', 'banner', 'logo', 'favicon'].includes(tipo)) return null;
+    if (!(tipoImagenWebEnum.enumValues as readonly string[]).includes(tipo)) return null;
     const [img] = await this.db.select().from(webImagenes)
       .where(and(eq(webImagenes.tipo, tipo as any), eq(webImagenes.refId, refId))).limit(1);
     return img ?? null;
