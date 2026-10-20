@@ -175,6 +175,8 @@ export class PresupuestosService {
          * el pedido se cierra en el POS. */
         listaId: it.listaId ? Number(it.listaId) : null,
         ofertaNombre: String(it.ofertaNombre ?? ''), ofertaId: it.ofertaId ? Number(it.ofertaId) : null, motivo: '',
+        /* La parte del descuento que es del cupón (0190): solo la pone la tienda; lo que se cotiza en el ERP llega sin ella. */
+        cuponPct: Math.min(Math.max(Number(it.cuponPct) || 0, 0), 0.95),
       };
     }).filter((it: any) => it.productoId && it.cantidad > 0);
     return { limpios, subtotalNeto: money(neto), ivaTotal: money(iva), total: money(neto + iva) };
@@ -272,7 +274,11 @@ export class PresupuestosService {
       barrio?: string; ubicacion?: { lat: number; lng: number }; envio?: number; descuentoBarrio?: number;
       /** Hecho desde la vista previa de una tienda en preparación: es de prueba. */
       prueba?: boolean;
+      /** Minorista (0190): cómo dijo que va a pagar, y si es su primera compra. */
+      medioPago?: string; primeraCompra?: boolean;
     };
+    /** El cupón del pedido (0190): lo que descontó en la mercadería (final) y el envío que regaló. */
+    cupon?: { id: number; codigo: string; descuento: number; envio: number | null } | null;
   }, tx: Database = this.db) {
     if (!dto?.sucursalId) throw new BadRequestException('Falta la sucursal.');
     if (!dto.clienteId && !dto.webCliente) throw new BadRequestException('Faltan los datos del cliente.');
@@ -286,6 +292,9 @@ export class PresupuestosService {
         usuarioId: null, vendedorId: null,
         estado: 'pendiente', origen: 'web', vencimiento: null,
         webCliente: dto.webCliente ?? null, modoTienda: dto.modoTienda,
+        ...(dto.cupon ? {
+          cuponId: dto.cupon.id, cuponCodigo: dto.cupon.codigo, cuponDescuento: money(dto.cupon.descuento), cuponEnvio: dto.cupon.envio,
+        } : {}),
         entrega, observaciones: (dto.observaciones ?? '').trim(),
         subtotalNeto, ivaTotal, total,
       }).returning();

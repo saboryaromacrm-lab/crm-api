@@ -127,7 +127,8 @@ const REARMAR: string[] = [
    *   lista       cantidad × precio de lista
    *   precio      cantidad × (lista − precio cobrado): el precio cambiado a mano
    *   nombrado    el % de un descuento con nombre (Efectivo, Empleados…), por descuento
-   *   cliente     el % del cliente o puesto a mano (sin nombre)
+   *   cliente     el % del cliente, puesto a mano o del barrio (sin nombre), sin el cupón
+   *   cupon       lo que descontó cada cupón de la tienda (0190), por cupón
    *   neto        lo que quedó (la oferta sale de metricas_oferta_dia)
    *   costeado / costo   para la ganancia, solo con costo congelado
    *   extra       los cargos aparte del ticket (envío, recargo por cuotas)
@@ -144,7 +145,8 @@ const REARMAR: string[] = [
          ('lista', 0, '', vi.cantidad * vi.precio_lista),
          ('precio', 0, '', vi.cantidad * (vi.precio_lista - vi.precio_unitario)),
          (CASE WHEN vi.descuento_id IS NULL THEN 'cliente' ELSE 'nombrado' END, coalesce(vi.descuento_id, 0),
-           vi.descuento_nombre, vi.cantidad * vi.precio_unitario * vi.descuento / 100),
+           vi.descuento_nombre, vi.cantidad * vi.precio_unitario * vi.descuento / 100 - vi.cupon_descuento),
+         ('cupon', coalesce(vi.cupon_id, 0), coalesce((SELECT c.codigo FROM cupones c WHERE c.id = vi.cupon_id), 'Cupón'), vi.cupon_descuento),
          ('neto', 0, '', vi.subtotal),
          ('costeado', 0, '', CASE WHEN vi.costo_unitario IS NOT NULL THEN vi.subtotal ELSE 0 END),
          ('costo', 0, '', coalesce(vi.cantidad * vi.costo_unitario, 0))

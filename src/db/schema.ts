@@ -2425,6 +2425,13 @@ export const ventaItems = pgTable('venta_items', {
    * renglón en 0 en vez de volver al 10% que el cliente tiene por contrato.
    */
   descuentoBase: doublePrecision('descuento_base').notNull().default(0),
+  /**
+   * EL CUPÓN DE LA TIENDA (0190): de qué cupón vino parte del descuento del
+   * renglón y cuánto fue (neto, sin IVA). Solo informa: la plata ya está en
+   * `descuento`. Es lo que Métricas y la pantalla de cupones miden.
+   */
+  cuponId: integer('cupon_id').references(() => cupones.id, { onDelete: 'set null' }),
+  cuponDescuento: doublePrecision('cupon_descuento').notNull().default(0),
   subtotal: doublePrecision('subtotal').notNull().default(0),
   /*
    * EL COSTO CONGELADO AL VENDER (0072) — sin esto no hay margen posible: el
@@ -2605,6 +2612,15 @@ export const presupuestos = pgTable('presupuestos', {
   webCliente: jsonb('web_cliente'),
   /** 0173: de qué modo de la tienda vino la orden web (null = no es del sitio). */
   modoTienda: text('modo_tienda').$type<'mayorista' | 'minorista'>(),
+  /**
+   * EL CUPÓN DE LA TIENDA MINORISTA (0190), congelado al pedir: el código como
+   * lo escribió, lo que descontó en la mercadería (final, con IVA) y el envío
+   * que regaló un cupón de envío gratis (null = no regaló o se coordinaba).
+   */
+  cuponId: integer('cupon_id').references(() => cupones.id, { onDelete: 'set null' }),
+  cuponCodigo: text('cupon_codigo').notNull().default(''),
+  cuponDescuento: doublePrecision('cupon_descuento').notNull().default(0),
+  cuponEnvio: doublePrecision('cupon_envio'),
   observaciones: text('observaciones').notNull().default(''),
   /** Totales CONGELADOS al cotizar: son la palabra dada al cliente. */
   subtotalNeto: doublePrecision('subtotal_neto').notNull().default(0),
@@ -2646,6 +2662,12 @@ export const presupuestoItems = pgTable('presupuesto_items', {
   ofertaNombre: text('oferta_nombre').notNull().default(''),
   /** La oferta que cotizó el renglón, por id (0180): el nombre de al lado puede repetirse. */
   ofertaId: integer('oferta_id').references(() => ofertas.id, { onDelete: 'set null' }),
+  /**
+   * La parte del `descuento` que es del CUPÓN (0190), como fracción (0,1 = 10 %):
+   * el descuento total es 1 − (1 − el del barrio)(1 − este). Con eso la caja
+   * sabe cuánto del descuento del renglón fue el cupón, a cualquier cantidad.
+   */
+  cuponPct: doublePrecision('cupon_pct').notNull().default(0),
   motivo: text('motivo').notNull().default(''),
 }, (t) => ({
   ixPresupuesto: index('ix_presupuesto_items_presupuesto').on(t.presupuestoId),
@@ -3528,6 +3550,48 @@ export const vencimientos = pgTable('vencimientos', {
   ixSucursal: index('ix_vencimientos_sucursal').on(t.sucursalId),
   ixProducto: index('ix_vencimientos_producto').on(t.productoId),
   ixProcesado: index('ix_vencimientos_procesado').on(t.procesado),
+}));
+
+/**
+ * LOS CUPONES DE LA TIENDA MINORISTA (0190): un código que el cliente escribe
+ * en el checkout. La cuenta y la validación viven en `cupones/reglas.ts`.
+ *   · tipo: `porcentaje` (valor = %, con `tope` en $ opcional), `monto` (valor
+ *     = $ finales) o `envio_gratis`.
+ *   · cuándo: `desde`/`hasta`, `dias` (máscara lunes→domingo, '' = todos) y
+ *     `horaDesde`/`horaHasta` ('HH:MM', '' = todo el día; puede cruzar medianoche).
+ *   · cómo: `mediosPago` (CSV, '' = cualquiera), `entrega` ('' / retiro / envio),
+ *     `montoMinimo` (lo que lleva en productos, $ finales), `marcas` y
+ *     `categorias` (CSV, '' = todo).
+ *   · cuántas veces: `usosMax` (0 = sin tope), `usosPorCliente` (0 = sin tope)
+ *     y `soloPrimeraCompra`.
+ * No se suma a una oferta: corre en los productos SIN oferta, como el del barrio.
+ */
+export const cupones = pgTable('cupones', {
+  id: serial('id').primaryKey(),
+  codigo: text('codigo').notNull(),
+  descripcion: text('descripcion').notNull().default(''),
+  activo: boolean('activo').notNull().default(true),
+  tipo: text('tipo').notNull().$type<'porcentaje' | 'monto' | 'envio_gratis'>(),
+  valor: doublePrecision('valor').notNull().default(0),
+  tope: doublePrecision('tope').notNull().default(0),
+  montoMinimo: doublePrecision('monto_minimo').notNull().default(0),
+  desde: timestamp('desde', { withTimezone: true }),
+  hasta: timestamp('hasta', { withTimezone: true }),
+  dias: text('dias').notNull().default(''),
+  horaDesde: text('hora_desde').notNull().default(''),
+  horaHasta: text('hora_hasta').notNull().default(''),
+  mediosPago: text('medios_pago').notNull().default(''),
+  entrega: text('entrega').notNull().default(''),
+  marcas: text('marcas').notNull().default(''),
+  categorias: text('categorias').notNull().default(''),
+  usosMax: integer('usos_max').notNull().default(0),
+  usosPorCliente: integer('usos_por_cliente').notNull().default(1),
+  soloPrimeraCompra: boolean('solo_primera_compra').notNull().default(false),
+  creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  uqCodigo: uniqueIndex('uq_cupones_codigo').on(t.codigo),
 }));
 
 /**

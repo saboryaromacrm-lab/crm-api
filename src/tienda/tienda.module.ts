@@ -61,6 +61,8 @@ import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
 import { rutaImagen } from '../web/ruta-imagen';
 import { BarriosModule, BarriosService } from './barrios/barrios.module';
+import { CuponesModule, CuponesService } from '../cupones/cupones.module';
+import { finalDe, MEDIOS_TIENDA } from '../cupones/reglas';
 import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
 
@@ -154,6 +156,9 @@ const montoDescuento = (items: any[], pct: number) => money(
   items.filter((it) => !it.ofertaId).reduce((s, it) => s + it.cantidad * it.precioLista * (1 + it.iva / 100), 0) * pct / 100,
 );
 
+/** El medio de pago que eligió el cliente (0190): solo los que la tienda coordina; cualquier otra cosa, ninguno. */
+const medioDeTienda = (m: unknown) => ((MEDIOS_TIENDA as readonly string[]).includes(String(m)) ? String(m) : null);
+
 /** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */
 const MAX_CALLE = 120;
 const MAX_LOCALIDAD = 80;
@@ -201,6 +206,7 @@ export class TiendaService {
     private readonly accesos: AccesosTiendaService,
     private readonly barrios: BarriosService,
     private readonly vistaPrevia: VistaPreviaService,
+    private readonly cupones: CuponesService,
   ) {}
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
@@ -1262,16 +1268,32 @@ export class TiendaService {
 
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
     const zona = entrega === 'cadete' ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
-    /* Lo del envío queda en la orden: el barrio y el punto (para el cadete), el costo (0 = gratis) y el descuento del barrio. */
-    const envio = zona ? {
-      ...(zona.barrio ? { barrio: zona.barrio.nombre } : {}),
-      ...(zona.punto ? { ubicacion: zona.punto } : {}),
-      ...(zona.envio != null ? { envio: zona.envio } : {}),
-      ...(zona.envio === 0 ? { envioGratis: true } : {}),
-      ...(zona.descuentoPct > 0 ? { descuentoBarrio: zona.descuentoPct } : {}),
-    } : {};
+    const conBarrio = conDescuentoBarrio(items, zona?.descuentoPct ?? 0);
+    const medioPago = medioDeTienda(dto?.medioPago);
 
     return this.db.transaction(async (tx) => {
+      /*
+       * EL CUPÓN (0190), con la fila trabada mientras se cuentan sus usos: dos
+       * pedidos a la vez no se pasan del tope. Lo que el checkout cotizó puede
+       * haber cambiado (la hora, el último uso): se vuelve a mirar todo acá.
+       */
+      const ev = await this.evaluarCupon(dto, c, entrega === 'cadete' ? 'envio' : 'retiro', conBarrio, tx);
+      const r = ev?.resultado;
+      if (r && !r.vale) throw new BadRequestException(r.motivo);
+      if (r?.vale && r.medios.length && !medioPago) {
+        throw new BadRequestException(`Elegí cómo vas a pagar: el cupón vale pagando con ${r.medios.join(' o ')}.`);
+      }
+      const regalaEnvio = !!r?.vale && r.envioGratis;
+      /* Lo del envío queda en la orden: el barrio y el punto (para el cadete), el costo (0 = gratis) y el descuento del barrio. */
+      const costoEnvio = regalaEnvio ? 0 : zona?.envio;
+      const envio = zona ? {
+        ...(zona.barrio ? { barrio: zona.barrio.nombre } : {}),
+        ...(zona.punto ? { ubicacion: zona.punto } : {}),
+        ...(costoEnvio != null ? { envio: costoEnvio } : {}),
+        ...(costoEnvio === 0 ? { envioGratis: true } : {}),
+        ...(zona.descuentoPct > 0 ? { descuentoBarrio: zona.descuentoPct } : {}),
+      } : {};
+
       /*
        * La dirección que escribió para ESTE envío pasa a ser la guardada, con su
        * punto (o sin punto, si no lo marcó). La guardada de antes del mapa se
@@ -1287,11 +1309,22 @@ export class TiendaService {
       const creado = await this.presupuestos.crearDesdeWeb({
         clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
         entrega, observaciones: String(dto?.observaciones ?? '').slice(0, 500),
-        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio, ...(prueba ? { prueba: true } : {}) },
-        items: conDescuentoBarrio(items, zona?.descuentoPct ?? 0),
+        webCliente: {
+          nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio,
+          ...(medioPago ? { medioPago } : {}),
+          /* Para medir cuántos clientes nuevos trae cada cupón. */
+          ...(!(c.pedidos > 0) ? { primeraCompra: true } : {}),
+          ...(prueba ? { prueba: true } : {}),
+        },
+        items: r?.vale ? conBarrio.map((it, i) => ({ ...it, descuento: r.renglones[i].descuento, cuponPct: r.renglones[i].cuponPct })) : conBarrio,
+        cupon: r?.vale && ev?.cupon ? {
+          id: ev.cupon.id, codigo: ev.cupon.codigo, descuento: r.descuento,
+          /* Lo que regaló un cupón de envío gratis (null = no regaló o se coordinaba). */
+          envio: regalaEnvio ? zona?.envio ?? null : null,
+        } : null,
       }, tx);
       /* `total` es la mercadería; el envío va aparte (null = se coordina), como en la orden. */
-      return { ...creado, envio: zona?.envio ?? null };
+      return { ...creado, envio: costoEnvio ?? null };
     });
   }
 
@@ -1306,20 +1339,52 @@ export class TiendaService {
     const c = await this.accesos.sesionMinorista(tokenMin);
     if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
-    const zona = await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde);
-    const descuento = montoDescuento(items, zona.descuentoPct);
+    /* Retirando no hay barrio ni envío: se cotiza igual, por el cupón (0190). Sin `entrega`, envío (como antes). */
+    const conEnvio = dto?.entrega !== 'retiro';
+    const zona = conEnvio ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
+    const descuento = montoDescuento(items, zona?.descuentoPct ?? 0);
+    const ev = await this.evaluarCupon(dto, c, conEnvio ? 'envio' : 'retiro', conDescuentoBarrio(items, zona?.descuentoPct ?? 0));
+    const r = ev?.resultado;
+    const cupon = r?.vale ? r.descuento : 0;
+    const envio = r?.vale && r.envioGratis && conEnvio ? 0 : zona?.envio ?? null;
     return {
       /** Si hay punto (marcado ahora o el de la dirección guardada): sin él no hay barrio. */
-      conPunto: !!zona.punto,
-      barrio: zona.barrio?.nombre ?? null,
-      envio: zona.envio,
-      descuentoPct: zona.descuentoPct,
+      conPunto: !!zona?.punto,
+      barrio: zona?.barrio?.nombre ?? null,
+      envio,
+      descuentoPct: zona?.descuentoPct ?? 0,
       descuento,
-      promos: zona.aplicadas.map((p) => describirPromo(p, zona.nombreDe)),
-      proxima: zona.proxima ? { texto: describirPromo(zona.proxima.promo, zona.nombreDe), faltan: money(zona.proxima.faltan) } : null,
+      promos: zona ? zona.aplicadas.map((p) => describirPromo(p, zona.nombreDe)) : [],
+      proxima: zona?.proxima ? { texto: describirPromo(zona.proxima.promo, zona.nombreDe), faltan: money(zona.proxima.faltan) } : null,
+      /** El cupón (0190): si vale, cuánto descuenta y qué pide; si no, por qué. */
+      cupon: r ? {
+        codigo: ev?.cupon?.codigo ?? String(dto.cupon).trim().toUpperCase(),
+        vale: r.vale,
+        ...(r.vale
+          ? { descuento: r.descuento, envioGratis: r.envioGratis, medios: r.medios, descripcion: ev?.cupon?.descripcion ?? '' }
+          : { motivo: r.motivo }),
+      } : null,
       subtotal: total,
-      total: money(total - descuento + (zona.envio ?? 0)),
+      total: money(total - descuento - cupon + (envio ?? 0)),
     };
+  }
+
+  /**
+   * EL CUPÓN (0190) sobre el pedido, con la MISMA cuenta en la cotización y en
+   * el alta. `items` ya llevan el % del barrio. Con `tx` (el alta) cuenta los
+   * usos con la fila del cupón trabada. Sin código, `null`.
+   */
+  private evaluarCupon(dto: any, c: Comprador, entrega: 'retiro' | 'envio', items: any[], tx?: Database) {
+    const codigo = String(dto?.cupon ?? '').trim();
+    if (!codigo) return Promise.resolve(null);
+    const renglones = items.map((it) => ({
+      productoId: it.productoId, ofertaId: it.ofertaId ?? null, cantidad: it.cantidad,
+      precioLista: it.precioLista, iva: it.iva, descuento: Number(it.descuento) || 0,
+    }));
+    return this.cupones.evaluar(codigo, {
+      renglones, telefono: c.telefono, primeraCompra: !(c.pedidos > 0), ahora: new Date(), entrega,
+      medioPago: medioDeTienda(dto?.medioPago), subtotal: renglones.reduce((s, x) => s + finalDe(x as any), 0),
+    }, tx, !!tx);
   }
 
   /**
@@ -1444,7 +1509,7 @@ export class TiendaController {
 }
 
 @Module({
-  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule, BarriosModule],
+  imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule, BarriosModule, CuponesModule],
   controllers: [TiendaController, AccesosTiendaController, VistaPreviaController],
   providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard, VistaPreviaService],
   exports: [TiendaService],

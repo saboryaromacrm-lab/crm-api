@@ -1331,6 +1331,13 @@
       "when": 1792486800000,
       "tag": "0189_metricas_ofertas",
       "breakpoints": true
+    },
+    {
+      "idx": 190,
+      "version": "7",
+      "when": 1792490400000,
+      "tag": "0190_cupones",
+      "breakpoints": true
     }
   ]
 }

@@ -60,6 +60,9 @@ async function desglose(c: PoolClient, f: Filtro) {
   const nombrados = de('nombrado').map((x) => ({ id: Number(x.ref_id), nombre: x.nombre || 'Descuento', importe: r2(N(x.importe)), renglones: N(x.renglones) }))
     .sort((a, b) => b.importe - a.importe);
   const cliente = suma('cliente');
+  const cupones = de('cupon').map((x) => ({ id: Number(x.ref_id), nombre: x.nombre || 'Cupón', importe: r2(N(x.importe)), renglones: N(x.renglones) }))
+    .sort((a, b) => b.importe - a.importe);
+  const enCupones = r2(cupones.reduce((a, x) => a + x.importe, 0));
   const porOferta = ofertas.rows.map((x) => ({ id: Number(x.oferta_id), nombre: x.nombre, importe: r2(N(x.importe)), renglones: N(x.renglones), neto: r2(N(x.neto)) }));
   const enOfertas = r2(porOferta.reduce((a, x) => a + x.importe, 0));
   const enNombrados = r2(nombrados.reduce((a, x) => a + x.importe, 0));
@@ -67,12 +70,15 @@ async function desglose(c: PoolClient, f: Filtro) {
   const extra = suma('extra');
   const costeado = suma('costeado');
   const costo = suma('costo');
-  const descuentos = r2(precio + enNombrados + cliente + enOfertas);
+  const descuentos = r2(precio + enNombrados + cliente + enCupones + enOfertas);
   return {
     lista,
     precio,
     nombrados,
     cliente,
+    /** Los cupones de la tienda minorista (0190), uno por uno. */
+    cupones,
+    enCupones,
     ofertas: porOferta,
     enOfertas,
     enNombrados,

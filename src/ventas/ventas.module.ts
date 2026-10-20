@@ -33,7 +33,7 @@ import {
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
   presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
-  listasVenta, modalidadesVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas,
+  listasVenta, modalidadesVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas, cupones,
   type ReceptorVenta,
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
@@ -56,6 +56,7 @@ import { consultarCuit, cuitValido, ErrorPadron, soloDigitos } from '../arca/pad
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
 import { esNotaCredito, etiquetaVenta, letraDe } from './etiqueta';
+import { descuentoCuponNeto } from '../cupones/reglas';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -405,7 +406,18 @@ type RenglonResuelto = VentaItemDto & {
   costoUnitario: number;
   ivaAbsorbidoUnitario: number;
   porcSinFactura: number;
+  /** El cupón de la tienda (0190): de cuál y qué parte del descuento fue (o, en una nota, cuánto). */
+  cuponId?: number | null;
+  cuponPct?: number;
+  cuponDescuento?: number;
 };
+
+/**
+ * Lo que un presupuesto confirmado ya prometió de un renglón: el precio, la
+ * lista y el descuento de la tienda (barrio y cupón). `cuponPct` es la parte
+ * de ese descuento que fue el cupón (0190), como fracción.
+ */
+type Congelado = { precioLista: number; listaId: number | null; descuento: number; cuponId: number | null; cuponPct: number };
 
 /** Un descuento con nombre ya validado y listo para aplicar. */
 type DescuentoResuelto = {
@@ -1934,12 +1946,13 @@ export class VentasService {
    * `descuento`: el del BARRIO de un pedido de la tienda (0185) — lo calculó el
    * servidor con las promos del dueño, así que no pasa por el tope a mano de la
    * cajera. Solo en renglones sin oferta: el % de una oferta lo vuelve a poner
-   * el motor de la caja y no es un descuento a mano.
+   * el motor de la caja y no es un descuento a mano. Si el pedido trajo CUPÓN
+   * (0190), ese % ya lo incluye y `cuponPct` dice qué parte fue el cupón.
    */
   private async congeladosDePresupuesto(
     presupuestoId: number | undefined, clienteId: number, sucursalId?: number | null,
   ) {
-    const vacio = new Map<string, { precioLista: number; listaId: number | null; descuento: number }>();
+    const vacio = new Map<string, Congelado>();
     if (!presupuestoId) return vacio;
 
     const [pre] = await this.db.select().from(presupuestos)
@@ -1974,6 +1987,8 @@ export class VentasService {
         precioLista: money(r.precioLista),
         listaId: r.listaId ?? null,
         descuento: pre.origen === 'web' && !r.ofertaId ? Number(r.descuento) || 0 : 0,
+        cuponId: pre.origen === 'web' && !r.ofertaId && r.cuponPct > 0 ? pre.cuponId ?? null : null,
+        cuponPct: pre.origen === 'web' && !r.ofertaId ? Number(r.cuponPct) || 0 : 0,
       });
     }
     return vacio;
@@ -2070,7 +2085,7 @@ export class VentasService {
     cliente: { id: number; descuento?: number | null },
     config: any,
     puedePisarPrecio: boolean,
-    congelados: Map<string, { precioLista: number; listaId: number | null; descuento: number }> = new Map(),
+    congelados: Map<string, Congelado> = new Map(),
     descuentosPorLista: Map<number, DescuentoResuelto> = new Map(),
     sucursalId: number | null = null,
     /**
@@ -2506,11 +2521,22 @@ export class VentasService {
         }
       }
 
+      /*
+       * EL CUPÓN DE LA TIENDA (0190): el renglón lleva el descuento que prometió
+       * el pedido —con la parte del cupón adentro— y ninguna otra cosa le ganó.
+       * Si la cajera lo cambió, ya no es el del cupón: se cuenta como a mano.
+       */
+      const conCupon = !!congelado?.cuponId && congelado.cuponPct > 0 && !descuentoId && ofertaDesc === 0
+        && Math.abs(desc - congelado.descuento) < 1e-6;
+
       return {
         ...it,
         descuentoId,
         descuentoNombre,
         descuentoBase,
+        cuponId: conCupon ? congelado!.cuponId : null,
+        cuponPct: conCupon ? congelado!.cuponPct : 0,
+        cuponDescuento: 0,
         cantidad,
         listaId: elegida.fila.listaId,
         lista: elegida.lista.etiqueta || elegida.lista.nombre || '',
@@ -2622,6 +2648,8 @@ export class VentasService {
       // tope en 0 evita que una promo mal calculada deje un renglón negativo.
       const ofertaDesc = Math.min(Math.max(0, Number(it.ofertaDescuento) || 0), bonificado);
       const netoCrudo = bonificado - ofertaDesc;
+      /* Lo que fue cupón (0190), neto: la última capa del %. En una nota de crédito viene ya prorrateado. */
+      const cuponDesc = it.cuponPct ? descuentoCuponNeto(bonificado, it.cuponPct) : Number(it.cuponDescuento) || 0;
       const bruto = money(brutoCrudo);
       const neto = money(netoCrudo);
       subtotalNeto += neto;
@@ -2656,6 +2684,9 @@ export class VentasService {
          * como si lo hubiera tipeado el vendedor: el autoguardado siguiente lo
          * rebotaría contra el tope y el ticket quedaría trabado. */
         descuentoBase: (it as any).descuentoBase ?? desc,
+        /* El cupón de la tienda (0190): solo informa, la plata ya está en `descuento`. */
+        cuponId: it.cuponId ?? null,
+        cuponDescuento: money(cuponDesc),
         refItemId: (it as any).refItemId ?? null,
         /* El costo congelado (0072). `?? null`, no `?? 0`: si un camino no lo
          * resolvió, "sin dato" tiene que quedar como NULL — un cero acá es un
@@ -3237,6 +3268,33 @@ export class VentasService {
   }
 
   /**
+   * EL MEDIO DE PAGO DEL CUPÓN (0190): un cupón de la tienda puede valer solo
+   * pagando en efectivo o por transferencia. El pedido lo dijo al pedir; acá,
+   * al cobrar, se exige de verdad: al contado y todo con esos medios.
+   */
+  private async validarMediosPagoCupones(items: any[], condicionPago: string, pagos: VentaPagoDto[]) {
+    const ids = [...new Set(items.map((it: any) => it.cuponId).filter(Boolean))] as number[];
+    if (!ids.length) return;
+    const exigentes = await this.db.select({ codigo: cupones.codigo, mediosPago: cupones.mediosPago })
+      .from(cupones).where(inArray(cupones.id, ids));
+    for (const c of exigentes) {
+      const permitidos = c.mediosPago.split(',').map((m) => m.trim()).filter(Boolean);
+      if (!permitidos.length) continue;
+      const legibles = permitidos.join(' o ');
+      if (condicionPago !== 'contado') {
+        throw new BadRequestException(`El cupón ${c.codigo} del pedido solo vale pagando al contado con ${legibles}.`);
+      }
+      const invalido = (pagos ?? []).filter((p) => Number(p.importe) > 0).map((p) => p.medio).find((m) => !permitidos.includes(m));
+      if (invalido) {
+        throw new BadRequestException(
+          `El cupón ${c.codigo} del pedido solo vale pagando con ${legibles}, y se está usando «${invalido}». `
+          + 'Cobrá con ese medio o sacá el descuento del pedido.',
+        );
+      }
+    }
+  }
+
+  /**
    * EL CANDADO DEL MEDIO DE PAGO — decisión del dueño, 14/8/2026.
    *
    * Un descuento puede exigir una forma de pago ("15% pagando en efectivo"). El
@@ -3609,6 +3667,7 @@ export class VentasService {
     this.validarMediosFacturar(tipo, pagos, config);
     const esMayorista = await this.validarMediosMayorista(tot.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(tot.items, condicionPago, pagos);
+    await this.validarMediosPagoCupones(tot.items, condicionPago, pagos);
     this.validarMediosPagoDescuentos(tot.items, condicionPago, pagos, descuentosPorLista.values());
     await this.validarCredito(cliente, config, condicionPago, tot.total);
     const turno = await this.resolverTurno(dto.cajaSesionId, sucursalId, condicionPago, config);
@@ -4070,6 +4129,7 @@ export class VentasService {
     }
     const esMayorista = await this.validarMediosMayorista(borrador.items, condicionPago, pagos, config);
     await this.validarMediosPagoOfertas(borrador.items, condicionPago, pagos);
+    await this.validarMediosPagoCupones(borrador.items, condicionPago, pagos);
     /*
      * LOS DESCUENTOS CON NOMBRE, RELEÍDOS DE LA BASE.
      *
@@ -4601,6 +4661,8 @@ export class VentasService {
         precioLista: it.precioLista,
         descuento: it.descuento,
         ofertaDescuento: money((Number(it.ofertaDescuento) || 0) * (cant / Number(it.cantidad))),
+        cuponPct: 0,
+        cuponDescuento: money((Number(it.cuponDescuento) || 0) * (cant / Number(it.cantidad))),
         iva: it.iva,
       } as RenglonResuelto);
     }
