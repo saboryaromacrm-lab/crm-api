@@ -441,6 +441,11 @@ export class TiendaService {
       },
       /** Los locales con su horario por día ('' = cerrado): el pie del sitio y la ficha de comercio para Google. */
       locales: (web.locales as Array<Record<string, string>>).filter((l) => l.nombre || l.direccion),
+      /** Quiénes somos y las preguntas frecuentes (20/10/2026): /nosotros y /llms.txt, lo que leen Google y las IA. */
+      nosotros: {
+        texto: String(web.nosotrosTexto ?? ''),
+        faq: (web.faq as Array<Record<string, string>>).filter((f) => f.pregunta && f.respuesta),
+      },
       /** El cartel de bienvenida (3/10/2026): editable en Web › Configuración del sitio. */
       popup: {
         activo: web.popupActivo !== false,

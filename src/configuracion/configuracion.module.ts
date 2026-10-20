@@ -402,6 +402,20 @@ export const WEB_DEFAULTS = {
    * Sus campos están en PLANTILLAS (el default vacío no trae ítem de muestra).
    */
   locales: [] as Array<Record<string, any>>,
+  /*
+   * NOSOTROS Y PREGUNTAS FRECUENTES (20/10/2026, pedido del dueño: «que me
+   * encuentren cuando buscan en ChatGPT o similares»). Las IA responden con lo
+   * que leen escrito en el sitio: quiénes son, qué venden, cómo se compra. Van
+   * en la página /nosotros, en /llms.txt y como datos de preguntas para Google.
+   * Los defaults salen de lo que ya dicen los textos de la tienda: a revisar.
+   */
+  nosotrosTexto: 'Sabor y Aroma es una dietética y distribuidora de productos saludables de Formosa. Frutos secos, semillas, harinas y más: productos naturales, sin TACC y orgánicos de las mejores marcas, por menor y por mayor.\n\nPodés comprar en nuestros locales o en la tienda online: elegís, hacés tu pedido y coordinamos el pago y la entrega por WhatsApp.' as string,
+  faq: [
+    { pregunta: '¿Venden por menor y por mayor?', respuesta: 'Sí. En la tienda online elegís cómo comprar: por menor, sin mínimo de compra, o por mayor, con precios mayoristas.' },
+    { pregunta: '¿Hacen envíos a domicilio?', respuesta: 'Sí. Podés retirar tu pedido en el local o pedir que te lo llevemos; coordinamos la entrega por WhatsApp.' },
+    { pregunta: '¿Tienen productos sin TACC y orgánicos?', respuesta: 'Sí. Trabajamos productos naturales, sin TACC y orgánicos; en la tienda online los encontrás por categoría y por etiqueta.' },
+    { pregunta: '¿Cómo pago mi pedido?', respuesta: 'Hacés el pedido en la tienda online y coordinamos el pago y la entrega por WhatsApp, igual que siempre.' },
+  ] as Array<Record<string, any>>,
   slides: [
     {
       id: 1,
@@ -610,6 +624,8 @@ const REGLAS: Record<string, {
   'web.seoTitulo': { texto: (v: string) => String(v ?? '').trim().slice(0, 70) },
   'web.seoDescripcion': { texto: (v: string) => String(v ?? '').trim().slice(0, 170) },
   'web.locales': { lista: { max: 6, largo: 120 } },
+  'web.nosotrosTexto': { texto: (v: string) => String(v ?? '').trim().slice(0, 1500) },
+  'web.faq': { lista: { max: 15, largo: 600 } },
 };
 
 /**
