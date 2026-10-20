@@ -100,6 +100,13 @@ export const VENTAS_DEFAULTS = {
   /** Envío gratis en la tienda minorista desde este monto (0 = nunca es gratis: se coordina). */
   tiendaMinoristaEnvioGratisDesde: 0 as number,
   /**
+   * PUBLICACIÓN DE CADA TIENDA (20/10/2026): abierta al público o en
+   * preparación. En preparación solo se ve (y se compra de prueba) con el link
+   * de vista previa del ERP. Por defecto abiertas: como siempre.
+   */
+  tiendaMayoristaPublica: true as boolean,
+  tiendaMinoristaPublica: true as boolean,
+  /**
    * La clave de Google Maps del navegador (0185): con ella el checkout minorista
    * pide la ubicación en el mapa y el ERP dibuja los barrios. Es pública por
    * diseño (viaja a cada navegador) y se protege en Google Cloud restringiéndola
@@ -845,7 +852,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  */
 const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
   [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey']), 'web.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica']), 'web.configuracion'],
 ];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];

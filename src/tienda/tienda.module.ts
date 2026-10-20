@@ -60,6 +60,7 @@ import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
 import { stockSinControl } from '../inventario/inventario.service';
 import { rutaImagen } from '../web/ruta-imagen';
 import { BarriosModule, BarriosService } from './barrios/barrios.module';
+import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -78,6 +79,8 @@ const MAX_RENGLONES_PEDIDO = 100;
 const SESION = 'x-tienda-sesion';
 /** La del comprador minorista (0178): otra cookie, otra cabecera — una sesión no abre el otro modo. */
 const SESION_MIN = 'x-tienda-sesion-min';
+/** La de la vista previa (20/10/2026): con ella se ven las tiendas en preparación. */
+const VISTA_PREVIA = 'x-tienda-vista-previa';
 
 /** Los dos modos de la tienda (0173). */
 type Modo = 'mayorista' | 'minorista';
@@ -196,6 +199,7 @@ export class TiendaService {
     private readonly ofertasSvc: OfertasService,
     private readonly accesos: AccesosTiendaService,
     private readonly barrios: BarriosService,
+    private readonly vistaPrevia: VistaPreviaService,
   ) {}
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
@@ -207,10 +211,41 @@ export class TiendaService {
   }
 
   /** El modo que se va a servir: minorista solo si está encendido en el ERP; cualquier otra cosa, mayorista. */
-  private async modoVigente(pedido?: string): Promise<Modo> {
-    if (pedido !== 'minorista') return 'mayorista';
-    const cfg = await this.cfg.get('ventas');
-    return cfg.tiendaMinoristaActiva === false ? 'mayorista' : 'minorista';
+  /**
+   * QUÉ TIENDAS VE QUIEN PIDE (20/10/2026): las abiertas al público y, con la
+   * vista previa, también las que están en preparación; la minorista apagada no
+   * la ve nadie. `publica`: si está abierta al público (si no, lo que se compre
+   * ahí es de prueba).
+   */
+  private async visibles(previa?: string) {
+    const [cfg, conPrevia] = await Promise.all([this.cfg.get('ventas'), this.vistaPrevia.valida(previa)]);
+    const existe: Record<Modo, boolean> = { mayorista: true, minorista: cfg.tiendaMinoristaActiva !== false };
+    const publica: Record<Modo, boolean> = {
+      mayorista: cfg.tiendaMayoristaPublica !== false,
+      minorista: existe.minorista && cfg.tiendaMinoristaPublica !== false,
+    };
+    const ve: Record<Modo, boolean> = {
+      mayorista: publica.mayorista || conPrevia,
+      minorista: existe.minorista && (publica.minorista || conPrevia),
+    };
+    return { publica, ve };
+  }
+
+  /** El modo que se sirve: el pedido si se ve; si no, el otro; null = ninguna tienda abierta para quien pide. */
+  private async modoVigente(pedido: string | undefined, previa?: string) {
+    const v = await this.visibles(previa);
+    const pedidoModo: Modo = pedido === 'minorista' ? 'minorista' : 'mayorista';
+    const otro: Modo = pedidoModo === 'minorista' ? 'mayorista' : 'minorista';
+    return { modo: v.ve[pedidoModo] ? pedidoModo : v.ve[otro] ? otro : null, v };
+  }
+
+  /** Para comprar en un modo, tiene que verse. Devuelve si el pedido es de PRUEBA (la tienda está en preparación). */
+  private async exigirAbierta(modo: Modo, previa?: string): Promise<boolean> {
+    const { ve, publica } = await this.visibles(previa);
+    if (!ve[modo]) {
+      throw new BadRequestException(modo === 'minorista' ? 'La compra minorista no está disponible por ahora.' : 'La tienda todavía no está abierta.');
+    }
+    return !publica[modo];
   }
 
   /** El catálogo armado del modo, de la caché (o armado ahora si no hay copia). */
@@ -222,16 +257,24 @@ export class TiendaService {
    *   · Mayorista: con sesión válida, con precios y los datos del cliente para
    *     el checkout; sin ella, sin nada de plata (`sinPrecios`).
    */
-  async catalogo(token?: string, modoPedido?: string, tokenMin?: string) {
-    const modo = await this.modoVigente(modoPedido);
+  async catalogo(token?: string, modoPedido?: string, tokenMin?: string, previa?: string) {
+    const { modo, v } = await this.modoVigente(modoPedido, previa);
+    /* Ninguna tienda abierta para quien pide: solo lo necesario para la página de «Próximamente». */
+    if (!modo) {
+      const { logoUrl, contacto } = (await this.armado('mayorista')).catalogo.sitio;
+      return { cerrada: true, sitio: { logoUrl, contacto } };
+    }
+    /* Lo que depende de quien mira va encima del catálogo compartido: si elige modo y si ve una tienda en preparación. */
+    const deQuienMira = { minoristaActiva: v.ve.mayorista && v.ve.minorista, vistaPrevia: !v.publica[modo] };
     if (modo === 'minorista') {
       /* También con ingreso (0178): sin sesión minorista, sin nada de plata, como la mayorista. */
       const [arm, c] = await Promise.all([this.armado('minorista'), this.accesos.sesionMinorista(tokenMin)]);
-      const cat = { ...arm.catalogo, conPrecios: true, cliente: null };
+      const cat = { ...arm.catalogo, ...deQuienMira, conPrecios: true, cliente: null };
       return c ? { ...cat, comprador: this.accesos.datosMinorista(c) } : sinPrecios(cat);
     }
     const [completo, s] = await Promise.all([this.catalogoCompleto(), this.accesos.sesion(token)]);
-    return s ? { ...completo, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(completo);
+    const cat = { ...completo, ...deQuienMira };
+    return s ? { ...cat, cliente: await this.accesos.datosCheckout(s) } : sinPrecios(cat);
   }
 
   /**
@@ -434,8 +477,6 @@ export class TiendaService {
     const comun = {
       sucursalId: suc?.id ?? null,
       ...reglasModo,
-      /** El modo minorista existe (0173): con él, el sitio ofrece elegir modo. */
-      minoristaActiva: cfg.tiendaMinoristaActiva !== false,
       /** El cartel de elegir modo dice desde cuánto compra el mayorista (17/10/2026), aunque se esté en minorista. */
       minimoMayorista,
       /** Minorista: envío gratis desde este monto (0 = se coordina). */
@@ -1086,7 +1127,8 @@ export class TiendaService {
    * Alta de un pedido MAYORISTA. Recotiza TODO server-side, valida el mínimo
    * de compra y el envío sin costo, y crea el presupuesto.
    */
-  async pedido(dto: any, token?: string) {
+  async pedido(dto: any, token?: string, previa?: string) {
+    const prueba = await this.exigirAbierta('mayorista', previa);
     /* Compra solo el habilitado (0155): quién es sale de la SESIÓN, no del body. */
     const s = await this.accesos.sesion(token);
     if (!s) throw new UnauthorizedException('Para comprar, ingresá con tu DNI.');
@@ -1160,6 +1202,7 @@ export class TiendaService {
         // La dirección viaja con los datos del cliente (jsonb, sin migración):
         // el ERP la muestra en la orden y la usa al darlo de alta.
         ...(domicilio ?? {}),
+        ...(prueba ? { prueba: true } : {}),
       },
       items,
     });
@@ -1176,10 +1219,8 @@ export class TiendaService {
    * promos y el descuento; sin punto o fuera de todo barrio, la regla general
    * (gratis desde el monto configurado; si no, se coordina).
    */
-  async pedidoMinorista(dto: any, tokenMin?: string) {
-    if ((await this.modoVigente('minorista')) !== 'minorista') {
-      throw new BadRequestException('La compra minorista no está disponible por ahora.');
-    }
+  async pedidoMinorista(dto: any, tokenMin?: string, previa?: string) {
+    const prueba = await this.exigirAbierta('minorista', previa);
     const c = await this.accesos.sesionMinorista(tokenMin);
     if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
 
@@ -1216,7 +1257,7 @@ export class TiendaService {
       const creado = await this.presupuestos.crearDesdeWeb({
         clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
         entrega, observaciones: String(dto?.observaciones ?? '').slice(0, 500),
-        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio },
+        webCliente: { nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio, ...(prueba ? { prueba: true } : {}) },
         items: conDescuentoBarrio(items, zona?.descuentoPct ?? 0),
       }, tx);
       /* `total` es la mercadería; el envío va aparte (null = se coordina), como en la orden. */
@@ -1230,7 +1271,8 @@ export class TiendaService {
    * barrio, las promos que se usan y la que está cerca. Misma cuenta que el
    * alta del pedido: lo que ve el cliente es lo que se le cobra.
    */
-  async envioMinorista(dto: any, tokenMin?: string) {
+  async envioMinorista(dto: any, tokenMin?: string, previa?: string) {
+    await this.exigirAbierta('minorista', previa);
     const c = await this.accesos.sesionMinorista(tokenMin);
     if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
@@ -1275,23 +1317,29 @@ export class TiendaController {
   /** `?modo=minorista` pide el catálogo minorista (0173); cualquier otra cosa, el mayorista. */
   @Get('catalogo')
   @RateLimit('catalogo')
-  catalogo(@Query('modo') modo?: string, @Headers(SESION) token?: string, @Headers(SESION_MIN) tokenMin?: string) {
-    return this.svc.catalogo(token, modo, tokenMin);
+  catalogo(
+    @Query('modo') modo?: string, @Headers(SESION) token?: string, @Headers(SESION_MIN) tokenMin?: string, @Headers(VISTA_PREVIA) previa?: string,
+  ) {
+    return this.svc.catalogo(token, modo, tokenMin, previa);
   }
 
   @Post('pedidos')
   @RateLimit('pedidos')
-  pedido(@Body() body: any, @Headers(SESION) token?: string) { return this.svc.pedido(body ?? {}, token); }
+  pedido(@Body() body: any, @Headers(SESION) token?: string, @Headers(VISTA_PREVIA) previa?: string) { return this.svc.pedido(body ?? {}, token, previa); }
 
   /* Modo minorista (0173). POST y no GET: el teléfono no queda escrito en la dirección ni en los registros. */
   @Post('minorista/pedidos')
   @RateLimit('pedidos')
-  pedidoMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string) { return this.svc.pedidoMinorista(body ?? {}, tokenMin); }
+  pedidoMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string, @Headers(VISTA_PREVIA) previa?: string) {
+    return this.svc.pedidoMinorista(body ?? {}, tokenMin, previa);
+  }
 
   /* Cuánto sale recibir en casa (0185): el checkout la pide al marcar el punto en el mapa. */
   @Post('minorista/envio')
   @RateLimit('envio')
-  envioMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string) { return this.svc.envioMinorista(body ?? {}, tokenMin); }
+  envioMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string, @Headers(VISTA_PREVIA) previa?: string) {
+    return this.svc.envioMinorista(body ?? {}, tokenMin, previa);
+  }
 
   /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
   @Post('minorista/registro')
@@ -1367,8 +1415,8 @@ export class TiendaController {
 
 @Module({
   imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule, BarriosModule],
-  controllers: [TiendaController, AccesosTiendaController],
-  providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard],
+  controllers: [TiendaController, AccesosTiendaController, VistaPreviaController],
+  providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard, VistaPreviaService],
   exports: [TiendaService],
 })
 export class TiendaModule {}

@@ -270,6 +270,8 @@ export class PresupuestosService {
       envioGratis?: boolean;
       /** Minorista (0185): el barrio del punto marcado en el mapa, el punto, el costo del envío (0 = gratis; sin dato = se coordina) y el % del barrio. */
       barrio?: string; ubicacion?: { lat: number; lng: number }; envio?: number; descuentoBarrio?: number;
+      /** Hecho desde la vista previa de una tienda en preparación: es de prueba. */
+      prueba?: boolean;
     };
   }, tx: Database = this.db) {
     if (!dto?.sucursalId) throw new BadRequestException('Falta la sucursal.');
