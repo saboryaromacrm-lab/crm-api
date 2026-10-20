@@ -39,6 +39,7 @@ import { MULTI_UNIDAD, totalConOferta } from './oferta-linea';
 import { Publico } from '../auth/auth.decoradores';
 import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
+import { fechaQr as fechaArgentina } from '../arca/fecha';
 import type { Response } from 'express';
 import { and, eq, gte, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -616,6 +617,8 @@ export class TiendaService {
         if (!mejor) return null;
         return {
           id: mejor.id, nombre: mejor.nombre, tipo: mejor.tipo, badge: describirOferta(mejor),
+          /* NutriRescate (20/10/2026): la promo es para mercadería por vencer (0187) y hasta cuándo vale (= el vencimiento). */
+          ...(mejor.porVencer ? { porVencer: true, venceEl: mejor.hasta ? fechaArgentina(new Date(mejor.hasta)) : null } : {}),
           precioOferta: mejorPrecio != null ? money(mejorPrecio * por) : null,
           ...(MULTI_UNIDAD.has(mejor.tipo)
             ? { lleva: Number(mejor.lleva) || 0, paga: Number(mejor.paga) || 0, porcentaje: Number(mejor.porcentaje) || 0, precioPack: Number(mejor.precio) || 0 }
@@ -881,6 +884,20 @@ export class TiendaService {
         /** Las opciones del selector (3/10/2026): bolsa del madre y paquetes con lista mayorista. */
         variantes,
       });
+    }
+
+    /*
+     * NUTRIRESCATE (20/10/2026, pedido del dueño): el producto está en la
+     * sección de lo próximo a vencer si alguna de sus opciones tiene una promo
+     * por vencimiento, con la fecha más cercana. Va en el PRODUCTO y no solo en
+     * la oferta: sin sesión la oferta no viaja (`sinPrecios`), pero la sección
+     * igual muestra qué productos hay, e invita a ingresar para ver el precio.
+     */
+    for (const it of items) {
+      const porVencer = [it.oferta, ...(it.variantes ?? []).map((v: any) => v.oferta)].filter((o: any) => o?.porVencer);
+      if (!porVencer.length) continue;
+      it.porVencer = true;
+      it.venceEl = porVencer.map((o: any) => o.venceEl).filter(Boolean).sort()[0] ?? null;
     }
 
     const contar = (mapa: Map<number, { id: number; nombre: string; count: number }>, id: number | null, nombre: string) => {
