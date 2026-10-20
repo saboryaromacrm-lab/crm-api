@@ -1995,6 +1995,7 @@ export class InventarioService {
         throw new BadRequestException('El pedido no tiene ningún renglón con cantidad.');
       }
       for (const it of vacios) await tx.delete(transferenciaItems).where(eq(transferenciaItems.id, it.id));
+      await this.exigirStockEnOrigen(tx, t.origenId, items.filter((it: any) => it.cantidad > 1e-9).map((it: any) => it.productoId));
 
       const codigo = 'TR' + String(t.id).padStart(4, '0');
       // Reclamo atómico: dos "Enviar" simultáneos mandarían el pedido dos veces.
@@ -2021,6 +2022,37 @@ export class InventarioService {
       await tx.delete(transferencias).where(eq(transferencias.id, t.id));
       return { ok: true };
     });
+  }
+
+  /**
+   * NO SE PIDE LO QUE EL ORIGEN NO TIENE (20/10/2026, pedido del dueño). La
+   * misma regla que `puedeMandar` del ERP: de un entero, lo disponible del
+   * producto en el origen; de un granel, el granel SUELTO —de ahí se fracciona;
+   * los paquetes armados son la góndola del origen y no viajan—. Vale también
+   * sin control de stock: 0 es 0. Lo que sí tiene puede pedirse por más de lo
+   * que hay (el origen ajusta lo que prepara).
+   */
+  private async exigirStockEnOrigen(tx: any, origenId: number, productoIds: number[]) {
+    const ids = [...new Set(productoIds)];
+    if (!ids.length) return;
+    const [prods, filas, [origen]] = await Promise.all([
+      tx.select({ id: productos.id, nombre: productos.nombre, tipo: productos.tipo }).from(productos).where(inArray(productos.id, ids)),
+      tx.select({ productoId: stock.productoId, presentacionId: stock.presentacionId, cantidad: stock.cantidad }).from(stock)
+        .where(and(eq(stock.sucursalId, origenId), eq(stock.estado, 'disponible'), inArray(stock.productoId, ids))),
+      tx.select({ nombre: sucursales.nombre }).from(sucursales).where(eq(sucursales.id, origenId)).limit(1),
+    ]);
+    const tipo = new Map<number, string>(prods.map((x: any) => [x.id, x.tipo]));
+    const hay = new Map<number, number>();
+    for (const f of filas) {
+      if (tipo.get(f.productoId) === 'granel' && f.presentacionId != null) continue;
+      hay.set(f.productoId, (hay.get(f.productoId) ?? 0) + Number(f.cantidad));
+    }
+    const sin = prods.filter((x: any) => !((hay.get(x.id) ?? 0) > 1e-9)).map((x: any) => x.nombre);
+    if (sin.length) {
+      throw new BadRequestException(
+        `${origen?.nombre ?? 'El origen'} no tiene stock para mandar de: ${sin.slice(0, 6).join(', ')}${sin.length > 6 ? ` y ${sin.length - 6} más` : ''}. Sacalos del pedido.`,
+      );
+    }
   }
 
   /** Guarda común de los tres de arriba: existe y TODAVÍA es borrador. */
