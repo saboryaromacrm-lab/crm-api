@@ -2786,6 +2786,9 @@ export const cashflowMovimientos = pgTable('cashflow_movimientos', {
   gastoId: integer('gasto_id').references(() => gastos.id, { onDelete: 'restrict' }),
   /** El ajuste de un conteo (0134). */
   conteoId: integer('conteo_id').references(() => cashflowConteos.id, { onDelete: 'restrict' }),
+  /** Efectivo por transferencia (0191): quién transfirió y a qué cuenta. NULL = salió en efectivo. */
+  cambioPor: text('cambio_por'),
+  cambioCuenta: text('cambio_cuenta'),
   detalle: text('detalle').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   anuladoEn: timestamp('anulado_en', { withTimezone: true }),

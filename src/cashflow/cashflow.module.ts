@@ -120,6 +120,12 @@ function contarBilletes(billetesIn: unknown, otrosIn: unknown) {
  */
 export const esConceptoDeposito = (nombre: unknown) =>
   String(nombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().includes('deposito');
+/**
+ * UN CONCEPTO QUE ES EN SÍ UN CAMBIO (0191): «Cambio a mi cuenta (efectivo por
+ * transferencia)». También por el nombre: siempre pide quién y a qué cuenta.
+ */
+export const esConceptoCambio = (nombre: unknown) =>
+  String(nombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().includes('efectivo por transferencia');
 
 const TIPOS = ['ingreso', 'egreso'] as const;
 const CLASES = ['gasto', 'movimiento'] as const;
@@ -226,6 +232,9 @@ class MovimientoDto {
   @IsNumber() @Min(0) @Max(MAX_IMPORTE) importe!: number;
   @IsOptional() @IsString() fecha?: string;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  /** Efectivo por transferencia (0191): quién transfirió y a qué cuenta. Van juntos y solo en un egreso. */
+  @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
+  @IsOptional() @IsString() @MaxLength(120) cambioCuenta?: string;
   @IsBoolean() confirmado!: boolean;
 }
 
@@ -832,7 +841,7 @@ export class CashflowService {
 
   /* ------------------------------ Movimientos ------------------------------ */
 
-  async movimientos(q: { desde?: string; hasta?: string; tipo?: string; origen?: string; conceptoId?: string | number; sucursalId?: string | number; anulados?: string; limite?: number; fechaDe?: string }) {
+  async movimientos(q: { desde?: string; hasta?: string; tipo?: string; origen?: string; conceptoId?: string | number; sucursalId?: string | number; anulados?: string; limite?: number; fechaDe?: string; cambio?: string }) {
     const cond: any[] = [];
     if (q.anulados !== '1') cond.push(sql`m.anulado_en is null`);
     /*
@@ -848,6 +857,8 @@ export class CashflowService {
     if (esDia(q.hasta)) cond.push(hastaDia(col, q.hasta));
     if (q.tipo && (TIPOS as readonly string[]).includes(q.tipo)) cond.push(sql`m.tipo = ${q.tipo}`);
     if (q.origen) cond.push(sql`m.origen = ${String(q.origen)}`);
+    /* Solo lo que salió como efectivo por transferencia (0191). */
+    if (q.cambio === '1') cond.push(sql`m.cambio_por is not null`);
     const cid = Number(q.conceptoId);
     if (Number.isInteger(cid) && cid > 0) cond.push(sql`m.concepto_id = ${cid}`);
     const suc = Number(q.sucursalId);
@@ -857,7 +868,7 @@ export class CashflowService {
       select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto,
         m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia", cs.cierre as "cierreCaja",
         m.pago_id as "pagoId", m.gasto_id as "gastoId", u.nombre as usuario,
-        pr.nombre as proveedor, pp.medio, pp.cambio_por as "cambioPor", pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
+        pr.nombre as proveedor, pp.medio, coalesce(m.cambio_por, pp.cambio_por) as "cambioPor", m.cambio_cuenta as "cambioCuenta", pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
         m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo", ua.nombre as "anuladoPor"
       from cashflow_movimientos m
       left join cashflow_conceptos c on c.id = m.concepto_id
@@ -885,6 +896,21 @@ export class CashflowService {
     if (!esDia(fecha)) throw new BadRequestException('La fecha tiene que ser un día válido.');
     if (fecha > hoyAr()) throw new BadRequestException('La fecha no puede ser futura.');
     const detalle = String(dto.detalle ?? '').trim();
+    /*
+     * EFECTIVO POR TRANSFERENCIA (0191, pedido del dueño): el efectivo se le da
+     * a alguien y esa persona transfiere (a tu cuenta, o para pagar un gasto).
+     * Para la caja es un egreso de efectivo como cualquier otro; queda quién
+     * hizo la transferencia y a qué cuenta fue. Un pago a proveedor así va por
+     * «Pagar a un proveedor» (`pagarProveedor`), que lo deja en su cuenta.
+     */
+    const cambioPor = String(dto.cambioPor ?? '').trim();
+    const cambioCuenta = String(dto.cambioCuenta ?? '').trim();
+    const esCambio = !!(cambioPor || cambioCuenta);
+    if (esCambio) {
+      if (dto.tipo !== 'egreso') throw new BadRequestException('El efectivo por transferencia es una salida de plata.');
+      if (!cambioPor) throw new BadRequestException('Escribí quién hizo la transferencia (a quién le diste el efectivo).');
+      if (!cambioCuenta) throw new BadRequestException('Escribí a qué cuenta transfirió (por ejemplo, tu cuenta del banco).');
+    }
     return this.db.transaction(async (tx) => {
       /* El candado es la fila de la caja: dos egresos a la vez no pueden pasar
        * los dos el control del saldo. */
@@ -897,23 +923,31 @@ export class CashflowService {
       if (c.tipo !== dto.tipo) throw new BadRequestException(`«${c.nombre}» es un concepto de ${c.tipo}.`);
       const esGasto = c.clase === 'gasto';
       if (esGasto && !c.gastoCategoriaId) throw new BadRequestException(`«${c.nombre}» es un concepto de gasto pero no tiene rubro: asignale uno en la pestaña Conceptos.`);
+      /* Un depósito es el efectivo que llevás vos al banco: no es la transferencia de otro. */
+      if (esCambio && esConceptoDeposito(c.nombre)) throw new BadRequestException(`«${c.nombre}» es un depósito: sale en efectivo. Para un cambio por transferencia elegí otro concepto.`);
+      if (!esCambio && c.tipo === 'egreso' && esConceptoCambio(c.nombre)) throw new BadRequestException(`«${c.nombre}» es un cambio: escribí quién hizo la transferencia y a qué cuenta.`);
       const instante = instanteDe(fecha);
       if (dto.tipo === 'egreso') await this.exigirEfectivo(tx, fecha, instante, importe, 'el egreso');
       const [m] = await tx.insert(cashflowMovimientos).values({
         fecha: instante,
         tipo: dto.tipo, origen: esGasto ? 'gasto' : 'concepto', importe, conceptoId: c.id, detalle, usuarioId,
+        cambioPor: esCambio ? cambioPor : null, cambioCuenta: esCambio ? cambioCuenta : null,
       }).returning();
       /*
        * EL CONCEPTO DE GASTO CREA EL GASTO EN GASTOS (decisión del dueño): sin
        * factura (recibo, letra X, sin IVA), con su rubro, pagado en el acto en
        * efectivo. Así aparece en rentabilidad y no se carga dos veces. Si el
        * alta del gasto falla, esta transacción se deshace y el egreso no queda.
+       * Por cambio (0191) el gasto queda pagado por transferencia, con quién la hizo.
        */
       if (esGasto) {
         const g: any = await this.gastos.crear({
           fecha, tipoDoc: 'recibo', letra: 'X', categoriaId: c.gastoCategoriaId!, descripcion: detalle || c.nombre,
           condicionPago: 'contado', neto: importe, iva: 0, observaciones: 'Registrado desde Cash Flow (efectivo del dueño)',
-          usuarioId: usuarioId ?? undefined, pagoInmediato: { importe, medio: 'efectivo', fecha },
+          usuarioId: usuarioId ?? undefined,
+          pagoInmediato: esCambio
+            ? { importe, medio: 'transferencia', fecha, cambioPor, referencia: `A ${cambioCuenta}` }
+            : { importe, medio: 'efectivo', fecha },
         } as any, sesion);
         const [imp] = await tx.select({ pagoId: proveedorImputaciones.pagoId }).from(proveedorImputaciones)
           .where(eq(proveedorImputaciones.gastoId, g.id)).limit(1);
@@ -978,7 +1012,7 @@ export class CashflowService {
       await this.exigirEfectivo(tx, fecha, instante, importe, 'el pago');
       const [m] = await tx.insert(cashflowMovimientos).values({
         fecha: instante, conceptoId: dto.conceptoId ?? null,
-        tipo: 'egreso', origen: 'pago_proveedor', importe, usuarioId,
+        tipo: 'egreso', origen: 'pago_proveedor', importe, usuarioId, cambioPor: cambioPor || null,
         detalle: `Pago a ${prov.nombre} (${dto.medio === 'deposito' ? 'depósito' : cambioPor ? `efectivo por transferencia · ${cambioPor}` : 'efectivo'})${detalle ? ` · ${detalle}` : ''}`,
       }).returning();
       /* El pago de siempre. Si falla, esta transacción se deshace y el egreso no queda. */

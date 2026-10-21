@@ -209,6 +209,8 @@ class PagoDto {
   @IsOptional() @IsIn(MEDIOS as unknown as string[]) medio?: string;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
   @IsOptional() @IsString() referencia?: string;
+  /** Efectivo por transferencia (0175): quién transfirió a cambio de nuestro efectivo; va con medio transferencia. */
+  @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
   /** Turno de caja del que sale el efectivo (genera el egreso). */
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -938,6 +940,7 @@ export class GastosService {
         medio: dto.pagoInmediato.medio,
         fecha: dto.pagoInmediato.fecha,
         referencia: dto.pagoInmediato.referencia,
+        cambioPor: dto.pagoInmediato.cambioPor,
         concepto: (descripcion ?? dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
         sucursalId: sucursalId ?? undefined,
         cajaSesionId: dto.pagoInmediato.cajaSesionId,
@@ -1216,6 +1219,7 @@ export class GastosService {
       medio: dto.medio,
       fecha: dto.fecha,
       referencia: dto.referencia,
+      cambioPor: dto.cambioPor,
       concepto: g.descripcion || `Gasto #${g.id}`,
       sucursalId: g.sucursalId ?? undefined,
       cajaSesionId: dto.cajaSesionId,
