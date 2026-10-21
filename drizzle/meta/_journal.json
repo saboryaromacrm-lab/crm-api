@@ -1345,6 +1345,13 @@
       "when": 1792494000000,
       "tag": "0191_cashflow_cambio_transferencia",
       "breakpoints": true
+    },
+    {
+      "idx": 192,
+      "version": "7",
+      "when": 1792497600000,
+      "tag": "0192_conceptos_caja",
+      "breakpoints": true
     }
   ]
 }

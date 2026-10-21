@@ -25,8 +25,11 @@ import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../au
 import { MarcaDto, PERMISO_CASHFLOW, marcarCaja } from '../cashflow/a-controlar';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
+import { GastosModule, GastosService } from '../gastos/gastos.module';
+import { type ConceptoRegla, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
 import {
-  cajaControles, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, mpCobros, sucursales, ventaPagos, ventas,
+  cajaControles, cajaMovimientos, cajaSesiones, cashflowConceptos, cobranzaPagos, cobranzas, gastoCategorias, mpCobros,
+  proveedorImputaciones, proveedorPagos, sucursales, ventaPagos, ventas,
 } from '../db/schema';
 
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -190,6 +193,10 @@ class ExplicarControlDto {
 class MovimientoCajaDto {
   @IsIn(['ingreso', 'egreso']) tipo!: 'ingreso' | 'egreso';
   @IsNumber() importe!: number;
+  /** 0192: SIEMPRE un concepto (la lista del Cash Flow) y, si hace falta, la descripción. */
+  @IsOptional() @IsInt() conceptoId?: number;
+  @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  /** El motivo a mano de antes del 0192: ya no alcanza solo (una pantalla vieja recibe el aviso). */
   @IsOptional() @IsString() motivo?: string;
   @IsOptional() @IsInt() usuarioId?: number;
   /** Ídem `ControlCajaDto`: el relevo firma el movimiento manual. */
@@ -200,7 +207,9 @@ class MovimientoCajaDto {
 class MovimientoPosteriorDto {
   @IsIn(['ingreso', 'egreso']) tipo!: 'ingreso' | 'egreso';
   @IsNumber() @Min(0.01) @Max(100_000_000_000) importe!: number;
-  @IsString() @MaxLength(300) motivo!: string;
+  /** 0192: el concepto y la descripción (qué fue y quién avisó: obligatoria acá). */
+  @IsOptional() @IsInt() conceptoId?: number;
+  @IsOptional() @IsString() @MaxLength(300) detalle?: string;
   @IsBoolean() confirmado!: boolean;
 }
 class AnularPosteriorDto {
@@ -256,7 +265,37 @@ export class CajaService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly audit: AuditoriaService,
+    private readonly gastos: GastosService,
   ) {}
+
+  /* ------------------------------ Conceptos (0192) ------------------------------ */
+
+  /**
+   * LOS CONCEPTOS DE LA CAJA: la MISMA lista del Cash Flow, los que se usan en
+   * la caja de los locales. El cambio por transferencia nunca (es del Cash
+   * Flow). Un gasto sin rubro no se ofrece: no se podría cargar en Gastos.
+   * `todos` = también los desactivados (para filtrar lo ya registrado).
+   */
+  async conceptosCaja(todos = false) {
+    const filas = await this.db.select({
+      id: cashflowConceptos.id, nombre: cashflowConceptos.nombre, tipo: cashflowConceptos.tipo, clase: cashflowConceptos.clase,
+      gastoCategoriaId: cashflowConceptos.gastoCategoriaId, gastoCategoria: gastoCategorias.nombre,
+      pideDetalle: cashflowConceptos.pideDetalle, activo: cashflowConceptos.activo,
+    }).from(cashflowConceptos)
+      .leftJoin(gastoCategorias, eq(gastoCategorias.id, cashflowConceptos.gastoCategoriaId))
+      .where(todos ? eq(cashflowConceptos.enCaja, true) : and(eq(cashflowConceptos.enCaja, true), eq(cashflowConceptos.activo, true)))
+      .orderBy(cashflowConceptos.tipo, cashflowConceptos.orden, cashflowConceptos.nombre);
+    return filas.filter((c) => !esConceptoCambio(c.nombre) && (todos || c.clase !== 'gasto' || c.gastoCategoriaId));
+  }
+
+  /** El concepto pedido, si se puede usar en la caja de un local. */
+  private async conceptoDeCaja(conceptoId: number | undefined): Promise<ConceptoRegla & { id: number }> {
+    if (!conceptoId) throw new BadRequestException('Elegí el concepto del movimiento (si no ves la lista, actualizá la pantalla).');
+    const [c] = await this.db.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, conceptoId)).limit(1);
+    if (!c) throw new BadRequestException('Ese concepto no existe.');
+    if (!c.enCaja || esConceptoCambio(c.nombre)) throw new BadRequestException(`«${c.nombre}» no se usa en la caja de los locales: elegí otro concepto.`);
+    return c;
+  }
 
   /**
    * ¿El cajero ve lo que tiene que haber en caja? (`ventas.cajaVeEsperado`,
@@ -320,7 +359,7 @@ export class CajaService {
    * otro (lo que se cargó a mano en «Ingreso / egreso»). Las filas vienen
    * hasta 2000; los totales y la agrupación son del filtro ENTERO.
    */
-  async movimientosCaja(q: { sucursalId?: number | null; desde?: string; hasta?: string; tipo?: string; clase?: string; q?: string; anulados?: boolean }) {
+  async movimientosCaja(q: { sucursalId?: number | null; desde?: string; hasta?: string; tipo?: string; clase?: string; q?: string; anulados?: boolean; conceptoId?: number | null }) {
     const conds: any[] = [sql`true`];
     if (q.sucursalId) conds.push(sql`cs.sucursal_id = ${q.sucursalId}`);
     if (esDia(q.desde)) conds.push(sql`m.fecha >= (${q.desde}::date::timestamp at time zone 'America/Argentina/Buenos_Aires')`);
@@ -328,13 +367,16 @@ export class CajaService {
     if (q.tipo === 'ingreso' || q.tipo === 'egreso') conds.push(sql`m.tipo = ${q.tipo}`);
     if (!q.anulados) conds.push(sql`m.anulado_en is null`);
     const texto = String(q.q ?? '').trim();
-    if (texto) conds.push(sql`(m.motivo ilike ${`%${texto}%`} or pr.nombre ilike ${`%${texto}%`})`);
-    const clase = ['pago_proveedor', 'devolucion', 'otro'].includes(String(q.clase)) ? String(q.clase) : '';
+    if (texto) conds.push(sql`(m.motivo ilike ${`%${texto}%`} or pr.nombre ilike ${`%${texto}%`} or co.nombre ilike ${`%${texto}%`})`);
+    if (q.conceptoId) conds.push(sql`m.concepto_id = ${q.conceptoId}`);
+    const clase = ['concepto', 'pago_proveedor', 'devolucion', 'otro'].includes(String(q.clase)) ? String(q.clase) : '';
     const base = sql`
       select m.id, m.fecha, m.tipo, m.importe, m.motivo, m.posterior, m.anulado_en as "anuladoEn", m.anulado_motivo as "anuladoMotivo",
         m.caja_sesion_id as "cajaSesionId", cs.sucursal_id as "sucursalId", su.nombre as sucursal, cs.apertura, cs.cierre,
         coalesce(uc.nombre, ua.nombre, '') as cajero, um.nombre as "cargo", pr.nombre as proveedor,
-        case when pp.id is not null then 'pago_proveedor' when m.motivo like 'Devolución %' then 'devolucion' else 'otro' end as clase
+        m.concepto_id as "conceptoId", co.nombre as concepto, co.clase as "conceptoClase",
+        case when m.concepto_id is not null then 'concepto' when pp.id is not null then 'pago_proveedor'
+          when m.motivo like 'Devolución %' then 'devolucion' else 'otro' end as clase
       from caja_movimientos m
       join caja_sesiones cs on cs.id = m.caja_sesion_id
       join sucursales su on su.id = cs.sucursal_id
@@ -347,6 +389,7 @@ export class CajaService {
       left join usuarios um on um.id = m.usuario_id
       left join proveedor_pagos pp on pp.caja_movimiento_id = m.id
       left join proveedores pr on pr.id = pp.proveedor_id
+      left join cashflow_conceptos co on co.id = m.concepto_id
       where ${sql.join(conds, sql` and `)}`;
     const filtro = clase ? sql`where b.clase = ${clase}` : sql``;
     /* Lo anulado se lista (si se pide) pero no suma. */
@@ -358,7 +401,8 @@ export class CajaService {
           count(*)::int as cantidad
         from b ${filtro}`),
       this.db.execute(sql`with b as (${base}) select b.tipo, b.clase,
-          case when b.clase = 'pago_proveedor' then coalesce(b.proveedor, 'Proveedor') when b.clase = 'devolucion' then 'Devoluciones a clientes' else b.motivo end as nombre,
+          case when b.clase = 'concepto' then b.concepto when b.clase = 'pago_proveedor' then coalesce(b.proveedor, 'Proveedor')
+            when b.clase = 'devolucion' then 'Devoluciones a clientes' else b.motivo end as nombre,
           coalesce(sum(b.importe), 0) as importe, count(*)::int as cantidad
         from b ${clase ? sql`where b.clase = ${clase} and` : sql`where`} b."anuladoEn" is null
         group by 1, 2, 3 order by 4 desc limit 50`),
@@ -843,12 +887,15 @@ export class CajaService {
     return c;
   }
 
-  async movimiento(id: number, dto: MovimientoCajaDto, sucursalSesion: number | null) {
+  async movimiento(id: number, dto: MovimientoCajaDto, sucursalSesion: number | null, sesion: Sesion) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe debe ser mayor a 0.');
-    if (!dto.motivo?.trim()) throw new BadRequestException('Indicá el motivo del movimiento.');
+    /* SIEMPRE UN CONCEPTO (0192): el de la lista y, si la pide, la descripción. */
+    const c = await this.conceptoDeCaja(dto.conceptoId);
+    const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
     // El relevo (0088): el ingreso/egreso manual lo firma quien está en la caja.
     const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
+    if (c.clase === 'gasto') return this.egresoComoGasto(id, c, detalle, importe, autor, sesion, sucursalSesion);
 
     return this.db.transaction(async (tx) => {
       /* Con candado y en la misma transacción que el insert: si el cierre está
@@ -864,10 +911,47 @@ export class CajaService {
       if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
 
       const [m] = await tx.insert(cajaMovimientos).values({
-        cajaSesionId: id, tipo: dto.tipo, importe, motivo: dto.motivo!.trim(), usuarioId: autor,
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo: textoConcepto(c.nombre, detalle), conceptoId: c.id, usuarioId: autor,
       }).returning();
       return m;
     });
+  }
+
+  /**
+   * UN EGRESO CON CONCEPTO DE GASTO (0192). Se carga el GASTO en Gastos (recibo
+   * X, sin IVA, en su rubro, de la sucursal del turno) pagado en EFECTIVO de
+   * este turno: es el camino de siempre de «lo pagué y lo cargo», que crea el
+   * egreso del cajón en la misma transacción que el pago (con el turno candado).
+   * Así entra en Resultados y no se carga dos veces. Al egreso que nace ahí se le
+   * pone el concepto. Se deshace como cualquier gasto pagado desde la caja:
+   * anulando el gasto en Gastos mientras el turno siga abierto.
+   */
+  private async egresoComoGasto(
+    id: number, c: ConceptoRegla & { id: number }, detalle: string, importe: number, autor: number | null, sesion: Sesion, sucursalSesion: number | null,
+  ) {
+    /* Los avisos claros antes de cargar nada (el pago los vuelve a mirar con candado). */
+    const [turno] = await this.db.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1);
+    if (!turno) throw new NotFoundException('Turno de caja inexistente.');
+    if (sucursalSesion != null && turno.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+    if (turno.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
+    if (!tienePermiso(sesion?.permisos ?? [], ['ventas.caja', 'gastos_pagar', 'gastos_pagar_proveedor'])) {
+      throw new ForbiddenException(`«${c.nombre}» es un gasto: cargarlo pagado desde la caja necesita el permiso de caja.`);
+    }
+    const hoy = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Argentina/Buenos_Aires' });
+    const g: any = await this.gastos.crear({
+      fecha: hoy, tipoDoc: 'recibo', letra: 'X', categoriaId: c.gastoCategoriaId!, descripcion: detalle || c.nombre,
+      condicionPago: 'contado', neto: importe, iva: 0, sucursalId: turno.sucursalId,
+      observaciones: `Pagado desde la caja (turno #${id}) con el concepto «${c.nombre}»`,
+      usuarioId: autor ?? undefined, pagoInmediato: { importe, medio: 'efectivo', fecha: hoy, cajaSesionId: id },
+    } as any, sesion);
+    /* El egreso del cajón que creó el pago: queda con el concepto y su texto. */
+    const [p] = await this.db.select({ movId: proveedorPagos.cajaMovimientoId }).from(proveedorImputaciones)
+      .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
+      .where(and(eq(proveedorImputaciones.gastoId, g.id), eq(proveedorPagos.estado, 'activo'))).limit(1);
+    if (!p?.movId) throw new ConflictException('El gasto se cargó pero su egreso de caja no aparece: revisá el turno en Gastos.');
+    const [m] = await this.db.update(cajaMovimientos).set({ conceptoId: c.id, motivo: textoConcepto(c.nombre, detalle) })
+      .where(eq(cajaMovimientos.id, p.movId)).returning();
+    return { ...m, gastoId: g.id };
   }
 
   /**
@@ -883,8 +967,18 @@ export class CajaService {
     if (dto.confirmado !== true) throw new BadRequestException('Confirmá el movimiento.');
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe tiene que ser mayor a 0.');
-    const motivo = String(dto.motivo ?? '').trim();
-    if (motivo.length < 5) throw new BadRequestException('Escribí el motivo: qué fue y quién avisó (queda en el turno).');
+    /*
+     * También con concepto (0192). Uno de GASTO no: el pago de un gasto sale de
+     * un turno ABIERTO (así lo deshace Gastos); el gasto olvidado se carga en
+     * Gastos y acá su egreso, con un concepto de movimiento («Otro egreso»).
+     */
+    const c = await this.conceptoDeCaja(dto.conceptoId);
+    if (c.clase === 'gasto') {
+      throw new BadRequestException(`«${c.nombre}» es un gasto: después del cierre no se carga desde acá. Cargá el gasto en Gastos (pagado) y asentá acá el egreso con un concepto que no sea gasto, como «Otro egreso».`);
+    }
+    const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
+    if (detalle.length < 5) throw new BadRequestException('Escribí la descripción: qué fue y quién avisó (queda en el turno).');
+    const motivo = textoConcepto(c.nombre, detalle);
     return this.db.transaction(async (tx) => {
       const sesion = await this.turnoCerrado(tx, id);
       /* El mismo movimiento recién asentado (doble clic, o reintento de una red
@@ -896,7 +990,7 @@ export class CajaService {
       )).limit(1);
       if (gemelo) throw new ConflictException('Ese movimiento ya se asentó recién: revisá los movimientos del turno.');
       const [m] = await tx.insert(cajaMovimientos).values({
-        cajaSesionId: id, tipo: dto.tipo, importe, motivo, usuarioId, posterior: true,
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo, conceptoId: c.id, usuarioId, posterior: true,
       }).returning();
       const turno = await this.recalcularCierre(tx, sesion, dto.tipo, importe, false, usuarioId,
         `${dto.tipo === 'egreso' ? 'Egreso' : 'Ingreso'} asentado después del cierre: $${importe.toLocaleString('es-AR')} · ${motivo}`);
@@ -1034,12 +1128,19 @@ export class CajaController {
     @Auth() sesion: Sesion,
     @Query('sucursalId') sucursalId?: string, @Query('desde') desde?: string, @Query('hasta') hasta?: string,
     @Query('tipo') tipo?: string, @Query('clase') clase?: string, @Query('q') q?: string, @Query('anulados') anulados?: string,
+    @Query('conceptoId') conceptoId?: string,
   ) {
     const mia = soloSuSucursal(sesion);
     return this.svc.movimientosCaja({
       sucursalId: mia ?? (Number(sucursalId) > 0 ? Number(sucursalId) : null),
-      desde, hasta, tipo, clase, q, anulados: anulados === '1',
+      desde, hasta, tipo, clase, q, anulados: anulados === '1', conceptoId: Number(conceptoId) > 0 ? Number(conceptoId) : null,
     });
+  }
+
+  /** Los conceptos de la caja (0192): la lista del Cash Flow que se usa en los locales. `todos=1` suma los desactivados. */
+  @Get('conceptos')
+  conceptos(@Query('todos') todos?: string) {
+    return this.svc.conceptosCaja(todos === '1');
   }
 
   /*
@@ -1149,7 +1250,7 @@ export class CajaController {
   @Post(':id/movimiento')
   @Permiso('diferencias')
   mov(@Param('id', ParseIntPipe) id: number, @Body() dto: MovimientoCajaDto, @Auth() sesion: Sesion) {
-    return this.svc.movimiento(id, dto, soloSuSucursal(sesion));
+    return this.svc.movimiento(id, dto, soloSuSucursal(sesion), sesion);
   }
 
   /* Después del cierre (0137): solo el superadmin — la llave no está en el catálogo, pasa el comodín. */
@@ -1170,7 +1271,7 @@ export class CajaController {
 }
 
 @Module({
-  imports: [AuditoriaModule],
+  imports: [AuditoriaModule, GastosModule],
   controllers: [CajaController],
   providers: [CajaService],
   exports: [CajaService],

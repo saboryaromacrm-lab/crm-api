@@ -2127,6 +2127,8 @@ export const cajaMovimientos = pgTable('caja_movimientos', {
   anuladoEn: timestamp('anulado_en', { withTimezone: true }),
   anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   anuladoMotivo: text('anulado_motivo').notNull().default(''),
+  /** 0192: el concepto (la lista del Cash Flow). NULL = motivo a mano de antes, o pago a proveedor / devolución. */
+  conceptoId: integer('concepto_id').references((): AnyPgColumn => cashflowConceptos.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixSesion: index('ix_caja_mov_sesion').on(t.cajaSesionId),
 }));
@@ -2736,6 +2738,10 @@ export const cashflowConceptos = pgTable('cashflow_conceptos', {
   gastoCategoriaId: integer('gasto_categoria_id').references(() => gastoCategorias.id, { onDelete: 'set null' }),
   activo: boolean('activo').notNull().default(true),
   orden: integer('orden').notNull().default(0),
+  /** 0192: dónde se ofrece (al menos uno) y si la descripción es obligatoria. La misma lista sirve a las dos cajas. */
+  enCashflow: boolean('en_cashflow').notNull().default(true),
+  enCaja: boolean('en_caja').notNull().default(true),
+  pideDetalle: boolean('pide_detalle').notNull().default(false),
 });
 /** El control de un sobre: lo que mandó el cajero contra lo que contó el dueño. Uno vigente por sobre. */
 export const cashflowSobres = pgTable('cashflow_sobres', {

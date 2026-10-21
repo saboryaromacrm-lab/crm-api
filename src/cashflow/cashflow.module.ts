@@ -45,6 +45,7 @@ import { type EstadoTurno, estadoTurno } from './planilla';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
+import { esConceptoCambio, esConceptoDeposito, exigirConcepto } from './conceptos';
 import {
   MarcaDto, PERMISO_CASHFLOW, cambiarUmbral, cuantasPendientes, listarCajas, marcarCaja, marcarDesdePantalla, resolverCaja, umbralControlar,
 } from './a-controlar';
@@ -113,19 +114,8 @@ function contarBilletes(billetesIn: unknown, otrosIn: unknown) {
   if (otros < 0 || otros > MAX_IMPORTE) throw new BadRequestException('Las monedas y otros no son un importe válido.');
   return { billetes, otros, contado: money(suma + otros) };
 }
-/**
- * UN DEPÓSITO SE PUEDE APLICAR A UN PROVEEDOR (16/10/2026, pedido del dueño).
- * Se reconoce por el nombre del concepto (decisión del dueño): todo concepto de
- * egreso que diga «depósito», con o sin tilde.
- */
-export const esConceptoDeposito = (nombre: unknown) =>
-  String(nombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().includes('deposito');
-/**
- * UN CONCEPTO QUE ES EN SÍ UN CAMBIO (0191): «Cambio a mi cuenta (efectivo por
- * transferencia)». También por el nombre: siempre pide quién y a qué cuenta.
- */
-export const esConceptoCambio = (nombre: unknown) =>
-  String(nombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().includes('efectivo por transferencia');
+/* Las reglas de los conceptos viven aparte: la caja de los locales usa las mismas (0192). */
+export { esConceptoCambio, esConceptoDeposito } from './conceptos';
 
 const TIPOS = ['ingreso', 'egreso'] as const;
 const CLASES = ['gasto', 'movimiento'] as const;
@@ -174,6 +164,10 @@ class ConceptoDto {
   @IsOptional() @IsInt() gastoCategoriaId?: number | null;
   @IsOptional() @IsBoolean() activo?: boolean;
   @IsOptional() @IsInt() @Min(0) @Max(100000) orden?: number;
+  /** 0192: dónde se ofrece (al menos uno) y si la descripción es obligatoria. */
+  @IsOptional() @IsBoolean() enCashflow?: boolean;
+  @IsOptional() @IsBoolean() enCaja?: boolean;
+  @IsOptional() @IsBoolean() pideDetalle?: boolean;
 }
 /** Una imputación del pago a proveedor: a qué factura (o gasto cargado) y cuánto. */
 class ImputacionCfDto {
@@ -788,7 +782,9 @@ export class CashflowService {
       id: cashflowConceptos.id, nombre: cashflowConceptos.nombre, tipo: cashflowConceptos.tipo, clase: cashflowConceptos.clase,
       gastoCategoriaId: cashflowConceptos.gastoCategoriaId, activo: cashflowConceptos.activo, orden: cashflowConceptos.orden,
       gastoCategoria: gastoCategorias.nombre,
+      enCashflow: cashflowConceptos.enCashflow, enCaja: cashflowConceptos.enCaja, pideDetalle: cashflowConceptos.pideDetalle,
       usos: sql<number>`(select count(*)::int from cashflow_movimientos m where m.concepto_id = ${cashflowConceptos.id})`,
+      usosCaja: sql<number>`(select count(*)::int from caja_movimientos m where m.concepto_id = ${cashflowConceptos.id})`,
     }).from(cashflowConceptos)
       .leftJoin(gastoCategorias, eq(gastoCategorias.id, cashflowConceptos.gastoCategoriaId))
       .orderBy(asc(cashflowConceptos.tipo), asc(cashflowConceptos.orden), asc(cashflowConceptos.nombre));
@@ -807,7 +803,15 @@ export class CashflowService {
       const [cat] = await this.db.select({ id: gastoCategorias.id }).from(gastoCategorias).where(eq(gastoCategorias.id, gastoCategoriaId)).limit(1);
       if (!cat) throw new BadRequestException('Esa categoría de gasto no existe.');
     }
-    return { nombre, tipo, clase, gastoCategoriaId, activo: dto.activo ?? actual?.activo ?? true, orden: dto.orden ?? actual?.orden ?? 0 };
+    /* Dónde se ofrece (0192): la misma lista sirve al Cash Flow y a la caja de los locales. */
+    const enCashflow = dto.enCashflow ?? actual?.enCashflow ?? true;
+    const enCaja = dto.enCaja ?? actual?.enCaja ?? true;
+    if (!enCashflow && !enCaja) throw new BadRequestException('El concepto tiene que usarse en algún lado: en el Cash Flow, en la caja de los locales o en los dos.');
+    if (enCaja && esConceptoCambio(nombre)) throw new BadRequestException('Un cambio por efectivo por transferencia se usa solo en el Cash Flow (pide quién y a qué cuenta).');
+    return {
+      nombre, tipo, clase, gastoCategoriaId, activo: dto.activo ?? actual?.activo ?? true, orden: dto.orden ?? actual?.orden ?? 0,
+      enCashflow, enCaja, pideDetalle: dto.pideDetalle ?? actual?.pideDetalle ?? false,
+    };
   }
 
   async crearConcepto(dto: ConceptoDto) {
@@ -827,8 +831,10 @@ export class CashflowService {
     const v = await this.validarConcepto(dto, actual);
     /* Con movimientos registrados el tipo no cambia: un egreso no se vuelve ingreso por detrás. */
     if (v.tipo !== actual.tipo || v.clase !== actual.clase) {
-      const [n] = await this.db.select({ n: sql<number>`count(*)::int` }).from(cashflowMovimientos).where(eq(cashflowMovimientos.conceptoId, id));
-      if (Number(n?.n) > 0) throw new BadRequestException('Ese concepto ya tiene movimientos: no se le cambia el tipo ni la clase. Desactivalo y creá otro.');
+      /* Usado en el Cash Flow o en la caja de un local (0192): cualquiera de los dos lo traba. */
+      const r = await this.db.execute(sql`select (select count(*) from cashflow_movimientos where concepto_id = ${id})
+        + (select count(*) from caja_movimientos where concepto_id = ${id}) as n`);
+      if (Number((r.rows[0] as any)?.n) > 0) throw new BadRequestException('Ese concepto ya tiene movimientos: no se le cambia el tipo ni la clase. Desactivalo y creá otro.');
     }
     try {
       const [c] = await this.db.update(cashflowConceptos).set(v).where(eq(cashflowConceptos.id, id)).returning();
@@ -895,7 +901,6 @@ export class CashflowService {
     const fecha = dto.fecha ?? hoyAr();
     if (!esDia(fecha)) throw new BadRequestException('La fecha tiene que ser un día válido.');
     if (fecha > hoyAr()) throw new BadRequestException('La fecha no puede ser futura.');
-    const detalle = String(dto.detalle ?? '').trim();
     /*
      * EFECTIVO POR TRANSFERENCIA (0191, pedido del dueño): el efectivo se le da
      * a alguien y esa persona transfiere (a tu cuenta, o para pagar un gasto).
@@ -919,10 +924,9 @@ export class CashflowService {
       if (fecha < caja.fechaInicio) throw new BadRequestException(`La fecha es anterior al arranque del Cash Flow (${caja.fechaInicio}).`);
       const [c] = await tx.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, dto.conceptoId)).limit(1);
       if (!c) throw new NotFoundException('Ese concepto no existe.');
-      if (!c.activo) throw new BadRequestException('Ese concepto está desactivado.');
-      if (c.tipo !== dto.tipo) throw new BadRequestException(`«${c.nombre}» es un concepto de ${c.tipo}.`);
+      if (!c.enCashflow) throw new BadRequestException(`«${c.nombre}» es solo para la caja de los locales: elegí otro concepto.`);
+      const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
       const esGasto = c.clase === 'gasto';
-      if (esGasto && !c.gastoCategoriaId) throw new BadRequestException(`«${c.nombre}» es un concepto de gasto pero no tiene rubro: asignale uno en la pestaña Conceptos.`);
       /* Un depósito es el efectivo que llevás vos al banco: no es la transferencia de otro. */
       if (esCambio && esConceptoDeposito(c.nombre)) throw new BadRequestException(`«${c.nombre}» es un depósito: sale en efectivo. Para un cambio por transferencia elegí otro concepto.`);
       if (!esCambio && c.tipo === 'egreso' && esConceptoCambio(c.nombre)) throw new BadRequestException(`«${c.nombre}» es un cambio: escribí quién hizo la transferencia y a qué cuenta.`);
@@ -1004,7 +1008,7 @@ export class CashflowService {
       /* El depósito cargado desde «Sacar plata» se queda con su concepto (16/10/2026). */
       if (dto.conceptoId != null) {
         const [c] = await tx.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, dto.conceptoId)).limit(1);
-        if (!c || c.tipo !== 'egreso' || !c.activo || !esConceptoDeposito(c.nombre) || dto.medio !== 'deposito') {
+        if (!c || c.tipo !== 'egreso' || !c.activo || !c.enCashflow || !esConceptoDeposito(c.nombre) || dto.medio !== 'deposito') {
           throw new BadRequestException('Solo un concepto de depósito (activo) se aplica a un proveedor, y como depósito.');
         }
       }
