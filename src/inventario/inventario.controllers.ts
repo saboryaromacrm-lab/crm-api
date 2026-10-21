@@ -33,7 +33,7 @@
  * dueño es el de la Cafetería, y ese va por otro circuito (`cafeteria/`).
  */
 import {
-  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Param,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, NotFoundException, Param,
   ParseIntPipe, Patch, Post, Put, Query, Req, Res,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -50,6 +50,7 @@ import { InventarioService } from './inventario.service';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { productosSinMovimiento } from './sin-movimiento';
 import { datosBajosStock } from './bajos-stock';
+import { coherenciaStock, kardexProducto } from './kardex-consulta';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { eq, sql } from 'drizzle-orm';
 import {
@@ -362,7 +363,38 @@ export class BootstrapController {
 
 @Controller('movimientos')
 export class MovimientosController {
-  constructor(private readonly inv: InventarioService) {}
+  constructor(private readonly inv: InventarioService, @Inject(DRIZZLE) private readonly db: Database) {}
+
+  /**
+   * LA FICHA DE UN PRODUCTO (20/10/2026): todo lo que le pasó, con lo que movió
+   * cada movimiento y el saldo que dejó, y si su stock cierra. El que no es jefe
+   * ve su sucursal, como en el historial.
+   */
+  @Get('kardex')
+  @Permiso('almacen.operaciones', 'compras.historial')
+  async kardex(
+    @Auth() sesion: Sesion,
+    @Query('productoId') productoId?: string,
+    @Query('sucursalId') sucursalId?: string,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
+    @Query('tipo') tipo?: string,
+  ) {
+    const id = Number(productoId);
+    if (!Number.isInteger(id) || id <= 0) throw new BadRequestException('Elegí el producto.');
+    const r = await kardexProducto(this.db, id, {
+      sucursalId: soloSuSucursal(sesion) ?? (sucursalId ? Number(sucursalId) : null), desde, hasta, tipo,
+    });
+    if (!r) throw new NotFoundException('Ese producto no existe.');
+    return r;
+  }
+
+  /** ¿El stock de TODOS los productos se explica con sus movimientos? A pedido (lee todo). */
+  @Get('coherencia')
+  @Permiso('almacen.operaciones', 'compras.historial')
+  coherencia(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
+    return coherenciaStock(this.db, soloSuSucursal(sesion) ?? (sucursalId ? Number(sucursalId) : null));
+  }
 
   /** El historial completo del stock: solo quien tiene el libro del almacén. */
   @Get()
