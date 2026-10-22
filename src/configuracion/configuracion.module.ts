@@ -92,6 +92,13 @@ export const VENTAS_DEFAULTS = {
    */
   tiendaVistaLista: false as boolean,
   /**
+   * LA TIENDA SOLO VENDE LO QUE TIENE STOCK (22/10/2026, pedido del dueño):
+   * encendida, el sitio respeta el stock de la Distribuidora aunque las llaves
+   * generales de control (Almacén) estén apagadas; la caja sigue igual. Solo
+   * quedan sin tope los productos marcados «nunca controlar» en su ficha.
+   */
+  tiendaSoloConStock: false as boolean,
+  /**
    * TIENDA MINORISTA (0173, 16/10/2026, pedido del dueño): la misma tienda con
    * un modo Minorista a precio de mostrador (la lista base), sin compra mínima;
    * desde 0178 se ingresa con el WhatsApp. Apagado, el sitio queda solo mayorista.
@@ -927,7 +934,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  */
 const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
   [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp']), 'web.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaSoloConStock', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp']), 'web.configuracion'],
 ];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];

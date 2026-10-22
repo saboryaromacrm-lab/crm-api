@@ -598,8 +598,10 @@ export class TiendaService {
       /*
        * Sin control de stock (el propio del producto, 0129, o la llave de su
        * tipo): se ofrece siempre y sin tope (`disponible: null`), como en la caja.
+       * Con «La tienda solo vende lo que tiene stock», el sitio controla aunque
+       * la llave general esté apagada; solo el «nunca controlar» de la ficha manda.
        */
-      const sinTope = stockSinControl(cfg, p);
+      const sinTope = cfg.tiendaSoloConStock === true ? p.controlStock === false : stockSinControl(cfg, p);
       const etiquetasIds = etiquetasDe.get(p.id) ?? [];
       /**
        * Una promo por opción: la de mayor beneficio entre las que alcanzan, con
@@ -913,6 +915,9 @@ export class TiendaService {
       it.porVencer = true;
       it.venceEl = porVencer.map((o: any) => o.venceEl).filter(Boolean).sort()[0] ?? null;
     }
+
+    /* Lo que no se puede comprar, al final de cada listado (22/10/2026): el orden estable deja todo lo demás como estaba. */
+    items.sort((a, b) => Number(!a.enStock) - Number(!b.enStock));
 
     const contar = (mapa: Map<number, { id: number; nombre: string; count: number }>, id: number | null, nombre: string) => {
       if (!id || !nombre) return;
