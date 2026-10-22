@@ -1352,6 +1352,13 @@
       "when": 1792497600000,
       "tag": "0192_conceptos_caja",
       "breakpoints": true
+    },
+    {
+      "idx": 193,
+      "version": "7",
+      "when": 1792501200000,
+      "tag": "0193_asesor",
+      "breakpoints": true
     }
   ]
 }

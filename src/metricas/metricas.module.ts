@@ -45,7 +45,7 @@ import {
 import { reporteIva } from './iva';
 import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
 import { reporteProductos } from './productos';
-import { reporteStock } from './stock';
+import { reporteStock, valorizarStock } from './stock';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
 import { reporteOfertas } from './ofertas';
@@ -214,6 +214,11 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
         : (sucs.find((s) => s.tipo === 'distribuidora')?.id ?? null);
     const datos = await montosPorProveedor(this.db, this.pool, { sucursalId, ventana: Number(q.ventana) || 30 });
     return { ...datos, sucursales: sucs };
+  }
+
+  /** El stock valorizado (la misma cuenta de Montos y Stock), para el Asesor (0193): sobre el pool propio. */
+  stockValorizado(sucursalId: number | null, ventana: number) {
+    return valorizarStock(this.db, this.pool, { sucursalId, ventana });
   }
 
   async sucursales() {

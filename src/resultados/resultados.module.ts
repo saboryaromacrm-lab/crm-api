@@ -607,5 +607,7 @@ export class ResultadosController {
   imports: [MetricasModule],
   controllers: [ResultadosController],
   providers: [ResultadosService],
+  /* El Asesor (0193) lee el estado de resultados. */
+  exports: [ResultadosService],
 })
 export class ResultadosModule {}

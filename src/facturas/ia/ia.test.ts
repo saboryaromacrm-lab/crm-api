@@ -126,5 +126,6 @@ test('el costo: Haiku y Sonnet a precio oficial; un modelo desconocido, al más 
   const uso = { entrada: 5000, salida: 1800, cacheEscritura: 0, cacheLectura: 0 };
   assert.equal(costoUsd('claude-haiku-5-5', uso), 0.0014);
   assert.equal(costoUsd('claude-sonnet-5-5', uso), 0.028);
-  assert.equal(costoUsd('modelo-nuevo', uso), 0.056);
+  /* El más caro de la tabla: Opus 4.8 (respaldo del Asesor, 0193), a $5 / $25. */
+  assert.equal(costoUsd('modelo-nuevo', uso), 0.07);
 });

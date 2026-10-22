@@ -14,9 +14,12 @@ const PRECIOS: Record<string, Precio> = {
   'claude-sonnet-5-5': { entrada: 2, salida: 10, cacheEscritura: 2.5, cacheLectura: 0.10 },
   'claude-opus-5-5': { entrada: 4, salida: 20, cacheEscritura: 5, cacheLectura: 0.20 },
   'claude-haiku-4-5': { entrada: 1, salida: 5, cacheEscritura: 1.25, cacheLectura: 0.10 },
+  /* Los que pueden responder cuando el modelo principal declina (respaldo del Asesor, 0193). */
+  'claude-opus-5': { entrada: 5, salida: 25, cacheEscritura: 6.25, cacheLectura: 0.50 },
+  'claude-opus-4-8': { entrada: 5, salida: 25, cacheEscritura: 6.25, cacheLectura: 0.50 },
 };
 /** Un modelo que no está en la tabla se cuenta al precio del más caro de arriba: mejor sobrestimar el tope que pasarlo. */
-const DESCONOCIDO: Precio = PRECIOS['claude-opus-5-5'];
+const DESCONOCIDO: Precio = PRECIOS['claude-opus-4-8'];
 
 export const precioDe = (modelo: string): Precio => PRECIOS[modelo] ?? PRECIOS[modelo.replace(/-\d{8}$/, '')] ?? DESCONOCIDO;
 

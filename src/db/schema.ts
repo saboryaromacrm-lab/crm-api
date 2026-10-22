@@ -4215,3 +4215,87 @@ export const feriadoSucursales = pgTable('feriado_sucursales', {
 }, (t) => ({
   pk: primaryKey({ columns: [t.feriadoId, t.sucursalId] }),
 }));
+
+/* ============================================================================
+ * GERENCIA › ASESOR (0193): la IA que mira los números. Ver src/asesor.
+ * ========================================================================== */
+export const asesorConfig = pgTable('asesor_config', {
+  id: integer('id').primaryKey().default(1),
+  topeMensualUsd: doublePrecision('tope_mensual_usd').notNull().default(10),
+  /** Lo que el dueño escribe de su negocio: la IA lo lee siempre. */
+  ficha: text('ficha').notNull().default(''),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+/** Lo que el asesor sabe del negocio, confirmado por el dueño. */
+export const asesorAprendizajes = pgTable('asesor_aprendizajes', {
+  id: serial('id').primaryKey(),
+  texto: text('texto').notNull(),
+  activo: boolean('activo').notNull().default(true),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+export const asesorInformes = pgTable('asesor_informes', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  enfoque: text('enfoque').notNull().default(''),
+  foto: jsonb('foto').notNull(),
+  senales: jsonb('senales').notNull().default([]),
+  /** Lo que escribió la IA. NULL = no se pudo (ver `error`): la foto y las señales quedan igual. */
+  informe: jsonb('informe'),
+  modelo: text('modelo').notNull().default(''),
+  costoUsd: doublePrecision('costo_usd').notNull().default(0),
+  error: text('error').notNull().default(''),
+  /** En segundo plano: 'analizando' mientras la IA escribe, 'listo' al terminar (bien o con error). */
+  estado: text('estado').notNull().default('listo'),
+});
+/** «Útil / No aplica / Ya lo sé» de cada alerta de un informe (una por alerta). */
+export const asesorOpiniones = pgTable('asesor_opiniones', {
+  id: serial('id').primaryKey(),
+  informeId: integer('informe_id').notNull().references(() => asesorInformes.id, { onDelete: 'cascade' }),
+  alerta: integer('alerta').notNull(),
+  titulo: text('titulo').notNull(),
+  area: text('area').notNull().default(''),
+  valor: text('valor').notNull(),
+  nota: text('nota').notNull().default(''),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  uqAlerta: uniqueIndex('uq_asesor_opinion').on(t.informeId, t.alerta),
+}));
+export const asesorConversaciones = pgTable('asesor_conversaciones', {
+  id: serial('id').primaryKey(),
+  titulo: text('titulo').notNull().default(''),
+  creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadaEn: timestamp('actualizada_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+/** Cada turno de la conversación con el contenido TAL CUAL de la API: se reenvía sin tocar. */
+export const asesorMensajes = pgTable('asesor_mensajes', {
+  id: serial('id').primaryKey(),
+  conversacionId: integer('conversacion_id').notNull().references(() => asesorConversaciones.id, { onDelete: 'cascade' }),
+  rol: text('rol').notNull(),
+  contenido: jsonb('contenido').notNull(),
+  texto: text('texto').notNull().default(''),
+  herramientas: jsonb('herramientas').notNull().default([]),
+  costoUsd: doublePrecision('costo_usd').notNull().default(0),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixConv: index('ix_asesor_mensajes_conv').on(t.conversacionId, t.id),
+}));
+export const asesorUsos = pgTable('asesor_usos', {
+  id: serial('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  tarea: text('tarea').notNull(),
+  modelo: text('modelo').notNull().default(''),
+  tokensEntrada: integer('tokens_entrada').notNull().default(0),
+  tokensSalida: integer('tokens_salida').notNull().default(0),
+  tokensCacheEscritura: integer('tokens_cache_escritura').notNull().default(0),
+  tokensCacheLectura: integer('tokens_cache_lectura').notNull().default(0),
+  costoUsd: doublePrecision('costo_usd').notNull().default(0),
+  ok: boolean('ok').notNull().default(true),
+  error: text('error').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixFecha: index('ix_asesor_usos_fecha').on(t.fecha),
+}));
