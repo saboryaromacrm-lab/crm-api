@@ -65,11 +65,19 @@ import { CuponesModule, CuponesService } from '../cupones/cupones.module';
 import { finalDe, MEDIOS_TIENDA } from '../cupones/reglas';
 import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
+import { clasificarLlegada } from '../web/origen-llegada';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
 const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 /** «500 g», «1 kg», «2,5 kg»: como se lee en la etiqueta. */
+/** La llegada de una sesión (0194): canal y detalle, clasificados acá con lo que mandó el sitio. */
+const origenDe = (e: any) => {
+  const { origen, detalle } = clasificarLlegada({
+    referente: e.referente, utmSource: e.utmSource, utmMedium: e.utmMedium, utmCampaign: e.utmCampaign, clic: e.clic, meta: e.meta === true, propio: e.propio,
+  });
+  return { origen, origenDetalle: detalle || null };
+};
 const textoKg = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${String(r3(kg)).replace('.', ',')} kg`);
 
 /** Últimos N días para considerar un producto "recién reingresado" (stock de nuevo > 0). */
@@ -948,8 +956,9 @@ export class TiendaService {
   async eventos(dto: any) {
     // 'busqueda': el término va en `ruta` — qué busca la gente (y no encuentra)
     // es la lista de compras del catálogo. 'pedido': el pedido que se mandó
-    // (0179), para cerrar el embudo por sesión.
-    const TIPOS = new Set(['vista_pagina', 'vista_producto', 'agregar_carrito', 'busqueda', 'pedido']);
+    // (0179), para cerrar el embudo por sesión. 'llegada' (0194): una por sesión,
+    // de dónde vino; el canal lo decide `clasificarLlegada`, no el navegador.
+    const TIPOS = new Set(['vista_pagina', 'vista_producto', 'agregar_carrito', 'busqueda', 'pedido', 'llegada']);
     const sesion = String(dto?.sesion ?? '').slice(0, 64);
     /* El modo lo dice el navegador (0179); cualquier otra cosa cuenta como mayorista. */
     const modo: Modo = dto?.modo === 'minorista' ? 'minorista' : 'mayorista';
@@ -962,6 +971,7 @@ export class TiendaService {
       .map((e: any) => ({
         sesion,
         modo,
+        ...(e.tipo === 'llegada' ? origenDe(e) : {}),
         tipo: String(e.tipo),
         ruta: String(e.ruta ?? '').slice(0, 200),
         productoId: Number(e.productoId) > 0 ? Number(e.productoId) : null,

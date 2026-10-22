@@ -196,6 +196,8 @@ export async function tiendaOnline(f: Fuentes, dias = 30) {
       /* Mucho interés y poca compra: candidatos a revisar precio, foto o a ponerles oferta. */
       seMiranYNoSeCompran: ranking.filter((x) => x.vistas >= 20 && x.pedidos <= Math.max(1, x.vistas * 0.02)).sort((a, b) => b.vistas - a.vistas).slice(0, 10)
         .map((x) => ({ productoId: x.id, producto: x.nombre, vistas: x.vistas, alCarrito: x.carrito, pedidos: x.pedidos })),
+      /* De dónde llegan (0194): por canal, visitantes y cuántos pidieron. */
+      deDondeLlegan: (m.trafico?.origenes?.canales ?? []).map((c: any) => ({ canal: c.nombre, visitantes: c.sesiones, cargaronCarrito: c.carrito, pidieron: c.pedidos, conversionPct: c.conversion })),
       busquedasMasHechas: (m.productos?.busquedas ?? []).slice(0, 20),
       ofertasEnLaTienda: (m.ofertas?.lista ?? []).slice(0, 12).map((o: any) => ({
         oferta: o.nombre, estado: o.estado, vistas: o.vistas, alCarrito: o.carrito, pedidos: o.pedidos, total: r0(o.total), descuento: r0(o.descuento),

@@ -20,15 +20,26 @@
  *
  * Los pedidos web anteriores a la minorista (16/10/2026) no tienen
  * `modo_tienda`: cuentan como mayoristas, que es lo que eran.
+ *
+ * DE DÓNDE LLEGAN y «EMPEZAR DE 0» (0194, 22/10/2026): cada sesión trae su
+ * `llegada` (canal clasificado en origen-llegada.ts) y las métricas de un modo
+ * cuentan solo desde su último reinicio (`web_metricas_reinicios`): la
+ * telemetría anterior se borra; pedidos y clientes quedan (son ventas y
+ * fichas), pero ya no entran en los números.
  */
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import { CANALES, type Canal } from './origen-llegada';
 import { sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { PASOS, type Paso, periodos, r2, variacion } from '../metricas/consultas';
 import { ZONA_AR, sumarDias } from '../cafeteria/cuenta';
 
 export type ModoTienda = 'mayorista' | 'minorista';
-export interface FiltroTienda { modo: ModoTienda; desde: string; hasta: string; paso: Paso }
+export interface FiltroTienda {
+  modo: ModoTienda; desde: string; hasta: string; paso: Paso;
+  /** Desde cuándo cuentan las métricas de este modo (el último «Empezar de 0»); lo pone `metricas`. */
+  reinicio?: string | null;
+}
 
 const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_DIAS = 400;
@@ -68,14 +79,37 @@ export class MetricasTiendaService {
 
   /* ------------------------------ condiciones ------------------------------ */
 
+  /** Lo de antes del último «Empezar de 0» no cuenta. */
+  private desdeReinicio(f: FiltroTienda, col: any) {
+    return f.reinicio ? sql` and ${col} >= ${f.reinicio}::timestamptz` : sql``;
+  }
+
   /** Los eventos del modo en el período. */
   private eventos(f: FiltroTienda) {
-    return sql`modo = ${f.modo} and ${diaAr(sql`fecha`)} between ${f.desde}::date and ${f.hasta}::date`;
+    return sql`modo = ${f.modo} and ${diaAr(sql`fecha`)} between ${f.desde}::date and ${f.hasta}::date${this.desdeReinicio(f, sql`fecha`)}`;
   }
 
   /** Los pedidos web del modo en el período (los de antes de la minorista cuentan como mayoristas). */
   private pedidos(f: FiltroTienda) {
-    return sql`origen = 'web' and coalesce(modo_tienda, 'mayorista') = ${f.modo} and ${diaAr(sql`fecha`)} between ${f.desde}::date and ${f.hasta}::date`;
+    return sql`origen = 'web' and coalesce(modo_tienda, 'mayorista') = ${f.modo} and ${diaAr(sql`fecha`)} between ${f.desde}::date and ${f.hasta}::date${this.desdeReinicio(f, sql`fecha`)}`;
+  }
+
+  /** El último «Empezar de 0» del modo, o null. */
+  private async reinicioDe(modo: ModoTienda): Promise<string | null> {
+    const [r] = await this.q(sql`select max(fecha) as f from web_metricas_reinicios where modo = ${modo}`);
+    return r?.f ? new Date(r.f).toISOString() : null;
+  }
+
+  /**
+   * «EMPEZAR DE 0» (0194): borra la telemetría del modo y anota el reinicio;
+   * desde ahí las métricas arrancan en cero. Pedidos y clientes no se tocan.
+   */
+  async reiniciar(modo: ModoTienda, usuarioId: number | null) {
+    return this.db.transaction(async (tx) => {
+      const [b] = filas(await tx.execute(sql`with b as (delete from web_eventos where modo = ${modo} returning 1) select count(*)::int as n from b`));
+      const [r] = filas(await tx.execute(sql`insert into web_metricas_reinicios (modo, usuario_id, eventos_borrados) values (${modo}, ${usuarioId}, ${N(b?.n)}) returning fecha`));
+      return { ok: true, modo, eventosBorrados: N(b?.n), desde: new Date(r.fecha).toISOString() };
+    });
   }
 
   /** Quién compró: la ficha del cliente (mayorista) o el WhatsApp (minorista); con lo que haya. */
@@ -140,17 +174,48 @@ export class MetricasTiendaService {
     }));
   }
 
+  /**
+   * DE DÓNDE LLEGAN (0194): por canal, las sesiones que entraron y cuántas
+   * cargaron el carrito y mandaron el pedido (así se ve qué canal TRAE
+   * compradores, no solo visitas), y los sitios o campañas que más mandan.
+   * La otra pestaña de la propia tienda no es un origen: no se lista.
+   */
+  private async origenes(f: FiltroTienda) {
+    const llegadas = sql`select distinct on (sesion) sesion, coalesce(origen, 'directo') as origen, coalesce(origen_detalle, '') as detalle
+      from web_eventos where ${this.eventos(f)} and tipo = 'llegada' and sesion <> '' order by sesion, fecha`;
+    const [porCanal, porDetalle] = await Promise.all([
+      this.q(sql`with ll as (${llegadas}),
+          act as (select sesion, bool_or(tipo = 'agregar_carrito') as carrito, bool_or(tipo = 'pedido') as pedido
+            from web_eventos where ${this.eventos(f)} and sesion in (select sesion from ll) group by 1)
+        select ll.origen, count(*) as sesiones, count(*) filter (where act.carrito) as carrito, count(*) filter (where act.pedido) as pedidos
+        from ll left join act using (sesion) where ll.origen <> 'interno' group by 1 order by 2 desc`),
+      this.q(sql`with ll as (${llegadas})
+        select origen, detalle, count(*) as sesiones from ll where detalle <> '' and origen <> 'interno' group by 1, 2 order by 3 desc limit 12`),
+    ]);
+    const nombre = (c: string) => CANALES[c as Canal] ?? c;
+    const total = porCanal.reduce((a, r) => a + N(r.sesiones), 0);
+    return {
+      sesiones: total,
+      canales: porCanal.map((r) => ({
+        canal: String(r.origen), nombre: nombre(String(r.origen)), sesiones: N(r.sesiones), pct: pct(N(r.sesiones), total),
+        carrito: N(r.carrito), pedidos: N(r.pedidos), conversion: pct(N(r.pedidos), N(r.sesiones)),
+      })),
+      detalle: porDetalle.map((r) => ({ canal: String(r.origen), nombre: nombre(String(r.origen)), detalle: String(r.detalle), sesiones: N(r.sesiones) })),
+    };
+  }
+
   /** A qué hora y qué día de la semana se navega y se pide, y las páginas más vistas. */
   private async trafico(f: FiltroTienda) {
     const hora = (col: any) => sql`extract(hour from ${col} at time zone ${ZONA_AR})::int`;
     const dow = (col: any) => sql`extract(isodow from ${col} at time zone ${ZONA_AR})::int`;
-    const [horas, dias, paginas, pHoras, pDias] = await Promise.all([
+    const [horas, dias, paginas, pHoras, pDias, origenes] = await Promise.all([
       this.q(sql`select ${hora(sql`fecha`)} as k, count(*) as n from web_eventos where ${this.eventos(f)} and tipo = 'vista_pagina' group by 1`),
       this.q(sql`select ${dow(sql`fecha`)} as k, count(*) as n from web_eventos where ${this.eventos(f)} and tipo = 'vista_pagina' group by 1`),
       this.q(sql`select split_part(ruta, '?', 1) as ruta, count(*) as vistas, count(distinct sesion) as sesiones
         from web_eventos where ${this.eventos(f)} and tipo = 'vista_pagina' group by 1 order by 2 desc limit 15`),
       this.q(sql`select ${hora(sql`fecha`)} as k, count(*) as n from presupuestos where ${this.pedidos(f)} and estado <> 'cancelado' group by 1`),
       this.q(sql`select ${dow(sql`fecha`)} as k, count(*) as n from presupuestos where ${this.pedidos(f)} and estado <> 'cancelado' group by 1`),
+      this.origenes(f),
     ]);
     const serie = (rs: any[], largo: number, desde: number) => {
       const m = new Map(rs.map((r) => [N(r.k), N(r.n)]));
@@ -162,6 +227,7 @@ export class MetricasTiendaService {
       /** 7 valores, de lunes a domingo. */
       vistasPorDia: serie(dias, 7, 1), pedidosPorDia: serie(pDias, 7, 1),
       paginas: paginas.map((r) => ({ ruta: String(r.ruta || '/'), vistas: N(r.vistas), sesiones: N(r.sesiones) })),
+      origenes,
     };
   }
 
@@ -189,7 +255,7 @@ export class MetricasTiendaService {
 
   /** Los clientes del modo: altas, ingresos, quién compra, quién repite y los que más compran. */
   private async clientes(f: FiltroTienda) {
-    const rango = (col: any) => sql`${diaAr(col)} between ${f.desde}::date and ${f.hasta}::date`;
+    const rango = (col: any) => sql`${diaAr(col)} between ${f.desde}::date and ${f.hasta}::date${this.desdeReinicio(f, col)}`;
     const may = f.modo === 'mayorista';
     const [[altas], [ing], [rep], top] = await Promise.all([
       may
@@ -354,14 +420,15 @@ export class MetricasTiendaService {
 
   /* ------------------------------ la respuesta ------------------------------ */
 
-  async metricas(f: FiltroTienda) {
+  async metricas(filtro: FiltroTienda) {
+    const f: FiltroTienda = { ...filtro, reinicio: await this.reinicioDe(filtro.modo) };
     const dias = diasDe(f.desde, f.hasta);
     const antes: FiltroTienda = { ...f, desde: sumarDias(f.desde, -dias), hasta: sumarDias(f.desde, -1) };
     const [ahora, previo, serie, trafico, pedidos, clientes, productos, ofertas] = await Promise.all([
       this.sumas(f), this.sumas(antes), this.serie(f), this.trafico(f), this.detallePedidos(f), this.clientes(f), this.productos(f), this.ofertas(f),
     ]);
     return {
-      periodo: { modo: f.modo, desde: f.desde, hasta: f.hasta, paso: f.paso, dias, antes: { desde: antes.desde, hasta: antes.hasta } },
+      periodo: { modo: f.modo, desde: f.desde, hasta: f.hasta, paso: f.paso, dias, antes: { desde: antes.desde, hasta: antes.hasta }, reinicio: f.reinicio },
       resumen: {
         visitas: cmp(ahora.vistas, previo.vistas),
         sesiones: cmp(ahora.sesiones, previo.sesiones),

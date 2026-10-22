@@ -2826,11 +2826,29 @@ export const webEventos = pgTable('web_eventos', {
   /** Con qué oferta estaba publicado el producto en ese momento (0180); lo pone el servidor. Sin FK: la oferta se puede borrar. */
   ofertaId: integer('oferta_id'),
   segundos: doublePrecision('segundos').notNull().default(0),
+  /** Solo en `llegada` (0194): el canal por el que entró la sesión (lo clasifica el servidor, ver web/origen-llegada.ts). */
+  origen: text('origen'),
+  /** Solo en `llegada` (0194): el sitio que la mandó o la campaña. */
+  origenDetalle: text('origen_detalle'),
 }, (t) => ({
   ixFecha: index('ix_web_eventos_fecha').on(t.fecha),
   ixModoFecha: index('ix_web_eventos_modo_fecha').on(t.modo, t.fecha),
   ixProducto: index('ix_web_eventos_producto').on(t.productoId),
   ixOferta: index('ix_web_eventos_oferta').on(t.ofertaId).where(sql`oferta_id is not null`),
+}));
+
+/**
+ * «EMPEZAR DE 0» LAS MÉTRICAS DE UNA TIENDA (0194): una fila por cada vez. Las
+ * métricas de ese modo cuentan desde la última; la telemetría anterior se borra.
+ */
+export const webMetricasReinicios = pgTable('web_metricas_reinicios', {
+  id: serial('id').primaryKey(),
+  modo: text('modo').$type<'mayorista' | 'minorista'>().notNull(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  eventosBorrados: integer('eventos_borrados').notNull().default(0),
+}, (t) => ({
+  ixModo: index('ix_web_metricas_reinicios_modo').on(t.modo, t.fecha),
 }));
 
 /**

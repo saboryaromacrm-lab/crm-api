@@ -229,6 +229,19 @@ export class WebController {
   @Permiso('web.estadisticas')
   metricas(@Query() q: Record<string, any>) { return this.metricasTienda.metricas(filtroTienda(q)); }
 
+  /**
+   * «Empezar de 0» las métricas de una tienda (0194): borra su telemetría y
+   * las métricas cuentan desde ahora. Solo el superadmin, y confirmado dos veces.
+   */
+  @Post('metricas/reiniciar')
+  @Permiso('web.estadisticas')
+  reiniciarMetricas(@Body() body: any, @Auth() sesion: Sesion) {
+    if (!sesion?.permisos?.includes('*')) throw new ForbiddenException('Empezar de 0 las métricas es exclusivo del superadmin.');
+    if (body?.confirmado !== true) throw new BadRequestException('Falta confirmar.');
+    const { modo } = filtroTienda({ modo: body?.modo });
+    return this.metricasTienda.reiniciar(modo, sesion?.usuarioId ?? null);
+  }
+
   /** Cómo se ve un producto en cada tienda (Compras › Productos › pestaña Tienda online). */
   @Get('productos/:id')
   @Permiso('compras.productos')
