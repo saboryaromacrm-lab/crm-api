@@ -12,6 +12,9 @@
  *     (`stock_controlado`, 0159), para el filtro «solo controlados».
  *   · la regla: días de venta a cubrir y el % de productos en falta que pone
  *     rojo a un proveedor (Almacén › Configuración).
+ *   · a qué proveedores YA SE LES PIDIÓ (22/10/2026, pedido del dueño): la
+ *     tarjeta de Proveedores › Pedidos en «Pedido», o en «Solicitado» con el
+ *     pedido ya mandado. Cuando llega (Recibido), vuelve a contar.
  *
  * Una consulta agregada por el índice de fecha de ventas: no pesa.
  */
@@ -28,7 +31,7 @@ const entre = (n: unknown, min: number, max: number, def: number) => {
 export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: number | null) {
   const suc = sucursalId != null ? sql`AND v.sucursal_id = ${sucursalId}` : sql``;
   const desde = new Date(Date.now() - DIAS_VENTA * 86_400_000);
-  const [ventas, controlados]: any[] = await Promise.all([
+  const [ventas, controlados, pedidos]: any[] = await Promise.all([
     db.execute(sql`
       SELECT vi.producto_id AS "productoId",
              SUM(CASE WHEN v.tipo::text LIKE 'nota_credito%' THEN -1 ELSE 1 END
@@ -44,6 +47,11 @@ export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: 
     db.execute(sql`
       SELECT DISTINCT producto_id AS "productoId" FROM stock_controlado
        ${sucursalId != null ? sql`WHERE sucursal_id = ${sucursalId}` : sql``}`),
+    db.execute(sql`
+      SELECT proveedor_id AS "proveedorId", MAX(COALESCE(fecha_pedido, fecha_alta)) AS fecha
+        FROM pedidos_proveedor
+       WHERE estado = 'pedido' OR (estado = 'solicitado' AND pedido_enviado)
+       GROUP BY proveedor_id`),
   ]);
   const filas = (r: any) => (r.rows ?? r) as any[];
   return {
@@ -54,5 +62,7 @@ export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: 
     /** [productoId, cantidad vendida en la ventana] — compacto: pueden ser miles. */
     ventas: filas(ventas).filter((x) => Number(x.cantidad) > 0).map((x) => [x.productoId, Math.round(Number(x.cantidad) * 1000) / 1000]),
     controlados: filas(controlados).map((x) => x.productoId),
+    /** [proveedorId, desde cuándo está pedido] de los pedidos en curso. */
+    pedidos: filas(pedidos).map((x) => [x.proveedorId, new Date(x.fecha).toISOString()]),
   };
 }
