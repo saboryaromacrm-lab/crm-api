@@ -420,6 +420,28 @@ export class GastosService {
       .orderBy(asc(gastoCategorias.orden), asc(gastoCategorias.nombre));
   }
 
+  /**
+   * LOS CONCEPTOS YA USADOS (22/10/2026, pedido del dueño: «que me guarde los
+   * ítems así no los escribo cada vez que compro»). No hay lista aparte que
+   * mantener: sale de los renglones de los gastos cargados (sin los anulados),
+   * uno por concepto sin importar mayúsculas ni espacios, escrito como se lo
+   * escribió más veces. Primero los de ESE proveedor, después los más usados.
+   */
+  async conceptosUsados(proveedorId: number | null) {
+    const r = await this.db.execute(sql`
+      WITH escrito AS (
+        SELECT lower(trim(i.concepto)) AS clave, trim(i.concepto) AS texto, count(*) AS veces,
+               count(*) FILTER (WHERE g.proveedor_id = ${proveedorId}) AS del_proveedor, max(g.fecha) AS ultima
+          FROM gasto_items i JOIN gastos g ON g.id = i.gasto_id
+         WHERE g.estado <> 'anulado' AND trim(i.concepto) <> ''
+         GROUP BY 1, 2)
+      SELECT (array_agg(texto ORDER BY veces DESC, ultima DESC))[1] AS concepto
+        FROM escrito GROUP BY clave
+       ORDER BY sum(del_proveedor) DESC, sum(veces) DESC, max(ultima) DESC
+       LIMIT 500`);
+    return ((r as any).rows ?? r).map((x: any) => String(x.concepto));
+  }
+
   async crearCategoria(dto: CategoriaDto) {
     const nombre = (dto.nombre ?? '').trim();
     if (!nombre) throw new BadRequestException('Poné el nombre del rubro.');
@@ -1590,6 +1612,10 @@ export class GastosController {
   // Leer el plan de rubros lo necesita cualquier pantalla del módulo (el
   // selector del formulario); ADMINISTRARLO es su propia sección.
   @Get('categorias') categorias() { return this.svc.listCategorias(); }
+  /* Los que carga gastos: para sugerirle lo que ya escribió alguna vez. */
+  @Get('conceptos') @Permiso('gastos.gastos') conceptos(@Query('proveedorId') proveedorId?: string) {
+    return this.svc.conceptosUsados(Number(proveedorId) > 0 ? Number(proveedorId) : null);
+  }
   @Post('categorias') @Permiso('gastos.categorias') crearCategoria(@Body() dto: CategoriaDto) {
     return this.svc.crearCategoria(dto);
   }
