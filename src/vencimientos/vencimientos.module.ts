@@ -921,5 +921,7 @@ export class VencimientosController {
   imports: [InventarioModule, OfertasModule, ConfiguracionModule, ListasModule],
   providers: [VencimientosService, ReglasVencimientoService],
   controllers: [VencimientosController],
+  /* El Asesor comercial (0193) cotiza con el mismo precio y costo de cada artículo. */
+  exports: [ReglasVencimientoService],
 })
 export class VencimientosModule {}

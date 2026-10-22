@@ -8,17 +8,13 @@
  *   · el mes anterior completo y el actual en Resultados.
  * Cada parte se arma por separado: si una falla, va su error y el resto sigue.
  */
-import type { Fuentes } from './datos';
+import type { Fuentes } from '../datos';
 import {
   caja, comparar, contexto, costosQueSubieron, fraccionado, gastos, granelYEnteros, mismosDiasMesAnterior, ofertas, paquetes, periodo,
-  rentabilidad, resultados, stock, ultimosDias, ventas,
-} from './datos';
-import { hoyAr } from '../cafeteria/cuenta';
+  rentabilidad, resultados, seguro, stock, ultimosDias, ventas,
+} from '../datos';
+import { hoyAr } from '../../cafeteria/cuenta';
 
-/** Una parte que falla no tumba la foto: queda su error, para que la IA sepa que falta. */
-async function seguro<T>(fn: () => Promise<T>): Promise<T | { error: string }> {
-  try { return await fn(); } catch (e) { return { error: String((e as Error)?.message ?? e).slice(0, 200) }; }
-}
 
 const mesDe = (d: string) => d.slice(0, 7);
 const mesAntes = (m: string) => { const [y, mm] = m.split('-').map(Number); return mm === 1 ? `${y - 1}-12` : `${y}-${String(mm - 1).padStart(2, '0')}`; };

@@ -99,6 +99,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'ventas.caja', nombre: 'Caja' },
       { clave: 'ventas.listas', nombre: 'Formato de venta' },
       { clave: 'ventas.ofertas', nombre: 'Ofertas' },
+      /* 0193: la IA de ofertas, combos, fechas comerciales, tienda online y vencimientos. */
+      { clave: 'ventas.asesor', nombre: 'Asesor comercial (IA)' },
       { clave: 'ventas.cambios', nombre: 'Cambios de precio' },
       { clave: 'ventas.configuracion', nombre: 'Configuración de ventas' },
     ],

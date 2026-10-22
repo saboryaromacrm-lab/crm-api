@@ -1,5 +1,5 @@
 /**
- * GERENCIA › ASESOR · LA IA (0193)
+ * LOS ASESORES · LA IA (0193)
  * ============================================================================
  * Con la librería oficial de Anthropic. La clave es la misma de la lectura de
  * facturas (`ANTHROPIC_API_KEY`, solo en el servidor). El modelo: Claude Opus
@@ -7,15 +7,15 @@
  * la reintenta sola con otro modelo (respaldo del servidor, `fallbacks`).
  *
  *   · analizar: UNA llamada con la foto entera; la respuesta sale con FORMATO
- *     FIJO (JSON Schema), así la pantalla siempre sabe qué mostrar.
- *   · responder: la conversación; la IA llama a las herramientas (solo lectura)
- *     hasta tener los números, y contesta. Cada turno se guarda TAL CUAL lo
- *     devolvió la API y se reenvía sin tocar.
+ *     FIJO (el JSON Schema del especialista), así la pantalla sabe qué mostrar.
+ *   · responder: la conversación; la IA llama a las herramientas del
+ *     especialista (solo lectura) hasta tener los números, y contesta. Cada
+ *     turno se guarda TAL CUAL lo devolvió la API y se reenvía sin tocar.
  */
 import Anthropic from '@anthropic-ai/sdk';
-import { IA } from '../facturas/ia/anthropic';
-import { costoUsd } from '../facturas/ia/precios';
-import { HERRAMIENTAS } from './herramientas';
+import { IA } from '../../facturas/ia/anthropic';
+import { costoUsd } from '../../facturas/ia/precios';
+import type { Especialidad } from './especialidad';
 
 export const MODELO_ASESOR = () => (process.env.ANTHROPIC_MODELO_ASESOR || 'claude-opus-5-5').trim();
 /** El respaldo del servidor cuando Claude declina (elige el modelo según el motivo). */
@@ -61,102 +61,44 @@ function llamada(r: Anthropic.Beta.BetaMessage): Llamada {
   return { modelo: r.model, uso, costo: costoUsd(r.model, uso) };
 }
 
-/* ============================== QUIÉN ES ============================== */
-
-const NEGOCIO = `Sos el asesor de negocio de «Sabor y Aroma», una distribuidora y cadena de locales de alimentos de Formosa (Argentina). Trabajás para el dueño: le leés los números de su sistema (un ERP propio) y le decís, como un socio que sabe de números, qué está pasando, qué te parece raro y qué haría.
-
-Cómo es el negocio (lo que no dice la ficha del dueño):
-- Vende productos ENTEROS (por unidad: envasados, bebidas…) y mucho GRANEL: se compra por kg en bolsas grandes y se vende SUELTO por peso o FRACCIONADO en paquetes de distintos tamaños (100 g, 250 g, 500 g, 1 kg…). Hay listas de precios minorista y mayorista.
-- Fraccionar: un colaborador arma paquetes; el sistema descuenta esos kg del granel suelto y suma los paquetes. El costo de un paquete es el costo por kg × el tamaño, agrandado por una merma fija por producto. Si al contar faltan paquetes, se corrigen como «faltante» y se dan de baja: es la señal más directa de pérdida en el fraccionado. Un paquete chico tendría que salir más caro por kg que uno grande; si no, se regala margen.
-- El precio puede seguir solo al costo (con markup) o ser un precio fijo: con precio fijo, si el costo sube y nadie cambia el precio, el margen se come.
-- Cada local cierra la caja contando billetes; la diferencia contra lo que esperaba el sistema es faltante (negativa) o sobrante.
-- Coffit es la cafetería: va aparte, no la mezcles con la distribuidora.
-
-Cómo leer los números:
-- Importes en pesos argentinos y NETOS (sin IVA), salvo los que dicen «conIva». Granel en kg.
-- Margen = venta − costo de lo vendido, solo sobre los renglones con costo cargado; «ventaSinCosto» es lo que quedó afuera.
-- Una «variación» es en % contra el período con el que se compara; los márgenes se comparan en puntos.
-- Las «señales» son reglas fijas que ya corrió el sistema: no las repitas tal cual; explicá por qué pasan, cuánto pesan en plata y sumá lo que las reglas no ven (cruces entre ventas, márgenes, stock, granel, caja y gastos).
-
-Cómo escribís:
-- En castellano rioplatense, de vos, directo, sin relleno ni frases de cortesía. Honesto: si algo está mal, decilo; si está bien, decilo en una línea y seguí.
-- SOLO usás números que estén en los datos, y los citás. Nunca inventes un número ni lo estimes como si fuera dato; si algo no se puede saber con estos datos, decilo y decí qué dato faltaría.
-- Priorizás por plata: lo que más pesos cuesta o deja, primero. Pocas cosas importantes valen más que muchas obvias.
-- Cada recomendación es una acción concreta que el dueño o su equipo puedan hacer esta semana, y dónde en el sistema (por ejemplo Gerencia › Métricas, Gerencia › Resultados, Ventas › Caja, Almacén › Existencias, el historial de fraccionamiento, Compras › Productos, Gastos). Si no estás seguro del nombre de la pantalla, nombrá el área.
-- Respetás lo que el dueño ya te dijo: lo que marcó como «No aplica» o «Ya lo sé» no lo repetís, salvo que haya empeorado (y entonces decís que empeoró).`;
-
-/* ============================== EL INFORME ============================== */
-
-const AREAS = ['ventas', 'rentabilidad', 'granel', 'stock', 'precios', 'caja', 'gastos', 'resultados', 'ofertas', 'datos'];
-const lista = (items: object, description: string) => ({ type: 'array', items, description });
-const cadena = (description: string) => ({ type: 'string', description });
-
-export const ESQUEMA_INFORME = {
-  type: 'object', additionalProperties: false,
-  required: ['estado', 'resumen', 'alertas', 'granel', 'preguntas', 'aprendizajesSugeridos'],
-  properties: {
-    estado: { type: 'string', enum: ['bien', 'atencion', 'problema'], description: 'Cómo está el negocio en general.' },
-    resumen: cadena('Dos a cuatro frases: lo más importante, para leer en veinte segundos.'),
-    alertas: lista({
-      type: 'object', additionalProperties: false,
-      required: ['prioridad', 'area', 'titulo', 'quePasa', 'porQueImporta', 'queHacer', 'numeros', 'dondeVerlo'],
-      properties: {
-        prioridad: { type: 'string', enum: ['urgente', 'mirar', 'oportunidad', 'dato'] },
-        area: { type: 'string', enum: AREAS },
-        titulo: cadena('Una línea, concreta.'),
-        quePasa: cadena('Qué pasa, con los números.'),
-        porQueImporta: cadena('Por qué importa, en plata si se puede.'),
-        queHacer: cadena('Qué haría, concreto y para esta semana.'),
-        numeros: lista({ type: 'string' }, 'Los números de los datos en que se apoya, tal cual (con su unidad).'),
-        dondeVerlo: cadena('Dónde lo comprueba en el sistema.'),
-      },
-    }, 'Hasta 8, de la más importante a la menos.'),
-    granel: {
-      type: 'object', additionalProperties: false, required: ['resumen', 'fraccionar', 'revisar'],
-      properties: {
-        resumen: cadena('Cómo viene el granel y el fraccionado, en dos o tres frases.'),
-        fraccionar: lista({
-          type: 'object', additionalProperties: false, required: ['producto', 'tamano', 'motivo'],
-          properties: { producto: { type: 'string' }, tamano: { type: 'string' }, motivo: { type: 'string' } },
-        }, 'Qué conviene fraccionar ya (hasta 10), con el motivo.'),
-        revisar: lista({ type: 'string' }, 'Precios por tamaño, sobrefraccionado, faltantes o colaboradores a revisar (hasta 6).'),
-      },
-    },
-    preguntas: lista({ type: 'string' }, 'Hasta 3 preguntas al dueño cuya respuesta te ayudaría a entender mejor el negocio.'),
-    aprendizajesSugeridos: lista({ type: 'string' }, 'Hasta 3 cosas del negocio que convendría recordar (el dueño las confirma), escritas como un hecho.'),
-  },
-};
+/* ============================== LO QUE EL DUEÑO YA DIJO ============================== */
 
 export interface Contexto {
+  /** La ficha de este especialista. */
   ficha: string;
+  /** La ficha general del negocio (la del asesor de negocio), si este especialista es otro. */
+  fichaNegocio?: string;
   aprendizajes: string[];
   opiniones: { titulo: string; area: string; valor: string; nota: string; fecha: string }[];
 }
 
 const bloqueContexto = (x: Contexto) => [
-  `<ficha_del_duenio>\n${x.ficha.trim() || '(El dueño todavía no escribió nada de su negocio.)'}\n</ficha_del_duenio>`,
+  ...(x.fichaNegocio?.trim() ? [`<ficha_general_del_negocio>\n${x.fichaNegocio.trim()}\n</ficha_general_del_negocio>`] : []),
+  `<ficha_del_duenio>\n${x.ficha.trim() || '(El dueño todavía no escribió nada para vos.)'}\n</ficha_del_duenio>`,
   `<lo_que_ya_sabes>\n${x.aprendizajes.length ? x.aprendizajes.map((a) => `- ${a}`).join('\n') : '(Nada todavía.)'}\n</lo_que_ya_sabes>`,
   `<opiniones_del_duenio_sobre_alertas_anteriores>\n${x.opiniones.length ? JSON.stringify(x.opiniones) : '(Ninguna todavía.)'}\n</opiniones_del_duenio_sobre_alertas_anteriores>`,
 ].join('\n\n');
 
-export async function analizar(o: { foto: unknown; senales: unknown; contexto: Contexto; enfoque: string }): Promise<{ informe: any; llamada: Llamada }> {
+/* ============================== EL INFORME ============================== */
+
+export async function analizar(esp: Especialidad, o: { foto: unknown; senales: unknown; contexto: Contexto; enfoque: string }): Promise<{ informe: any; llamada: Llamada }> {
   const mensaje = [
     bloqueContexto(o.contexto),
     `<senales_del_sistema>\n${JSON.stringify(o.senales)}\n</senales_del_sistema>`,
     `<foto_del_negocio>\n${JSON.stringify(o.foto)}\n</foto_del_negocio>`,
     o.enfoque.trim()
       ? `El dueño pidió que mires especialmente: «${o.enfoque.trim()}». Respondé eso primero, sin dejar afuera lo urgente.`
-      : 'Hacé el análisis completo del negocio.',
-    'Escribí el informe con el formato pedido. Revisá antes de terminar que cada número que citás esté en los datos.',
+      : 'Hacé el análisis completo.',
+    esp.pedidoInforme,
   ].join('\n\n');
   let r: Anthropic.Beta.BetaMessage;
   try {
     r = await ia().beta.messages.stream({
       model: MODELO_ASESOR(),
       max_tokens: 32000,
-      system: NEGOCIO,
+      system: esp.quienEs,
       messages: [{ role: 'user', content: mensaje }],
-      output_config: { effort: 'high', format: { type: 'json_schema', schema: ESQUEMA_INFORME } },
+      output_config: { effort: 'high', format: { type: 'json_schema', schema: esp.esquemaInforme } },
       ...RESPALDO,
     }).finalMessage();
   } catch (e) { throw explicar(e); }
@@ -173,10 +115,10 @@ export async function analizar(o: { foto: unknown; senales: unknown; contexto: C
 
 /* ============================== LAS PREGUNTAS ============================== */
 
-export function sistemaPreguntas(x: Contexto & { hoy: string; sucursales: { id: number; nombre: string }[]; ultimoInforme: string }) {
-  return `${NEGOCIO}
+export function sistemaPreguntas(esp: Especialidad, x: Contexto & { hoy: string; sucursales: { id: number; nombre: string }[]; ultimoInforme: string }) {
+  return `${esp.quienEs}
 
-Ahora el dueño te hace preguntas. Para responder con números usás las herramientas: consultan el sistema en el momento y son de solo lectura. Nunca supongas un número que podés consultar; si una herramienta no tiene el dato, decilo. Si la pregunta es ambigua (qué período, qué local), elegí lo razonable, decí qué elegiste y respondé. Respuestas cortas y al grano: primero la respuesta, después el detalle que la sostiene; tablas chicas en markdown solo si ayudan.
+Ahora el dueño te hace preguntas. Para responder con números usás las herramientas: consultan el sistema en el momento y son de solo lectura. Nunca supongas un número que podés consultar; si una herramienta no tiene el dato, decilo. Si la pregunta es ambigua (qué período, qué local), elegí lo razonable, decí qué elegiste y respondé. Respuestas cortas y al grano: primero la respuesta, después el detalle que la sostiene; tablas chicas en markdown solo si ayudan. ${esp.enPreguntas}
 
 Hoy es ${x.hoy}. Sucursales activas (id: nombre): ${x.sucursales.map((s) => `${s.id}: ${s.nombre}`).join(', ')}.
 
@@ -200,7 +142,7 @@ export interface Turno { rol: 'user' | 'assistant'; contenido: Anthropic.Beta.Be
  * guardarlos tal cual. `puedeGastar` se pregunta antes de cada llamada (tope).
  */
 export async function responder(o: {
-  sistema: string; historial: Anthropic.Beta.BetaMessageParam[]; pregunta: string;
+  sistema: string; herramientas: Anthropic.Beta.BetaTool[]; historial: Anthropic.Beta.BetaMessageParam[]; pregunta: string;
   ejecutar: (nombre: string, input: unknown) => Promise<unknown>;
   puedeGastar: () => Promise<boolean>;
   alLlamar: (l: Llamada, ok: boolean, error?: string) => Promise<void>;
@@ -208,7 +150,7 @@ export async function responder(o: {
   const nuevos: Turno[] = [{ rol: 'user', contenido: o.pregunta, texto: o.pregunta, herramientas: [], llamada: null }];
   const mensajes: Anthropic.Beta.BetaMessageParam[] = [...o.historial, { role: 'user', content: o.pregunta }];
   for (let vuelta = 0; vuelta < MAX_VUELTAS; vuelta++) {
-    if (!(await o.puedeGastar())) throw new ErrorAsesor('Se llegó al tope de gasto del mes del asesor. Subilo en «Configuración» del Asesor si querés seguir.');
+    if (!(await o.puedeGastar())) throw new ErrorAsesor('Se llegó al tope de gasto del mes de este asesor. Subilo en «Configuración» si querés seguir.');
     const ultima = vuelta === MAX_VUELTAS - 1;
     let r: Anthropic.Beta.BetaMessage;
     try {
@@ -216,7 +158,7 @@ export async function responder(o: {
         model: MODELO_ASESOR(),
         max_tokens: 16000,
         system: o.sistema,
-        tools: HERRAMIENTAS,
+        tools: o.herramientas,
         /* En la última vuelta no hay más herramientas: contesta con lo que juntó. */
         ...(ultima ? { tool_choice: { type: 'none' as const } } : {}),
         messages: mensajes,

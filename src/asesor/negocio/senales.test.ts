@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { detectar } from './senales';
-import { mismosDiasMesAnterior } from './datos';
+import { mismosDiasMesAnterior } from '../datos';
 
 const AHORA = new Date('2026-10-21T15:00:00-03:00');
 const base = () => ({

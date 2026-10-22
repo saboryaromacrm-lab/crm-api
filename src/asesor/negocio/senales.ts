@@ -6,8 +6,7 @@
  * punto de partida (no tiene que «descubrirlo», tiene que explicarlo).
  * Funciones puras: se prueban sin base (senales.test.ts).
  */
-export type Nivel = 'urgente' | 'mirar' | 'dato';
-export interface Senal { nivel: Nivel; area: string; titulo: string; detalle: string }
+import type { Nivel, Senal } from '../nucleo/especialidad';
 
 /** Los umbrales, juntos y con nombre: si el dueño quiere más o menos sensibilidad, se toca acá. */
 export const UMBRALES = {
@@ -25,16 +24,21 @@ const nombres = (xs: any[], k: string, n = 4) => xs.slice(0, n).map((x) => x[k])
 const dia = (iso: string) => Number(iso.slice(8, 10));
 const diasDelMes = (iso: string) => { const [y, m] = iso.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).getUTCDate(); };
 
+/** Los números de ventas (Métricas) sin sincronizar hace horas: lo de hoy puede faltar. La usan los dos especialistas. */
+export function metricasViejas(foto: any, ahora = new Date()): Senal | null {
+  const al = foto?.contexto?.metricasAl ? new Date(foto.contexto.metricasAl).getTime() : null;
+  if (al != null && ahora.getTime() - al <= UMBRALES.metricasViejasHoras * 3600_000) return null;
+  return { nivel: 'dato', area: 'datos', titulo: 'Los números de ventas no están al día', detalle: 'Métricas no se sincronizó en las últimas horas: lo de hoy puede faltar. Apretá «Sincronizar» en Gerencia › Métricas.' };
+}
+
 export function detectar(foto: any, ahora = new Date()): Senal[] {
   const s: Senal[] = [];
   const U = UMBRALES;
   const hoy: string = foto?.contexto?.hoy ?? ahora.toISOString().slice(0, 10);
 
   /* Datos */
-  const al = foto?.contexto?.metricasAl ? new Date(foto.contexto.metricasAl).getTime() : null;
-  if (al == null || ahora.getTime() - al > U.metricasViejasHoras * 3600_000) {
-    s.push({ nivel: 'dato', area: 'datos', titulo: 'Los números de ventas no están al día', detalle: 'Métricas no se sincronizó en las últimas horas: lo de hoy puede faltar. Apretá «Sincronizar» en Gerencia › Métricas.' });
-  }
+  const viejas = metricasViejas(foto, ahora);
+  if (viejas) s.push(viejas);
 
   /* Ventas del mes */
   const v = foto?.ventasDelMes;

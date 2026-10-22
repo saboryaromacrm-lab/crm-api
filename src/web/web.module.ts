@@ -262,6 +262,8 @@ export class WebController {
   imports: [TiendaModule],
   controllers: [WebController],
   providers: [WebService, MetricasTiendaService],
+  /* El Asesor comercial (0193) lee las métricas de la tienda. */
+  exports: [MetricasTiendaService],
 })
 export class WebModule {}
 

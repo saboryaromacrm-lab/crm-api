@@ -4217,18 +4217,20 @@ export const feriadoSucursales = pgTable('feriado_sucursales', {
 }));
 
 /* ============================================================================
- * GERENCIA › ASESOR (0193): la IA que mira los números. Ver src/asesor.
+ * LOS ASESORES (0193): IAs que miran los números. Ver src/asesor.
+ * `especialidad`: 'negocio' (Gerencia › Asesor) o 'comercial' (Ventas › Asesor comercial).
  * ========================================================================== */
 export const asesorConfig = pgTable('asesor_config', {
-  id: integer('id').primaryKey().default(1),
+  especialidad: text('especialidad').primaryKey(),
   topeMensualUsd: doublePrecision('tope_mensual_usd').notNull().default(10),
-  /** Lo que el dueño escribe de su negocio: la IA lo lee siempre. */
+  /** Lo que el dueño escribe de su negocio para este especialista: la IA lo lee siempre. */
   ficha: text('ficha').notNull().default(''),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });
 /** Lo que el asesor sabe del negocio, confirmado por el dueño. */
 export const asesorAprendizajes = pgTable('asesor_aprendizajes', {
   id: serial('id').primaryKey(),
+  especialidad: text('especialidad').notNull(),
   texto: text('texto').notNull(),
   activo: boolean('activo').notNull().default(true),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
@@ -4236,19 +4238,22 @@ export const asesorAprendizajes = pgTable('asesor_aprendizajes', {
 });
 export const asesorInformes = pgTable('asesor_informes', {
   id: serial('id').primaryKey(),
+  especialidad: text('especialidad').notNull(),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   enfoque: text('enfoque').notNull().default(''),
   foto: jsonb('foto').notNull(),
   senales: jsonb('senales').notNull().default([]),
-  /** Lo que escribió la IA. NULL = no se pudo (ver `error`): la foto y las señales quedan igual. */
+  /** Lo que escribió la IA. NULL = todavía no, o no se pudo (ver `error`): la foto y las señales quedan igual. */
   informe: jsonb('informe'),
   modelo: text('modelo').notNull().default(''),
   costoUsd: doublePrecision('costo_usd').notNull().default(0),
   error: text('error').notNull().default(''),
   /** En segundo plano: 'analizando' mientras la IA escribe, 'listo' al terminar (bien o con error). */
   estado: text('estado').notNull().default('listo'),
-});
+}, (t) => ({
+  ixEsp: index('ix_asesor_informes_esp').on(t.especialidad, t.id),
+}));
 /** «Útil / No aplica / Ya lo sé» de cada alerta de un informe (una por alerta). */
 export const asesorOpiniones = pgTable('asesor_opiniones', {
   id: serial('id').primaryKey(),
@@ -4263,13 +4268,27 @@ export const asesorOpiniones = pgTable('asesor_opiniones', {
 }, (t) => ({
   uqAlerta: uniqueIndex('uq_asesor_opinion').on(t.informeId, t.alerta),
 }));
+/** Lo que se hizo con una propuesta del asesor comercial: la oferta que se creó (una vez). */
+export const asesorAcciones = pgTable('asesor_acciones', {
+  id: serial('id').primaryKey(),
+  informeId: integer('informe_id').notNull().references(() => asesorInformes.id, { onDelete: 'cascade' }),
+  propuesta: integer('propuesta').notNull(),
+  ofertaId: integer('oferta_id').references(() => ofertas.id, { onDelete: 'set null' }),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  uqPropuesta: uniqueIndex('uq_asesor_accion').on(t.informeId, t.propuesta),
+}));
 export const asesorConversaciones = pgTable('asesor_conversaciones', {
   id: serial('id').primaryKey(),
+  especialidad: text('especialidad').notNull(),
   titulo: text('titulo').notNull().default(''),
   creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadaEn: timestamp('actualizada_en', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
-});
+}, (t) => ({
+  ixEsp: index('ix_asesor_conv_esp').on(t.especialidad, t.actualizadaEn),
+}));
 /** Cada turno de la conversación con el contenido TAL CUAL de la API: se reenvía sin tocar. */
 export const asesorMensajes = pgTable('asesor_mensajes', {
   id: serial('id').primaryKey(),
@@ -4285,6 +4304,7 @@ export const asesorMensajes = pgTable('asesor_mensajes', {
 }));
 export const asesorUsos = pgTable('asesor_usos', {
   id: serial('id').primaryKey(),
+  especialidad: text('especialidad').notNull(),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   tarea: text('tarea').notNull(),
   modelo: text('modelo').notNull().default(''),
@@ -4297,5 +4317,15 @@ export const asesorUsos = pgTable('asesor_usos', {
   error: text('error').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
-  ixFecha: index('ix_asesor_usos_fecha').on(t.fecha),
+  ixEsp: index('ix_asesor_usos_esp').on(t.especialidad, t.fecha),
 }));
+/** Las fechas propias del asesor comercial; `anual` = se repite cada año en el mismo día y mes. */
+export const asesorFechas = pgTable('asesor_fechas', {
+  id: serial('id').primaryKey(),
+  fecha: date('fecha').notNull(),
+  nombre: text('nombre').notNull(),
+  nota: text('nota').notNull().default(''),
+  anual: boolean('anual').notNull().default(true),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});

@@ -20,26 +20,55 @@ import type { PoolClient } from 'pg';
 import type { MetricasService } from '../metricas/metricas.module';
 import type { ResultadosService } from '../resultados/resultados.module';
 import type { GastosService } from '../gastos/gastos.module';
+import type { CuponesService } from '../cupones/cupones.module';
+import type { MetricasTiendaService } from '../web/metricas-tienda';
+import type { ReglasVencimientoService } from '../vencimientos/reglas.service';
 import {
   type Filtro, type Lente, N, r2, pct, variacion, reporteVentas, reporteMargenes, sumaMargen, reporteGranel, reporteComparar,
 } from '../metricas/consultas';
 import { reporteOfertas } from '../metricas/ofertas';
 import { hoyAr, sumarDias } from '../cafeteria/cuenta';
 
+/** Los servicios que leen los asesores (los arma el módulo: token `FUENTES`). */
 export interface Fuentes {
   metricas: MetricasService;
   resultados: ResultadosService;
   gastos: GastosService;
+  cupones: CuponesService;
+  tienda: MetricasTiendaService;
+  /** Precio de cada lista y costo real de hoy, por artículo: los mismos de la caja. */
+  precios: ReglasVencimientoService;
 }
+export const FUENTES = 'ASESOR_FUENTES';
 
 const ZONA = 'America/Argentina/Buenos_Aires';
 const r1 = (n: number) => Math.round((Number(n) || 0) * 10) / 10;
 const r0 = (n: number) => Math.round(Number(n) || 0);
 const DIAS = ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'];
-const diaValido = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T12:00:00Z`));
+/** AAAA-MM-DD de un día que existe (el 30 de febrero, no: JavaScript lo correría al 2 de marzo). */
+export const diaValido = (v: unknown): v is string => {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const t = Date.parse(`${v}T12:00:00Z`);
+  return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v;
+};
 const diasEntre = (a: string, b: string) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000) + 1;
 /** Un rango de días argentino sobre una columna timestamptz (usa el índice). */
 const enRango = (col: string, i: number) => `${col} >= ($${i}::date::timestamp AT TIME ZONE '${ZONA}') AND ${col} < (($${i + 1}::date + 1)::timestamp AT TIME ZONE '${ZONA}')`;
+
+/** Una parte de la foto que falla no la tumba: queda su error, para que la IA sepa que falta. */
+export async function seguro<T>(fn: () => Promise<T>): Promise<T | { error: string }> {
+  try { return await fn(); } catch (e) { return { error: String((e as Error)?.message ?? e).slice(0, 200) }; }
+}
+
+/**
+ * Las consultas de UNA conexión, una detrás de otra: el cliente de pg no admite
+ * dos a la vez (y en paralelo no se ganaba nada: igual iban en fila).
+ */
+export async function enSerie<T extends unknown[]>(...pasos: { [K in keyof T]: () => Promise<T[K]> }): Promise<T> {
+  const out: unknown[] = [];
+  for (const paso of pasos) out.push(await paso());
+  return out as T;
+}
 
 /* ============================== PERÍODOS ============================== */
 
@@ -72,10 +101,9 @@ export function ultimosDias(n: number, sucursalId: number | null = null): { a: F
 /* ============================== CONTEXTO ============================== */
 
 export async function contexto(c: PoolClient) {
-  const [sucs, est] = await Promise.all([
-    c.query(`SELECT id, nombre, tipo::text AS tipo FROM sucursales WHERE activa ORDER BY id`),
-    c.query(`SELECT ultima_ok FROM metricas_estado WHERE id = 1`),
-  ]);
+  const [sucs, est] = await enSerie(
+    () => c.query(`SELECT id, nombre, tipo::text AS tipo FROM sucursales WHERE activa ORDER BY id`),
+    () => c.query(`SELECT ultima_ok FROM metricas_estado WHERE id = 1`));
   return {
     hoy: hoyAr(),
     sucursales: sucs.rows.map((s: any) => ({ id: N(s.id), nombre: s.nombre, tipo: s.tipo })),
@@ -86,7 +114,7 @@ export async function contexto(c: PoolClient) {
 /* ============================== VENTAS ============================== */
 
 export async function ventas(c: PoolClient, f: Filtro, contra: Filtro) {
-  const [a, b] = await Promise.all([reporteVentas(c, f, 'mes'), reporteVentas(c, contra, 'mes')]);
+  const [a, b] = await enSerie(() => reporteVentas(c, f, 'mes'), () => reporteVentas(c, contra, 'mes'));
   const sucB = new Map(b.porSucursal.map((s) => [s.sucursalId, s]));
   const t = a.totales; const tb = b.totales;
   return {
@@ -118,11 +146,10 @@ export async function rentabilidad(
   o: { orden?: Orden; limite?: number; buscar?: string | null; tipo?: 'granel' | 'entero' | null } = {},
 ) {
   const tipo = o.tipo ?? null;
-  const [a, b, tb] = await Promise.all([
-    reporteMargenes(c, { ...f, tipo }, 'mes', lente),
-    reporteMargenes(c, { ...contra, tipo }, 'mes', lente),
-    sumaMargen(c, { ...contra, tipo }),
-  ]);
+  const [a, b, tb] = await enSerie(
+    () => reporteMargenes(c, { ...f, tipo }, 'mes', lente),
+    () => reporteMargenes(c, { ...contra, tipo }, 'mes', lente),
+    () => sumaMargen(c, { ...contra, tipo }));
   const antes = new Map(b.filas.map((x) => [x.clave, x]));
   const total = a.totales.ventaNeta;
   /* Para «el peor margen» no cuentan las migas: al menos 0,2 % de la venta del período. */
@@ -130,6 +157,7 @@ export async function rentabilidad(
   let filas = a.filas.filter((x) => x.ventaNeta > 0 || (x.comprasNeto ?? 0) > 0).map((x) => {
     const p = antes.get(x.clave);
     return {
+      ...(lente === 'producto' ? { productoId: x.clave } : {}),
       nombre: x.nombre, ventaNeta: x.ventaNeta, margen: x.margen, margenPct: x.margenPct, participacionPct: x.participacion,
       ...(x.unidades != null ? { cantidad: x.unidades } : {}),
       ...(x.comprasNeto != null ? { comprasNeto: x.comprasNeto } : {}),
@@ -202,31 +230,30 @@ export async function fraccionado(c: PoolClient, f: Filtro, buscar?: string | nu
   let extraMov = '';
   if (f.sucursalId) { paramsMov.push(f.sucursalId); extraMov += ` AND m.sucursal_id = $${paramsMov.length}`; }
   if (buscar?.trim()) { paramsMov.push(`%${buscar.trim()}%`); extraMov += ` AND p.nombre ILIKE $${paramsMov.length}`; }
-  const [tot, porProducto, porTamano, porOperador, faltantes] = await Promise.all([
-    c.query(`SELECT
+  const [tot, porProducto, porTamano, porOperador, faltantes] = await enSerie(
+    () => c.query(`SELECT
         coalesce(sum(fi.paquetes * fi.tam_kg) FILTER (WHERE f.origen <> 'correccion'), 0)::float8 AS kg,
         coalesce(sum(fi.paquetes) FILTER (WHERE f.origen <> 'correccion'), 0)::float8 AS paquetes,
         count(DISTINCT f.id) FILTER (WHERE f.origen <> 'correccion')::int AS registros,
         coalesce(-sum(fi.paquetes * fi.tam_kg) FILTER (WHERE f.origen = 'correccion'), 0)::float8 AS kg_corregidos,
         count(DISTINCT f.id) FILTER (WHERE f.origen = 'correccion')::int AS correcciones ${base}`, params),
-    c.query(`SELECT p.nombre, coalesce(s.nombre, '') AS sucursal,
+    () => c.query(`SELECT p.nombre, coalesce(s.nombre, '') AS sucursal,
         sum(fi.paquetes * fi.tam_kg) FILTER (WHERE f.origen <> 'correccion')::float8 AS kg,
         sum(fi.paquetes) FILTER (WHERE f.origen <> 'correccion')::float8 AS paquetes,
         coalesce(-sum(fi.paquetes * fi.tam_kg) FILTER (WHERE f.origen = 'correccion'), 0)::float8 AS kg_corregidos
       ${base.replace('JOIN productos p ON p.id = fi.producto_id', 'JOIN productos p ON p.id = fi.producto_id LEFT JOIN sucursales s ON s.id = f.sucursal_id')}
       GROUP BY 1, 2 ORDER BY 3 DESC NULLS LAST LIMIT 25`, params),
-    c.query(`SELECT fi.tam_kg::float8 AS tam, sum(fi.paquetes)::float8 AS paquetes, sum(fi.paquetes * fi.tam_kg)::float8 AS kg
+    () => c.query(`SELECT fi.tam_kg::float8 AS tam, sum(fi.paquetes)::float8 AS paquetes, sum(fi.paquetes * fi.tam_kg)::float8 AS kg
       ${base} AND f.origen <> 'correccion' GROUP BY 1 ORDER BY 3 DESC`, params),
-    c.query(`SELECT coalesce(o.nombre, 'Sin colaborador') AS nombre,
+    () => c.query(`SELECT coalesce(o.nombre, 'Sin colaborador') AS nombre,
         count(DISTINCT ((f.fecha AT TIME ZONE '${ZONA}')::date, f.turno))::int AS turnos,
         sum(fi.paquetes * fi.tam_kg)::float8 AS kg, sum(fi.paquetes)::float8 AS paquetes
       ${base.replace('JOIN productos p ON p.id = fi.producto_id', 'JOIN productos p ON p.id = fi.producto_id LEFT JOIN fraccion_operadores o ON o.id = f.operador_id')}
         AND f.origen <> 'correccion' GROUP BY 1 ORDER BY 3 DESC`, params),
-    c.query(`SELECT p.nombre, sum(m.cantidad * coalesce(pr.tam_kg, 1))::float8 AS kg, sum(m.cantidad)::float8 AS paquetes
+    () => c.query(`SELECT p.nombre, sum(m.cantidad * coalesce(pr.tam_kg, 1))::float8 AS kg, sum(m.cantidad)::float8 AS paquetes
       FROM movimientos m JOIN productos p ON p.id = m.producto_id LEFT JOIN presentaciones pr ON pr.id = m.presentacion_id
       WHERE m.tipo = 'merma' AND m.motivo LIKE 'Faltan al corregir el fraccionado%' AND ${enRango('m.fecha', 1)}${extraMov}
-      GROUP BY 1 ORDER BY 2 DESC LIMIT 15`, paramsMov),
-  ]);
+      GROUP BY 1 ORDER BY 2 DESC LIMIT 15`, paramsMov));
   const t: any = tot.rows[0] ?? {};
   const kg = r1(N(t.kg));
   const kgFaltantes = r1(faltantes.rows.reduce((a: number, x: any) => a + N(x.kg), 0));
@@ -289,7 +316,7 @@ export async function paquetes(c: PoolClient, dias: number, sucursalId: number |
   const aFraccionar: any[] = []; const sinGranel: any[] = []; const sobrefraccionado: any[] = []; const precioIncoherente: any[] = [];
   const porTam = new Map<number, { kg: number; vn: number; vc: number; co: number }>();
   const productos: any[] = [];
-  for (const [, p] of prods) {
+  for (const [id, p] of prods) {
     const suelto = p.filas.find((x) => x.pres === 0);
     const packs = p.filas.filter((x) => x.pres > 0 && x.tam && x.tam > 0).sort((a, b) => a.tam! - b.tam!);
     const kgDia = p.filas.reduce((a, x) => a + x.kg, 0) / dias;
@@ -305,12 +332,12 @@ export async function paquetes(c: PoolClient, dias: number, sucursalId: number |
       /* Fraccionar ya: se vende y alcanza para menos de una semana. Lo que falta para 14 días, en kg. */
       if (uDia > 0 && cobertura != null && cobertura < 7) {
         const kgPara14 = r1(Math.max(0, uDia * 14 - x.stock) * x.tam!);
-        const item = { producto: p.nombre, tamanoKg: x.tam, stockPaquetes: r0(x.stock), vendePorDia: r1(uDia), diasQueAlcanza: cobertura, kgParaDosSemanas: kgPara14, granelSueltoKg: r1(granelKg) };
+        const item = { productoId: id, presentacionId: x.pres, producto: p.nombre, tamanoKg: x.tam, stockPaquetes: r0(x.stock), vendePorDia: r1(uDia), diasQueAlcanza: cobertura, kgParaDosSemanas: kgPara14, granelSueltoKg: r1(granelKg) };
         if (granelKg + 1e-9 >= kgPara14 * 0.5) aFraccionar.push(item); else sinGranel.push(item);
       }
       /* Sobrefraccionado: paquetes que no rotan (más de 90 días de stock, o stock sin ventas). */
       if (x.stock > 0 && (cobertura == null || cobertura > 90)) {
-        sobrefraccionado.push({ producto: p.nombre, tamanoKg: x.tam, stockPaquetes: r0(x.stock), kgEnPaquetes: r1(x.stock * x.tam!), diasQueAlcanza: cobertura, vendePorDia: r1(uDia) });
+        sobrefraccionado.push({ productoId: id, presentacionId: x.pres, producto: p.nombre, tamanoKg: x.tam, stockPaquetes: r0(x.stock), kgEnPaquetes: r1(x.stock * x.tam!), diasQueAlcanza: cobertura, vendePorDia: r1(uDia) });
       }
     }
     /* Un tamaño más chico vendido MÁS BARATO por kg que uno más grande (con al menos 3 % de diferencia). */
@@ -363,7 +390,7 @@ export async function stock(f: Fuentes, sucursalId: number | null, estado?: 'par
   const de = (e: string) => lista.filter((x) => x.estado === e);
   const parado = de('parado'); const agotarse = de('por_agotarse'); const sobre = de('sobrestock');
   const fila = (x: any) => ({
-    producto: x.nombre, unidad: x.unidad, stock: x.stock, valor: r0(x.valor), vendePorDia: x.promedioPorDia, diasDeStock: x.diasDeStock,
+    productoId: x.productoId, producto: x.nombre, unidad: x.unidad, stock: x.stock, valor: r0(x.valor), vendePorDia: x.promedioPorDia, diasDeStock: x.diasDeStock,
     ...(x.estado === 'parado' ? { ultimaVenta: x.ultimaVenta } : {}),
   });
   const lim = Math.min(Math.max(limite, 1), 50);
@@ -427,8 +454,8 @@ export async function costosQueSubieron(c: PoolClient, dias: number) {
 export async function caja(c: PoolClient, f: Filtro) {
   const params: any[] = [f.desde, f.hasta];
   const suc = f.sucursalId ? (params.push(f.sucursalId), ` AND cs.sucursal_id = $${params.length}`) : '';
-  const [turnos, egresos] = await Promise.all([
-    c.query(
+  const [turnos, egresos] = await enSerie(
+    () => c.query(
       `SELECT su.nombre AS sucursal, coalesce(uc.nombre, ua.nombre, '') AS cajero, cs.diferencia::float8 AS dif
        FROM caja_sesiones cs JOIN sucursales su ON su.id = cs.sucursal_id
        LEFT JOIN usuarios ua ON ua.id = cs.usuario_id
@@ -436,15 +463,14 @@ export async function caja(c: PoolClient, f: Filtro) {
          AND cc.observaciones LIKE 'Cierre por envío%' ORDER BY cc.id DESC LIMIT 1) cx ON true
        LEFT JOIN usuarios uc ON uc.id = cx.usuario_id
        WHERE cs.cierre IS NOT NULL AND ${enRango('cs.cierre', 1)}${suc}`, params),
-    c.query(
+    () => c.query(
       `SELECT coalesce(co.nombre, CASE WHEN pp.id IS NOT NULL THEN 'Pago a proveedor' WHEN m.motivo LIKE 'Devolución %' THEN 'Devoluciones a clientes'
          ELSE 'A mano (sin concepto)' END) AS que, count(*)::int AS veces, sum(m.importe)::float8 AS importe
        FROM caja_movimientos m JOIN caja_sesiones cs ON cs.id = m.caja_sesion_id
        LEFT JOIN cashflow_conceptos co ON co.id = m.concepto_id
        LEFT JOIN proveedor_pagos pp ON pp.caja_movimiento_id = m.id
        WHERE m.tipo = 'egreso' AND m.anulado_en IS NULL AND ${enRango('m.fecha', 1)}${suc}
-       GROUP BY 1 ORDER BY 3 DESC LIMIT 15`, params),
-  ]);
+       GROUP BY 1 ORDER BY 3 DESC LIMIT 15`, params));
   /* Una diferencia de menos de $100 es redondeo: no cuenta como faltante ni sobrante. */
   const agrupar = (clave: (x: any) => string) => {
     const m = new Map<string, { turnos: number; faltantes: number; sumaFaltantes: number; sobrantes: number; sumaSobrantes: number; neto: number }>();
@@ -529,7 +555,7 @@ export async function ofertas(c: PoolClient, f: Filtro) {
 export async function comparar(c: PoolClient, a: Filtro, b: Filtro) {
   const r: any = await reporteComparar(c, a, b, 'mes');
   const prod = (x: any) => ({
-    producto: x.nombre, ventaA: r0(x.a), ventaB: r0(x.b), cantidadA: r1(x.cantidadA), cantidadB: r1(x.cantidadB), diferencia: r0(x.diferencia), variacionPct: x.variacion,
+    productoId: x.productoId, producto: x.nombre, ventaA: r0(x.a), ventaB: r0(x.b), cantidadA: r1(x.cantidadA), cantidadB: r1(x.cantidadB), diferencia: r0(x.diferencia), variacionPct: x.variacion,
   });
   return {
     periodoA: `${a.desde} a ${a.hasta}`, periodoB: `${b.desde} a ${b.hasta}`,
@@ -557,28 +583,27 @@ export async function producto(c: PoolClient, texto: string) {
      LIMIT 5`, [`%${t}%`, d60]);
   if (!ps.rows.length) return { encontrados: 0, aviso: `No hay productos que digan «${t}».` };
   const ids = ps.rows.map((x: any) => N(x.id));
-  const [provs, st, vend, cost, prec, fijos] = await Promise.all([
-    c.query(`SELECT pp.producto_id, pv.nombre, coalesce(nullif(pp.costo_final, 0), pp.costo / greatest(pp.cantidad, 1))::float8 AS costo, pp.usar_para_precio FROM producto_proveedores pp
+  const [provs, st, vend, cost, prec, fijos] = await enSerie(
+    () => c.query(`SELECT pp.producto_id, pv.nombre, coalesce(nullif(pp.costo_final, 0), pp.costo / greatest(pp.cantidad, 1))::float8 AS costo, pp.usar_para_precio FROM producto_proveedores pp
       JOIN proveedores pv ON pv.id = pp.proveedor_id WHERE pp.producto_id = ANY($1)`, [ids]),
-    c.query(`SELECT s.producto_id, su.nombre AS sucursal, coalesce(pr.tam_kg, 0)::float8 AS tam, s.estado::text AS estado, sum(s.cantidad)::float8 AS cant
+    () => c.query(`SELECT s.producto_id, su.nombre AS sucursal, coalesce(pr.tam_kg, 0)::float8 AS tam, s.estado::text AS estado, sum(s.cantidad)::float8 AS cant
       FROM stock s JOIN sucursales su ON su.id = s.sucursal_id LEFT JOIN presentaciones pr ON pr.id = s.presentacion_id
       WHERE s.producto_id = ANY($1) AND abs(s.cantidad) > 1e-9 GROUP BY 1, 2, 3, 4`, [ids]),
-    c.query(`SELECT v.producto_id, coalesce(pr.tam_kg, 0)::float8 AS tam, (v.dia >= $2::date) AS reciente,
+    () => c.query(`SELECT v.producto_id, coalesce(pr.tam_kg, 0)::float8 AS tam, (v.dia >= $2::date) AS reciente,
         sum(v.unidades)::float8 AS u, sum(v.cantidad_base)::float8 AS kg, sum(v.venta_neta)::float8 AS vn, sum(v.venta_costeada)::float8 AS vc, sum(v.costo)::float8 AS co
       FROM metricas_venta_prod_dia v LEFT JOIN presentaciones pr ON pr.id = v.presentacion_id
       WHERE v.producto_id = ANY($1) AND v.dia >= $3::date GROUP BY 1, 2, 3`, [ids, d30, d60]),
-    c.query(`SELECT * FROM (SELECT pp.producto_id, to_char(h.fecha AT TIME ZONE '${ZONA}', 'YYYY-MM-DD') AS fecha,
+    () => c.query(`SELECT * FROM (SELECT pp.producto_id, to_char(h.fecha AT TIME ZONE '${ZONA}', 'YYYY-MM-DD') AS fecha,
         coalesce(nullif(h.costo_final_anterior, 0), h.costo_anterior)::float8 AS antes, coalesce(nullif(h.costo_final, 0), h.costo)::float8 AS ahora,
         row_number() OVER (PARTITION BY pp.producto_id ORDER BY h.fecha DESC) AS n
       FROM producto_proveedor_costos h JOIN producto_proveedores pp ON pp.id = h.producto_proveedor_id
       WHERE pp.producto_id = ANY($1) AND pp.usar_para_precio) x WHERE n <= 3`, [ids]),
-    c.query(`SELECT * FROM (SELECT ph.producto_id, coalesce(lv.nombre, '') AS lista, to_char(ph.fecha AT TIME ZONE '${ZONA}', 'YYYY-MM-DD') AS fecha,
+    () => c.query(`SELECT * FROM (SELECT ph.producto_id, coalesce(lv.nombre, '') AS lista, to_char(ph.fecha AT TIME ZONE '${ZONA}', 'YYYY-MM-DD') AS fecha,
         ph.precio::float8, ph.precio_anterior::float8 AS antes, row_number() OVER (PARTITION BY ph.producto_id, ph.lista_id ORDER BY ph.fecha DESC) AS n
       FROM precio_historial ph LEFT JOIN listas_venta lv ON lv.id = ph.lista_id WHERE ph.producto_id = ANY($1)) x WHERE n = 1`, [ids]),
-    c.query(`SELECT pl.producto_id, coalesce(lv.nombre, '') || coalesce(' · ' || pr.tam_kg || ' kg', '') AS lista
+    () => c.query(`SELECT pl.producto_id, coalesce(lv.nombre, '') || coalesce(' · ' || pr.tam_kg || ' kg', '') AS lista
       FROM producto_listas pl LEFT JOIN listas_venta lv ON lv.id = pl.lista_id LEFT JOIN presentaciones pr ON pr.id = pl.presentacion_id
-      WHERE pl.producto_id = ANY($1) AND pl.modo_precio = 'precio'`, [ids]),
-  ]);
+      WHERE pl.producto_id = ANY($1) AND pl.modo_precio = 'precio'`, [ids]));
   const de = <T>(rows: T[], id: number) => rows.filter((x: any) => N(x.producto_id) === id);
   return {
     encontrados: ps.rows.length,
