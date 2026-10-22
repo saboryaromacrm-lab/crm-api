@@ -17,6 +17,11 @@
  *     pedido ya mandado. Cuando llega (Recibido), vuelve a contar.
  *
  * Una consulta agregada por el índice de fecha de ventas: no pesa.
+ *
+ * EL DE COFFIT (22/10/2026, pedido del dueño): lo de uso exclusivo de Coffit
+ * no se vende en la caja, se le MANDA. Su «venta» es lo que salió en los
+ * envíos a Coffit (sentido salida, no anulados) en la misma ventana, en la
+ * misma unidad del stock; y su depósito es el de todas las sucursales.
  */
 import { sql } from 'drizzle-orm';
 import { Database } from '../db/drizzle';
@@ -28,11 +33,18 @@ const entre = (n: unknown, min: number, max: number, def: number) => {
   return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : def;
 };
 
-export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: number | null) {
+export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: number | null, coffit = false) {
   const suc = sucursalId != null ? sql`AND v.sucursal_id = ${sucursalId}` : sql``;
   const desde = new Date(Date.now() - DIAS_VENTA * 86_400_000);
   const [ventas, controlados, pedidos]: any[] = await Promise.all([
-    db.execute(sql`
+    coffit ? db.execute(sql`
+      SELECT i.producto_id AS "productoId",
+             SUM(i.cantidad * CASE WHEN p.tipo = 'granel' AND i.modo = 'paquete' THEN i.tam_kg ELSE 1 END)::float8 AS cantidad
+        FROM envio_cafeteria_items i
+        JOIN envios_cafeteria e ON e.id = i.envio_id
+        JOIN productos p ON p.id = i.producto_id
+       WHERE e.sentido = 'salida' AND e.estado = 'enviado' AND e.fecha >= ${desde} AND p.solo_cafeteria
+       GROUP BY i.producto_id`) : db.execute(sql`
       SELECT vi.producto_id AS "productoId",
              SUM(CASE WHEN v.tipo::text LIKE 'nota_credito%' THEN -1 ELSE 1 END
                  * vi.cantidad
@@ -55,6 +67,8 @@ export async function datosBajosStock(db: Database, cfgVentas: any, sucursalId: 
   ]);
   const filas = (r: any) => (r.rows ?? r) as any[];
   return {
+    /** De quién es la lista: el ERP filtra los productos con esto (`ALCANCE_BAJOS`). */
+    alcance: coffit ? 'coffit' : 'saborYAroma',
     sucursalId,
     diasVenta: DIAS_VENTA,
     diasCobertura: entre(cfgVentas?.bajosDiasCobertura, 1, 90, 7),

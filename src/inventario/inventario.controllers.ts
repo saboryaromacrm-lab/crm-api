@@ -868,6 +868,7 @@ class StockMinimoDto {
  * ALMACÉN › BAJOS EN STOCK (12/10/2026). La venta de 30 días y lo controlado
  * de la sucursal (por defecto la Distribuidora, que es la que compra; «todas»
  * solo el jefe; el resto, la suya), y el mínimo a mano de un producto.
+ * `coffit`: el de Almacén › Coffit (22/10/2026), con la llave de esa sección.
  */
 @Controller('bajos-stock')
 @Permiso('almacen.bajos')
@@ -887,6 +888,13 @@ export class BajosStockController {
       suc = d?.id ?? null;
     }
     return datosBajosStock(this.db, await this.cfg.get('ventas'), suc);
+  }
+
+  /** Lo de uso exclusivo de Coffit, en todas las sucursales, con lo que se le mandó como consumo. */
+  @Get('coffit')
+  @Permiso('almacen.cafeteria')
+  async coffit() {
+    return datosBajosStock(this.db, await this.cfg.get('ventas'), null, true);
   }
 
   /** El mínimo a mano manda sobre el automático; 0 lo vuelve automático. Quien maneja stock o la ficha del producto. */

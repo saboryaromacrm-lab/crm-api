@@ -9,7 +9,8 @@
  *
  * Quedan, por decisión del dueño: la COMPRA (es como entra; la factura ya se la
  * imputa a Coffit), el ENVÍO a Coffit, su control de stock DENTRO de Almacén ›
- * Coffit, y la orden de pedido al proveedor con Bajos en stock (para reponerlo).
+ * Coffit, y la orden de pedido al proveedor con SU Bajos en stock (Almacén ›
+ * Coffit, 22/10/2026: el de Sabor y Aroma ya no lo cuenta).
  *
  * Las pantallas lo esconden; este candado es el de verdad, para que ningún
  * camino viejo (una pantalla abierta desde antes, un borrador guardado, una
