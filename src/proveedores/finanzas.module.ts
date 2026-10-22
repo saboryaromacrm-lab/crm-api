@@ -489,6 +489,9 @@ export class FinanzasProveedorService {
       vencidosM: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where ${proveedorEcheqs.fechaVenc} < ${hoy.toISOString()}), 0)`,
       prox3N: sql<number>`count(*) filter (where ${proveedorEcheqs.fechaVenc} >= ${hoy.toISOString()} and ${proveedorEcheqs.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()})::int`,
       prox3M: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where ${proveedorEcheqs.fechaVenc} >= ${hoy.toISOString()} and ${proveedorEcheqs.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()}), 0)`,
+      /* La semana (22/10/2026, tarjeta del Dashboard): la misma ventana que el filtro «semana» del listado. */
+      semanaN: sql<number>`count(*) filter (where ${proveedorEcheqs.fechaVenc} >= ${hoy.toISOString()} and ${proveedorEcheqs.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()})::int`,
+      semanaM: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where ${proveedorEcheqs.fechaVenc} >= ${hoy.toISOString()} and ${proveedorEcheqs.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()}), 0)`,
     }).from(proveedorEcheqs).where(activos);
     const porBanco = await this.db.select({
       banco: proveedorEcheqs.banco,
@@ -498,11 +501,20 @@ export class FinanzasProveedorService {
       .groupBy(proveedorEcheqs.banco)
       .orderBy(desc(sql`coalesce(sum(${proveedorEcheqs.importe}), 0)`))
       .limit(5);
+    /* Los próximos a debitar (los vencidos sin marcar primero), para la tarjeta del Dashboard. */
+    const proximos = await this.db.select(this.selectEcheq())
+      .from(proveedorEcheqs)
+      .leftJoin(proveedores, eq(proveedores.id, proveedorEcheqs.proveedorId))
+      .where(activos)
+      .orderBy(proveedorEcheqs.fechaVenc, proveedorEcheqs.id)
+      .limit(6);
     return {
       activos: { n: Number(r?.activosN) || 0, monto: money(Number(r?.activosM) || 0) },
       vencidos: { n: Number(r?.vencidosN) || 0, monto: money(Number(r?.vencidosM) || 0) },
       prox3: { n: Number(r?.prox3N) || 0, monto: money(Number(r?.prox3M) || 0) },
+      semana: { n: Number(r?.semanaN) || 0, monto: money(Number(r?.semanaM) || 0) },
       porBanco: porBanco.map((b) => ({ banco: b.banco, n: Number(b.n) || 0, monto: money(Number(b.monto) || 0) })),
+      proximos: proximos.map((f) => ({ ...f, diasRest: diasHasta(f.fechaVenc) })),
     };
   }
 
