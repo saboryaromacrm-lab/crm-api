@@ -3110,6 +3110,8 @@ export const gastoItems = pgTable('gasto_items', {
   gastoId: integer('gasto_id').notNull().references(() => gastos.id, { onDelete: 'cascade' }),
   concepto: text('concepto').notNull().default(''),
   monto: doublePrecision('monto').notNull().default(0),
+  /** 0196: unidades del renglón, opcional (NULL = no va por unidad). El precio por unidad se calcula: monto / cantidad. */
+  cantidad: doublePrecision('cantidad'),
 }, (t) => ({
   ixGasto: index('ix_gasto_items_gasto').on(t.gastoId),
 }));

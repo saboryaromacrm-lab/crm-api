@@ -218,10 +218,11 @@ class PagoDto {
   @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
 }
 
-/** Un renglón del gasto: concepto + importe FINAL, como se lee del papel. */
+/** Un renglón del gasto: concepto + importe del renglón, como se lee del papel; la cantidad, si va por unidad (0196). */
 class GastoItemDto {
   @IsString() @MaxLength(200) concepto!: string;
   @IsNumber() @Min(0.01) @Max(TOPE_IMPORTE) monto!: number;
+  @IsOptional() @IsNumber() @Min(0.001) @Max(1_000_000) cantidad?: number | null;
 }
 
 class GastoDto {
@@ -426,20 +427,38 @@ export class GastosService {
    * mantener: sale de los renglones de los gastos cargados (sin los anulados),
    * uno por concepto sin importar mayúsculas ni espacios, escrito como se lo
    * escribió más veces. Primero los de ESE proveedor, después los más usados.
+   *
+   * Con la cantidad (0196) va también la ÚLTIMA compra por unidad de cada
+   * concepto: cuánto salió la unidad, cuándo, y si ese renglón era sin IVA
+   * (factura A: neto guardado = suma de los renglones, con IVA). Así al
+   * volver a comprar se compara con lo mismo.
    */
   async conceptosUsados(proveedorId: number | null) {
     const r = await this.db.execute(sql`
-      WITH escrito AS (
+      WITH por_unidad AS (
+        SELECT DISTINCT ON (lower(trim(i.concepto))) lower(trim(i.concepto)) AS clave,
+               i.monto / i.cantidad AS unitario, g.fecha,
+               (g.iva > 0 AND abs(g.neto - sum(i.monto) OVER (PARTITION BY g.id)) < 0.01) AS sin_iva
+          FROM gasto_items i JOIN gastos g ON g.id = i.gasto_id
+         WHERE g.estado <> 'anulado' AND i.cantidad > 0
+         ORDER BY lower(trim(i.concepto)), g.fecha DESC, i.id DESC),
+      escrito AS (
         SELECT lower(trim(i.concepto)) AS clave, trim(i.concepto) AS texto, count(*) AS veces,
                count(*) FILTER (WHERE g.proveedor_id = ${proveedorId}) AS del_proveedor, max(g.fecha) AS ultima
           FROM gasto_items i JOIN gastos g ON g.id = i.gasto_id
          WHERE g.estado <> 'anulado' AND trim(i.concepto) <> ''
          GROUP BY 1, 2)
-      SELECT (array_agg(texto ORDER BY veces DESC, ultima DESC))[1] AS concepto
-        FROM escrito GROUP BY clave
-       ORDER BY sum(del_proveedor) DESC, sum(veces) DESC, max(ultima) DESC
+      SELECT (array_agg(e.texto ORDER BY e.veces DESC, e.ultima DESC))[1] AS concepto,
+             max(u.unitario) AS unitario, to_json(max(u.fecha)) #>> '{}' AS fecha, bool_or(u.sin_iva) AS sin_iva
+        FROM escrito e LEFT JOIN por_unidad u ON u.clave = e.clave
+       GROUP BY e.clave
+       ORDER BY sum(e.del_proveedor) DESC, sum(e.veces) DESC, max(e.ultima) DESC
        LIMIT 500`);
-    return ((r as any).rows ?? r).map((x: any) => String(x.concepto));
+    return ((r as any).rows ?? r).map((x: any) => ({
+      concepto: String(x.concepto),
+      ultimaPorUnidad: x.unitario == null ? null
+        : { unitario: money(Number(x.unitario)), fecha: x.fecha, sinIva: Boolean(x.sin_iva) },
+    }));
   }
 
   async crearCategoria(dto: CategoriaDto) {
@@ -739,7 +758,7 @@ export class GastosService {
    */
   private importesDe(dto: GastoDto) {
     const renglones = (dto.items ?? [])
-      .map((i) => ({ concepto: (i.concepto ?? '').trim(), monto: money(i.monto) }))
+      .map((i) => ({ concepto: (i.concepto ?? '').trim(), monto: money(i.monto), cantidad: i.cantidad || null }))
       .filter((i) => i.concepto && i.monto > 0);
     if (!renglones.length) return { ...this.totalesDe(dto), items: null, descripcion: null };
 

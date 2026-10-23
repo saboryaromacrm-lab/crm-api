@@ -1373,6 +1373,13 @@
       "when": 1792674000000,
       "tag": "0195_tienda_links",
       "breakpoints": true
+    },
+    {
+      "idx": 196,
+      "version": "7",
+      "when": 1792760400000,
+      "tag": "0196_gasto_items_cantidad",
+      "breakpoints": true
     }
   ]
 }
