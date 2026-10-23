@@ -1366,6 +1366,13 @@
       "when": 1792587600000,
       "tag": "0194_tienda_origen",
       "breakpoints": true
+    },
+    {
+      "idx": 195,
+      "version": "7",
+      "when": 1792674000000,
+      "tag": "0195_tienda_links",
+      "breakpoints": true
     }
   ]
 }

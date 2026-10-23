@@ -22,13 +22,14 @@ import { rutaImagen } from './ruta-imagen';
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable,
   Logger, Module, NotFoundException, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe,
-  Post, Query,
+  Patch, Post, Query,
 } from '@nestjs/common';
 import { and, eq, lt } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { TiendaModule, TiendaService } from '../tienda/tienda.module';
 import { tienePermiso } from '../auth/auth.guard';
 import { MetricasTiendaService, filtroTienda } from './metricas-tienda';
+import { EditarLinkDto, LinkDto, LinksTiendaService } from './links';
 import { MIMES_IMAGEN, mimeReal } from '../common/archivos';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
@@ -213,7 +214,10 @@ export class WebService implements OnModuleInit, OnModuleDestroy {
  */
 @Controller('web')
 export class WebController {
-  constructor(private readonly svc: WebService, private readonly tienda: TiendaService, private readonly metricasTienda: MetricasTiendaService) {}
+  constructor(
+    private readonly svc: WebService, private readonly tienda: TiendaService,
+    private readonly metricasTienda: MetricasTiendaService, private readonly links: LinksTiendaService,
+  ) {}
 
   /**
    * Lo que ve un cliente habilitado, CON precios (0155): el público
@@ -241,6 +245,23 @@ export class WebController {
     const { modo } = filtroTienda({ modo: body?.modo });
     return this.metricasTienda.reiniciar(modo, sesion?.usuarioId ?? null);
   }
+
+  /* Links medibles (0195): los del modo con su alcance, crear, renombrar y desactivar, y el día a día de uno. */
+  @Get('links')
+  @Permiso('web.estadisticas')
+  listarLinks(@Query('modo') modo?: string) { return this.links.listar(filtroTienda({ modo }).modo); }
+
+  @Get('links/:id')
+  @Permiso('web.estadisticas')
+  detalleLink(@Param('id', ParseIntPipe) id: number) { return this.links.detalle(id); }
+
+  @Post('links')
+  @Permiso('web.estadisticas')
+  crearLink(@Body() dto: LinkDto, @Auth() sesion: Sesion) { return this.links.crear(dto, sesion?.usuarioId ?? null); }
+
+  @Patch('links/:id')
+  @Permiso('web.estadisticas')
+  editarLink(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarLinkDto) { return this.links.editar(id, dto); }
 
   /** Cómo se ve un producto en cada tienda (Compras › Productos › pestaña Tienda online). */
   @Get('productos/:id')

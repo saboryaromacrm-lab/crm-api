@@ -2830,12 +2830,33 @@ export const webEventos = pgTable('web_eventos', {
   origen: text('origen'),
   /** Solo en `llegada` (0194): el sitio que la mandó o la campaña. */
   origenDetalle: text('origen_detalle'),
+  /** Solo en `llegada` (0195): el link medible por el que entró la sesión. */
+  linkId: integer('link_id').references(() => webLinks.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixFecha: index('ix_web_eventos_fecha').on(t.fecha),
   ixModoFecha: index('ix_web_eventos_modo_fecha').on(t.modo, t.fecha),
   ixProducto: index('ix_web_eventos_producto').on(t.productoId),
   ixOferta: index('ix_web_eventos_oferta').on(t.ofertaId).where(sql`oferta_id is not null`),
+  ixLink: index('ix_web_eventos_link').on(t.linkId).where(sql`link_id is not null`),
+  ixSesion: index('ix_web_eventos_sesion').on(t.sesion),
 }));
+
+/**
+ * LINKS MEDIBLES (0195): un código corto (`/l/<codigo>` en la tienda) que lleva
+ * a `destino` en un `modo`. `canal` viaja como utm_source para «De dónde
+ * llegan». Desactivado, el link sigue abriendo la tienda pero ya no cuenta.
+ */
+export const webLinks = pgTable('web_links', {
+  id: serial('id').primaryKey(),
+  codigo: text('codigo').notNull().unique(),
+  nombre: text('nombre').notNull(),
+  modo: text('modo').$type<'mayorista' | 'minorista'>().notNull(),
+  destino: text('destino').notNull().default('/'),
+  canal: text('canal').notNull().default(''),
+  activo: boolean('activo').notNull().default(true),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
 
 /**
  * «EMPEZAR DE 0» LAS MÉTRICAS DE UNA TIENDA (0194): una fila por cada vez. Las

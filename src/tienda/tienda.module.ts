@@ -66,6 +66,7 @@ import { finalDe, MEDIOS_TIENDA } from '../cupones/reglas';
 import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
 import { clasificarLlegada } from '../web/origen-llegada';
+import { LinksTiendaService } from '../web/links';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
@@ -215,6 +216,7 @@ export class TiendaService {
     private readonly barrios: BarriosService,
     private readonly vistaPrevia: VistaPreviaService,
     private readonly cupones: CuponesService,
+    private readonly links: LinksTiendaService,
   ) {}
 
   /** La sucursal que surte al sitio. Hoy es la Distribuidora (depósito central). */
@@ -972,11 +974,14 @@ export class TiendaService {
     const ofertaDe = crudos.some((e: any) => Number(e.productoId) > 0)
       ? new Map<number, number>((await this.armado(modo)).catalogo.items.filter((i: any) => i.oferta).map((i: any): [number, number] => [i.id, i.oferta.id]))
       : new Map<number, number>();
+    /* La llegada por un link medible (0195): el código que trajo la dirección, si existe y está activo. */
+    const llegadaConLink = crudos.find((e: any) => e.tipo === 'llegada' && e.link);
+    const linkId = llegadaConLink ? (await this.links.resolver(llegadaConLink.link))?.id ?? null : null;
     const filas = crudos
       .map((e: any) => ({
         sesion,
         modo,
-        ...(e.tipo === 'llegada' ? origenDe(e) : {}),
+        ...(e.tipo === 'llegada' ? { ...origenDe(e), linkId } : {}),
         tipo: String(e.tipo),
         ruta: String(e.ruta ?? '').slice(0, 200),
         productoId: Number(e.productoId) > 0 ? Number(e.productoId) : null,
@@ -1422,7 +1427,7 @@ export class TiendaService {
 @Publico()
 @UseGuards(TiendaRateLimitGuard)
 export class TiendaController {
-  constructor(private readonly svc: TiendaService, private readonly accesos: AccesosTiendaService) {}
+  constructor(private readonly svc: TiendaService, private readonly accesos: AccesosTiendaService, private readonly links: LinksTiendaService) {}
 
   /** `?modo=minorista` pide el catálogo minorista (0173); cualquier otra cosa, el mayorista. */
   @Get('catalogo')
@@ -1478,6 +1483,19 @@ export class TiendaController {
   eventos(@Body() body: any) { return this.svc.eventos(body ?? {}); }
 
   /**
+   * A dónde lleva un link medible (0195): lo pide el servidor de la tienda al
+   * abrir `/l/<codigo>`. Sin límite por IP a propósito: todas las visitas
+   * llegan desde el servidor de la tienda, y es una lectura de una fila por su
+   * código; un código que no existe o está desactivado lleva a la portada.
+   */
+  @Get('links/:codigo')
+  async link(@Param('codigo') codigo: string) {
+    const l = await this.links.resolver(codigo);
+    if (!l) throw new NotFoundException('Ese link no existe.');
+    return { modo: l.modo, destino: l.destino, canal: l.canal };
+  }
+
+  /**
    * Sirve el binario de una imagen del sitio. El `?v=` del catálogo versiona el caché.
    *
    * ESTE ENDPOINT ES EL QUE VUELVE PELIGROSA UNA SUBIDA. Es público, y nginx lo
@@ -1526,7 +1544,7 @@ export class TiendaController {
 @Module({
   imports: [ListasModule, ConfiguracionModule, PresupuestosModule, OfertasModule, ClientesModule, BarriosModule, CuponesModule],
   controllers: [TiendaController, AccesosTiendaController, VistaPreviaController],
-  providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard, VistaPreviaService],
-  exports: [TiendaService],
+  providers: [TiendaService, AccesosTiendaService, TiendaRateLimitGuard, VistaPreviaService, LinksTiendaService],
+  exports: [TiendaService, LinksTiendaService],
 })
 export class TiendaModule {}
