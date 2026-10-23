@@ -41,11 +41,12 @@ import { MIMES_IMAGEN } from '../common/archivos';
 import { telefonoArgentino } from '../common/telefono';
 import { fechaQr as fechaArgentina } from '../arca/fecha';
 import type { Response } from 'express';
-import { and, eq, gte, ne, sql } from 'drizzle-orm';
+import { and, eq, gte, lte, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, subcategorias, etiquetas, marcas, movimientos, presentaciones, productoEtiquetas, productoListas,
   productoProveedores, productos, stock, sucursales, tiendaCompradores, tipoImagenWebEnum, webEventos, webImagenes,
+  feriados, feriadoSucursales,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import { ofertaAlcanza } from '../ventas/ventas.module';
@@ -67,6 +68,7 @@ import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
 import { clasificarLlegada } from '../web/origen-llegada';
 import { LinksTiendaService } from '../web/links';
+import { DIAS_BUSQUEDA, agendaEnvios, cuandoDe, excepcionesDe, localDeEnvios } from './horario-envio';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Kilos y paquetes a 3 decimales: 0.1 + 0.2 no da 0.3. */
@@ -1275,6 +1277,28 @@ export class TiendaService {
    * promos y el descuento; sin punto o fuera de todo barrio, la regla general
    * (gratis desde el monto configurado; si no, se coordina).
    */
+  /**
+   * ¿PARA CUÁNDO EL ENVÍO? (23/10/2026): las opciones del checkout minorista
+   * con el horario del local de los envíos y los feriados de la sucursal que
+   * despacha. Las reglas, en `horario-envio.ts`.
+   */
+  async agendaEnviosMinorista(previa?: string) {
+    await this.exigirAbierta('minorista', previa);
+    return this.agendaEnvios();
+  }
+
+  private async agendaEnvios() {
+    const ahora = new Date();
+    const hoy = fechaArgentina(ahora);
+    const hasta = fechaArgentina(new Date(ahora.getTime() + DIAS_BUSQUEDA * 86_400_000));
+    const [web, ventas, suc] = await Promise.all([this.cfg.get('web'), this.cfg.get('ventas'), this.sucursalTienda()]);
+    const delLocal = suc ? await this.db.select({ fecha: feriados.fecha, abre: feriadoSucursales.abre, horario: feriadoSucursales.horario })
+      .from(feriadoSucursales).innerJoin(feriados, eq(feriados.id, feriadoSucursales.feriadoId))
+      .where(and(eq(feriadoSucursales.sucursalId, suc.id), gte(feriados.fecha, hoy), lte(feriados.fecha, hasta))) : [];
+    const local = localDeEnvios(web.locales ?? [], ventas.tiendaMinoristaLocalEnvios ?? '');
+    return agendaEnvios(local ?? {}, excepcionesDe(delLocal), ahora);
+  }
+
   async pedidoMinorista(dto: any, tokenMin?: string, previa?: string) {
     const prueba = await this.exigirAbierta('minorista', previa);
     const c = await this.accesos.sesionMinorista(tokenMin);
@@ -1290,6 +1314,9 @@ export class TiendaService {
     const zona = entrega === 'cadete' ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
     const conBarrio = conDescuentoBarrio(items, zona?.descuentoPct ?? 0);
     const medioPago = medioDeTienda(dto?.medioPago);
+    /* Con envío, para cuándo (23/10/2026): lo elegido tiene que seguir valiendo ahora. */
+    const elegido = entrega === 'cadete' ? cuandoDe(dto?.cuando, await this.agendaEnvios()) : null;
+    if (elegido && 'error' in elegido) throw new BadRequestException(elegido.error);
 
     return this.db.transaction(async (tx) => {
       /*
@@ -1332,6 +1359,7 @@ export class TiendaService {
         webCliente: {
           nombre: c.nombre, apellido: c.apellido, telefono: c.telefono, dni: '', ...(domicilio ?? {}), ...envio,
           ...(medioPago ? { medioPago } : {}),
+          ...(elegido ? { cuando: elegido.cuando } : {}),
           /* Para medir cuántos clientes nuevos trae cada cupón. */
           ...(!(c.pedidos > 0) ? { primeraCompra: true } : {}),
           ...(prueba ? { prueba: true } : {}),
@@ -1455,6 +1483,11 @@ export class TiendaController {
   envioMinorista(@Body() body: any, @Headers(SESION_MIN) tokenMin?: string, @Headers(VISTA_PREVIA) previa?: string) {
     return this.svc.envioMinorista(body ?? {}, tokenMin, previa);
   }
+
+  /* Para cuándo el envío (23/10/2026): las opciones del checkout con el horario del local. */
+  @Get('minorista/horarios-envio')
+  @RateLimit('envio')
+  horariosEnvio(@Headers(VISTA_PREVIA) previa?: string) { return this.svc.agendaEnviosMinorista(previa); }
 
   /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
   @Post('minorista/registro')

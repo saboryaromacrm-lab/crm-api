@@ -21,6 +21,7 @@ import { tienePermiso } from '../auth/auth.guard';
 // tiene que quedar igual venga de donde venga (ver REGLAS, más abajo).
 import { normalizarPuntoVenta } from '../facturas/comun';
 import { configuracion } from '../db/schema';
+import { DIAS_SEMANA, horarioDelDia } from '../common/horario';
 
 /** Preferencias del circuito de ventas. */
 export const VENTAS_DEFAULTS = {
@@ -126,6 +127,13 @@ export const VENTAS_DEFAULTS = {
    * vacío = el botón avisa que falta cargarlo. No viaja a la tienda.
    */
   tiendaCadeteWhatsapp: '' as string,
+  /**
+   * DE QUÉ LOCAL ES EL HORARIO DE LOS ENVÍOS (23/10/2026): el nombre de uno de
+   * los locales de la tienda (General › Locales). Con su horario, el checkout
+   * minorista ofrece «lo antes posible» solo abierto y las franjas para elegir.
+   * Vacío = el primer local con horario cargado.
+   */
+  tiendaMinoristaLocalEnvios: '' as string,
   /**
    * Medios de pago con los que se respeta ese precio. Vacío = cualquiera.
    * Se valida AL CONFIRMAR, porque el medio de pago se elige al cobrar y el
@@ -599,6 +607,7 @@ const REGLAS: Record<string, {
   /* Una clave de Google son letras, números, «-» y «_»: cualquier otra cosa (espacios, comillas) se descarta. */
   'ventas.tiendaMinoristaMapsKey': { texto: (v: string) => (/^[\w-]{1,100}$/.test(String(v ?? '').trim()) ? String(v).trim() : '') },
   'ventas.tiendaCadeteWhatsapp': { texto: (v: string) => String(v ?? '').replace(/\D/g, '').slice(0, 15) },
+  'ventas.tiendaMinoristaLocalEnvios': { texto: (v: string) => String(v ?? '').trim().slice(0, 120) },
   'ventas.listaBaseId': { min: 0, max: 1_000_000, entero: true },
   'ventas.topeSinIdentificar': { min: 0, max: 10_000_000_000 },
   'ventas.modalidadMontoId': { min: 0, max: 1_000_000, entero: true },
@@ -738,24 +747,6 @@ const rutaInterna = (v: string): string => {
   } catch { return '/'; }
 };
 
-/**
- * EL HORARIO DE UN DÍA: hasta tres tramos «HH:MM-HH:MM» separados por coma;
- * vacío = cerrado. El ERP lo arma con relojes, pero un PUT a mano no: se
- * toman las horas de a pares (también «8 a 13 y 17 a 21») y lo que no es una
- * hora válida, o un tramo que termina antes de empezar, deja el día cerrado o
- * fuera ese tramo — nunca llega a Google un horario inventado.
- */
-export const DIAS_SEMANA = ['lun', 'mar', 'mie', 'jue', 'vie', 'sab', 'dom'] as const;
-function horarioDelDia(v: string): string {
-  const horas = [...String(v ?? '').matchAll(/(\d{1,2})(?:[:.h](\d{2}))?/g)]
-    .map(([, h, m = '00']) => (Number(h) <= 24 && Number(m) < 60 ? `${h.padStart(2, '0')}:${m}` : ''));
-  if (horas.some((h) => !h)) return '';
-  const tramos: string[] = [];
-  for (let i = 0; i + 1 < horas.length && tramos.length < 3; i += 2) {
-    if (horas[i] < horas[i + 1]) tramos.push(`${horas[i]}-${horas[i + 1]}`);
-  }
-  return tramos.join(', ');
-}
 
 /** Campos de un ítem que se saben más que texto libre: el `ctaUrl` de un slide y los días de un local. */
 const NORMALIZADORES: Record<string, (v: string) => string> = {
@@ -779,7 +770,7 @@ const PLANTILLAS: Record<string, Record<string, any>> = {
  * vacío vuelve al default —un número de WhatsApp en blanco rompe el sitio—,
  * pero en estos vacío quiere decir «no mostrar esa línea».
  */
-const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto', 'ventas.tiendaMinoristaMapsKey', 'ventas.tiendaCadeteWhatsapp']);
+const VACIO_VALIDO = new Set(['web.popupEtiqueta', 'web.popupTexto', 'ventas.tiendaMinoristaMapsKey', 'ventas.tiendaCadeteWhatsapp', 'ventas.tiendaMinoristaLocalEnvios']);
 
 /**
  * Limpia un ítem de un array de objetos contra su plantilla (el primer
@@ -934,7 +925,7 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  */
 const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
   [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaSoloConStock', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp']), 'web.configuracion'],
+  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaSoloConStock', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp', 'tiendaMinoristaLocalEnvios']), 'web.configuracion'],
 ];
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];
