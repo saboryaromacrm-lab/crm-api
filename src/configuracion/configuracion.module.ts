@@ -437,6 +437,15 @@ export const WEB_DEFAULTS = {
     { pregunta: '¿Tienen productos sin TACC y orgánicos?', respuesta: 'Sí. Trabajamos productos naturales, sin TACC y orgánicos; en la tienda online los encontrás por categoría y por etiqueta.' },
     { pregunta: '¿Cómo pago mi pedido?', respuesta: 'Hacés el pedido en la tienda online y coordinamos el pago y la entrega por WhatsApp, igual que siempre.' },
   ] as Array<Record<string, any>>,
+  /*
+   * LOS SLIDES (23/10/2026, pedido del dueño: «elegir marcas o productos y que
+   * se arme el contenido solo»). `contenido`: 'imagen' (la subida, como
+   * siempre), 'marca' (su logo y las fotos de sus productos) o 'productos'
+   * (`productoIds`, «12,45,78»). `tiendas`: 'mayorista', 'minorista' o
+   * 'ambas'. Los textos vacíos de una marca o de productos los completa la
+   * tienda con el catálogo del momento; `ctaUrl` vacío = lleva a la marca o a
+   * la tienda. Ver `bannersTienda` en la tienda.
+   */
   slides: [
     {
       id: 1,
@@ -446,6 +455,7 @@ export const WEB_DEFAULTS = {
       cta: 'Ver catálogo',
       ctaUrl: '/tienda',
       posicion: 'left',
+      contenido: 'imagen', marcaId: 0, productoIds: '', tiendas: 'mayorista',
     },
     {
       id: 2,
@@ -455,6 +465,7 @@ export const WEB_DEFAULTS = {
       cta: 'Ver ofertas',
       ctaUrl: '/#ofertas',
       posicion: 'center',
+      contenido: 'imagen', marcaId: 0, productoIds: '', tiendas: 'mayorista',
     },
     {
       id: 3,
@@ -464,6 +475,7 @@ export const WEB_DEFAULTS = {
       cta: 'Conocer marcas',
       ctaUrl: '/#marcas',
       posicion: 'right',
+      contenido: 'imagen', marcaId: 0, productoIds: '', tiendas: 'mayorista',
     },
   ] as Array<Record<string, any>>,
 };
@@ -748,9 +760,14 @@ const rutaInterna = (v: string): string => {
 };
 
 
-/** Campos de un ítem que se saben más que texto libre: el `ctaUrl` de un slide y los días de un local. */
+/** Campos de un ítem que se saben más que texto libre: los de un slide (destino, contenido, tiendas, productos) y los días de un local. */
+const MAX_PRODUCTOS_SLIDE = 12;
 const NORMALIZADORES: Record<string, (v: string) => string> = {
-  ctaUrl: rutaInterna,
+  /* Vacío vale en un slide de marca o de productos: lleva a la marca o a la tienda. */
+  ctaUrl: (v) => (v ? rutaInterna(v) : ''),
+  contenido: (v) => (v === 'marca' || v === 'productos' ? v : 'imagen'),
+  tiendas: (v) => (v === 'minorista' || v === 'ambas' ? v : 'mayorista'),
+  productoIds: (v) => [...new Set(v.split(/\D+/).filter(Boolean))].slice(0, MAX_PRODUCTOS_SLIDE).join(','),
   ...Object.fromEntries(DIAS_SEMANA.map((d) => [d, horarioDelDia])),
 };
 
