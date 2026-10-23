@@ -33,15 +33,15 @@ import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
   MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, inArray, lt, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
-import { segunCorte, sinIvaHasta } from '../cafeteria/cuenta';
+import { segunCorte, sinIvaHasta, ZONA_AR } from '../cafeteria/cuenta';
 import {
-  comprobantes, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
-  proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
+  comprobantes, cuentaDisponiblePagos, cuentasDisponibles, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas,
+  proveedorAjustes, proveedorCompromisos, proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { nombreMes } from './facturas-mes.module';
 import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } from '../pagos/pagos.module';
@@ -808,7 +808,7 @@ export class FinanzasProveedorService {
       .where(eq(proveedores.id, proveedorId)).limit(1);
     if (!prov) throw new NotFoundException('Proveedor inexistente.');
 
-    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit] = await Promise.all([
+    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit, deCuentaDisp] = await Promise.all([
       this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -858,6 +858,13 @@ export class FinanzasProveedorService {
        * que la aplicación va a aceptar. */
       this.pagos.documentosPendientes(proveedorId),
       sinIvaHasta(this.db),
+      /* Qué pagos son transferencias a una cuenta disponible (vivas), y de cuál. */
+      this.db.select({
+        pagoId: cuentaDisponiblePagos.proveedorPagoId, cuentaId: cuentasDisponibles.id,
+        titular: cuentasDisponibles.titular, cbuAlias: cuentasDisponibles.cbuAlias, objetivo: cuentasDisponibles.importe,
+      }).from(cuentaDisponiblePagos)
+        .innerJoin(cuentasDisponibles, eq(cuentasDisponibles.id, cuentaDisponiblePagos.cuentaId))
+        .where(and(eq(cuentasDisponibles.proveedorId, proveedorId), isNull(cuentaDisponiblePagos.anuladoEn))),
     ]);
 
     const formasPorPago = new Map<number, any[]>();
@@ -872,6 +879,7 @@ export class FinanzasProveedorService {
     const saldoVivo = new Map<number, number>(
       docsPendientes.filter((d: any) => d.tipo === 'comprobante').map((d: any) => [d.docId, money(d.saldo)]),
     );
+    const $ = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     const movs: any[] = [];
     for (const c of comps) {
       const esNc = c.tipo === 'nota_credito';
@@ -909,7 +917,51 @@ export class FinanzasProveedorService {
           : 0,
       });
     }
+    /*
+     * LAS TRANSFERENCIAS DE UNA CUENTA DISPONIBLE, EN UN SOLO RENGLÓN (23/10/2026,
+     * pedido del dueño): los clientes la van llenando de a muchas transferencias
+     * (cada cobro deja su pago al proveedor), y para el proveedor es UN pago: el
+     * total que entró a esa cuenta. Sale con la fecha de la última transferencia
+     * y la suma de lo pagado y lo aplicado, así el saldo y los totales son los
+     * mismos que sumando de a uno. Cada transferencia, con su cliente y su venta,
+     * se ve en Proveedores › Cuentas disponibles. No se anula desde acá: cada
+     * transferencia muere con su venta.
+     */
+    const cuentaDe = new Map(deCuentaDisp.map((x) => [x.pagoId, x]));
+    const porCuenta = new Map<number, any>();
     for (const p of pgs) {
+      const cd = cuentaDe.get(p.id);
+      if (!cd) continue;
+      const g = porCuenta.get(cd.cuentaId) ?? {
+        kind: 'pago', id: p.id, agrupado: true, medio: 'transferencia', formas: [], debe: 0, haber: 0, aplicado: 0,
+        esFlete: false, cuenta: cd, transferencias: 0, desde: p.fecha, fecha: p.fecha,
+      };
+      g.id = Math.min(g.id, p.id);
+      g.haber = money(g.haber + p.importe);
+      g.aplicado = money(g.aplicado + p.aplicado);
+      g.transferencias += 1;
+      if (p.fecha < g.desde) g.desde = p.fecha;
+      if (p.fecha > g.fecha) g.fecha = p.fecha;
+      porCuenta.set(cd.cuentaId, g);
+    }
+    const dia = (f: Date) => f.toLocaleDateString('es-AR', { timeZone: ZONA_AR, day: '2-digit', month: '2-digit' });
+    for (const g of porCuenta.values()) {
+      const { cuenta: c, transferencias: n, desde, ...mov } = g;
+      const falta = money(c.objetivo - g.haber);
+      movs.push({
+        ...mov,
+        etiqueta: 'Pago (transferencias de clientes)',
+        detalle: [
+          `Cuenta disponible ${c.titular || 'del proveedor'}${c.cbuAlias ? ` · ${c.cbuAlias}` : ''}`,
+          n === 1 ? '1 transferencia' : `${n} transferencias del ${dia(desde)} al ${dia(g.fecha)}`,
+          falta > EPS ? `en curso: faltan ${$(falta)} de ${$(c.objetivo)}` : null,
+        ].filter(Boolean).join(' · '),
+        transferencias: n,
+        sinAplicar: money(g.haber - g.aplicado),
+      });
+    }
+    for (const p of pgs) {
+      if (cuentaDe.has(p.id)) continue;
       const formas = formasPorPago.get(p.id) ?? [];
       movs.push({
         kind: 'pago',
@@ -950,7 +1002,6 @@ export class FinanzasProveedorService {
       .from(facturacionesMesFacturas)
       .innerJoin(facturacionesMes, eq(facturacionesMes.id, facturacionesMesFacturas.facturacionId))
       .where(and(eq(facturacionesMesFacturas.proveedorId, proveedorId), eq(facturacionesMesFacturas.activa, true)));
-    const $ = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     for (const { f, mes } of delMes) {
       movs.push({
         kind: 'factura_mes',
