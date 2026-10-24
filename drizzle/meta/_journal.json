@@ -1380,6 +1380,13 @@
       "when": 1792760400000,
       "tag": "0196_gasto_items_cantidad",
       "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "7",
+      "when": 1792846800000,
+      "tag": "0197_descuentos_dias",
+      "breakpoints": true
     }
   ]
 }

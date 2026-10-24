@@ -49,7 +49,7 @@ import {
   feriados, feriadoSucursales,
 } from '../db/schema';
 import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
-import { ofertaAlcanza } from '../ventas/ventas.module';
+import { ofertaAlcanza, valeElDia } from '../ventas/ventas.module';
 import { ListasModule } from '../listas/listas.module';
 import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -127,7 +127,7 @@ function ofertaVigente(o: any, sucursalId: number | null) {
   const t = new Date();
   if (o.desde && t < new Date(o.desde)) return false;
   if (o.hasta && t > new Date(o.hasta)) return false;
-  if (o.dias && o.dias.length === 7 && o.dias[(t.getDay() + 6) % 7] !== '1') return false;
+  if (!valeElDia(o.dias, t)) return false;
   if (o.sucursales && sucursalId != null) {
     const ids = String(o.sucursales).split(',').map((x: string) => x.trim()).filter(Boolean);
     if (ids.length && !ids.includes(String(sucursalId))) return false;

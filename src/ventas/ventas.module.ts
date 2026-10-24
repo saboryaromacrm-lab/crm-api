@@ -187,6 +187,23 @@ function techoDeOferta(
 }
 
 /**
+ * ¿VALE ESTE DÍA DE LA SEMANA? La máscara de ofertas y descuentos va de lunes
+ * a domingo ('0010000' = solo miércoles); vacía, todos los días. `getDay()`
+ * arranca en domingo, de ahí el corrimiento.
+ */
+export function valeElDia(dias: unknown, ahora: Date): boolean {
+  const m = String(dias ?? '');
+  return m.length !== 7 || m[(ahora.getDay() + 6) % 7] === '1';
+}
+
+const NOMBRES_DIAS = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábados', 'domingos'];
+/** «los miércoles», «los lunes y miércoles»: para el mensaje del descuento que hoy no vale. */
+export function textoDias(dias: string): string {
+  const n = NOMBRES_DIAS.filter((_, i) => dias[i] === '1');
+  return `los ${n.length > 1 ? `${n.slice(0, -1).join(', ')} y ${n[n.length - 1]}` : n[0] ?? ''}`;
+}
+
+/**
  * ¿LA OFERTA ESTÁ VIVA AHORA, ACÁ? (26/9/2026) La MISMA regla que la caja
  * (`ofertaVigente` en domain/ofertas.js): fechas, días de la semana y
  * sucursal. El servidor solo miraba el tilde "activa", así que una promo del
@@ -197,8 +214,7 @@ export function ofertaVigenteAhora(o: any, ahora: Date, sucursalId?: number | nu
   if (!o || o.activa === false) return false;
   if (o.desde && ahora < new Date(o.desde)) return false;
   if (o.hasta && ahora > new Date(o.hasta)) return false;
-  const dias = String(o.dias ?? '');
-  if (dias.length === 7 && dias[(ahora.getDay() + 6) % 7] !== '1') return false;
+  if (!valeElDia(o.dias, ahora)) return false;
   if (o.sucursales && sucursalId != null) {
     const ids = String(o.sucursales).split(',').map((x) => x.trim()).filter(Boolean);
     if (ids.length && !ids.includes(String(sucursalId))) return false;
@@ -2050,6 +2066,9 @@ export class VentasService {
       if (d.vence && d.vence.getTime() < ahora.getTime()) {
         throw new BadRequestException(`El descuento "${d.nombre}" venció.`);
       }
+      if (!valeElDia(d.dias, ahora)) {
+        throw new BadRequestException(`El descuento "${d.nombre}" hoy no vale: es solo para ${textoDias(d.dias)}.`);
+      }
       if (d.sucursalId != null && d.sucursalId !== sucursalId) {
         throw new BadRequestException(`El descuento "${d.nombre}" no es de esta sucursal.`);
       }
@@ -3367,11 +3386,18 @@ export class VentasService {
     const ids = [...new Set(items.map((it: any) => it.descuentoId).filter(Boolean) as number[])];
     if (!ids.length) return;
     const filas = await this.db.select().from(descuentos).where(inArray(descuentos.id, ids));
-    const ahora = Date.now();
+    const ahora = new Date();
     for (const d of filas) {
-      if (d.vence && d.vence.getTime() < ahora) {
+      if (d.vence && d.vence.getTime() < ahora.getTime()) {
         throw new BadRequestException(
           `El descuento "${d.nombre}" venció y este ticket todavía lo tiene aplicado. `
+          + 'Quitalo del ticket y volvé a cobrar.',
+        );
+      }
+      /* El ticket armado el martes a las 23:50 y cobrado el miércoles, o al revés. */
+      if (!valeElDia(d.dias, ahora)) {
+        throw new BadRequestException(
+          `El descuento "${d.nombre}" es solo para ${textoDias(d.dias)} y este ticket todavía lo tiene aplicado. `
           + 'Quitalo del ticket y volvé a cobrar.',
         );
       }
@@ -5555,6 +5581,13 @@ const FIN_DEL_DIA_AR = 'T23:59:59.999-03:00';
  */
 const SOLO_FECHA = /^$|^\d{4}-\d{2}-\d{2}$/;
 
+/** Los días del descuento, como los de una oferta: los siete (o ninguno mandado) = vacío, «todos los días». */
+const diasDe = (v?: string | null): string => {
+  const m = String(v ?? '').trim();
+  if (m === '0000000') throw new BadRequestException('Elegí al menos un día para el descuento.');
+  return m === '1111111' ? '' : m;
+};
+
 const vencimientoDe = (v?: string | null): Date | null => {
   const s = String(v ?? '').trim();
   if (!s) return null;
@@ -5568,6 +5601,8 @@ class DescuentoDto {
    * negativo. El 0 se permite para poder dejarlo "en pausa" sin borrarlo. */
   @IsOptional() @IsNumber() @Min(0) @Max(100) porcentaje?: number;
   @IsOptional() @IsString() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vence?: string;
+  /** Lunes → domingo, '1' = vale ese día; vacío = todos los días (igual que las ofertas). */
+  @IsOptional() @IsString() @Matches(/^$|^[01]{7}$/, { message: 'Los días van como siete 0 y 1, de lunes a domingo.' }) dias?: string;
   /** Vacío/ausente = cualquier forma de pago (por eso `''` entra en la lista). */
   @IsOptional() @IsIn(['', ...MEDIOS] as unknown as string[]) medioPago?: string;
   @IsOptional() @IsInt() listaId?: number;
@@ -5587,7 +5622,7 @@ const nombreEfectivo = (nombre: string) => `${nombre} (efectivo)`;
  * UN DESCUENTO CON DOS PORCENTAJES (0149, 8/10/2026, pedido del dueño): el
  * general y uno mayor pagando en efectivo. El de efectivo es OTRO descuento,
  * «solo con Efectivo» y enlazado por `efectivoDeId`, que copia todo lo demás
- * del general (lista, sucursal, vencimiento, quién lo aplica, activo). Así lo
+ * del general (lista, sucursal, vencimiento, días, quién lo aplica, activo). Así lo
  * controlan las reglas que ya existen —pago íntegro con ese medio, uno por
  * lista— sin una cuenta nueva de plata, y la caja puede pasar de uno al otro.
  * Se maneja SOLO desde el general: la pareja no se edita ni se borra sola.
@@ -5668,6 +5703,7 @@ export class DescuentosService {
       nombre,
       porcentaje: pct2(dto.porcentaje),
       vence: vencimientoDe(dto.vence),
+      dias: diasDe(dto.dias),
       medioPago: (dto.medioPago || null) as any,
       listaId,
       sucursalId: dto.sucursalId ?? null,
@@ -5699,6 +5735,7 @@ export class DescuentosService {
       porcentaje: dto.porcentaje != null ? pct2(dto.porcentaje) : actual.porcentaje,
       // `vence` se distingue de "no lo mandaron": una cadena vacía lo BORRA.
       vence: dto.vence !== undefined ? vencimientoDe(dto.vence) : actual.vence,
+      dias: dto.dias !== undefined ? diasDe(dto.dias) : actual.dias,
       medioPago: dto.medioPago !== undefined ? ((dto.medioPago || null) as any) : actual.medioPago,
       listaId,
       sucursalId: dto.sucursalId !== undefined ? (dto.sucursalId ?? null) : actual.sucursalId,

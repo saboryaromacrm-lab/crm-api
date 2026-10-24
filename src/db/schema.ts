@@ -2231,6 +2231,11 @@ export const descuentos = pgTable('descuentos', {
    * acordarse de sumar un día. Nulo = sin vencimiento.
    */
   vence: timestamp('vence', { withTimezone: true }),
+  /**
+   * LOS DÍAS EN QUE VALE (0197): la misma máscara que las ofertas, lunes →
+   * domingo ('0010000' = solo los miércoles). Vacío = todos los días.
+   */
+  dias: text('dias').notNull().default(''),
   /** Nulo = cualquier forma de pago. Si tiene valor, el pago debe ser ÍNTEGRO. */
   medioPago: medioPagoEnum('medio_pago'),
   listaId: integer('lista_id').notNull().references(() => listasVenta.id, { onDelete: 'restrict' }),
