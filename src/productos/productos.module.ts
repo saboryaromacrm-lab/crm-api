@@ -1,7 +1,8 @@
 import {
   Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module, BadRequestException,
-  NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
+  NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query, Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
@@ -29,6 +30,8 @@ import {
   precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
+import { exportarProductos } from './exportar';
+import { fechaQr } from '../arca/fecha';
 import { costoCafe, costoUltimaFactura, cupoCafe } from '../cafeteria/cuenta';
 
 /*
@@ -313,6 +316,11 @@ export class ProductosService {
     private readonly evolucion: HistorialPreciosService,
     private readonly audit: AuditoriaService,
   ) {}
+
+  /** Los productos elegidos, completos, para importar en otro ERP (ver exportar.ts). */
+  exportar(ids: unknown, conFotos: boolean) {
+    return exportarProductos(this.db, ids, conFotos);
+  }
 
   /* ------------------------------ Armado ------------------------------ */
 
@@ -2727,6 +2735,18 @@ export class ProductosController {
   /** Catálogo completo de un proveedor, en una sola transacción. */
   @Permiso('compras.productos')
   @Post('importar') importar(@Body() dto: ImportarDto) { return this.svc.importar(dto); }
+  /**
+   * Los productos elegidos, completos, en un archivo para importar en otro ERP
+   * (24/10/2026). Lleva costos y proveedores: solo el superadmin.
+   */
+  @Permiso('compras.productos')
+  @Post('exportar')
+  async exportar(@Body() body: any, @Auth() sesion: Sesion, @Res({ passthrough: true }) res: Response) {
+    if (!sesion?.permisos?.includes('*')) throw new ForbiddenException('Exportar productos es exclusivo del superadmin.');
+    const archivo = await this.svc.exportar(body?.ids, body?.fotos === true);
+    res.setHeader('Content-Disposition', `attachment; filename="productos-${fechaQr(new Date(archivo.exportadoEn))}.json"`);
+    return archivo;
+  }
 
   /** Solo costos, sin el maestro: ver el comentario del servicio. */
   @Permiso('compras.productos')
