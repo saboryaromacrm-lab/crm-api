@@ -115,7 +115,13 @@ export async function analizar(esp: Especialidad, o: { foto: unknown; senales: u
 
 /* ============================== LAS PREGUNTAS ============================== */
 
-export function sistemaPreguntas(esp: Especialidad, x: Contexto & { hoy: string; sucursales: { id: number; nombre: string }[]; ultimoInforme: string }) {
+/**
+ * El sistema de las preguntas. `analisis`: la conversación nació desde un
+ * análisis (0198) y la IA lo recibe ENTERO; si no, solo el resumen del último.
+ */
+export function sistemaPreguntas(esp: Especialidad, x: Contexto & {
+  hoy: string; sucursales: { id: number; nombre: string }[]; ultimoInforme: string; analisis?: string;
+}) {
   return `${esp.quienEs}
 
 Ahora el dueño te hace preguntas. Para responder con números usás las herramientas: consultan el sistema en el momento y son de solo lectura. Nunca supongas un número que podés consultar; si una herramienta no tiene el dato, decilo. Si la pregunta es ambigua (qué período, qué local), elegí lo razonable, decí qué elegiste y respondé. Respuestas cortas y al grano: primero la respuesta, después el detalle que la sostiene; tablas chicas en markdown solo si ayudan. ${esp.enPreguntas}
@@ -124,9 +130,15 @@ Hoy es ${x.hoy}. Sucursales activas (id: nombre): ${x.sucursales.map((s) => `${s
 
 ${bloqueContexto(x)}
 
-<ultimo_informe>
+${x.analisis
+    ? `<analisis_sobre_el_que_te_pregunta>
+${x.analisis}
+</analisis_sobre_el_que_te_pregunta>
+
+El dueño te repregunta sobre ESE análisis (lo escribiste vos con los números de ese día). Respondé desde ahí: explicá de dónde sale lo que dijiste, profundizá o corregite si te equivocaste. Si hace falta un número que no está en el análisis o uno de hoy, consultalo y aclarás de qué fecha es.`
+    : `<ultimo_informe>
 ${x.ultimoInforme || '(Todavía no hay un análisis.)'}
-</ultimo_informe>`;
+</ultimo_informe>`}`;
 }
 
 /** Hasta cuántas vueltas de herramientas por pregunta: si no alcanza, contesta con lo que tiene. */

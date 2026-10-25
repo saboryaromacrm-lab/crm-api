@@ -161,7 +161,7 @@ const REGISTRO: Record<string, { def: Tool; correr: Correr }> = {
   consultar_resultados: {
     def: {
       name: 'consultar_resultados', strict: true,
-      description: 'Estado de resultados por mes (neto): ventas, margen bruto, gastos variables, contribución, gastos fijos, resultado operativo y neto, punto de equilibrio y objetivo.',
+      description: 'Estado de resultados por mes (neto): ventas (facturadas y sin factura), margen bruto, gastos variables (Ingresos Brutos, tasa municipal, comisiones de tarjeta/QR), contribución, gastos fijos (sueldos y lo cargado en Gastos), resultado operativo, Ganancias, resultado neto (lo que queda en limpio), IVA, retiros, punto de equilibrio y objetivo. Para «cuánto me queda en limpio», usá esta.',
       input_schema: obj({ desde_mes: { type: 'string', description: 'AAAA-MM' }, hasta_mes: { type: 'string', description: 'AAAA-MM (no futuro). Hasta 12 meses.' } }),
     },
     correr: (f, i) => {

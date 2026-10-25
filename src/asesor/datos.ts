@@ -508,14 +508,24 @@ export async function gastos(f: Fuentes, desde: string, hasta: string, sucursalI
 
 /* ============================== RESULTADOS ============================== */
 
-/** El estado de resultados de cada mes (todo neto), con el punto de equilibrio calculado igual que la pantalla. */
+/**
+ * El estado de resultados de cada mes (todo neto), con el punto de equilibrio
+ * calculado igual que la pantalla. Con el DETALLE de cada renglón (25/10/2026):
+ * con los totales solos la IA no veía Ingresos Brutos, comisiones ni sueldos y
+ * decía que «no están»; tampoco cuánto de la venta es facturada.
+ */
 export async function resultados(f: Fuentes, desdeMes: string, hastaMes: string) {
   const e: any = await f.resultados.estado({ desde: desdeMes, hasta: hastaMes });
   const objetivo = (mes: string) => e.objetivos.find((o: any) => o.mes === mes && (o.sucursalId == null || o.sucursalId === 0)) ?? null;
   return {
-    nota: 'Todo neto (sin IVA). El mes en curso va hasta hoy. Punto de equilibrio = fijos ÷ (contribución ÷ ventas).',
+    nota: 'Todo neto (sin IVA). El mes en curso va hasta hoy. Lo que le queda al dueño «en limpio» es resultadoNeto (después de Ganancias); '
+      + 'los retiros sin costo son retiro de socios y van aparte. Ingresos Brutos y la tasa municipal se estiman por % sobre lo facturado y la comisión '
+      + 'de tarjetas/QR por % de lo cobrado así, salvo que se haya cargado el pago real. El margen no se separa entre facturado y no facturado: '
+      + 'solo la venta. IVA: lo declarado se paga aparte (aPagar); el de lo vendido sin factura queda en la casa. '
+      + 'Punto de equilibrio = fijos ÷ (contribución ÷ ventas). Los «avisos» dicen qué falta cargar para que el número sea completo.',
     meses: e.meses.map((m: any) => {
       const c = m.total.cascada;
+      const h = m.total.hechos;
       const contribPct = c.ventasNetas > 0 ? c.contribucion / c.ventasNetas : 0;
       /* Sin gastos fijos cargados no hay equilibrio que calcular (daría $0, que confunde). */
       const equilibrio = contribPct > 0 && c.totalFijos > 0 ? r0(c.totalFijos / contribPct) : null;
@@ -523,8 +533,16 @@ export async function resultados(f: Fuentes, desdeMes: string, hastaMes: string)
       return {
         mes: m.mes, enCurso: m.mes === e.mesEnCurso,
         ventasNetas: r0(c.ventasNetas), margenBruto: r0(c.margenBruto), margenBrutoPct: pct(c.margenBruto, c.ventasNetas),
-        gastosVariables: r0(c.totalVariables), contribucion: r0(c.contribucion), contribucionPct: pct(c.contribucion, c.ventasNetas),
-        gastosFijos: r0(c.totalFijos), resultadoOperativo: r0(c.operativo), antesDeGanancias: r0(c.antesGanancias), resultadoNeto: r0(m.neto ?? c.antesGanancias),
+        ventasFacturadas: r0(h.facturado), ventasSinFactura: r0(c.ventasNetas - h.facturado), facturadoPct: pct(h.facturado, c.ventasNetas),
+        gastosVariables: {
+          total: r0(c.totalVariables), ingresosBrutos: r0(h.iibb), tasaMunicipal: r0(h.municipalidad),
+          comisionesTarjetaYQr: r0(h.comisiones), deEsasMercadoPago: r0(h.comisionesMp), otros: r0(c.otrosVariables),
+        },
+        contribucion: r0(c.contribucion), contribucionPct: pct(c.contribucion, c.ventasNetas),
+        gastosFijos: { total: r0(c.totalFijos), sueldos: r0(h.sueldos), otrosCargadosEnGastos: r0(c.otrosFijos), amortizaciones: r0(h.amortizaciones) },
+        resultadoOperativo: r0(c.operativo), resultadoFinanciero: r0(c.resultadoFinanciero), antesDeGanancias: r0(c.antesGanancias),
+        gananciasEstimadas: r0(m.ganancias?.impuesto ?? 0), resultadoNeto: r0(m.neto ?? c.antesGanancias), retirosSinCosto: r0(h.retiros),
+        iva: { aPagar: r0(m.iva?.aPagar), saldoAFavor: r0(m.iva?.saldoAFavor), deLoVendidoSinFactura: r0(m.iva?.sinFactura) },
         puntoDeEquilibrio: equilibrio, margenDeSeguridadPct: equilibrio && c.ventasNetas > 0 ? pct(c.ventasNetas - equilibrio, c.ventasNetas) : null,
         ...(o ? { objetivoVenta: o.ventaNeta ?? null, objetivoResultado: o.resultado ?? null } : {}),
       };

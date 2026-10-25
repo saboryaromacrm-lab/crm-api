@@ -1387,6 +1387,13 @@
       "when": 1792846800000,
       "tag": "0197_descuentos_dias",
       "breakpoints": true
+    },
+    {
+      "idx": 198,
+      "version": "7",
+      "when": 1792933200000,
+      "tag": "0198_asesor_charla_informe",
+      "breakpoints": true
     }
   ]
 }

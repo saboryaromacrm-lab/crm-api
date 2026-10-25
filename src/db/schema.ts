@@ -4332,6 +4332,8 @@ export const asesorConversaciones = pgTable('asesor_conversaciones', {
   creadaEn: timestamp('creada_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadaEn: timestamp('actualizada_en', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** El análisis desde el que nació (0198): la IA lo tiene entero en cada pregunta. */
+  informeId: integer('informe_id').references(() => asesorInformes.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixEsp: index('ix_asesor_conv_esp').on(t.especialidad, t.actualizadaEn),
 }));

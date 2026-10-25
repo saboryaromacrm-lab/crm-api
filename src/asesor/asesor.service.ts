@@ -53,6 +53,8 @@ export class AprendizajeEditarDto {
 }
 export class PreguntaDto {
   @IsOptional() @IsInt() conversacionId?: number;
+  /** Solo al empezar: la conversación nace desde ese análisis (0198). */
+  @IsOptional() @IsInt() informeId?: number;
   @IsString() @MaxLength(2000) pregunta!: string;
 }
 
@@ -258,13 +260,16 @@ export class AsesorService {
     const [i] = await this.db.select().from(asesorInformes)
       .where(and(eq(asesorInformes.id, id), eq(asesorInformes.especialidad, esp.id))).limit(1);
     if (!i) throw new NotFoundException('Ese análisis no existe.');
-    const [ops, acs] = await Promise.all([
+    const [ops, acs, [charla]] = await Promise.all([
       this.db.select().from(asesorOpiniones).where(eq(asesorOpiniones.informeId, id)),
       this.db.select().from(asesorAcciones).where(eq(asesorAcciones.informeId, id)),
+      this.db.select({ id: asesorConversaciones.id }).from(asesorConversaciones)
+        .where(eq(asesorConversaciones.informeId, id)).orderBy(desc(asesorConversaciones.actualizadaEn)).limit(1),
     ]);
     const { foto, ...resto } = i;
     return {
       ...resto,
+      conversacionId: charla?.id ?? null,
       opiniones: Object.fromEntries(ops.map((o) => [o.alerta, { valor: o.valor, nota: o.nota }])),
       acciones: Object.fromEntries(acs.map((a) => [a.propuesta, { ofertaId: a.ofertaId, fecha: a.fecha }])),
       ...(conFoto ? { foto } : { datosAl: (foto as any)?.contexto?.metricasAl ?? null }),
@@ -286,6 +291,7 @@ export class AsesorService {
 
   async conversaciones(esp: Especialidad) {
     const r = await this.db.execute(sql`select c.id, c.titulo, c.creada_en as "creadaEn", c.actualizada_en as "actualizadaEn",
+        c.informe_id as "informeId", (select i.fecha from asesor_informes i where i.id = c.informe_id) as "informeFecha",
         (select count(*) from asesor_mensajes m where m.conversacion_id = c.id and m.rol = 'user' and m.texto <> '')::int as preguntas,
         (select coalesce(sum(m.costo_usd), 0) from asesor_mensajes m where m.conversacion_id = c.id)::float8 as "costoUsd"
       from asesor_conversaciones c where c.especialidad = ${esp.id} order by c.actualizada_en desc limit 50`);
@@ -321,14 +327,33 @@ export class AsesorService {
     return { ok: true };
   }
 
+  /**
+   * El análisis entero para la charla que nace de él (0198): fecha, enfoque y
+   * lo que escribió la IA (sin la foto: si hace falta un número, lo consulta).
+   * Al empezar, uno sin texto (en curso o con error) no sirve; si ya hay charla
+   * y el análisis se borró, sigue como una conversación común.
+   */
+  private async analisisParaCharla(esp: Especialidad, informeId: number, alEmpezar: boolean) {
+    const [i] = await this.db.select({ fecha: asesorInformes.fecha, enfoque: asesorInformes.enfoque, informe: asesorInformes.informe })
+      .from(asesorInformes).where(and(eq(asesorInformes.id, informeId), eq(asesorInformes.especialidad, esp.id))).limit(1);
+    if (!i?.informe) {
+      if (alEmpezar) throw new BadRequestException('Ese análisis no tiene texto de la IA para preguntarle.');
+      return '';
+    }
+    const fecha = i.fecha.toLocaleString('es-AR', { timeZone: ZONA, dateStyle: 'short', timeStyle: 'short' });
+    return `Análisis del ${fecha}${i.enfoque ? `, con el enfoque «${i.enfoque}»` : ''}:\n${JSON.stringify(i.informe)}`;
+  }
+
   async preguntar(esp: Especialidad, dto: PreguntaDto, usuarioId: number | null) {
     if (!IA.configurado) throw new BadRequestException('El asesor no está configurado: falta la clave de la IA (ANTHROPIC_API_KEY) en el servidor.');
     const pregunta = dto.pregunta.trim();
     if (pregunta.length < 3) throw new BadRequestException('Escribí la pregunta.');
     let convId = dto.conversacionId ?? null;
     let creada: Date | null = null;
+    let informeId = convId ? null : dto.informeId ?? null;
     if (convId) {
-      creada = (await this.conversacionDe(esp.id, convId)).creadaEn;
+      const c = await this.conversacionDe(esp.id, convId);
+      creada = c.creadaEn; informeId = c.informeId;
       const [n] = await this.db.select({ n: sql<number>`count(*)::int` }).from(asesorMensajes)
         .where(and(eq(asesorMensajes.conversacionId, convId), eq(asesorMensajes.rol, 'user'), sql`${asesorMensajes.texto} <> ''`));
       if (Number(n?.n) >= MAX_PREGUNTAS) throw new BadRequestException(`Esta conversación ya tiene ${MAX_PREGUNTAS} preguntas: empezá una nueva (sale más barato y más preciso).`);
@@ -343,18 +368,21 @@ export class AsesorService {
           .where(eq(asesorMensajes.conversacionId, convId)).orderBy(asc(asesorMensajes.id)))
           .map((m) => ({ role: m.rol as 'user' | 'assistant', content: m.contenido as any }))
         : [];
-      const [ctx, [ultimo], sucs] = await Promise.all([
+      const [ctx, [ultimo], sucs, analisis] = await Promise.all([
         this.contexto(esp.id),
         this.db.select({ fecha: asesorInformes.fecha, informe: asesorInformes.informe }).from(asesorInformes)
           .where(and(eq(asesorInformes.especialidad, esp.id), sql`${asesorInformes.informe} is not null`)).orderBy(desc(asesorInformes.id)).limit(1),
         this.fuentes.metricas.sucursales(),
+        informeId ? this.analisisParaCharla(esp, informeId, !convId) : Promise.resolve(''),
       ]);
       const resumenUltimo = ultimo ? `Del ${ultimo.fecha.toISOString().slice(0, 10)}: ${esp.resumirInforme(ultimo.informe)}` : '';
       /* El sistema se arma con la fecha del primer turno, para que el caché sirva entre preguntas;
        * si la conversación viene de otro día, la fecha de hoy va en la pregunta. */
       const hoy = hoyAr();
       const sistemaHoy = creada ? creada.toLocaleDateString('sv-SE', { timeZone: ZONA }) : hoy;
-      const sistema = sistemaPreguntas(esp, { ...ctx, hoy: sistemaHoy, sucursales: sucs.map((s: any) => ({ id: Number(s.id), nombre: s.nombre })), ultimoInforme: resumenUltimo });
+      const sistema = sistemaPreguntas(esp, {
+        ...ctx, hoy: sistemaHoy, sucursales: sucs.map((s: any) => ({ id: Number(s.id), nombre: s.nombre })), ultimoInforme: resumenUltimo, analisis,
+      });
       const pregHoy = sistemaHoy !== hoy ? `(Hoy es ${hoy}.) ${pregunta}` : pregunta;
 
       let error: ErrorAsesor | null = null;
@@ -375,7 +403,7 @@ export class AsesorService {
         throw new BadRequestException(error?.message ?? 'La IA no terminó de responder: probá de nuevo.');
       }
       if (!convId) {
-        const [c] = await this.db.insert(asesorConversaciones).values({ especialidad: esp.id, titulo: pregunta.slice(0, 120), usuarioId })
+        const [c] = await this.db.insert(asesorConversaciones).values({ especialidad: esp.id, titulo: pregunta.slice(0, 120), usuarioId, informeId })
           .returning({ id: asesorConversaciones.id });
         convId = c.id;
       }
