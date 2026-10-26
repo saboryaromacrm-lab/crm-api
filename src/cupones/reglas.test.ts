@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { aplicar, descuentoCuponNeto, enFranja, errorDeCupon, momentoAr, motivoNoVale, type Contexto, type Cupon, type Renglon } from './reglas';
+import { aplicar, descuentoCuponNeto, enFranja, errorDeCupon, mejorPorMedio, momentoAr, motivoNoVale, type Contexto, type Cupon, type Renglon } from './reglas';
 
 const cupon = (x: Partial<Cupon> = {}): Cupon => ({
   codigo: 'BIENVENIDA', activo: true, tipo: 'porcentaje', valor: 10, tope: 0, montoMinimo: 0, desde: null, hasta: null,
@@ -104,4 +104,17 @@ test('validación de la definición', () => {
   assert.ok(errorDeCupon(cupon({ tipo: 'envio_gratis', entrega: 'retiro' })));
   assert.ok(errorDeCupon(cupon({ tipo: 'monto', valor: 5000, montoMinimo: 3000 })));
   assert.ok(errorDeCupon(cupon({ horaDesde: '25:00' })));
+});
+
+test('automáticos (0199): el mejor de cada medio; sin medio elegido, solo los de cualquier medio', () => {
+  const evaluar = (codigo: string, x: Partial<Cupon>) => ({ codigo, resultado: aplicar(cupon({ codigo, ...x }), carrito(), ctx()) });
+  const efectivo5 = evaluar('EFECTIVO5', { valor: 5, mediosPago: 'efectivo' });
+  const todos3 = evaluar('TODOS3', { valor: 3 });
+  const vencido = evaluar('VIEJO', { valor: 50, hasta: '2026-01-01T23:59:59-03:00' });
+  const m = mejorPorMedio([efectivo5, todos3, vencido]);
+  assert.equal(m.porMedio.efectivo?.codigo, 'EFECTIVO5');     // 5 % le gana al 3 %; el vencido no cuenta
+  assert.equal(m.porMedio.transferencia?.codigo, 'TODOS3');   // el de efectivo no vale con transferencia
+  assert.equal(m.todos?.codigo, 'TODOS3');                    // antes de elegir, solo el que vale con cualquiera
+  assert.equal(mejorPorMedio([efectivo5]).todos, null);
+  assert.equal(mejorPorMedio([]).porMedio.efectivo, null);
 });

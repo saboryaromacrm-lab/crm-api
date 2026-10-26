@@ -1394,6 +1394,13 @@
       "when": 1792933200000,
       "tag": "0198_asesor_charla_informe",
       "breakpoints": true
+    },
+    {
+      "idx": 199,
+      "version": "7",
+      "when": 1793019600000,
+      "tag": "0199_cupones_automaticos",
+      "breakpoints": true
     }
   ]
 }

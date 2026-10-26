@@ -63,7 +63,7 @@ import { stockSinControl } from '../inventario/inventario.service';
 import { rutaImagen } from '../web/ruta-imagen';
 import { BarriosModule, BarriosService } from './barrios/barrios.module';
 import { CuponesModule, CuponesService } from '../cupones/cupones.module';
-import { finalDe, MEDIOS_TIENDA } from '../cupones/reglas';
+import { finalDe, MEDIOS_TIENDA, mejorPorMedio } from '../cupones/reglas';
 import { VistaPreviaController, VistaPreviaService } from './vista-previa';
 import { describirPromo, puntoValido } from './barrios/reglas';
 import { clasificarLlegada } from '../web/origen-llegada';
@@ -168,7 +168,13 @@ const montoDescuento = (items: any[], pct: number) => money(
 );
 
 /** El medio de pago que eligió el cliente (0190): solo los que la tienda coordina; cualquier otra cosa, ninguno. */
-const medioDeTienda = (m: unknown) => ((MEDIOS_TIENDA as readonly string[]).includes(String(m)) ? String(m) : null);
+const medioDeTienda = (m: unknown) => ((MEDIOS_TIENDA as readonly string[]).includes(String(m)) ? String(m) as (typeof MEDIOS_TIENDA)[number] : null);
+
+/** Un descuento automático (0199) como lo muestra el checkout. */
+const resumenAutomatico = (e: { cupon: { codigo: string; descripcion: string; tipo: string; valor: number }; resultado: { descuento: number; envioGratis: boolean } }) => ({
+  codigo: e.cupon.codigo, descripcion: e.cupon.descripcion, porcentaje: e.cupon.tipo === 'porcentaje' ? e.cupon.valor : null,
+  descuento: e.resultado.descuento, envioGratis: e.resultado.envioGratis,
+});
 
 /** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */
 const MAX_CALLE = 120;
@@ -1324,7 +1330,7 @@ export class TiendaService {
        * pedidos a la vez no se pasan del tope. Lo que el checkout cotizó puede
        * haber cambiado (la hora, el último uso): se vuelve a mirar todo acá.
        */
-      const ev = await this.evaluarCupon(dto, c, entrega === 'cadete' ? 'envio' : 'retiro', conBarrio, tx);
+      const { ev } = await this.descuentoDelPedido(dto, c, entrega === 'cadete' ? 'envio' : 'retiro', conBarrio, tx);
       const r = ev?.resultado;
       if (r && !r.vale) throw new BadRequestException(r.motivo);
       if (r?.vale && r.medios.length && !medioPago) {
@@ -1391,7 +1397,7 @@ export class TiendaService {
     const conEnvio = dto?.entrega !== 'retiro';
     const zona = conEnvio ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
     const descuento = montoDescuento(items, zona?.descuentoPct ?? 0);
-    const ev = await this.evaluarCupon(dto, c, conEnvio ? 'envio' : 'retiro', conDescuentoBarrio(items, zona?.descuentoPct ?? 0));
+    const { ev, porMedio } = await this.descuentoDelPedido(dto, c, conEnvio ? 'envio' : 'retiro', conDescuentoBarrio(items, zona?.descuentoPct ?? 0));
     const r = ev?.resultado;
     const cupon = r?.vale ? r.descuento : 0;
     const envio = r?.vale && r.envioGratis && conEnvio ? 0 : zona?.envio ?? null;
@@ -1404,35 +1410,50 @@ export class TiendaService {
       descuento,
       promos: zona ? zona.aplicadas.map((p) => describirPromo(p, zona.nombreDe)) : [],
       proxima: zona?.proxima ? { texto: describirPromo(zona.proxima.promo, zona.nombreDe), faltan: money(zona.proxima.faltan) } : null,
-      /** El cupón (0190): si vale, cuánto descuenta y qué pide; si no, por qué. */
-      cupon: r ? {
+      /** El cupón que escribió (0190): si vale, cuánto descuenta y qué pide; si no, por qué. */
+      cupon: !porMedio && r ? {
         codigo: ev?.cupon?.codigo ?? String(dto.cupon).trim().toUpperCase(),
         vale: r.vale,
         ...(r.vale
           ? { descuento: r.descuento, envioGratis: r.envioGratis, medios: r.medios, descripcion: ev?.cupon?.descripcion ?? '' }
           : { motivo: r.motivo }),
       } : null,
+      /**
+       * Sin código, los automáticos (0199): el que corre con el medio elegido y lo
+       * que daría cada medio (para animar a pagar así). Sin automáticos, null.
+       */
+      automatico: porMedio && ev ? resumenAutomatico(ev) : null,
+      porMedio: porMedio && Object.values(porMedio).some(Boolean)
+        ? Object.fromEntries(Object.entries(porMedio).map(([m, e]) => [m, e && resumenAutomatico(e)]))
+        : null,
       subtotal: total,
       total: money(total - descuento - cupon + (envio ?? 0)),
     };
   }
 
   /**
-   * EL CUPÓN (0190) sobre el pedido, con la MISMA cuenta en la cotización y en
-   * el alta. `items` ya llevan el % del barrio. Con `tx` (el alta) cuenta los
-   * usos con la fila del cupón trabada. Sin código, `null`.
+   * EL DESCUENTO DE LA TIENDA SOBRE EL PEDIDO, con la MISMA cuenta en la
+   * cotización y en el alta. `items` ya llevan el % del barrio. Con `tx` (el
+   * alta) cuenta los usos con las filas trabadas.
+   *   · Con código, ese cupón (0190); `porMedio` null.
+   *   · Sin código, los automáticos (0199): el mejor para el medio elegido o,
+   *     sin medio, el mejor de los que valen con cualquiera. `porMedio`: lo que
+   *     daría cada medio. Nunca se suman: un pedido lleva un solo cupón.
    */
-  private evaluarCupon(dto: any, c: Comprador, entrega: 'retiro' | 'envio', items: any[], tx?: Database) {
-    const codigo = String(dto?.cupon ?? '').trim();
-    if (!codigo) return Promise.resolve(null);
+  private async descuentoDelPedido(dto: any, c: Comprador, entrega: 'retiro' | 'envio', items: any[], tx?: Database) {
     const renglones = items.map((it) => ({
       productoId: it.productoId, ofertaId: it.ofertaId ?? null, cantidad: it.cantidad,
       precioLista: it.precioLista, iva: it.iva, descuento: Number(it.descuento) || 0,
     }));
-    return this.cupones.evaluar(codigo, {
+    const medioPago = medioDeTienda(dto?.medioPago);
+    const pedido = {
       renglones, telefono: c.telefono, primeraCompra: !(c.pedidos > 0), ahora: new Date(), entrega,
-      medioPago: medioDeTienda(dto?.medioPago), subtotal: renglones.reduce((s, x) => s + finalDe(x as any), 0),
-    }, tx, !!tx);
+      medioPago, subtotal: renglones.reduce((s, x) => s + finalDe(x as any), 0),
+    };
+    const codigo = String(dto?.cupon ?? '').trim();
+    if (codigo) return { ev: await this.cupones.evaluar(codigo, pedido, tx, !!tx), porMedio: null };
+    const { todos, porMedio } = mejorPorMedio(await this.cupones.evaluarAutomaticos(pedido, tx, !!tx));
+    return { ev: medioPago ? porMedio[medioPago] : todos, porMedio };
   }
 
   /**

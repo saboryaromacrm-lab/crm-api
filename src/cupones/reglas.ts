@@ -207,6 +207,27 @@ export function aplicar(c: Cupon, renglones: Renglon[], x: Contexto): Aplicado {
   };
 }
 
+type Valido = Extract<Aplicado, { vale: true }>;
+
+/**
+ * LOS AUTOMÁTICOS (0199): de los que se evaluaron sin medio elegido, el mejor
+ * para cada medio de pago (uno sin medios vale con cualquiera) y el mejor de
+ * los que valen con cualquiera (`todos`: el que corre antes de elegir). Gana
+ * el que más descuenta; a igual descuento, el que regala el envío.
+ */
+export function mejorPorMedio<T extends { resultado: Aplicado }>(evaluados: T[]) {
+  type V = T & { resultado: Valido };
+  const validos = evaluados.filter((e): e is V => e.resultado.vale);
+  const puntaje = (e: V) => e.resultado.descuento + (e.resultado.envioGratis ? 0.001 : 0);
+  const mejor = (lista: V[]) => lista.reduce<V | null>((a, e) => (!a || puntaje(e) > puntaje(a) ? e : a), null);
+  const conCualquiera = validos.filter((e) => !e.resultado.medios.length);
+  return {
+    todos: mejor(conCualquiera),
+    porMedio: Object.fromEntries(MEDIOS_TIENDA.map((m) => [m, mejor(validos.filter((e) => !e.resultado.medios.length || e.resultado.medios.includes(m)))])) as
+      Record<(typeof MEDIOS_TIENDA)[number], V | null>,
+  };
+}
+
 /**
  * Lo que el cupón descontó en un renglón de VENTA, neto: `bonificado` es lo
  * que quedó después de todos los % (cantidad × precio × (1 − descuento)), y el

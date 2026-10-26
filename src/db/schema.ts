@@ -3642,6 +3642,8 @@ export const cupones = pgTable('cupones', {
   usosMax: integer('usos_max').notNull().default(0),
   usosPorCliente: integer('usos_por_cliente').notNull().default(1),
   soloPrimeraCompra: boolean('solo_primera_compra').notNull().default(false),
+  /** Sin código (0199): el checkout lo aplica solo si se cumplen sus condiciones (el medio de pago, casi siempre). */
+  automatico: boolean('automatico').notNull().default(false),
   creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),

@@ -18,7 +18,7 @@ import {
   Param, ParseIntPipe, Post, Put, Query,
 } from '@nestjs/common';
 import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLength, Min } from 'class-validator';
-import { asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { cupones, productos } from '../db/schema';
@@ -53,7 +53,13 @@ class CuponDto {
   @IsOptional() @IsInt() @Min(0) usosMax?: number;
   @IsOptional() @IsInt() @Min(0) usosPorCliente?: number;
   @IsOptional() @IsBoolean() soloPrimeraCompra?: boolean;
+  /** Sin código (0199): se aplica solo en el checkout. */
+  @IsOptional() @IsBoolean() automatico?: boolean;
 }
+
+/** El pedido como lo cotiza la tienda (los usos y la marca de cada renglón los suma el servicio). */
+type Pedido = { renglones: Omit<Renglon, 'marcaId' | 'categoriaId'>[]; telefono: string; primeraCompra: boolean }
+  & Omit<Contexto, 'usos' | 'usosCliente' | 'primeraCompra'>;
 
 /** CSV de ids sin repetidos, ordenado (como las listas de las ofertas). */
 const idsCsv = (s?: string) => [...new Set(String(s ?? '').split(',').map((x) => parseInt(x.trim(), 10)).filter((n) => n > 0))]
@@ -67,6 +73,7 @@ export class CuponesService {
 
   private normalizar(dto: CuponDto) {
     const tipo = dto.tipo;
+    const automatico = dto.automatico ?? false;
     const fila = {
       codigo: String(dto.codigo ?? '').trim().toUpperCase(),
       descripcion: String(dto.descripcion ?? '').trim(),
@@ -86,8 +93,10 @@ export class CuponesService {
       marcas: idsCsv(dto.marcas),
       categorias: idsCsv(dto.categorias),
       usosMax: N(dto.usosMax),
-      usosPorCliente: dto.usosPorCliente == null ? 1 : N(dto.usosPorCliente),
+      /* Uno automático es para siempre (pagar en efectivo no se agota); uno con código, una vez por cliente. */
+      usosPorCliente: dto.usosPorCliente == null ? (automatico ? 0 : 1) : N(dto.usosPorCliente),
       soloPrimeraCompra: dto.soloPrimeraCompra ?? false,
+      automatico,
     };
     const error = errorDeCupon(fila);
     if (error) throw new BadRequestException(error);
@@ -134,31 +143,48 @@ export class CuponesService {
   /* ============================== EL USO ============================== */
 
   /**
-   * El cupón sobre un pedido de la tienda. `renglones` llegan como los arma la
-   * tienda (con su % de barrio); acá se les suma marca y categoría. `tx` +
+   * El cupón del código que escribió el cliente, sobre un pedido de la tienda.
+   * `renglones` llegan como los arma la tienda (con su % de barrio). `tx` +
    * `trabar`: el alta del pedido, que cuenta los usos con la fila trabada.
    */
-  async evaluar(
-    codigo: string,
-    pedido: { renglones: Omit<Renglon, 'marcaId' | 'categoriaId'>[]; telefono: string; primeraCompra: boolean } & Omit<Contexto, 'usos' | 'usosCliente' | 'primeraCompra'>,
-    tx: Database = this.db, trabar = false,
-  ) {
+  async evaluar(codigo: string, pedido: Pedido, tx: Database = this.db, trabar = false) {
     const cod = String(codigo ?? '').trim().toUpperCase();
     if (!cod) return null;
     const [c] = await tx.select().from(cupones).where(eq(cupones.codigo, cod)).limit(1);
     if (!c) return { cupon: null, resultado: { vale: false as const, motivo: 'Ese cupón no existe o ya no está activo.' } };
-    if (trabar) await tx.execute(sql`SELECT id FROM cupones WHERE id = ${c.id} FOR UPDATE`);
-    const [u] = (await tx.execute(sql`
-      SELECT count(*)::int AS usos, count(*) FILTER (WHERE web_cliente->>'telefono' = ${pedido.telefono})::int AS cliente
-      FROM presupuestos WHERE cupon_id = ${c.id} AND estado <> 'cancelado'`)).rows as any[];
-    const ids = [...new Set(pedido.renglones.map((r) => r.productoId))];
+    return this.aplicarA(c, await this.conMarcaYCategoria(pedido.renglones, tx), pedido, tx, trabar);
+  }
+
+  /**
+   * LOS AUTOMÁTICOS (0199): los activos que no piden código, cada uno sobre el
+   * pedido SIN medio elegido —así se ve cuánto daría cada medio—. Cuál corre lo
+   * decide `mejorPorMedio` con el medio que eligió el cliente.
+   */
+  async evaluarAutomaticos(pedido: Pedido, tx: Database = this.db, trabar = false) {
+    const filas = await tx.select().from(cupones).where(and(eq(cupones.automatico, true), eq(cupones.activo, true))).orderBy(asc(cupones.id));
+    if (!filas.length) return [];
+    const renglones = await this.conMarcaYCategoria(pedido.renglones, tx);
+    const sinMedio = { ...pedido, medioPago: null };
+    /* En la misma conexión las consultas van en fila: las filas se traban en orden de id. */
+    return Promise.all(filas.map((c) => this.aplicarA(c, renglones, sinMedio, tx, trabar)));
+  }
+
+  /** Los renglones con la marca y la categoría de cada producto (lo que miran los cupones que las acotan). */
+  private async conMarcaYCategoria(renglones: Pedido['renglones'], tx: Database): Promise<Renglon[]> {
+    const ids = [...new Set(renglones.map((r) => r.productoId))];
     const prods = ids.length
       ? await tx.select({ id: productos.id, marcaId: productos.marcaId, categoriaId: productos.categoriaId }).from(productos).where(inArray(productos.id, ids))
       : [];
     const porId = new Map(prods.map((p) => [p.id, p]));
-    const renglones: Renglon[] = pedido.renglones.map((r) => ({
-      ...r, marcaId: porId.get(r.productoId)?.marcaId ?? null, categoriaId: porId.get(r.productoId)?.categoriaId ?? null,
-    }));
+    return renglones.map((r) => ({ ...r, marcaId: porId.get(r.productoId)?.marcaId ?? null, categoriaId: porId.get(r.productoId)?.categoriaId ?? null }));
+  }
+
+  /** Un cupón sobre el pedido: cuenta sus usos (con la fila trabada si `trabar`) y aplica sus reglas. */
+  private async aplicarA(c: typeof cupones.$inferSelect, renglones: Renglon[], pedido: Pedido, tx: Database, trabar: boolean) {
+    if (trabar) await tx.execute(sql`SELECT id FROM cupones WHERE id = ${c.id} FOR UPDATE`);
+    const [u] = (await tx.execute(sql`
+      SELECT count(*)::int AS usos, count(*) FILTER (WHERE web_cliente->>'telefono' = ${pedido.telefono})::int AS cliente
+      FROM presupuestos WHERE cupon_id = ${c.id} AND estado <> 'cancelado'`)).rows as any[];
     return {
       cupon: c,
       resultado: aplicar(c, renglones, {
