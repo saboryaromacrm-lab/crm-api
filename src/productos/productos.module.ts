@@ -26,7 +26,7 @@ import {
 import { sincronizarProveedorCoffit } from './proveedorCoffit';
 import { fotoDeProducto, fotosDeProductos } from '../web/ruta-imagen';
 import {
-  costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, formatoActivo, formatoDeCosto,
+  costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, displaysDe, formatoActivo, formatoDeCosto,
   precioVentaFila, type OpcionesPrecio,
 } from '../inventario/pricing';
 import { PREFIJOS_INTERNOS, armarEan13, esEan13, secuenciaDe } from './ean13';
@@ -2479,6 +2479,13 @@ export class ProductosService {
       if (!(Number(f.cantidad) > 0)) {
         throw new BadRequestException('La cantidad por bulto tiene que ser mayor a cero.');
       }
+      /* El display (0203) es optativo, de los enteros, y tiene que dar justo:
+       * 144 u. con displays de 12 son 12 displays; con displays de 10 no hay bulto posible. */
+      if (Number(f.porDisplay) > 0 && p.tipo !== 'granel' && !displaysDe(f)) {
+        throw new BadRequestException(
+          `El display de ${f.porDisplay} u. no entra justo en el bulto de ${f.cantidad} u.: revisá las unidades por display (y que el bulto traiga al menos 2).`,
+        );
+      }
     }
 
     // Uno y solo uno fija el precio: sin esto, `formatoActivo()` elegiría el
@@ -2521,6 +2528,7 @@ export class ProductosService {
       productoId: id,
       proveedorId: Number(f.proveedorId),
       cantidad: plata(f.cantidad, 1_000_000) || 1,
+      porDisplay: p.tipo !== 'granel' && Number(f.porDisplay) > 0 ? Number(f.porDisplay) : null,
       costo: plata(f.costo),
       descuento: pct(f.descuento),
       descuento2: pct(f.descuento2),
@@ -2543,8 +2551,13 @@ export class ProductosService {
      * registro cuelga del PROVEEDOR (es su condición comercial) con el
      * producto como detalle — así la pestaña Auditoría del proveedor lo lista. */
     const dinero = (n: number) => `$ ${(Number(n) || 0).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
+    const textoDisplay = (v: any) => {
+      const d = displaysDe(v);
+      return d ? `${d.displays} displays × ${d.porDisplay} u.` : 'Sin display';
+    };
     const fotoFormato = (v: any): Record<string, string> => ({
       cantidad: `${Number(v.cantidad) || 1} u.`,
+      display: textoDisplay(v),
       costo: v.modoCosto === 'final' ? dinero(v.costoFinal) : dinero(v.costo),
       modoCosto: v.modoCosto === 'final' ? 'Costo final — se le quitan los descuentos' : 'Costo de lista — el sistema descuenta',
       descuentos: [v.descuento, v.descuento2, v.descuento3, v.descuento4]
@@ -2556,7 +2569,7 @@ export class ProductosService {
       codigoProveedor: v.codigoProveedor || '',
     });
     const CAMPOS_FORMATO = {
-      cantidad: 'Unidades por bulto', costo: 'Costo del bulto', modoCosto: 'Cómo se carga el costo',
+      cantidad: 'Unidades por bulto', display: 'Display', costo: 'Costo del bulto', modoCosto: 'Cómo se carga el costo',
       descuentos: 'Descuentos', flete: 'Flete %', comision: 'Comisión %', porcSinFactura: 'Sin factura %',
       usarParaPrecio: 'Fija el precio', codigoProveedor: 'Código del proveedor',
     };

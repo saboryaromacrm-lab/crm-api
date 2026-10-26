@@ -16,6 +16,7 @@ import {
   costosFormato,
   costoNetoPresentacion,
   descuentoEfectivo,
+  displaysDe,
   formatoActivo,
   formatoDeCosto,
   precioFinal,
@@ -215,4 +216,15 @@ test('bultoCerrado: la ficha manda; si no, la caja del proveedor que define el c
   assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, []), 0, 'sin proveedor no hay bulto');
   assert.equal(bultoCerrado({ tipo: 'granel', unidadesPorBulto: 25 }, provs), 0, 'el granel se vende por kg');
   assert.equal(bultoCerrado({ tipo: 'unidad', unidadesPorBulto: 1 }, [{ id: 1, cantidad: 2.5 }]), 0, 'medio bulto no es bulto');
+});
+
+test('displaysDe: el display del bulto solo si da justo, y el costo no se entera (0203)', () => {
+  assert.deepEqual(displaysDe({ cantidad: 144, porDisplay: 12 }), { displays: 12, porDisplay: 12 });
+  assert.equal(displaysDe({ cantidad: 144, porDisplay: null }), null, 'sin display');
+  assert.equal(displaysDe({ cantidad: 140, porDisplay: 12 }), null, 'no da justo: no se inventa');
+  assert.equal(displaysDe({ cantidad: 12, porDisplay: 12 }), null, 'un solo display no es display');
+  assert.equal(displaysDe({ cantidad: 30, porDisplay: 7.5 }), null, 'el display trae unidades enteras');
+  const sin = costosFormato({ cantidad: 144, costo: 72000, descuento: 0, flete: 0 }, 21);
+  const con = costosFormato({ cantidad: 144, porDisplay: 12, costo: 72000, descuento: 0, flete: 0 }, 21);
+  assert.equal(con.costoNetoUnitario, sin.costoNetoUnitario, 'el unitario sigue saliendo del bulto');
 });

@@ -136,12 +136,13 @@ export class PedidosProveedorService {
       select c.id, c.tipo, c.letra, c.punto_venta as "puntoVenta", c.numero, c.fecha, coalesce(su.nombre, '') as sucursal,
         coalesce((
           select json_agg(json_build_object('nombre', x.nombre, 'granel', x.granel, 'tamKg', x.tam_kg,
-                   'cantidad', x.cantidad, 'sinCargo', x.sin_cargo, 'porBulto', x.por_bulto) order by x.orden)
+                   'cantidad', x.cantidad, 'sinCargo', x.sin_cargo, 'porBulto', x.por_bulto, 'porDisplay', x.por_display) order by x.orden)
           from (
             select p.nombre, p.tipo = 'granel' as granel, pr.tam_kg, min(ci.id) as orden,
               sum(ci.cantidad) as cantidad,
               coalesce(sum(ci.cantidad) filter (where ci.costo_unitario <= 0), 0) as sin_cargo,
-              max(ci.por_bulto) filter (where ci.costo_unitario > 0) as por_bulto
+              max(ci.por_bulto) filter (where ci.costo_unitario > 0) as por_bulto,
+              max(ci.por_display) filter (where ci.costo_unitario > 0) as por_display
             from comprobante_items ci join productos p on p.id = ci.producto_id
             left join presentaciones pr on pr.id = ci.presentacion_id
             where ci.comprobante_id = c.id

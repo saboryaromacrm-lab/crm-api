@@ -1422,6 +1422,13 @@
       "when": 1793278800000,
       "tag": "0202_cambios_proveedor",
       "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "7",
+      "when": 1793365200000,
+      "tag": "0203_formato_display",
+      "breakpoints": true
     }
   ]
 }

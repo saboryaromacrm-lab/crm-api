@@ -35,6 +35,8 @@
 export interface CostoEntry {
   /** Unidades por bulto. "Caja x12" → 12. */
   cantidad?: number;
+  /** Unidades por display dentro del bulto (0203), optativo: ver `displaysDe`. No entra en la cuenta. */
+  porDisplay?: number | null;
   /** Costo de lista del bulto, sin descuentos ni flete. */
   costo: number;
   /** Escala de descuentos, EN CASCADA (30 y 10 = 37%, no 40%). */
@@ -318,6 +320,19 @@ export function costosFormato(e?: CostoEntry | null, iva = 0): CostosFormato {
     ...partir(costoBruto, flete),
     costoComision: 0, costoComisionUnitario: 0,
   }, costoBruto, e.comision, factorIva);
+}
+
+/**
+ * EL DISPLAY DEL BULTO (0203): «12 displays × 12 u.» a partir de las unidades
+ * por bulto y las del display. `null` si el formato no tiene display o si ya no
+ * da justo (el bulto cambió y nadie lo revisó): mejor no decir nada que inventar
+ * un display de 11,5 unidades. Un solo display por bulto tampoco es un display.
+ */
+export function displaysDe(e?: { cantidad?: number | null; porDisplay?: number | null } | null): { displays: number; porDisplay: number } | null {
+  const porDisplay = Number(e?.porDisplay) || 0;
+  const n = porDisplay > 0 ? (Number(e?.cantidad) || 0) / porDisplay : 0;
+  if (!Number.isInteger(porDisplay) || !(n >= 2) || Math.abs(n - Math.round(n)) > 1e-9) return null;
+  return { displays: Math.round(n), porDisplay };
 }
 
 /**

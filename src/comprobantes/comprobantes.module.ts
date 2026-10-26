@@ -116,6 +116,8 @@ class ComprobanteItemDto {
   @IsOptional() @IsBoolean() guardarCodigo?: boolean;
   /** Unidades (o kg) por bulto con que se cargó el renglón (0161): solo para mostrarlo como la factura. */
   @IsOptional() @IsNumber() @Min(0) @Max(100_000) porBulto?: number;
+  /** Unidades por display si el renglón se cargó POR DISPLAY (0203): solo para mostrarlo como la factura. */
+  @IsOptional() @IsNumber() @Min(0) @Max(100_000) porDisplay?: number;
   /**
    * EL RENGLÓN ES PARA COFFIT (0119): lo tildó quien cargó la factura (o tildó
    * «toda la factura es de Coffit»). Un artículo de uso exclusivo de Coffit lo
@@ -1394,6 +1396,7 @@ export class ComprobantesService {
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
         paraCafeteria: esDelCafe(it as any),
         porBulto: Number(it.porBulto) > 1 ? Number(it.porBulto) : null,
+        porDisplay: Number(it.porDisplay) > 1 ? Number(it.porDisplay) : null,
       })));
 
       /*

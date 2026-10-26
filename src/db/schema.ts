@@ -702,6 +702,13 @@ export const productoProveedores = pgTable('producto_proveedores', {
    * unitario los pone en la misma escala.
    */
   cantidad: doublePrecision('cantidad').notNull().default(1),
+  /**
+   * EL DISPLAY DENTRO DEL BULTO (0203), optativo y solo de los enteros:
+   * unidades que trae UN display («display x12»). Los displays por bulto se
+   * derivan (`cantidad` ÷ esto) y valen si dan justo (`displaysDe` en pricing).
+   * No cambia el costo: sigue siendo del bulto y el unitario sale de `cantidad`.
+   */
+  porDisplay: doublePrecision('por_display'),
   /** Costo de lista del BULTO entero, sin descuentos ni flete. */
   costo: doublePrecision('costo').notNull().default(0),
   /**
@@ -1828,6 +1835,8 @@ export const comprobanteItems = pgTable('comprobante_items', {
    * unidad o sin dato.
    */
   porBulto: doublePrecision('por_bulto'),
+  /** EL RENGLÓN SE CARGÓ POR DISPLAY (0203): unidades por display, congelado. NULL = no. */
+  porDisplay: doublePrecision('por_display'),
 }, (t) => ({
   /** Lo comprado para Coffit por artículo, para el cupo de los envíos (0119). */
   ixCafe: index('ix_comprobante_items_cafe').on(t.productoId).where(sql`${t.paraCafeteria}`),
