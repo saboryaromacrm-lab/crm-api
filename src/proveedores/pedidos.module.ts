@@ -124,6 +124,39 @@ export class PedidosProveedorService {
   }
 
   /**
+   * LA ÚLTIMA VEZ QUE ENTRÓ SU MERCADERÍA (26/10/2026, pedido del dueño): el
+   * último comprobante confirmado de este proveedor que ingresó stock, con
+   * cuánto entró de cada producto y el bulto con que se cargó (0161), para
+   * comparar al armar el pedido nuevo. Un renglón por producto: la bonificación
+   * (renglón a costo 0) se suma al total y se informa aparte (`sinCargo`). `ingreso: null` si nunca entró nada
+   * (en un objeto: un `null` suelto viaja como cuerpo vacío). Sin costos.
+   */
+  async ultimoIngresoDe(proveedorId: number) {
+    const r = await this.db.execute(sql`
+      select c.id, c.tipo, c.letra, c.punto_venta as "puntoVenta", c.numero, c.fecha, coalesce(su.nombre, '') as sucursal,
+        coalesce((
+          select json_agg(json_build_object('nombre', x.nombre, 'granel', x.granel, 'tamKg', x.tam_kg,
+                   'cantidad', x.cantidad, 'sinCargo', x.sin_cargo, 'porBulto', x.por_bulto) order by x.orden)
+          from (
+            select p.nombre, p.tipo = 'granel' as granel, pr.tam_kg, min(ci.id) as orden,
+              sum(ci.cantidad) as cantidad,
+              coalesce(sum(ci.cantidad) filter (where ci.costo_unitario <= 0), 0) as sin_cargo,
+              max(ci.por_bulto) filter (where ci.costo_unitario > 0) as por_bulto
+            from comprobante_items ci join productos p on p.id = ci.producto_id
+            left join presentaciones pr on pr.id = ci.presentacion_id
+            where ci.comprobante_id = c.id
+            group by p.id, pr.id
+          ) x
+        ), '[]'::json) as items
+      from comprobantes c left join sucursales su on su.id = c.sucursal_id
+      where c.proveedor_id = ${proveedorId} and c.estado = 'confirmado' and c.recepcion
+        and c.tipo in ('factura', 'remito', 'liquidacion')
+      order by c.fecha desc, c.id desc
+      limit 1`);
+    return { ingreso: r.rows[0] ?? null };
+  }
+
+  /**
    * «SUS ÚLTIMOS INGRESOS» (5/10/2026): las últimas facturas, remitos y
    * liquidaciones confirmadas de este proveedor, con qué trajo cada una.
    * Sin costos por renglón: el total del comprobante alcanza para ubicarlo.
@@ -329,6 +362,8 @@ export class PedidosProveedorController {
   /* El menú del nombre en la tarjeta (5/10/2026): su stock y sus últimos ingresos. */
   @Get('proveedor/:id/stock') stockDe(@Param('id', ParseIntPipe) id: number) { return this.svc.stockDe(id); }
   @Get('proveedor/:id/ingresos') ingresosDe(@Param('id', ParseIntPipe) id: number) { return this.svc.ingresosDe(id); }
+  /* Al escribir el pedido (26/10/2026): cuánto entró la última vez. */
+  @Get('proveedor/:id/ultimo-ingreso') ultimoIngresoDe(@Param('id', ParseIntPipe) id: number) { return this.svc.ultimoIngresoDe(id); }
   @Get('stats') stats() { return this.svc.stats(); }
   @Get('recibidos') recibidos(
     @Query('filtro') filtro?: string,
