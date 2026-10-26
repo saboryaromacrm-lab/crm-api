@@ -1961,9 +1961,10 @@ export class VentasService {
    *
    * `descuento`: el del BARRIO de un pedido de la tienda (0185) — lo calculó el
    * servidor con las promos del dueño, así que no pasa por el tope a mano de la
-   * cajera. Solo en renglones sin oferta: el % de una oferta lo vuelve a poner
-   * el motor de la caja y no es un descuento a mano. Si el pedido trajo CUPÓN
-   * (0190), ese % ya lo incluye y `cuponPct` dice qué parte fue el cupón.
+   * cajera. Si el pedido trajo CUPÓN (0190), ese % ya lo incluye y `cuponPct`
+   * dice qué parte fue el cupón. En un renglón CON oferta el % de la promo lo
+   * vuelve a poner el motor de la caja: lo único que viaja es la parte del
+   * cupón, si el cupón también corría en ofertas (0199).
    */
   private async congeladosDePresupuesto(
     presupuestoId: number | undefined, clienteId: number, sucursalId?: number | null,
@@ -1998,13 +1999,15 @@ export class VentasService {
 
     const renglones = await this.db.select().from(presupuestoItems)
       .where(eq(presupuestoItems.presupuestoId, pre.id));
+    const web = pre.origen === 'web';
     for (const r of renglones) {
+      const parteCupon = web ? Number(r.cuponPct) || 0 : 0;
       vacio.set(`${r.productoId}:${r.presentacionId ?? ''}`, {
         precioLista: money(r.precioLista),
         listaId: r.listaId ?? null,
-        descuento: pre.origen === 'web' && !r.ofertaId ? Number(r.descuento) || 0 : 0,
-        cuponId: pre.origen === 'web' && !r.ofertaId && r.cuponPct > 0 ? pre.cuponId ?? null : null,
-        cuponPct: pre.origen === 'web' && !r.ofertaId ? Number(r.cuponPct) || 0 : 0,
+        descuento: !web ? 0 : r.ofertaId ? Math.round(1e6 * parteCupon) / 1e4 : Number(r.descuento) || 0,
+        cuponId: parteCupon > 0 ? pre.cuponId ?? null : null,
+        cuponPct: parteCupon,
       });
     }
     return vacio;
@@ -2543,9 +2546,10 @@ export class VentasService {
       /*
        * EL CUPÓN DE LA TIENDA (0190): el renglón lleva el descuento que prometió
        * el pedido —con la parte del cupón adentro— y ninguna otra cosa le ganó.
-       * Si la cajera lo cambió, ya no es el del cupón: se cuenta como a mano.
+       * Con oferta (0199), la promo corre aparte y el % del renglón es solo el
+       * cupón. Si la cajera lo cambió, ya no es el del cupón: se cuenta como a mano.
        */
-      const conCupon = !!congelado?.cuponId && congelado.cuponPct > 0 && !descuentoId && ofertaDesc === 0
+      const conCupon = !!congelado?.cuponId && congelado.cuponPct > 0 && !descuentoId
         && Math.abs(desc - congelado.descuento) < 1e-6;
 
       return {
@@ -2667,7 +2671,12 @@ export class VentasService {
       // tope en 0 evita que una promo mal calculada deje un renglón negativo.
       const ofertaDesc = Math.min(Math.max(0, Number(it.ofertaDescuento) || 0), bonificado);
       const netoCrudo = bonificado - ofertaDesc;
-      /* Lo que fue cupón (0190), neto: la última capa del %. En una nota de crédito viene ya prorrateado. */
+      /*
+       * Lo que fue cupón (0190), neto: la última capa del %. En un renglón con
+       * oferta (0199) la caja cuenta el % primero y la promo después (la achica):
+       * así cupón + oferta suman exacto lo que se descontó. En una nota de
+       * crédito viene ya prorrateado.
+       */
       const cuponDesc = it.cuponPct ? descuentoCuponNeto(bonificado, it.cuponPct) : Number(it.cuponDescuento) || 0;
       const bruto = money(brutoCrudo);
       const neto = money(netoCrudo);

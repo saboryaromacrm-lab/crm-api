@@ -3644,6 +3644,9 @@ export const cupones = pgTable('cupones', {
   soloPrimeraCompra: boolean('solo_primera_compra').notNull().default(false),
   /** Sin código (0199): el checkout lo aplica solo si se cumplen sus condiciones (el medio de pago, casi siempre). */
   automatico: boolean('automatico').notNull().default(false),
+  /** También en los productos con oferta (0199): las comunes (NutriOfertas) y las por vencer (NutriRescate). Por defecto no. */
+  enOfertas: boolean('en_ofertas').notNull().default(false),
+  enRescate: boolean('en_rescate').notNull().default(false),
   creadoPor: integer('creado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),

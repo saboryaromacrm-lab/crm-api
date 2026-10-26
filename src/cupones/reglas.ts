@@ -7,8 +7,9 @@
  *
  * LA PLATA:
  *   · corre en los productos SIN oferta (una oferta ya tiene su beneficio y no
- *     se suman, como el descuento del barrio) y, si el cupón las tiene, de esas
- *     marcas o categorías;
+ *     se suman, como el descuento del barrio) salvo que el cupón diga que
+ *     también entran las ofertas comunes (NutriOfertas) o las por vencer
+ *     (NutriRescate) (0199); y, si el cupón las tiene, de esas marcas o categorías;
  *   · se aplica DESPUÉS del descuento del barrio, sobre lo que queda: el renglón
  *     termina con 1 − (1 − barrio)(1 − cupón);
  *   · un monto fijo se reparte en proporción entre los renglones que entran;
@@ -44,6 +45,9 @@ export interface Cupon {
   usosMax: number;
   usosPorCliente: number;
   soloPrimeraCompra: boolean;
+  /** También en los productos con oferta común (NutriOfertas) y con oferta por vencer (NutriRescate). */
+  enOfertas: boolean;
+  enRescate: boolean;
 }
 
 /** Lo que hace falta saber del pedido para decidir si el cupón vale. */
@@ -71,6 +75,9 @@ export interface Renglon {
   precioLista: number;
   iva: number;
   descuento: number;
+  /** De la oferta del renglón (si tiene): si es por vencer (NutriRescate) y su mecánica. */
+  porVencer?: boolean;
+  ofertaTipo?: string | null;
 }
 
 const c2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -124,9 +131,12 @@ export function errorDeCupon(c: Cupon): string | null {
   return null;
 }
 
-/** ¿El renglón entra en el cupón? Sin oferta y, si el cupón las tiene, de sus marcas o categorías. */
-export function entra(c: Pick<Cupon, 'marcas' | 'categorias'>, r: Renglon) {
-  if (r.ofertaId) return false;
+/**
+ * ¿El renglón entra en el cupón? Sin oferta (o con la que el cupón acepta:
+ * común o por vencer) y, si el cupón las tiene, de sus marcas o categorías.
+ */
+export function entra(c: Pick<Cupon, 'marcas' | 'categorias' | 'enOfertas' | 'enRescate'>, r: Renglon) {
+  if (r.ofertaId && !(r.porVencer ? c.enRescate : c.enOfertas)) return false;
   const marcas = csv(c.marcas).map(Number);
   const cats = csv(c.categorias).map(Number);
   if (marcas.length && !(r.marcaId && marcas.includes(r.marcaId))) return false;
@@ -176,7 +186,11 @@ export type Aplicado =
     envioGratis: boolean;
     /** Medios que pide (vacío = cualquiera): el checkout pregunta si hace falta. */
     medios: string[];
-    /** Los renglones con su nuevo descuento y la parte del cupón (`cuponPct`). */
+    /**
+     * Los renglones con su nuevo descuento y la parte del cupón (`cuponPct`). En
+     * uno con oferta, `cuponPct` es el % que la CAJA le pone al renglón para
+     * cobrar lo mismo (`parteDeCaja`).
+     */
     renglones: (Renglon & { cuponPct: number })[];
   };
 
@@ -190,7 +204,7 @@ export function aplicar(c: Cupon, renglones: Renglon[], x: Contexto): Aplicado {
 
   const base = renglones.filter((r) => entra(c, r)).reduce((s, r) => s + finalDe(r), 0);
   if (!(base > 0)) {
-    return { vale: false, motivo: 'Ninguno de los productos del carrito entra en este cupón (los que ya están en oferta no suman).' };
+    return { vale: false, motivo: 'Ninguno de los productos del carrito entra en este cupón (los que están en oferta no suman).' };
   }
   let fraccion = c.tipo === 'porcentaje' ? c.valor / 100 : c.valor / base;
   if (c.tipo === 'porcentaje' && c.tope > 0 && base * fraccion > c.tope) fraccion = c.tope / base;
@@ -202,9 +216,21 @@ export function aplicar(c: Cupon, renglones: Renglon[], x: Contexto): Aplicado {
     envioGratis: false,
     medios,
     renglones: renglones.map((r) => (entra(c, r)
-      ? { ...r, descuento: pct6(100 * (1 - (1 - r.descuento / 100) * (1 - fraccion))), cuponPct: fraccion }
+      ? { ...r, descuento: pct6(100 * (1 - (1 - r.descuento / 100) * (1 - fraccion))), cuponPct: parteDeCaja(r, fraccion) }
       : { ...r, cuponPct: 0 })),
   };
+}
+
+/**
+ * LO QUE LA CAJA LE PONE AL RENGLÓN para cobrar el cupón (0199). En uno sin
+ * oferta, la misma fracción. Con oferta, la caja vuelve a aplicar la promo y
+ * le suma el descuento del renglón así: en las proporcionales (%, 3×2, 2ª
+ * unidad) lo multiplica —misma fracción—; en precio fijo el renglón ya viaja
+ * a ese precio —misma fracción—; en el pack la promo resta un importe del
+ * precio lleno, así que el % va achicado a lo que se paga del pack.
+ */
+export function parteDeCaja(r: Renglon, fraccion: number) {
+  return pct6(r.ofertaId && r.ofertaTipo === 'pack' ? fraccion * (1 - r.descuento / 100) : fraccion);
 }
 
 type Valido = Extract<Aplicado, { vale: true }>;

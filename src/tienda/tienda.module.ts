@@ -170,10 +170,13 @@ const montoDescuento = (items: any[], pct: number) => money(
 /** El medio de pago que eligió el cliente (0190): solo los que la tienda coordina; cualquier otra cosa, ninguno. */
 const medioDeTienda = (m: unknown) => ((MEDIOS_TIENDA as readonly string[]).includes(String(m)) ? String(m) as (typeof MEDIOS_TIENDA)[number] : null);
 
-/** Un descuento automático (0199) como lo muestra el checkout. */
-const resumenAutomatico = (e: { cupon: { codigo: string; descripcion: string; tipo: string; valor: number }; resultado: { descuento: number; envioGratis: boolean } }) => ({
+/** Un descuento automático (0199) como lo muestra el checkout: qué da y si entran las ofertas. */
+const resumenAutomatico = (e: {
+  cupon: { codigo: string; descripcion: string; tipo: string; valor: number; enOfertas: boolean; enRescate: boolean };
+  resultado: { descuento: number; envioGratis: boolean };
+}) => ({
   codigo: e.cupon.codigo, descripcion: e.cupon.descripcion, porcentaje: e.cupon.tipo === 'porcentaje' ? e.cupon.valor : null,
-  descuento: e.resultado.descuento, envioGratis: e.resultado.envioGratis,
+  descuento: e.resultado.descuento, envioGratis: e.resultado.envioGratis, enOfertas: e.cupon.enOfertas, enRescate: e.cupon.enRescate,
 });
 
 /** Topes de largo de la dirección: el `maxLength` del checkout no protege al POST directo. */

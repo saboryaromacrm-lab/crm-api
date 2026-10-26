@@ -4,12 +4,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { aplicar, descuentoCuponNeto, enFranja, errorDeCupon, mejorPorMedio, momentoAr, motivoNoVale, type Contexto, type Cupon, type Renglon } from './reglas';
+import { aplicar, descuentoCuponNeto, enFranja, errorDeCupon, mejorPorMedio, momentoAr, motivoNoVale, parteDeCaja, type Contexto, type Cupon, type Renglon } from './reglas';
 
 const cupon = (x: Partial<Cupon> = {}): Cupon => ({
   codigo: 'BIENVENIDA', activo: true, tipo: 'porcentaje', valor: 10, tope: 0, montoMinimo: 0, desde: null, hasta: null,
   dias: '', horaDesde: '', horaHasta: '', mediosPago: '', entrega: '', marcas: '', categorias: '',
-  usosMax: 0, usosPorCliente: 1, soloPrimeraCompra: false, ...x,
+  usosMax: 0, usosPorCliente: 1, soloPrimeraCompra: false, enOfertas: false, enRescate: false, ...x,
 });
 /* Miércoles 21/10/2026 a las 10:30 de Argentina (13:30 UTC). */
 const MIE_1030 = new Date('2026-10-21T13:30:00Z');
@@ -118,3 +118,27 @@ test('automáticos (0199): el mejor de cada medio; sin medio elegido, solo los d
   assert.equal(mejorPorMedio([efectivo5]).todos, null);
   assert.equal(mejorPorMedio([]).porMedio.efectivo, null);
 });
+
+test('ofertas (0199): por defecto no entran; NutriOfertas y NutriRescate se habilitan por separado', () => {
+  const rescate = { productoId: 4, marcaId: 7, categoriaId: 3, ofertaId: 50, porVencer: true, ofertaTipo: 'precio_fijo', cantidad: 1, precioLista: 800, iva: 21, descuento: 0 };
+  const items = [...carrito(), rescate];
+  const nada: any = aplicar(cupon(), items, ctx());
+  assert.equal(nada.renglones[1].cuponPct, 0);     // la oferta común, afuera
+  assert.equal(nada.renglones[3].cuponPct, 0);     // la por vencer, afuera
+  const conOfertas: any = aplicar(cupon({ enOfertas: true }), items, ctx());
+  assert.equal(conOfertas.renglones[1].cuponPct, 0.1);
+  assert.ok(Math.abs(conOfertas.renglones[1].descuento - 28) < 1e-9);   // 1 − 0,8 × 0,9
+  assert.equal(conOfertas.renglones[3].cuponPct, 0);                   // el rescate sigue afuera
+  const conRescate: any = aplicar(cupon({ enRescate: true }), items, ctx());
+  assert.equal(conRescate.renglones[1].cuponPct, 0);
+  assert.equal(conRescate.renglones[3].cuponPct, 0.1);
+});
+
+test('la parte de la caja: en el pack, el % achicado a lo que se paga del pack', () => {
+  const base = { productoId: 1, marcaId: null, categoriaId: null, cantidad: 3, precioLista: 1000, iva: 21 };
+  assert.equal(parteDeCaja({ ...base, ofertaId: null, descuento: 0 }, 0.1), 0.1);
+  assert.equal(parteDeCaja({ ...base, ofertaId: 9, ofertaTipo: 'porcentaje', descuento: 20 }, 0.1), 0.1);
+  /* Pack 3 × $2.400 (20 % menos que $3.000): la caja cobra 2.400 − 3.000 × c; para 2.400 × 0,9 → c = 0,08. */
+  assert.equal(parteDeCaja({ ...base, ofertaId: 9, ofertaTipo: 'pack', descuento: 20 }, 0.1), 0.08);
+});
+

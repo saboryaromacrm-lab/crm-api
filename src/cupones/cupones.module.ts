@@ -21,7 +21,7 @@ import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, MaxLen
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { cupones, productos } from '../db/schema';
+import { cupones, ofertas, productos } from '../db/schema';
 import { aplicar, errorDeCupon, ENTREGAS_CUPON, TIPOS_CUPON, type Contexto, type Cupon, type Renglon } from './reglas';
 
 const r2 = (n: unknown) => Math.round((Number(n) || 0) * 100) / 100;
@@ -55,6 +55,9 @@ class CuponDto {
   @IsOptional() @IsBoolean() soloPrimeraCompra?: boolean;
   /** Sin código (0199): se aplica solo en el checkout. */
   @IsOptional() @IsBoolean() automatico?: boolean;
+  /** También en los productos con oferta común (NutriOfertas) y por vencer (NutriRescate). */
+  @IsOptional() @IsBoolean() enOfertas?: boolean;
+  @IsOptional() @IsBoolean() enRescate?: boolean;
 }
 
 /** El pedido como lo cotiza la tienda (los usos y la marca de cada renglón los suma el servicio). */
@@ -97,6 +100,9 @@ export class CuponesService {
       usosPorCliente: dto.usosPorCliente == null ? (automatico ? 0 : 1) : N(dto.usosPorCliente),
       soloPrimeraCompra: dto.soloPrimeraCompra ?? false,
       automatico,
+      /* El envío gratis no toca los productos: no hay ofertas que elegir. */
+      enOfertas: tipo !== 'envio_gratis' && (dto.enOfertas ?? false),
+      enRescate: tipo !== 'envio_gratis' && (dto.enRescate ?? false),
     };
     const error = errorDeCupon(fila);
     if (error) throw new BadRequestException(error);
@@ -152,7 +158,7 @@ export class CuponesService {
     if (!cod) return null;
     const [c] = await tx.select().from(cupones).where(eq(cupones.codigo, cod)).limit(1);
     if (!c) return { cupon: null, resultado: { vale: false as const, motivo: 'Ese cupón no existe o ya no está activo.' } };
-    return this.aplicarA(c, await this.conMarcaYCategoria(pedido.renglones, tx), pedido, tx, trabar);
+    return this.aplicarA(c, await this.completar(pedido.renglones, tx), pedido, tx, trabar);
   }
 
   /**
@@ -163,20 +169,31 @@ export class CuponesService {
   async evaluarAutomaticos(pedido: Pedido, tx: Database = this.db, trabar = false) {
     const filas = await tx.select().from(cupones).where(and(eq(cupones.automatico, true), eq(cupones.activo, true))).orderBy(asc(cupones.id));
     if (!filas.length) return [];
-    const renglones = await this.conMarcaYCategoria(pedido.renglones, tx);
+    const renglones = await this.completar(pedido.renglones, tx);
     const sinMedio = { ...pedido, medioPago: null };
     /* En la misma conexión las consultas van en fila: las filas se traban en orden de id. */
     return Promise.all(filas.map((c) => this.aplicarA(c, renglones, sinMedio, tx, trabar)));
   }
 
-  /** Los renglones con la marca y la categoría de cada producto (lo que miran los cupones que las acotan). */
-  private async conMarcaYCategoria(renglones: Pedido['renglones'], tx: Database): Promise<Renglon[]> {
+  /**
+   * Los renglones con lo que miran los cupones: la marca y la categoría del
+   * producto, y de su oferta si es por vencer (NutriRescate) y su mecánica.
+   */
+  private async completar(renglones: Pedido['renglones'], tx: Database): Promise<Renglon[]> {
     const ids = [...new Set(renglones.map((r) => r.productoId))];
+    const idsOferta = [...new Set(renglones.map((r) => r.ofertaId).filter((x): x is number => !!x))];
     const prods = ids.length
       ? await tx.select({ id: productos.id, marcaId: productos.marcaId, categoriaId: productos.categoriaId }).from(productos).where(inArray(productos.id, ids))
       : [];
+    const ofs = idsOferta.length
+      ? await tx.select({ id: ofertas.id, porVencer: ofertas.porVencer, tipo: ofertas.tipo }).from(ofertas).where(inArray(ofertas.id, idsOferta))
+      : [];
     const porId = new Map(prods.map((p) => [p.id, p]));
-    return renglones.map((r) => ({ ...r, marcaId: porId.get(r.productoId)?.marcaId ?? null, categoriaId: porId.get(r.productoId)?.categoriaId ?? null }));
+    const ofertaDe = new Map(ofs.map((o) => [o.id, o]));
+    return renglones.map((r) => ({
+      ...r, marcaId: porId.get(r.productoId)?.marcaId ?? null, categoriaId: porId.get(r.productoId)?.categoriaId ?? null,
+      ...(r.ofertaId ? { porVencer: ofertaDe.get(r.ofertaId)?.porVencer ?? false, ofertaTipo: ofertaDe.get(r.ofertaId)?.tipo ?? null } : {}),
+    }));
   }
 
   /** Un cupón sobre el pedido: cuenta sus usos (con la fila trabada si `trabar`) y aplica sus reglas. */
