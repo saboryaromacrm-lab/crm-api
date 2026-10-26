@@ -75,6 +75,9 @@ export const tipoMovEnum = pgEnum('tipo_movimiento', [
   // stock sin venta. Tipo propio para que ninguna suma de ventas ni de pérdidas
   // la cuente.
   'retiro',
+  // 0202 · los cambios de mercadería con el proveedor: lo que se le manda y lo
+  // que repone. Tipo propio: no es venta, ni compra, ni pérdida.
+  'cambio_proveedor',
 ]);
 /**
  * Condición frente al IVA. La usan las DOS puntas: en el cliente define la
@@ -3933,6 +3936,39 @@ export const proveedorEcheqs = pgTable('proveedor_echeqs', {
 }, (t) => ({
   ixEstado: index('ix_echeqs_estado').on(t.estado, t.fechaVenc),
   ixCompromiso: index('ix_echeqs_compromiso').on(t.compromisoId),
+}));
+
+/**
+ * CAMBIOS DE MERCADERÍA CON EL PROVEEDOR (0202): lo que se le manda (vencidos,
+ * fallados) y lo que repone, a costo congelado. Ver `reposiciones.module.ts`.
+ */
+export const proveedorReposiciones = pgTable('proveedor_reposiciones', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  /** pendiente → completo (lo repuesto alcanzó lo mandado) · anulado (cargado por error, sin nada repuesto). */
+  estado: text('estado').$type<'pendiente' | 'completo' | 'anulado'>().notNull().default('pendiente'),
+  nota: text('nota').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  completadoEn: timestamp('completado_en', { withTimezone: true }),
+}, (t) => ({
+  ixEstado: index('ix_reposiciones_estado').on(t.estado, t.proveedorId),
+}));
+export const proveedorReposicionItems = pgTable('proveedor_reposicion_items', {
+  id: serial('id').primaryKey(),
+  reposicionId: integer('reposicion_id').notNull().references(() => proveedorReposiciones.id, { onDelete: 'cascade' }),
+  /** envio = lo que se le mandó; recepcion = lo que repuso (cada entrega, con su fecha). */
+  sentido: text('sentido').$type<'envio' | 'recepcion'>().notNull(),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
+  cantidad: doublePrecision('cantidad').notNull(),
+  /** Costo neto de una unidad (o kg) al cargarlo: congelado, como en una venta. */
+  costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixReposicion: index('ix_reposicion_items_reposicion').on(t.reposicionId),
 }));
 
 /** Ajustes manuales del estado de cuenta. Importe CON SIGNO (+debe / −haber)
