@@ -1514,7 +1514,6 @@ export class TiendaController {
   @RateLimit('envio')
   horariosEnvio(@Headers(VISTA_PREVIA) previa?: string) { return this.svc.agendaEnviosMinorista(previa); }
 
-  /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
   /* Borrar una de sus direcciones guardadas (0200): devuelve las que le quedan. */
   @Delete('minorista/direcciones/:id')
   @RateLimit('envio')
@@ -1522,6 +1521,7 @@ export class TiendaController {
     return this.accesos.borrarDireccion(tokenMin, id);
   }
 
+  /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
   @Post('minorista/registro')
   @RateLimit('registro')
   registroMinorista(@Body() body: any) { return this.accesos.registrarMinorista(body ?? {}); }
