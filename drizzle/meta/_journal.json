@@ -1408,6 +1408,13 @@
       "when": 1793106000000,
       "tag": "0200_tienda_direcciones",
       "breakpoints": true
+    },
+    {
+      "idx": 201,
+      "version": "7",
+      "when": 1793192400000,
+      "tag": "0201_echeq_destinatario",
+      "breakpoints": true
     }
   ]
 }

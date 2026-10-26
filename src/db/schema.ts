@@ -3922,7 +3922,9 @@ export const proveedorEcheqs = pgTable('proveedor_echeqs', {
   importe: doublePrecision('importe').notNull().default(0),
   fechaEmision: timestamp('fecha_emision', { withTimezone: true }).notNull().defaultNow(),
   fechaVenc: timestamp('fecha_venc', { withTimezone: true }).notNull(),
-  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  /** A un proveedor o, si es null, a quien diga `destinatario` (0201): uno de los dos, siempre. */
+  proveedorId: integer('proveedor_id').references(() => proveedores.id, { onDelete: 'restrict' }),
+  destinatario: text('destinatario').notNull().default(''),
   compromisoId: integer('compromiso_id').references(() => proveedorCompromisos.id, { onDelete: 'set null' }),
   pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'set null' }),
   estado: estadoEcheqEnum('estado').notNull().default('emitido'),

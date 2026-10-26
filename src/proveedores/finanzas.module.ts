@@ -109,6 +109,8 @@ class EcheqDto {
   @IsOptional() @Matches(SOLO_FECHA) fechaEmision?: string;
   @IsOptional() @Matches(SOLO_FECHA) fechaVenc?: string;
   @IsOptional() @IsInt() proveedorId?: number;
+  /** A un no proveedor (0201): el nombre, escrito a mano. */
+  @IsOptional() @IsString() @MaxLength(120) destinatario?: string;
   @IsOptional() @IsString() @MaxLength(2000) obs?: string;
 }
 
@@ -441,7 +443,8 @@ export class FinanzasProveedorService {
       fechaEmision: proveedorEcheqs.fechaEmision,
       fechaVenc: proveedorEcheqs.fechaVenc,
       proveedorId: proveedorEcheqs.proveedorId,
-      proveedorNombre: sql<string>`coalesce(${proveedores.nombre}, '')`,
+      /** A nombre de quién: el proveedor o, si no es proveedor (0201), el nombre escrito a mano. */
+      aNombreDe: sql<string>`coalesce(${proveedores.nombre}, ${proveedorEcheqs.destinatario})`,
       compromisoId: proveedorEcheqs.compromisoId,
       pagoId: proveedorEcheqs.pagoId,
       estado: proveedorEcheqs.estado,
@@ -464,7 +467,8 @@ export class FinanzasProveedorService {
     if (q.proveedorId) conds.push(eq(proveedorEcheqs.proveedorId, q.proveedorId));
     if (q.buscar?.trim()) {
       const like = `%${q.buscar.trim()}%`;
-      conds.push(sql`(${proveedorEcheqs.numero} ILIKE ${like} OR ${proveedorEcheqs.banco} ILIKE ${like} OR ${proveedores.nombre} ILIKE ${like} OR ${proveedorEcheqs.obs} ILIKE ${like})`);
+      conds.push(sql`(${proveedorEcheqs.numero} ILIKE ${like} OR ${proveedorEcheqs.banco} ILIKE ${like} OR ${proveedores.nombre} ILIKE ${like}
+        OR ${proveedorEcheqs.destinatario} ILIKE ${like} OR ${proveedorEcheqs.obs} ILIKE ${like})`);
     }
     const filas = await this.db.select(this.selectEcheq())
       .from(proveedorEcheqs)
@@ -528,12 +532,16 @@ export class FinanzasProveedorService {
   }
 
   async crearEcheq(dto: EcheqDto) {
-    if (!dto.proveedorId) throw new BadRequestException('Elegí el proveedor del echeq.');
+    /* A un proveedor o, si no lo es (0201), a quien diga el nombre escrito a mano. */
+    const destinatario = dto.proveedorId ? '' : (dto.destinatario ?? '').replace(/\s+/g, ' ').trim();
+    if (!dto.proveedorId && !destinatario) throw new BadRequestException('Elegí el proveedor o escribí a nombre de quién va el echeq.');
     if (!dto.fechaVenc) throw new BadRequestException('El echeq necesita su fecha de cobro.');
     if (!(Number(dto.importe) > 0)) throw new BadRequestException('El importe del echeq tiene que ser mayor a 0.');
-    const [prov] = await this.db.select({ id: proveedores.id }).from(proveedores)
-      .where(eq(proveedores.id, dto.proveedorId)).limit(1);
-    if (!prov) throw new BadRequestException('Proveedor inválido.');
+    if (dto.proveedorId) {
+      const [prov] = await this.db.select({ id: proveedores.id }).from(proveedores)
+        .where(eq(proveedores.id, dto.proveedorId)).limit(1);
+      if (!prov) throw new BadRequestException('Proveedor inválido.');
+    }
     await this.exigirEcheqUnico(dto.numero, dto.banco);
     const [e] = await this.db.insert(proveedorEcheqs).values({
       numero: (dto.numero ?? '').trim(),
@@ -541,7 +549,8 @@ export class FinanzasProveedorService {
       importe: money(dto.importe!),
       fechaEmision: dto.fechaEmision ? fecha0(dto.fechaEmision) : new Date(),
       fechaVenc: fecha0(dto.fechaVenc),
-      proveedorId: dto.proveedorId,
+      proveedorId: dto.proveedorId || null,
+      destinatario,
       obs: (dto.obs ?? '').trim(),
     }).returning();
     return this.getEcheq(e.id);
@@ -559,6 +568,9 @@ export class FinanzasProveedorService {
     if (dto.numero !== undefined || dto.banco !== undefined) {
       await this.exigirEcheqUnico(dto.numero ?? e.numero, dto.banco ?? e.banco, id);
     }
+    /* El nombre del que no es proveedor se corrige; el proveedor de un echeq no se cambia. */
+    const destinatario = dto.destinatario !== undefined && !e.proveedorId ? dto.destinatario.replace(/\s+/g, ' ').trim() : undefined;
+    if (destinatario === '') throw new BadRequestException('Escribí a nombre de quién va el echeq.');
     await this.db.update(proveedorEcheqs).set({
       ...(dto.numero !== undefined ? { numero: dto.numero.trim() } : {}),
       ...(dto.banco !== undefined ? { banco: dto.banco.trim() } : {}),
@@ -566,6 +578,7 @@ export class FinanzasProveedorService {
       ...(dto.fechaEmision ? { fechaEmision: fecha0(dto.fechaEmision) } : {}),
       ...(dto.fechaVenc ? { fechaVenc: fecha0(dto.fechaVenc) } : {}),
       ...(dto.obs !== undefined ? { obs: dto.obs.trim() } : {}),
+      ...(destinatario !== undefined ? { destinatario } : {}),
     }).where(eq(proveedorEcheqs.id, id));
     return this.getEcheq(id);
   }
@@ -613,6 +626,11 @@ export class FinanzasProveedorService {
           await this.db.update(proveedorEcheqs).set({ estado: 'cobrado', pagoId: k.pagoId })
             .where(eq(proveedorEcheqs.id, id));
         }
+        return this.getEcheq(id);
+      }
+      /* A un no proveedor (0201): el banco debitó y no hay cuenta corriente donde imputarlo. */
+      if (!e.proveedorId) {
+        await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' }).where(eq(proveedorEcheqs.id, id));
         return this.getEcheq(id);
       }
       // Echeq suelto (sin compromiso): pago a cuenta del proveedor.
