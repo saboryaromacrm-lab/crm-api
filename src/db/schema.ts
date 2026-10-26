@@ -3952,6 +3952,8 @@ export const proveedorReposiciones = pgTable('proveedor_reposiciones', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   completadoEn: timestamp('completado_en', { withTimezone: true }),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixEstado: index('ix_reposiciones_estado').on(t.estado, t.proveedorId),
 }));

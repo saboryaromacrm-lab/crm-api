@@ -2,6 +2,7 @@
 -- reconoce vencidos: se los entrego y después me repone, a veces otro producto o sabor, o en otro
 -- envío»). Lo mandado sale del stock (tipo `cambio_proveedor`, no es pérdida) y queda lo que te
 -- debe a costo; lo que repone entra y lo descuenta. Se completa cuando lo repuesto alcanza lo mandado.
+-- Un envío por error se anula (sin nada repuesto): queda quién y cuándo.
 ALTER TYPE tipo_movimiento ADD VALUE IF NOT EXISTS 'cambio_proveedor';
 CREATE TABLE IF NOT EXISTS proveedor_reposiciones (
   id serial PRIMARY KEY,
@@ -11,7 +12,9 @@ CREATE TABLE IF NOT EXISTS proveedor_reposiciones (
   nota text NOT NULL DEFAULT '',
   usuario_id integer REFERENCES usuarios(id) ON DELETE SET NULL,
   creado_en timestamptz NOT NULL DEFAULT now(),
-  completado_en timestamptz
+  completado_en timestamptz,
+  anulado_en timestamptz,
+  anulado_por integer REFERENCES usuarios(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS ix_reposiciones_estado ON proveedor_reposiciones (estado, proveedor_id);
 CREATE TABLE IF NOT EXISTS proveedor_reposicion_items (

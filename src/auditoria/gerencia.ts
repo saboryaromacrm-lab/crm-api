@@ -10,6 +10,8 @@
  *   devolucion  notas de crédito y devoluciones de ticket           ventas
  *   a_mano      precio pisado, lista habilitada o descuento a mano  venta_items
  *   stock       ajustes y bajas (merma, vencido, defectuoso)        movimientos
+ *               y lo mandado al proveedor para cambio (0202): se ve,
+ *               no suma (no es pérdida, lo repone)    proveedor_reposiciones
  *   caja        cierres con diferencia, controles, sobres, caja del dueño
  *   retiro      retiros sin costo de los socios (0146), a costo        retiros
  *   otras       cobranzas, compras, movimientos de caja y del Cash Flow,
@@ -205,6 +207,16 @@ export async function auditoriaGerencia(db: Database, f: FiltroAuditoria) {
                (SELECT json_agg(json_build_array(i.nombre, i.cantidad) ORDER BY i.id) FROM retiro_items i WHERE i.retiro_id = r.id) AS items
           FROM retiros r JOIN clientes c ON c.id = r.cliente_id
          WHERE ${en('r.fecha')} ${deSuc('r.sucursal_id')}`),
+      /* Lo mandado al proveedor para que lo reponga (0202): mercadería que sale sin venta. */
+      cambiosProveedor: await q(sql`
+        SELECT r.id, r.creado_en AS fecha, r.usuario_id AS u, r.sucursal_id AS suc, r.estado, r.nota, r.anulado_en, r.anulado_por,
+               pv.nombre AS proveedor,
+               (SELECT coalesce(sum(i.cantidad * i.costo_unitario), 0) FROM proveedor_reposicion_items i
+                 WHERE i.reposicion_id = r.id AND i.sentido = 'envio') AS mandado,
+               (SELECT json_agg(json_build_array(p.nombre, i.cantidad) ORDER BY i.id) FROM proveedor_reposicion_items i
+                  JOIN productos p ON p.id = i.producto_id WHERE i.reposicion_id = r.id AND i.sentido = 'envio') AS items
+          FROM proveedor_reposiciones r JOIN proveedores pv ON pv.id = r.proveedor_id
+         WHERE ${en('r.creado_en')} ${deSuc('r.sucursal_id')}`),
       retirosAnulados: await q(sql`
         SELECT r.id, r.anulado_en AS fecha, r.anulado_por AS u, r.sucursal_id AS suc, r.costo_total, r.anulado_motivo AS motivo, c.nombre AS cliente
           FROM retiros r JOIN clientes c ON c.id = r.cliente_id
@@ -430,6 +442,18 @@ function armarEventos(d: Datos): { eventos: EventoAuditoria[]; ajustes: AjusteSu
       detalle: [...its.slice(0, 8).map(([nombre, c]) => `${nombre} × ${cant(c)}`), ...(its.length > 8 ? [`y ${its.length - 8} más`] : []),
         ...(x.anulado_en ? ['Anulado: no suma'] : [])],
       motivo: '', ...(x.anulado_en ? { informativo: true } : {}),
+    });
+  }
+  /* Lo mandado al proveedor: a la vista con su valor, pero no suma (no es pérdida, lo repone). */
+  for (const x of d.cambiosProveedor) {
+    const its = (x.items ?? []) as [string, number][];
+    push({
+      id: `cambio-proveedor-${x.id}`, tipo: 'stock', fecha: iso(x.fecha), usuarioId: num(x.u), sucursalId: num(x.suc), monto: -r2(x.mandado),
+      titulo: `Cambio de mercadería #${x.id}: mandado a ${x.proveedor}`,
+      detalle: [...its.slice(0, 8).map(([nombre, c]) => `${nombre} × ${cant(c)}`), ...(its.length > 8 ? [`y ${its.length - 8} más`] : []),
+        x.anulado_en ? 'Anulado: la mercadería volvió al stock' : 'No es pérdida: el proveedor lo repone (Proveedores › Cambios de mercadería)'],
+      motivo: x.nota ?? '', informativo: true,
+      ...(x.anulado_por ? { otro: { etiqueta: 'Lo anuló', usuarioId: Number(x.anulado_por) } } : {}),
     });
   }
   for (const x of d.retirosAnulados) {

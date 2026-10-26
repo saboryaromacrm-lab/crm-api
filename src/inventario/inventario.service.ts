@@ -1160,7 +1160,7 @@ export class InventarioService {
       await this.addDelta(tx, { productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, estado: 'disponible' }, cantidad);
       const prod = await this.getProducto(tx, it.productoId);
       await this.mov(tx, {
-        tipo: o.tipoMovimiento || 'compra', productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: 1,
+        tipo: 'compra', productoId: it.productoId, sucursalId: o.sucursalId, presentacionId: presId, signo: 1,
         cantidad, unidad: this.unidadDe(prod.tipo, presId), estadoHacia: 'disponible', usuarioId: o.usuarioId ?? null,
         proveedorNombre: o.proveedorNombre || '', descripcion: o.descripcion || 'Ingreso por comprobante',
       });

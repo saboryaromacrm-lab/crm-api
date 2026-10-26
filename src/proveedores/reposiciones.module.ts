@@ -6,24 +6,28 @@
  * a veces recién en el próximo envío—. Decisiones del dueño:
  *
  *   · SE MIDE POR VALOR A COSTO: lo que mandás suma lo que te debe; lo que
- *     repone (sea lo que sea) lo descuenta por su costo. Las unidades se
- *     muestran, pero lo que cierra la cuenta es la plata a costo.
- *   · EL STOCK SALE AL MANDARLA (movimiento `cambio_proveedor`, no es pérdida):
- *     la mercadería ya no está en el local. Lo repuesto entra con el mismo tipo.
+ *     repone (sea lo que sea) lo descuenta por su costo. Por eso un producto
+ *     sin costo cargado no entra: no habría con qué medirlo.
+ *   · EL STOCK SALE AL MANDARLA (movimiento `cambio_proveedor`, no es pérdida
+ *     ni venta: ningún reporte lo suma): la mercadería ya no está en el local.
+ *     Lo repuesto entra con el mismo tipo, en la sucursal de donde salió.
  *   · EL FALTANTE QUEDA PENDIENTE: el cambio se completa solo cuando lo
  *     repuesto alcanza lo mandado; no se da por perdido ni pasa a plata.
  *
  * No toca la cuenta corriente ni los gastos: es mercadería por mercadería. Un
  * envío cargado por error se ANULA mientras no tenga nada repuesto (el stock
- * vuelve). El costo de cada renglón se congela al cargarlo, como en una venta.
+ * vuelve y queda quién y cuándo). El costo de cada renglón se congela al
+ * cargarlo, como en una venta. Lo mandado queda a la vista del dueño en
+ * Gerencia › Auditoría.
  */
 import {
-  BadRequestException, Body, Controller, Get, Inject, Injectable, Module, NotFoundException, Param, ParseIntPipe, Post, Query,
+  BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Injectable, Module, NotFoundException, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested } from 'class-validator';
-import { and, asc, desc, eq, ilike, inArray, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { soloSuSucursal, sucursalDeOperacion } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   presentaciones, productoProveedores, productos, proveedorReposicionItems, proveedorReposiciones, proveedores, stock, sucursales,
@@ -36,6 +40,11 @@ const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Lo repuesto alcanza lo mandado con un centavo de tolerancia. */
 const EPS = 0.01;
 const MOV = 'cambio_proveedor' as const;
+const ESTADOS = ['pendientes', 'completos', 'todos'] as const;
+type Filtro = (typeof ESTADOS)[number];
+/** Lo mandado (`envio`) o lo repuesto (`recepcion`) de un cambio, a costo congelado. */
+const valor = (sentido: 'envio' | 'recepcion') => sql<number>`coalesce(sum(${proveedorReposicionItems.cantidad} * ${proveedorReposicionItems.costoUnitario})
+  filter (where ${proveedorReposicionItems.sentido} = ${sentido}), 0)::float8`;
 
 class RenglonDto {
   @IsInt() productoId!: number;
@@ -44,7 +53,6 @@ class RenglonDto {
 }
 class MandarDto {
   @IsInt() proveedorId!: number;
-  @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsString() @MaxLength(300) nota?: string;
   @IsArray() @ArrayMinSize(1) @ArrayMaxSize(100) @ValidateNested({ each: true }) @Type(() => RenglonDto)
   items!: RenglonDto[];
@@ -61,9 +69,10 @@ export class ReposicionesService {
   /**
    * El costo NETO de hoy de cada renglón, el mismo que se congela en una venta
    * (formato de costo del proveedor que fija el precio): el paquete hereda el
-   * del kilo por su tamaño y su merma.
+   * del kilo por su tamaño y su merma. Con `paraMover`, además, las reglas del
+   * mostrador: paquetes y unidades enteros, y nada sin costo.
    */
-  private async conCosto(tx: Database, items: RenglonDto[]) {
+  private async conCosto(tx: Database, items: RenglonDto[], paraMover: boolean) {
     const ids = [...new Set(items.map((it) => it.productoId))];
     const presIds = [...new Set(items.map((it) => it.presentacionId).filter((x): x is number => !!x))];
     const [prods, provs] = await Promise.all([
@@ -77,46 +86,57 @@ export class ReposicionesService {
       const p = it.presentacionId ? pres.find((x) => x.id === it.presentacionId && x.productoId === prod.id) : null;
       if (it.presentacionId && !p) throw new BadRequestException(`El envasado elegido no es de ${prod.nombre}.`);
       const cf = costosFormato(formatoDeCosto(prod as any, provs.filter((x) => x.productoId === prod.id)) as any, prod.iva);
-      const costo = cf.costoNetoUnitario * (p ? escalaPaquete(p.tamKg, prod.merma) : 1);
-      return { productoId: prod.id, presentacionId: p?.id ?? null, cantidad: Number(it.cantidad), costoUnitario: Math.round(costo * 1e4) / 1e4 };
+      const costoUnitario = Math.round(cf.costoNetoUnitario * (p ? escalaPaquete(p.tamKg, prod.merma) : 1) * 1e4) / 1e4;
+      const cantidad = Number(it.cantidad);
+      if (paraMover) {
+        this.inv.exigirEntero(prod, p?.id ?? null, cantidad);
+        if (!(costoUnitario > 0)) {
+          throw new BadRequestException(`${prod.nombre} no tiene costo cargado: sin costo no se puede medir el cambio. Cargáselo en su ficha.`);
+        }
+      }
+      return { productoId: prod.id, presentacionId: p?.id ?? null, cantidad, costoUnitario };
     });
   }
 
-  /** Lo mandado, lo repuesto y lo que falta de cada cambio (a costo). */
-  private saldos() {
-    const valor = (sentido: string) => sql<number>`coalesce(sum(${proveedorReposicionItems.cantidad} * ${proveedorReposicionItems.costoUnitario})
-      filter (where ${proveedorReposicionItems.sentido} = ${sentido}), 0)::float8`;
-    const unidades = (sentido: string) => sql<number>`coalesce(sum(${proveedorReposicionItems.cantidad})
-      filter (where ${proveedorReposicionItems.sentido} = ${sentido}), 0)::float8`;
-    return { mandado: valor('envio'), repuesto: valor('recepcion'), unidadesMandadas: unidades('envio'), unidadesRepuestas: unidades('recepcion') };
-  }
-
-  async listar(q: { estado?: string; proveedorId?: number }) {
-    const conds: any[] = [];
-    if (q.estado === 'pendientes' || !q.estado) conds.push(eq(proveedorReposiciones.estado, 'pendiente'));
-    else if (q.estado === 'completos') conds.push(eq(proveedorReposiciones.estado, 'completo'));
-    else conds.push(ne(proveedorReposiciones.estado, 'anulado'));
-    if (q.proveedorId) conds.push(eq(proveedorReposiciones.proveedorId, q.proveedorId));
-    const filas = await this.db.select({
+  /**
+   * Los cambios con lo mandado, lo repuesto y lo que falta (a costo). Una sola
+   * consulta para la lista, el detalle y la tarjeta de Pedidos.
+   */
+  private async filas(conds: SQL[], limite?: number) {
+    const q = this.db.select({
       id: proveedorReposiciones.id, proveedorId: proveedorReposiciones.proveedorId, proveedorNombre: proveedores.nombre,
-      sucursalNombre: sucursales.nombre, estado: proveedorReposiciones.estado, nota: proveedorReposiciones.nota,
-      creadoEn: proveedorReposiciones.creadoEn, completadoEn: proveedorReposiciones.completadoEn, ...this.saldos(),
+      sucursalId: proveedorReposiciones.sucursalId, sucursalNombre: sucursales.nombre, estado: proveedorReposiciones.estado,
+      nota: proveedorReposiciones.nota, creadoEn: proveedorReposiciones.creadoEn, completadoEn: proveedorReposiciones.completadoEn,
+      anuladoEn: proveedorReposiciones.anuladoEn,
+      mandado: valor('envio'), repuesto: valor('recepcion'),
+      /** Renglones repuestos: con uno solo, el cambio ya no se anula (aunque valga centavos). */
+      entregas: sql<number>`count(*) filter (where ${proveedorReposicionItems.sentido} = 'recepcion')::int`,
     }).from(proveedorReposiciones)
       .innerJoin(proveedores, eq(proveedores.id, proveedorReposiciones.proveedorId))
       .innerJoin(sucursales, eq(sucursales.id, proveedorReposiciones.sucursalId))
       .leftJoin(proveedorReposicionItems, eq(proveedorReposicionItems.reposicionId, proveedorReposiciones.id))
       .where(and(...conds))
       .groupBy(proveedorReposiciones.id, proveedores.nombre, sucursales.nombre)
-      .orderBy(desc(proveedorReposiciones.creadoEn))
-      .limit(300);
-    return filas.map((f) => ({ ...f, mandado: money(f.mandado), repuesto: money(f.repuesto), debe: money(Math.max(0, f.mandado - f.repuesto)) }));
+      .orderBy(desc(proveedorReposiciones.creadoEn));
+    const filas = await (limite ? q.limit(limite) : q);
+    return filas.map((f) => ({
+      ...f, mandado: money(f.mandado), repuesto: money(f.repuesto),
+      debe: f.estado === 'pendiente' ? money(Math.max(0, f.mandado - f.repuesto)) : 0,
+    }));
+  }
+
+  listar(q: { estado: Filtro; proveedorId?: number }) {
+    const conds: SQL[] = [];
+    if (q.estado === 'pendientes') conds.push(eq(proveedorReposiciones.estado, 'pendiente'));
+    else if (q.estado === 'completos') conds.push(eq(proveedorReposiciones.estado, 'completo'));
+    if (q.proveedorId) conds.push(eq(proveedorReposiciones.proveedorId, q.proveedorId));
+    return this.filas(conds, 300);
   }
 
   /** Lo que cada proveedor te debe en cambios pendientes (para su tarjeta en Pedidos). */
   async pendientesPorProveedor() {
-    const filas = await this.listar({ estado: 'pendientes' });
     const por = new Map<number, { proveedorId: number; cambios: number; debe: number }>();
-    for (const f of filas) {
+    for (const f of await this.filas([eq(proveedorReposiciones.estado, 'pendiente')])) {
       const x = por.get(f.proveedorId) ?? { proveedorId: f.proveedorId, cambios: 0, debe: 0 };
       x.cambios += 1; x.debe = money(x.debe + f.debe);
       por.set(f.proveedorId, x);
@@ -125,9 +145,8 @@ export class ReposicionesService {
   }
 
   async detalle(id: number) {
-    const [cab] = (await this.listar({ estado: 'todos' })).filter((f) => f.id === id);
-    const [anulado] = cab ? [] : await this.db.select({ id: proveedorReposiciones.id }).from(proveedorReposiciones).where(eq(proveedorReposiciones.id, id)).limit(1);
-    if (!cab) throw new NotFoundException(anulado ? 'Ese cambio está anulado.' : 'Ese cambio no existe.');
+    const [cab] = await this.filas([eq(proveedorReposiciones.id, id)]);
+    if (!cab) throw new NotFoundException('Ese cambio no existe.');
     const items = await this.db.select({
       id: proveedorReposicionItems.id, sentido: proveedorReposicionItems.sentido, fecha: proveedorReposicionItems.fecha,
       productoId: proveedorReposicionItems.productoId, nombre: productos.nombre, presentacionId: proveedorReposicionItems.presentacionId,
@@ -143,10 +162,10 @@ export class ReposicionesService {
   /**
    * Los productos para elegir: los del proveedor (o todos, si `todos`) que
    * coinciden con lo buscado, cada envasado por separado, con lo disponible
-   * en la sucursal y su costo de hoy. Para mandar solo sirven los que hay.
+   * en la sucursal y su costo de hoy.
    */
   async productos(q: { proveedorId?: number; sucursalId?: number; buscar?: string; todos?: boolean }) {
-    const conds: any[] = [ne(productos.estado, 'archivado')];
+    const conds: SQL[] = [ne(productos.estado, 'archivado')];
     if (q.buscar?.trim()) conds.push(ilike(productos.nombre, `%${q.buscar.trim()}%`));
     if (!q.todos && q.proveedorId) {
       conds.push(sql`exists (select 1 from ${productoProveedores} pp where pp.producto_id = ${productos.id} and pp.proveedor_id = ${q.proveedorId})`);
@@ -169,16 +188,18 @@ export class ReposicionesService {
         unidad: 'u', disponible: disp(p.id, x.id),
       })),
     ]);
-    const costos = await this.conCosto(this.db, opciones.map((o) => ({ productoId: o.productoId, presentacionId: o.presentacionId, cantidad: 1 })));
+    const costos = await this.conCosto(this.db, opciones.map((o) => ({ productoId: o.productoId, presentacionId: o.presentacionId, cantidad: 1 })), false);
     return opciones.map((o, i) => ({ ...o, costoUnitario: costos[i].costoUnitario }));
   }
 
   async mandar(dto: MandarDto, s: Sesion) {
-    const sucursalId = dto.sucursalId ?? s.sucursalId;
+    /* Sale de la sucursal con que se entró: la misma de la que la pantalla mostró lo disponible. */
+    const sucursalId = sucursalDeOperacion(s);
+    if (!sucursalId) throw new BadRequestException('Este puesto no trabaja en una sucursal: el cambio sale del stock de un local.');
     const [prov] = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Elegí el proveedor.');
     const id = await this.db.transaction(async (tx) => {
-      const renglones = await this.conCosto(tx as any, dto.items);
+      const renglones = await this.conCosto(tx as any, dto.items, true);
       const [cab] = await tx.insert(proveedorReposiciones).values({
         proveedorId: prov.id, sucursalId, nota: (dto.nota ?? '').trim(), usuarioId: s.usuarioId,
       }).returning({ id: proveedorReposiciones.id });
@@ -195,6 +216,16 @@ export class ReposicionesService {
     return this.detalle(id);
   }
 
+  /** El cambio con candado, si esta sesión puede tocarlo (un empleado, solo los de su sucursal). */
+  private async cambioParaTocar(tx: Database, id: number, s: Sesion) {
+    const [cab] = await tx.select().from(proveedorReposiciones).where(eq(proveedorReposiciones.id, id)).for('update').limit(1);
+    if (!cab) throw new NotFoundException('Ese cambio no existe.');
+    const mia = soloSuSucursal(s);
+    if (mia != null && cab.sucursalId !== mia) throw new ForbiddenException('Ese cambio es de otra sucursal.');
+    if (cab.estado !== 'pendiente') throw new BadRequestException(cab.estado === 'completo' ? 'Ese cambio ya está completo.' : 'Ese cambio está anulado.');
+    return cab;
+  }
+
   /**
    * Lo que trajo el proveedor (cualquier producto o sabor, todo o una parte):
    * entra al stock de la sucursal del cambio y descuenta lo que debe por su
@@ -202,17 +233,16 @@ export class ReposicionesService {
    */
   async recibir(id: number, dto: RecibirDto, s: Sesion) {
     await this.db.transaction(async (tx) => {
-      const [cab] = await tx.select().from(proveedorReposiciones).where(eq(proveedorReposiciones.id, id)).for('update').limit(1);
-      if (!cab) throw new NotFoundException('Ese cambio no existe.');
-      if (cab.estado !== 'pendiente') throw new BadRequestException(cab.estado === 'completo' ? 'Ese cambio ya está completo.' : 'Ese cambio está anulado.');
+      const cab = await this.cambioParaTocar(tx as any, id, s);
       const [prov] = await tx.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, cab.proveedorId)).limit(1);
-      const renglones = await this.conCosto(tx as any, dto.items);
-      await this.inv.ingresarStockItems(tx, {
-        sucursalId: cab.sucursalId, usuarioId: s.usuarioId, tipoMovimiento: MOV, proveedorNombre: prov?.nombre ?? '',
-        descripcion: `Cambio #${id}: repuesto por ${prov?.nombre ?? 'el proveedor'}`, items: renglones,
+      const renglones = await this.conCosto(tx as any, dto.items, true);
+      await this.inv.reingresarStockItems(tx, {
+        sucursalId: cab.sucursalId, usuarioId: s.usuarioId, tipoMovimiento: MOV,
+        descripcion: `Cambio #${id}: repuesto por ${prov.nombre}`, items: renglones,
       });
       await tx.insert(proveedorReposicionItems).values(renglones.map((r) => ({ ...r, reposicionId: id, sentido: 'recepcion' as const, usuarioId: s.usuarioId })));
-      const [x] = await tx.select(this.saldos()).from(proveedorReposicionItems).where(eq(proveedorReposicionItems.reposicionId, id));
+      const [x] = await tx.select({ mandado: valor('envio'), repuesto: valor('recepcion') })
+        .from(proveedorReposicionItems).where(eq(proveedorReposicionItems.reposicionId, id));
       if (x.repuesto + EPS >= x.mandado) {
         await tx.update(proveedorReposiciones).set({ estado: 'completo', completadoEn: new Date() }).where(eq(proveedorReposiciones.id, id));
       }
@@ -223,17 +253,17 @@ export class ReposicionesService {
   /** Un envío cargado por error: se anula mientras no tenga nada repuesto, y el stock vuelve. */
   async anular(id: number, s: Sesion) {
     await this.db.transaction(async (tx) => {
-      const [cab] = await tx.select().from(proveedorReposiciones).where(eq(proveedorReposiciones.id, id)).for('update').limit(1);
-      if (!cab || cab.estado === 'anulado') throw new NotFoundException('Ese cambio no existe o ya está anulado.');
+      const cab = await this.cambioParaTocar(tx as any, id, s);
       const items = await tx.select().from(proveedorReposicionItems).where(eq(proveedorReposicionItems.reposicionId, id));
       if (items.some((it) => it.sentido === 'recepcion')) {
         throw new BadRequestException('El proveedor ya repuso parte de este cambio: no se anula. Queda pendiente hasta que reponga el resto.');
       }
-      await this.inv.ingresarStockItems(tx, {
+      await this.inv.reingresarStockItems(tx, {
         sucursalId: cab.sucursalId, usuarioId: s.usuarioId, tipoMovimiento: MOV,
-        descripcion: `Cambio #${id} anulado: vuelve al stock`, items,
+        descripcion: `Cambio #${id} anulado: vuelve al stock`,
+        items: items.map((it) => ({ productoId: it.productoId, presentacionId: it.presentacionId, cantidad: it.cantidad })),
       });
-      await tx.update(proveedorReposiciones).set({ estado: 'anulado' }).where(eq(proveedorReposiciones.id, id));
+      await tx.update(proveedorReposiciones).set({ estado: 'anulado', anuladoEn: new Date(), anuladoPor: s.usuarioId }).where(eq(proveedorReposiciones.id, id));
     });
     return { ok: true };
   }
@@ -246,16 +276,17 @@ export class ReposicionesController {
   constructor(private readonly svc: ReposicionesService) {}
 
   @Get() listar(@Query('estado') estado?: string, @Query('proveedorId') proveedorId?: string) {
-    return this.svc.listar({ estado: ['pendientes', 'completos', 'todos'].includes(String(estado)) ? estado : 'pendientes', proveedorId: Number(proveedorId) || undefined });
+    const filtro = (ESTADOS as readonly string[]).includes(String(estado)) ? (estado as Filtro) : 'pendientes';
+    return this.svc.listar({ estado: filtro, proveedorId: Number(proveedorId) || undefined });
   }
 
   @Get('por-proveedor') pendientesPorProveedor() { return this.svc.pendientesPorProveedor(); }
 
-  /* Lo disponible es el de la sucursal con que se entró (de donde sale y adonde entra la mercadería). */
+  /* Lo disponible es el de la sucursal con que se entró (de donde sale la mercadería al mandar). */
   @Get('productos') productos(
     @Auth() s: Sesion, @Query('proveedorId') proveedorId?: string, @Query('buscar') buscar?: string, @Query('todos') todos?: string,
   ) {
-    return this.svc.productos({ proveedorId: Number(proveedorId) || undefined, sucursalId: s.sucursalId, buscar, todos: todos === '1' });
+    return this.svc.productos({ proveedorId: Number(proveedorId) || undefined, sucursalId: sucursalDeOperacion(s), buscar, todos: todos === '1' });
   }
 
   @Get(':id') detalle(@Param('id', ParseIntPipe) id: number) { return this.svc.detalle(id); }
