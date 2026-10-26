@@ -22,11 +22,11 @@
  * una sesión minorista no abre la mayorista ni al revés. Como el número solo
  * abre la puerta, lo guardado de la dirección viaja A MEDIAS (`direccionOculta`).
  */
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
-import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, lt, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { clientes, presupuestos, tiendaAccesos, tiendaCompradores, tiendaSesiones, usuarios } from '../db/schema';
+import { clientes, presupuestos, tiendaAccesos, tiendaCompradores, tiendaDirecciones, tiendaSesiones, usuarios } from '../db/schema';
 import { telefonoArgentino } from '../common/telefono';
 import { cuitValido } from '../arca/padron';
 import { ClientesService } from '../clientes/clientes.module';
@@ -75,11 +75,18 @@ export type EstadoIngreso =
 type Acceso = typeof tiendaAccesos.$inferSelect;
 /** El comprador minorista que ingresó (0178): lo usan el catálogo y el pedido. */
 export type Comprador = typeof tiendaCompradores.$inferSelect;
+/** Una de sus direcciones guardadas (0200). */
+export type DireccionGuardada = typeof tiendaDirecciones.$inferSelect;
 /** `completar`: ya compró pero le faltan datos (nombre, apellido o dirección): se los pide una vez. */
 export type EstadoMinorista =
   | { estado: 'habilitado'; token: string; nombre: string }
   | { estado: 'sin_registro' | 'completar' | 'bloqueado' };
-const incompleto = (c: Comprador) => !c.nombre || !c.apellido || !c.direccion;
+
+/** Cuántas direcciones guarda un comprador (0200): «Casa» y «Trabajo», por ejemplo. */
+export const MAX_DIRECCIONES = 2;
+/** El nombre de una dirección guardada: «casa» → «Casa», sin espacios de más, hasta 30 letras. */
+export const nombreDireccion = (v: unknown) => { const t = texto(v, 30); return t && t.charAt(0).toLocaleUpperCase('es') + t.slice(1); };
+const mismoNombre = (a: string, b: string) => a.toLocaleLowerCase('es') === b.toLocaleLowerCase('es');
 
 @Injectable()
 export class AccesosTiendaService {
@@ -199,10 +206,14 @@ export class AccesosTiendaService {
     const direccion = texto(dto?.direccion, 120);
     if (direccion.length < 5) throw new BadRequestException('Escribí tu dirección: calle, número y barrio.');
     /* `onConflictDoNothing`: dos registros juntos con el mismo número dejan UNA fila. */
-    await this.db.insert(tiendaCompradores).values({ telefono, nombre, apellido, direccion })
+    await this.db.insert(tiendaCompradores).values({ telefono, nombre, apellido })
       .onConflictDoNothing({ target: tiendaCompradores.telefono });
     let [c] = await this.db.select().from(tiendaCompradores).where(eq(tiendaCompradores.telefono, telefono)).limit(1);
-    const faltan = { ...(c.nombre ? {} : { nombre }), ...(c.apellido ? {} : { apellido }), ...(c.direccion ? {} : { direccion }) };
+    /* La del registro es su primera dirección guardada, «Casa» (0200); si ya tiene, no se toca. */
+    if (!(await this.direcciones(c.id)).length) {
+      await this.db.insert(tiendaDirecciones).values({ compradorId: c.id, nombre: 'Casa', direccion }).onConflictDoNothing();
+    }
+    const faltan = { ...(c.nombre ? {} : { nombre }), ...(c.apellido ? {} : { apellido }) };
     if (Object.keys(faltan).length) {
       [c] = await this.db.update(tiendaCompradores).set({ ...faltan, actualizadoEn: new Date() })
         .where(eq(tiendaCompradores.id, c.id)).returning();
@@ -212,7 +223,7 @@ export class AccesosTiendaService {
 
   private async respuestaMinorista(c: Comprador): Promise<EstadoMinorista> {
     if (c.bloqueado) return { estado: 'bloqueado' };
-    if (incompleto(c)) return { estado: 'completar' };
+    if (!c.nombre || !c.apellido || !(await this.direcciones(c.id)).length) return { estado: 'completar' };
     const token = await this.abrirSesion({ compradorId: c.id }, (tx, ahora) =>
       tx.update(tiendaCompradores).set({ ultimoIngreso: ahora }).where(eq(tiendaCompradores.id, c.id)));
     return { estado: 'habilitado', token, nombre: c.nombre };
@@ -229,9 +240,71 @@ export class AccesosTiendaService {
     return r && (await this.vigente(h, r.expiraEn)) ? r.c : null;
   }
 
-  /** Lo que ve la tienda de quien ingresó: el nombre, la inicial del apellido, su WhatsApp y la dirección a medias. */
-  datosMinorista(c: Comprador) {
-    return { nombre: c.nombre, inicial: c.apellido.charAt(0).toUpperCase(), telefono: c.telefono, direccion: direccionOculta(c.direccion) };
+  /** Lo que ve la tienda de quien ingresó: el nombre, la inicial del apellido, su WhatsApp y sus direcciones a medias. */
+  async datosMinorista(c: Comprador) {
+    return {
+      nombre: c.nombre, inicial: c.apellido.charAt(0).toUpperCase(), telefono: c.telefono,
+      direcciones: await this.direccionesVisibles(c.id), maxDirecciones: MAX_DIRECCIONES,
+    };
+  }
+
+  /* ========================= sus direcciones guardadas (0200) ========================= */
+
+  /** Sus direcciones, en el orden en que las guardó. */
+  direcciones(compradorId: number, db: Database = this.db) {
+    return db.select().from(tiendaDirecciones).where(eq(tiendaDirecciones.compradorId, compradorId)).orderBy(asc(tiendaDirecciones.id));
+  }
+
+  /** Lo que el navegador ve de ellas: el nombre y la dirección a medias. */
+  private async direccionesVisibles(compradorId: number) {
+    return (await this.direcciones(compradorId)).map((d) => ({ id: d.id, nombre: d.nombre, direccion: direccionOculta(d.direccion) }));
+  }
+
+  /**
+   * La guardada que eligió en el checkout (`{ guardada: id }`), o null si
+   * escribió otra. `true` es la primera: lo que mandaba el checkout de antes.
+   */
+  async direccionElegida(compradorId: number, cruda: any): Promise<DireccionGuardada | null> {
+    const id = cruda?.guardada;
+    if (id == null || id === false) return null;
+    const ds = await this.direcciones(compradorId);
+    const d = id === true ? ds[0] : ds.find((x) => x.id === Number(id));
+    if (!d) throw new BadRequestException('Esa dirección ya no está guardada: elegí otra o escribila.');
+    return d;
+  }
+
+  /**
+   * Guarda en su perfil la dirección de un envío, con el nombre que eligió.
+   * Si ya tiene una con ese nombre, la reemplaza; si no, entra mientras no
+   * pase el tope (con el tope lleno hay que reemplazar una).
+   */
+  async guardarDireccion(
+    tx: Database, compradorId: number, nombre: string,
+    datos: Pick<DireccionGuardada, 'direccion' | 'localidad' | 'referencia' | 'lat' | 'lng'>,
+  ) {
+    const ds = await this.direcciones(compradorId, tx);
+    const misma = ds.find((d) => mismoNombre(d.nombre, nombre));
+    if (misma) {
+      await tx.update(tiendaDirecciones).set({ ...datos, nombre, actualizadoEn: new Date() }).where(eq(tiendaDirecciones.id, misma.id));
+      return;
+    }
+    if (ds.length >= MAX_DIRECCIONES) {
+      throw new BadRequestException(`Ya tenés ${MAX_DIRECCIONES} direcciones guardadas (${ds.map((d) => d.nombre).join(' y ')}): para guardar esta, reemplazá una.`);
+    }
+    await tx.insert(tiendaDirecciones).values({ compradorId, nombre, ...datos });
+  }
+
+  /** Una guardada de antes del mapa se queda con el punto que marcó ahora. */
+  async marcarPunto(tx: Database, id: number, punto: { lat: number | null; lng: number | null }) {
+    await tx.update(tiendaDirecciones).set({ ...punto, actualizadoEn: new Date() }).where(eq(tiendaDirecciones.id, id));
+  }
+
+  /** Borrar una de sus direcciones guardadas: devuelve las que le quedan. */
+  async borrarDireccion(token: unknown, id: number) {
+    const c = await this.sesionMinorista(token);
+    if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
+    await this.db.delete(tiendaDirecciones).where(and(eq(tiendaDirecciones.id, id), eq(tiendaDirecciones.compradorId, c.id)));
+    return { direcciones: await this.direccionesVisibles(c.id) };
   }
 
   async salir(token: unknown) {
@@ -347,14 +420,19 @@ export class AccesosTiendaService {
     const digitos = t.replace(/\D/g, '');
     const filtro = t ? sql`(${tiendaCompradores.nombre} || ' ' || ${tiendaCompradores.apellido}) ilike ${`%${t}%`}${
       digitos ? sql` or ${tiendaCompradores.telefono} like ${`%${digitos}%`}` : sql``}` : undefined;
-    return this.db.select({
+    const filas = await this.db.select({
       id: tiendaCompradores.id, telefono: tiendaCompradores.telefono, nombre: tiendaCompradores.nombre,
-      apellido: tiendaCompradores.apellido, direccion: tiendaCompradores.direccion, localidad: tiendaCompradores.localidad,
-      pedidos: tiendaCompradores.pedidos, bloqueado: tiendaCompradores.bloqueado,
+      apellido: tiendaCompradores.apellido, pedidos: tiendaCompradores.pedidos, bloqueado: tiendaCompradores.bloqueado,
       ultimoIngreso: tiendaCompradores.ultimoIngreso, creadoEn: tiendaCompradores.creadoEn,
     }).from(tiendaCompradores).where(filtro)
       .orderBy(desc(sql`coalesce(${tiendaCompradores.ultimoIngreso}, ${tiendaCompradores.creadoEn})`))
       .limit(500);
+    /* Sus direcciones guardadas (0200), enteras: el ERP es del dueño. */
+    const ds = filas.length
+      ? await this.db.select({ compradorId: tiendaDirecciones.compradorId, nombre: tiendaDirecciones.nombre, direccion: tiendaDirecciones.direccion, localidad: tiendaDirecciones.localidad })
+        .from(tiendaDirecciones).where(inArray(tiendaDirecciones.compradorId, filas.map((f) => f.id))).orderBy(asc(tiendaDirecciones.id))
+      : [];
+    return filas.map((f) => ({ ...f, direcciones: ds.filter((d) => d.compradorId === f.id).map(({ compradorId, ...d }) => d) }));
   }
 
   /** Bloquear (se le cierran las sesiones abiertas) o desbloquear a un comprador minorista. */

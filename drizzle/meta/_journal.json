@@ -1401,6 +1401,13 @@
       "when": 1793019600000,
       "tag": "0199_cupones_automaticos",
       "breakpoints": true
+    },
+    {
+      "idx": 200,
+      "version": "7",
+      "when": 1793106000000,
+      "tag": "0200_tienda_direcciones",
+      "breakpoints": true
     }
   ]
 }

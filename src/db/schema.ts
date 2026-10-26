@@ -2927,13 +2927,27 @@ export const tiendaCompradores = pgTable('tienda_compradores', {
   telefono: text('telefono').notNull().unique(),
   nombre: text('nombre').notNull().default(''),
   apellido: text('apellido').notNull().default(''),
-  direccion: text('direccion').notNull().default(''),
-  localidad: text('localidad').notNull().default(''),
-  referencia: text('referencia').notNull().default(''),
+  /* Sus direcciones, con nombre, en `tienda_direcciones` (0200). */
   pedidos: integer('pedidos').notNull().default(0),
   /** Bloqueado desde el ERP (0178): no entra y se le cierran las sesiones. */
   bloqueado: boolean('bloqueado').notNull().default(false),
   ultimoIngreso: timestamp('ultimo_ingreso', { withTimezone: true }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * LAS DIRECCIONES GUARDADAS DEL COMPRADOR MINORISTA (0200): hasta dos, con
+ * nombre («Casa», «Trabajo»). Se eligen en el checkout; el navegador las ve a
+ * medias (con un WhatsApp ajeno no se ven los datos de nadie).
+ */
+export const tiendaDirecciones = pgTable('tienda_direcciones', {
+  id: serial('id').primaryKey(),
+  compradorId: integer('comprador_id').notNull().references(() => tiendaCompradores.id, { onDelete: 'cascade' }),
+  nombre: text('nombre').notNull(),
+  direccion: text('direccion').notNull(),
+  localidad: text('localidad').notNull().default(''),
+  referencia: text('referencia').notNull().default(''),
   /** Dónde recibe (0185), marcado en el mapa del checkout: con él se sabe su barrio. El navegador no lo ve. */
   lat: doublePrecision('lat'),
   lng: doublePrecision('lng'),

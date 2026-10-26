@@ -30,7 +30,7 @@
  * cien visitantes son una sola armada.
  */
 import {
-  BadRequestException, Body, Controller, Get, Headers, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, Get, Headers, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Post, Query, Res, UnauthorizedException, UseGuards,
 } from '@nestjs/common';
 import { RateLimit, TiendaRateLimitGuard } from './rate-limit.guard';
@@ -55,7 +55,7 @@ import { ListasService } from '../listas/listas.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
 import { PresupuestosModule } from '../presupuestos/presupuestos.module';
 import { ClientesModule } from '../clientes/clientes.module';
-import { AccesosTiendaService, type Comprador } from './accesos';
+import { AccesosTiendaService, nombreDireccion, type Comprador, type DireccionGuardada } from './accesos';
 import { AccesosTiendaController } from './accesos.controller';
 import { PresupuestosService } from '../presupuestos/presupuestos.module';
 import { OfertasModule, OfertasService } from '../ofertas/ofertas.module';
@@ -298,7 +298,7 @@ export class TiendaService {
       /* También con ingreso (0178): sin sesión minorista, sin nada de plata, como la mayorista. */
       const [arm, c] = await Promise.all([this.armado('minorista'), this.accesos.sesionMinorista(tokenMin)]);
       const cat = { ...arm.catalogo, ...deQuienMira, conPrecios: true, cliente: null };
-      return c ? { ...cat, comprador: this.accesos.datosMinorista(c) } : sinPrecios(cat);
+      return c ? { ...cat, comprador: await this.accesos.datosMinorista(c) } : sinPrecios(cat);
     }
     const [completo, s] = await Promise.all([this.catalogoCompleto(), this.accesos.sesion(token)]);
     const cat = { ...completo, ...deQuienMira };
@@ -1314,13 +1314,14 @@ export class TiendaService {
     if (!c) throw new UnauthorizedException('Para comprar, ingresá con tu WhatsApp.');
 
     const entrega = ENTREGAS_MINORISTA[String(dto?.entrega ?? '')] ?? 'retiro';
-    const guardada = entrega !== 'retiro' && dto?.direccion?.guardada === true;
-    if (guardada && !c.direccion) throw new BadRequestException('No tenemos tu dirección guardada: escribila para el envío.');
-    const nueva = guardada ? null : direccionDeEntrega(entrega, dto?.direccion);
-    const domicilio = guardada ? { direccion: c.direccion, localidad: c.localidad, referencia: c.referencia } : nueva;
+    /* Una de sus direcciones guardadas (0200) o la que escribió, que puede guardar con un nombre. */
+    const elegida = entrega !== 'retiro' ? await this.accesos.direccionElegida(c.id, dto?.direccion) : null;
+    const nueva = elegida ? null : direccionDeEntrega(entrega, dto?.direccion);
+    const domicilio = elegida ? { direccion: elegida.direccion, localidad: elegida.localidad, referencia: elegida.referencia } : nueva;
+    const guardarComo = nueva ? nombreDireccion(dto?.direccion?.guardarComo) : '';
 
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
-    const zona = entrega === 'cadete' ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
+    const zona = entrega === 'cadete' ? await this.zonaDeEnvio(elegida, dto, total, cat.envioGratisDesde) : null;
     const conBarrio = conDescuentoBarrio(items, zona?.descuentoPct ?? 0);
     const medioPago = medioDeTienda(dto?.medioPago);
     /* Con envío, para cuándo (23/10/2026): lo elegido tiene que seguir valiendo ahora. */
@@ -1351,16 +1352,15 @@ export class TiendaService {
       } : {};
 
       /*
-       * La dirección que escribió para ESTE envío pasa a ser la guardada, con su
-       * punto (o sin punto, si no lo marcó). La guardada de antes del mapa se
-       * queda con el punto que marcó ahora. Con retiro no se toca.
+       * SUS DIRECCIONES (0200): la que escribió para ESTE envío queda en su
+       * perfil si lo pidió, con el nombre que eligió y su punto (o sin punto, si
+       * no lo marcó). Una guardada de antes del mapa se queda con el punto que
+       * marcó ahora. Con retiro no se toca nada.
        */
       const punto = zona?.punto ? { lat: zona.punto.lat, lng: zona.punto.lng } : { lat: null, lng: null };
-      await tx.update(tiendaCompradores)
-        .set({
-          ...(nueva ? { ...nueva, ...punto } : guardada && c.lat == null && zona?.punto ? punto : {}),
-          pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date(),
-        })
+      if (nueva && guardarComo) await this.accesos.guardarDireccion(tx, c.id, guardarComo, { ...nueva, ...punto });
+      else if (elegida && elegida.lat == null && zona?.punto) await this.accesos.marcarPunto(tx, elegida.id, punto);
+      await tx.update(tiendaCompradores).set({ pedidos: sql`${tiendaCompradores.pedidos} + 1`, actualizadoEn: new Date() })
         .where(eq(tiendaCompradores.id, c.id));
       const creado = await this.presupuestos.crearDesdeWeb({
         clienteId: null, sucursalId: cat.sucursalId, modoTienda: 'minorista',
@@ -1398,7 +1398,8 @@ export class TiendaService {
     const { cat, total, items } = await this.cotizar('minorista', Array.isArray(dto?.items) ? dto.items : []);
     /* Retirando no hay barrio ni envío: se cotiza igual, por el cupón (0190). Sin `entrega`, envío (como antes). */
     const conEnvio = dto?.entrega !== 'retiro';
-    const zona = conEnvio ? await this.zonaDeEnvio(c, dto, total, cat.envioGratisDesde) : null;
+    const elegida = conEnvio ? await this.accesos.direccionElegida(c.id, dto?.direccion) : null;
+    const zona = conEnvio ? await this.zonaDeEnvio(elegida, dto, total, cat.envioGratisDesde) : null;
     const descuento = montoDescuento(items, zona?.descuentoPct ?? 0);
     const { ev, porMedio } = await this.descuentoDelPedido(dto, c, conEnvio ? 'envio' : 'retiro', conDescuentoBarrio(items, zona?.descuentoPct ?? 0));
     const r = ev?.resultado;
@@ -1460,12 +1461,12 @@ export class TiendaService {
   }
 
   /**
-   * El barrio del envío y sus condiciones: el punto marcado en el mapa o, a la
+   * El barrio del envío y sus condiciones: el punto marcado en el mapa o, a una
    * dirección guardada, el de ella — y si es de antes del mapa y no tiene, el
    * que marque ahora.
    */
-  private async zonaDeEnvio(c: Comprador, dto: any, subtotal: number, gratisDesde: number) {
-    const punto = (dto?.direccion?.guardada === true ? puntoValido({ lat: c.lat, lng: c.lng }) : null) ?? puntoValido(dto?.ubicacion);
+  private async zonaDeEnvio(elegida: DireccionGuardada | null, dto: any, subtotal: number, gratisDesde: number) {
+    const punto = (elegida ? puntoValido({ lat: elegida.lat, lng: elegida.lng }) : null) ?? puntoValido(dto?.ubicacion);
     return { punto, ...(await this.barrios.condicionesPara(punto, subtotal, gratisDesde)) };
   }
 }
@@ -1514,6 +1515,13 @@ export class TiendaController {
   horariosEnvio(@Headers(VISTA_PREVIA) previa?: string) { return this.svc.agendaEnviosMinorista(previa); }
 
   /* Ingreso a la minorista con el WhatsApp (0178): mismos cupos que el del DNI. */
+  /* Borrar una de sus direcciones guardadas (0200): devuelve las que le quedan. */
+  @Delete('minorista/direcciones/:id')
+  @RateLimit('envio')
+  borrarDireccion(@Param('id', ParseIntPipe) id: number, @Headers(SESION_MIN) tokenMin?: string) {
+    return this.accesos.borrarDireccion(tokenMin, id);
+  }
+
   @Post('minorista/registro')
   @RateLimit('registro')
   registroMinorista(@Body() body: any) { return this.accesos.registrarMinorista(body ?? {}); }
