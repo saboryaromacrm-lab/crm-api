@@ -108,6 +108,16 @@ class PagarCompromisoDto {
   @IsOptional() @IsString() @MaxLength(300) obs?: string;
 }
 
+/** LAS FACTURAS QUE CUBRE UN ECHEQ (0205): la lista entera; 0 o ausente la saca. */
+class ImputacionEcheqDto {
+  @IsInt() comprobanteId!: number;
+  @IsNumber() @Min(0) importe!: number;
+}
+class ImputarEcheqDto {
+  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ImputacionEcheqDto)
+  facturas!: ImputacionEcheqDto[];
+}
+
 class EcheqDto {
   @IsOptional() @IsString() @MaxLength(40) numero?: string;
   @IsOptional() @IsString() @MaxLength(100) banco?: string;
@@ -118,6 +128,9 @@ class EcheqDto {
   /** A un no proveedor (0201): el nombre, escrito a mano. */
   @IsOptional() @IsString() @MaxLength(120) destinatario?: string;
   @IsOptional() @IsString() @MaxLength(2000) obs?: string;
+  /** Hecho desde «Pagarle» (28/10/2026): las facturas que cubre desde que nace. */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ImputacionEcheqDto)
+  facturas?: ImputacionEcheqDto[];
 }
 
 /** Borrar un ajuste pide el porqué: queda en Auditoría junto con lo que decía. */
@@ -135,16 +148,6 @@ class ConfirmarEcheqDto {
   @Matches(SOLO_FECHA, { message: 'La fecha de cobro va como AAAA-MM-DD.' }) fechaVenc!: string;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La emisión va como AAAA-MM-DD.' }) fechaEmision?: string;
   @IsOptional() @IsString() @MaxLength(2000) obs?: string;
-}
-
-/** LAS FACTURAS QUE CUBRE UN ECHEQ (0205): la lista entera; 0 o ausente la saca. */
-class ImputacionEcheqDto {
-  @IsInt() comprobanteId!: number;
-  @IsNumber() @Min(0) importe!: number;
-}
-class ImputarEcheqDto {
-  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ImputacionEcheqDto)
-  facturas!: ImputacionEcheqDto[];
 }
 
 class EstadoEcheqDto {
@@ -612,10 +615,16 @@ export class FinanzasProveedorService {
     return e;
   }
 
-  async crearEcheq(dto: EcheqDto) {
+  /**
+   * El alta de un echeq hecho. Si viene de «Pagarle» al proveedor (28/10/2026),
+   * trae las facturas tildadas y nace cubriéndolas, en la misma transacción: un
+   * echeq a medio imputar no queda nunca.
+   */
+  async crearEcheq(dto: EcheqDto, usuarioId: number | null) {
     /* A un proveedor o, si no lo es (0201), a quien diga el nombre escrito a mano. */
     const destinatario = dto.proveedorId ? '' : (dto.destinatario ?? '').replace(/\s+/g, ' ').trim();
     if (!dto.proveedorId && !destinatario) throw new BadRequestException('Elegí el proveedor o escribí a nombre de quién va el echeq.');
+    if (!dto.proveedorId && dto.facturas?.length) throw new BadRequestException('Solo el echeq a un proveedor cubre facturas.');
     if (!dto.fechaVenc) throw new BadRequestException('El echeq necesita su fecha de cobro.');
     if (!(Number(dto.importe) > 0)) throw new BadRequestException('El importe del echeq tiene que ser mayor a 0.');
     if (dto.proveedorId) {
@@ -624,17 +633,21 @@ export class FinanzasProveedorService {
       if (!prov) throw new BadRequestException('Proveedor inválido.');
     }
     await this.exigirEcheqUnico(dto.numero, dto.banco);
-    const [e] = await this.db.insert(proveedorEcheqs).values({
-      numero: (dto.numero ?? '').trim(),
-      banco: (dto.banco ?? '').trim(),
-      importe: money(dto.importe!),
-      fechaEmision: dto.fechaEmision ? fecha0(dto.fechaEmision) : new Date(),
-      fechaVenc: fecha0(dto.fechaVenc),
-      proveedorId: dto.proveedorId || null,
-      destinatario,
-      obs: (dto.obs ?? '').trim(),
-    }).returning();
-    return this.getEcheq(e.id);
+    const id = await this.db.transaction(async (tx) => {
+      const [e] = await tx.insert(proveedorEcheqs).values({
+        numero: (dto.numero ?? '').trim(),
+        banco: (dto.banco ?? '').trim(),
+        importe: money(dto.importe!),
+        fechaEmision: dto.fechaEmision ? fecha0(dto.fechaEmision) : new Date(),
+        fechaVenc: fecha0(dto.fechaVenc!),
+        proveedorId: dto.proveedorId || null,
+        destinatario,
+        obs: (dto.obs ?? '').trim(),
+      }).returning();
+      if (dto.facturas?.length) await this.repartirFacturas(tx, { ...e, proveedorId: dto.proveedorId!, facturas: [] }, dto.facturas, usuarioId);
+      return e.id as number;
+    });
+    return this.getEcheq(id);
   }
 
   async editarEcheq(id: number, dto: EcheqDto) {
@@ -794,44 +807,55 @@ export class FinanzasProveedorService {
         ? 'Ese echeq todavía no está confirmado: primero confirmalo con sus datos reales.'
         : 'Ese echeq ya no está en la cartera: sus facturas no se cambian.');
     }
+    await this.db.transaction((tx) => this.repartirFacturas(tx, { ...e, proveedorId: e.proveedorId! }, dto.facturas, usuarioId));
+    return this.getEcheq(id);
+  }
+
+  /**
+   * El reparto de un echeq entre facturas, dentro de la transacción de quien
+   * llama: cambiar sus facturas, o el alta desde «Pagarle». `e.facturas` es lo
+   * que cubre hoy.
+   */
+  private async repartirFacturas(
+    tx: any, e: { id: number; proveedorId: number; importe: number; facturas: { comprobanteId: number | null; etiqueta: string; importe: number }[] },
+    facturas: ImputacionEcheqDto[], usuarioId: number | null,
+  ) {
+    const id = e.id;
     const nuevo = new Map<number, number>();
-    for (const f of dto.facturas) nuevo.set(f.comprobanteId, money((nuevo.get(f.comprobanteId) ?? 0) + f.importe));
+    for (const f of facturas) nuevo.set(f.comprobanteId, money((nuevo.get(f.comprobanteId) ?? 0) + f.importe));
     const total = money([...nuevo.values()].reduce((a, n) => a + n, 0));
     if (total - e.importe > EPS) {
       throw new BadRequestException(`El echeq es de $ ${money(e.importe).toFixed(2)} y las facturas suman $ ${total.toFixed(2)}.`);
     }
-    await this.db.transaction(async (tx) => {
-      const docs = await this.pagos.documentosPendientes(e.proveedorId!, 'mercaderia', tx);
-      const etiqueta = (c: number) => e.facturas.find((f: any) => f.comprobanteId === c)?.etiqueta
-        ?? docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c)?.etiqueta ?? `comprobante #${c}`;
-      const antes = new Map<number, number>(e.facturas.map((f: any) => [f.comprobanteId, f.importe]));
-      /* Primero lo que baja: lo que se le saca a una factura queda libre para otra en el mismo guardado. */
-      const cambios = [...new Set([...antes.keys(), ...nuevo.keys()])]
-        .map((c) => ({ c, ahora: nuevo.get(c) ?? 0, delta: (nuevo.get(c) ?? 0) - (antes.get(c) ?? 0) }))
-        .sort((a, b) => a.delta - b.delta);
-      for (const { c, ahora } of cambios) {
-        if (ahora <= EPS) {
-          await tx.delete(proveedorCompromisos).where(and(
-            eq(proveedorCompromisos.echeqId, id), eq(proveedorCompromisos.comprobanteId, c), eq(proveedorCompromisos.pagado, false),
-          ));
-          continue;
-        }
-        const doc = docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c);
-        if (!doc) throw new BadRequestException(`${etiqueta(c)} ya no debe nada o no es de este proveedor. Actualizá la pantalla.`);
-        await this.hacerLugar(tx, id, doc, ahora);
-        await imputarEcheqTx(tx, { echeqId: id, proveedorId: e.proveedorId!, comprobanteId: c, importe: ahora });
+    const docs = await this.pagos.documentosPendientes(e.proveedorId, 'mercaderia', tx);
+    const etiqueta = (c: number) => e.facturas.find((f) => f.comprobanteId === c)?.etiqueta
+      ?? docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c)?.etiqueta ?? `comprobante #${c}`;
+    const antes = new Map<number, number>(e.facturas.map((f) => [f.comprobanteId!, f.importe]));
+    /* Primero lo que baja: lo que se le saca a una factura queda libre para otra en el mismo guardado. */
+    const cambios = [...new Set([...antes.keys(), ...nuevo.keys()])]
+      .map((c) => ({ c, ahora: nuevo.get(c) ?? 0, delta: (nuevo.get(c) ?? 0) - (antes.get(c) ?? 0) }))
+      .sort((a, b) => a.delta - b.delta);
+    for (const { c, ahora } of cambios) {
+      if (ahora <= EPS) {
+        await tx.delete(proveedorCompromisos).where(and(
+          eq(proveedorCompromisos.echeqId, id), eq(proveedorCompromisos.comprobanteId, c), eq(proveedorCompromisos.pagado, false),
+        ));
+        continue;
       }
-      const legible = (m: Map<number, number>) => [...m].filter(([, n]) => n > EPS)
-        .map(([c, n]) => `${etiqueta(c)} $ ${money(n).toFixed(2)}`).join(' · ') || 'ninguna';
-      await this.audit.registrar([{
-        entidad: 'proveedor', entidadId: e.proveedorId!, ambito: 'Echeqs',
-        campo: `Echeq #${id}: facturas que cubre`,
-        antes: legible(antes),
-        despues: legible(nuevo),
-        usuarioId,
-      }], tx);
-    });
-    return this.getEcheq(id);
+      const doc = docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c);
+      if (!doc) throw new BadRequestException(`${etiqueta(c)} ya no debe nada o no es de este proveedor. Actualizá la pantalla.`);
+      await this.hacerLugar(tx, id, doc, ahora);
+      await imputarEcheqTx(tx, { echeqId: id, proveedorId: e.proveedorId, comprobanteId: c, importe: ahora });
+    }
+    const legible = (m: Map<number, number>) => [...m].filter(([, n]) => n > EPS)
+      .map(([c, n]) => `${etiqueta(c)} $ ${money(n).toFixed(2)}`).join(' · ') || 'ninguna';
+    await this.audit.registrar([{
+      entidad: 'proveedor', entidadId: e.proveedorId, ambito: 'Echeqs',
+      campo: `Echeq #${id}: facturas que cubre`,
+      antes: legible(antes),
+      despues: legible(nuevo),
+      usuarioId,
+    }], tx);
   }
 
   /**
@@ -1599,7 +1623,7 @@ export class EcheqsController {
   }
   @Get('stats') stats() { return this.svc.statsEcheqs(); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.getEcheq(id); }
-  @Post() crear(@Body() dto: EcheqDto) { return this.svc.crearEcheq(dto); }
+  @Post() crear(@Body() dto: EcheqDto, @Auth() auth: Sesion) { return this.svc.crearEcheq(dto, auth.usuarioId ?? null); }
   @Patch(':id') editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EcheqDto) {
     return this.svc.editarEcheq(id, dto);
   }
