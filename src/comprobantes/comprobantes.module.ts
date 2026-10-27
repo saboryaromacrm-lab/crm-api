@@ -21,6 +21,7 @@ import {
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
+import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ajustePorAnulacion, fechaDeCuenta, finalCafeteria, importeEnCuenta } from '../cafeteria/cuenta';
@@ -190,6 +191,18 @@ class CompromisoNuevoDto {
   @IsOptional() @IsString() @MaxLength(300) obs?: string;
 }
 
+/** Un echeq ya hecho que cubre parte del saldo de esta factura (0205). */
+class EcheqImputadoDto {
+  @IsInt() echeqId!: number;
+  @IsNumber() @Min(0.01) importe!: number;
+}
+
+/** Lo que se promete pagar del saldo de la factura: las cuotas y los echeqs ya hechos. */
+type Promesas = {
+  cuotas: Array<{ importe: number; fechaVenc: Date; obs: string }>;
+  echeqs: Array<{ echeqId: number; importe: number }>;
+};
+
 class CreateComprobanteDto {
   @IsIn(TIPOS as unknown as string[]) tipo!: (typeof TIPOS)[number];
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
@@ -262,6 +275,10 @@ class CreateComprobanteDto {
   /** Compromisos de pago (0068): cuotas que suman el total. Ver `CompromisoNuevoDto`. */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => CompromisoNuevoDto)
   compromisos?: CompromisoNuevoDto[];
+
+  /** Echeqs ya hechos que cubren parte del saldo (0205); las cuotas cubren el resto. */
+  @IsOptional() @IsArray() @ArrayMaxSize(20) @ValidateNested({ each: true }) @Type(() => EcheqImputadoDto)
+  echeqs?: EcheqImputadoDto[];
 }
 
 /**
@@ -327,6 +344,8 @@ class FacturarRemitoDto {
   tomarPagos?: TomarPagoDto[];
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => CompromisoNuevoDto)
   compromisos?: CompromisoNuevoDto[];
+  @IsOptional() @IsArray() @ArrayMaxSize(20) @ValidateNested({ each: true }) @Type(() => EcheqImputadoDto)
+  echeqs?: EcheqImputadoDto[];
   @IsOptional() @IsInt() usuarioId?: number;
 }
 
@@ -1000,51 +1019,62 @@ export class ComprobantesService {
    * se pagó infla el saldo proyectado, entre por donde entre la factura.
    */
   private normalizarCompromisos(
-    dto: { compromisos?: CompromisoNuevoDto[]; pagoContado?: PagoContadoDto; tomarPagos?: TomarPagoDto[] },
+    dto: { compromisos?: CompromisoNuevoDto[]; echeqs?: EcheqImputadoDto[]; pagoContado?: PagoContadoDto; tomarPagos?: TomarPagoDto[] },
     total: number,
-  ) {
-    const compromisosNorm = (dto.compromisos ?? []).map((k) => ({
+  ): Promesas {
+    const cuotas = (dto.compromisos ?? []).map((k) => ({
       importe: r2(k.importe),
       fechaVenc: new Date(`${String(k.fechaVenc).slice(0, 10)}T00:00:00`),
       obs: String(k.obs ?? '').trim().slice(0, 300),
     }));
-    if (!compromisosNorm.length) return compromisosNorm;
-    for (const k of compromisosNorm) {
+    const echeqs = (dto.echeqs ?? []).map((x) => ({ echeqId: x.echeqId, importe: r2(x.importe) }));
+    if (!cuotas.length && !echeqs.length) return { cuotas, echeqs };
+    for (const k of cuotas) {
       if (Number.isNaN(k.fechaVenc.getTime())) {
         throw new BadRequestException('La fecha de vencimiento del compromiso va como AAAA-MM-DD.');
       }
     }
-    /* Las cuotas cubren LO QUE QUEDA EN CUENTA CORRIENTE: el total menos lo
-     * que se paga en el mismo acto (contado + pagos de sucursal tomados). */
-    const sumaComp = r2(compromisosNorm.reduce((a, k) => a + k.importe, 0));
+    if (new Set(echeqs.map((x) => x.echeqId)).size !== echeqs.length) {
+      throw new BadRequestException('Cada echeq va una sola vez en la factura.');
+    }
+    /* Los echeqs y las cuotas cubren LO QUE QUEDA EN CUENTA CORRIENTE: el total
+     * menos lo que se paga en el mismo acto (contado + pagos de sucursal tomados). */
+    const sumaComp = r2(cuotas.reduce((a, k) => a + k.importe, 0));
+    const sumaEcheqs = r2(echeqs.reduce((a, x) => a + x.importe, 0));
     const contadoPrevisto = r2((Number(dto.pagoContado?.importe) || 0)
       + (dto.tomarPagos ?? []).reduce((a, t) => a + (Number(t.importe) || 0), 0));
     const saldoPrevisto = r2(total - contadoPrevisto);
-    if (Math.abs(sumaComp - saldoPrevisto) > 0.009) {
+    if (sumaEcheqs - saldoPrevisto > 0.009) {
+      throw new BadRequestException(`Los echeqs suman ${sumaEcheqs} y lo que queda en cuenta corriente es ${saldoPrevisto}.`);
+    }
+    if (cuotas.length && Math.abs(sumaComp + sumaEcheqs - saldoPrevisto) > 0.009) {
       throw new BadRequestException(
-        `Los compromisos suman ${sumaComp} y lo que queda en cuenta corriente es ${saldoPrevisto}: las cuotas tienen que cubrir ese saldo exacto.`,
+        `Los compromisos suman ${sumaComp}${sumaEcheqs ? ` más ${sumaEcheqs} de echeqs` : ''} y lo que queda en cuenta corriente es ${saldoPrevisto}: `
+        + 'tienen que cubrir ese saldo exacto.',
       );
     }
-    return compromisosNorm;
+    return { cuotas, echeqs };
   }
 
   /**
    * EL COMPROMISO NACE CON LA FACTURA (0068), en la misma transacción: si la
    * factura no queda, la promesa tampoco. Si el proveedor cobra con ECHEQ,
-   * nace también el echeq con número y banco "a completar" — el papel del
-   * echeq se emite después, y la cartera lo espera con nombre.
+   * nace también el echeq PENDIENTE DE CONFIRMAR (0204), con número y banco
+   * "a completar": muchas veces no se hace o se hace distinto, así que no
+   * cuenta como hecho hasta que el dueño lo confirma con los datos del papel.
+   * Los echeqs YA HECHOS que se eligieron (0205) cubren su parte, y las
+   * cuotas, el resto: por esa parte no nace ningún automático.
    */
   private async crearCompromisosTx(
     tx: any,
     c: { id: number; fecha: Date; puntoVenta: string; numero: number | null },
     prov: { id: number; medioHabitual?: string | null },
-    compromisosNorm: Array<{ importe: number; fechaVenc: Date; obs: string }>,
+    promesas: Promesas,
     nombreDoc: string,
   ) {
-    const esEcheq = prov.medioHabitual === 'echeq';
-    const n = compromisosNorm.length;
+    const n = promesas.cuotas.length;
     for (let i = 0; i < n; i++) {
-      const k = compromisosNorm[i];
+      const k = promesas.cuotas[i];
       const [comp] = await tx.insert(proveedorCompromisos).values({
         proveedorId: prov.id,
         comprobanteId: c.id,
@@ -1052,23 +1082,26 @@ export class ComprobantesService {
         fechaEmision: c.fecha,
         fechaVenc: k.fechaVenc,
         origen: 'factura',
-        esEcheq,
         cuota: n > 1 ? i + 1 : null,
         cuotas: n > 1 ? n : null,
         obs: k.obs,
       }).returning();
-      if (esEcheq) {
-        await tx.insert(proveedorEcheqs).values({
+      if (prov.medioHabitual === 'echeq') {
+        const [e] = await tx.insert(proveedorEcheqs).values({
+          estado: 'pendiente',
           numero: `PEND-${comp.id}`,
           banco: 'A definir',
           importe: k.importe,
           fechaEmision: c.fecha,
           fechaVenc: k.fechaVenc,
           proveedorId: prov.id,
-          compromisoId: comp.id,
-          obs: `Auto-creado con ${nombreDoc} ${c.puntoVenta}-${c.numero ?? c.id} — completar número y banco reales.`,
-        });
+          obs: `Auto-creado con ${nombreDoc} ${c.puntoVenta}-${c.numero ?? c.id} — confirmar con el número y banco reales.`,
+        }).returning({ id: proveedorEcheqs.id });
+        await tx.update(proveedorCompromisos).set({ echeqId: e.id }).where(eq(proveedorCompromisos.id, comp.id));
       }
+    }
+    for (const x of promesas.echeqs) {
+      await imputarEcheqTx(tx, { echeqId: x.echeqId, proveedorId: prov.id, comprobanteId: c.id, importe: x.importe });
     }
   }
 
@@ -1138,6 +1171,9 @@ export class ComprobantesService {
         .set({ condicionPago: saldado ? 'contado' : 'cuenta_corriente' })
         .where(eq(comprobantes.id, id));
     }
+    /* Cuenta libre (27/10/2026): la plata que el proveedor ya tenía sin aplicar va a
+     * lo más viejo que se le debe. Después de los tomados, que eligió una persona. */
+    await this.pagos.aplicarCuentaLibre(args.proveedorId);
   }
 
   /**
@@ -1314,10 +1350,10 @@ export class ComprobantesService {
      */
     const puedeComprometer = estado === 'confirmado'
       && (dto.tipo === 'factura' || dto.tipo === 'liquidacion');
-    if (dto.compromisos?.length && !puedeComprometer) {
-      throw new BadRequestException('Los compromisos de pago son de una factura o liquidación confirmada.');
+    if ((dto.compromisos?.length || dto.echeqs?.length) && !puedeComprometer) {
+      throw new BadRequestException('Los compromisos de pago y los echeqs son de una factura o liquidación confirmada.');
     }
-    const compromisosNorm = this.normalizarCompromisos(dto, total);
+    const promesas = this.normalizarCompromisos(dto, total);
 
     /**
      * El mismo comprobante no se carga dos veces. El índice único de la base es
@@ -1436,8 +1472,8 @@ export class ComprobantesService {
       }
 
       /* El compromiso (0068) nace en la MISMA transacción — ver `crearCompromisosTx`. */
-      if (compromisosNorm.length) {
-        await this.crearCompromisosTx(tx, c, prov, compromisosNorm, NOMBRE_TIPO[dto.tipo]);
+      if (promesas.cuotas.length || promesas.echeqs.length) {
+        await this.crearCompromisosTx(tx, c, prov, promesas, NOMBRE_TIPO[dto.tipo]);
       }
 
       if (ingresaStock) {
@@ -2102,14 +2138,19 @@ export class ComprobantesService {
         tocados.push(...rv.productoIds);
       }
 
-      // Las cuotas que todavía no se pagaron: sin factura no hay promesa.
-      const pendientes = await tx.select({ id: proveedorCompromisos.id }).from(proveedorCompromisos)
+      /* Las cuotas que todavía no se pagaron: sin factura no hay promesa. El echeq
+       * automático que nadie confirmó se cae con ella; el HECHO es un papel en el
+       * banco (0205): sigue en la cartera, ya sin cubrir esta factura. */
+      const pendientes = await tx.select({ id: proveedorCompromisos.id, echeqId: proveedorCompromisos.echeqId })
+        .from(proveedorCompromisos)
         .where(and(eq(proveedorCompromisos.comprobanteId, c.id), eq(proveedorCompromisos.pagado, false)));
       if (pendientes.length) {
-        const ids = pendientes.map((x: any) => x.id);
-        await tx.update(proveedorEcheqs).set({ estado: 'anulado' })
-          .where(and(inArray(proveedorEcheqs.compromisoId, ids), inArray(proveedorEcheqs.estado, ['emitido', 'entregado'])));
-        await tx.delete(proveedorCompromisos).where(inArray(proveedorCompromisos.id, ids));
+        const echeqIds = pendientes.map((x: any) => x.echeqId).filter(Boolean);
+        if (echeqIds.length) {
+          await tx.update(proveedorEcheqs).set({ estado: 'anulado' })
+            .where(and(inArray(proveedorEcheqs.id, echeqIds), eq(proveedorEcheqs.estado, 'pendiente')));
+        }
+        await tx.delete(proveedorCompromisos).where(inArray(proveedorCompromisos.id, pendientes.map((x: any) => x.id)));
       }
 
       // El papel vuelve a la bandeja: sigue siendo la factura del proveedor, y
@@ -2272,7 +2313,7 @@ export class ComprobantesService {
       }
     }
 
-    const compromisosNorm = this.normalizarCompromisos(dto, pieReal.total);
+    const promesas = this.normalizarCompromisos(dto, pieReal.total);
 
     // La etiqueta del remito, capturada ANTES de convertirlo: es el rastro.
     const etiquetaRemito = etiquetaDoc(c);
@@ -2344,8 +2385,8 @@ export class ComprobantesService {
 
       /* El compromiso (0068) nace recién AHORA: el remito no generaba deuda,
        * así que no había nada que prometer hasta este momento. */
-      if (compromisosNorm.length) {
-        await this.crearCompromisosTx(tx, actualizado, prov, compromisosNorm, 'la factura');
+      if (promesas.cuotas.length || promesas.echeqs.length) {
+        await this.crearCompromisosTx(tx, actualizado, prov, promesas, 'la factura');
       }
 
       /*

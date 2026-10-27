@@ -102,6 +102,9 @@ class ArmarItemDto {
 class ArmarDto {
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ArmarItemDto)
   items?: ArmarItemDto[];
+  @IsOptional() @IsInt() usuarioId?: number;
+  /** Quién fraccionó los paquetes que se armaron con el granel reservado (0206). */
+  @IsOptional() @IsInt() operadorId?: number;
 }
 
 class AceptarOrdenDto {
@@ -113,10 +116,8 @@ class CancelarDto {
   @IsOptional() @IsInt() usuarioId?: number;
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
 }
-/** Confirmar: quién fracciona, si el pedido tiene paquetes que hay que armar (3/10/2026). */
 class ConfirmarDto {
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsOptional() @IsInt() operadorId?: number;
 }
 class DelegarDto {
   @IsOptional() @IsInt() vendedorId?: number | null;
@@ -356,7 +357,7 @@ export class PresupuestosService {
    * stock (disponible → comprometido) para que la caja no venda la mercadería
    * que el vendedor está apartando. Vencido no se confirma: se re-cotiza.
    */
-  async confirmar(id: number, usuarioId?: number, opciones: OpcionesPresupuesto = {}, operadorId?: number | null) {
+  async confirmar(id: number, usuarioId?: number, opciones: OpcionesPresupuesto = {}) {
     return this.db.transaction(async (tx) => {
       const [p] = await tx.select().from(presupuestos).where(eq(presupuestos.id, id)).limit(1);
       if (!p) throw new NotFoundException('Presupuesto inexistente.');
@@ -374,46 +375,67 @@ export class PresupuestosService {
         .where(and(eq(presupuestos.id, id), eq(presupuestos.estado, 'enviado')))
         .returning({ id: presupuestos.id });
       if (!gano.length) throw new BadRequestException('El presupuesto cambió de estado — actualizá la pantalla.');
-      let armados: string[] = [];
       if (reservar) {
         const items = await tx.select().from(presupuestoItems).where(eq(presupuestoItems.presupuestoId, id));
-        /* LOS PAQUETES QUE FALTAN SE ARMAN SOLOS (3/10/2026, decisión del dueño):
-         * si el pedido lleva paquetes de un granel y no están todos armados, se
-         * fraccionan con el granel ANTES de reservar, en esta misma transacción
-         * — si la reserva falla, el fraccionado se deshace con ella. */
-        armados = await this.inv.armarPaquetesParaPedido(tx, {
-          sucursalId: p.sucursalId, codigo: p.codigo, operadorId: operadorId ?? null, usuarioId: usuarioId ?? null, items,
-        });
+        /* LO QUE FALTA ARMAR SE RESERVA COMO GRANEL (0206, pedido del dueño): los
+         * paquetes que no están armados no se fraccionan acá —se fraccionan al
+         * cargar lo armado, por lo que se armó de verdad—; se aparta su granel. */
+        const porArmar = await this.inv.paquetesPorArmar(tx, p.sucursalId, items);
+        for (const [itemId, n] of porArmar) {
+          await tx.update(presupuestoItems).set({ porArmar: n }).where(eq(presupuestoItems.id, itemId));
+        }
         await this.inv.reservarItems(tx, {
           sucursalId: p.sucursalId, usuarioId: usuarioId ?? null,
           descripcion: `${p.codigo}: reserva por presupuesto confirmado`,
-          items,
+          items: items.map((it) => ({ ...it, porArmar: porArmar.get(it.id) ?? 0 })),
         });
       }
-      return { ok: true, reservado: reservar, armados };
+      return { ok: true, reservado: reservar };
     });
   }
 
-  /** El vendedor carga lo que ARMÓ de verdad (pedida / armada / motivo). */
+  /**
+   * El vendedor carga lo que ARMÓ de verdad (pedida / armada / motivo). Con la
+   * reserva, acá se FRACCIONAN los paquetes que se armaron con el granel
+   * apartado al confirmar (0206): de cada renglón, los que pasan de los paquetes
+   * que ya estaban armados, hasta lo que se apartó. Lo apartado que no se usó
+   * sigue reservado y vuelve al cerrar o cancelar el pedido. Bajar lo armado
+   * después no desarma nada: los paquetes ya existen.
+   */
   async armar(id: number, o: ArmarDto, opciones: OpcionesPresupuesto = {}) {
-    const p = await this.getRow(id);
-    this.exigirSucursal(p, opciones);
-    if (p.estado !== 'confirmado') throw new BadRequestException('El armado se carga con el presupuesto confirmado.');
     for (const it of o.items ?? []) {
-      const patch: any = {};
-      if (it.cantidadArmada != null) {
-        const c = Number(it.cantidadArmada);
-        if (!Number.isFinite(c) || c < 0) throw new BadRequestException('Cantidad armada inválida.');
-        patch.cantidadArmada = c;
-      }
-      if (it.motivo != null) patch.motivo = String(it.motivo).trim();
-      if (Object.keys(patch).length) {
-        await this.db.update(presupuestoItems)
-          .set(patch)
-          .where(and(eq(presupuestoItems.id, Number(it.itemId)), eq(presupuestoItems.presupuestoId, id)));
-      }
+      const c = it.cantidadArmada != null ? Number(it.cantidadArmada) : 0;
+      if (!Number.isFinite(c) || c < 0) throw new BadRequestException('Cantidad armada inválida.');
     }
-    return { ok: true };
+    return this.db.transaction(async (tx) => {
+      // Con candado: dos «Guardar armado» a la vez no fraccionan dos veces.
+      const [p] = await tx.select().from(presupuestos).where(eq(presupuestos.id, id)).limit(1).for('update');
+      if (!p) throw new NotFoundException('Presupuesto inexistente.');
+      this.exigirSucursal(p, opciones);
+      if (p.estado !== 'confirmado') throw new BadRequestException('El armado se carga con el presupuesto confirmado.');
+      for (const it of o.items ?? []) {
+        const patch: any = {};
+        if (it.cantidadArmada != null) patch.cantidadArmada = Number(it.cantidadArmada);
+        if (it.motivo != null) patch.motivo = String(it.motivo).trim();
+        if (Object.keys(patch).length) {
+          await tx.update(presupuestoItems)
+            .set(patch)
+            .where(and(eq(presupuestoItems.id, Number(it.itemId)), eq(presupuestoItems.presupuestoId, id)));
+        }
+      }
+      const items = await tx.select().from(presupuestoItems).where(eq(presupuestoItems.presupuestoId, id));
+      const aFraccionar = items
+        .map((it) => ({ it, paquetes: Math.min(it.porArmar, Math.max(0, Math.ceil((it.cantidadArmada ?? it.cantidad) - (it.cantidad - it.porArmar) - 1e-9))) }))
+        .filter((x) => x.paquetes > 0);
+      const fraccionados = await this.inv.fraccionarParaPedido(tx, {
+        sucursalId: p.sucursalId, codigo: p.codigo, operadorId: o.operadorId ?? null, usuarioId: o.usuarioId ?? null,
+        items: aFraccionar.map(({ it, paquetes }) => ({ productoId: it.productoId, presentacionId: it.presentacionId!, paquetes })),
+      });
+      for (const { it, paquetes } of aFraccionar) {
+        await tx.update(presupuestoItems).set({ porArmar: it.porArmar - paquetes }).where(eq(presupuestoItems.id, it.id));
+      }
+      return { ok: true, fraccionados };
+    });
   }
 
   /** Delegar el armado/cierre a un vendedor (su bandeja). */
@@ -459,8 +481,8 @@ export class PresupuestosService {
     const disponibleDe = (it: any) => st
       .filter((s) => s.productoId === it.productoId && (s.presentacionId ?? null) === (it.presentacionId ?? null))
       .reduce((a, s) => a + s.cantidad, 0);
-    /* LO QUE SE VA A FRACCIONAR AL CONFIRMAR (3/10/2026): los paquetes que no
-     * están armados y salen del granel. Un paquete «alcanza» si lo que falta se
+    /* LO QUE SE VA A ARMAR CON EL GRANEL (3/10/2026): los paquetes que no están
+     * armados; al confirmar se aparta su granel y se fraccionan al cargar lo armado. Un paquete «alcanza» si lo que falta se
      * cubre armándolo; el granel que se usa para eso ya no está para un renglón
      * del mismo producto a granel (la bolsa cerrada). */
     const plan = await this.inv.planPaquetes(p.sucursalId, items);
@@ -479,13 +501,13 @@ export class PresupuestosService {
           alcanza: libresIds.has(it.productoId) || disponible + 1e-9 >= it.cantidad || cubreArmando,
         };
       }),
-      /** Lo que «Confirmar» va a fraccionar (vacío = nada). */
+      /** Lo que se va a armar con el granel al confirmar (vacío = nada). */
       fraccionar: plan.renglones.filter((r: any) => r.armar > 0)
         .map((r: any) => ({ nombre: r.nombre, tam: r.tam, paquetes: r.armar, kg: r.kg })),
-      /* Quién puede fraccionar en esa sucursal, solo si hay algo para armar:
-       * el que confirma elige ahí mismo, aunque no tenga la pantalla de
+      /* Quién puede fraccionar en esa sucursal, solo si queda algo por armar:
+       * el que carga lo armado elige ahí mismo, aunque no tenga la pantalla de
        * Fraccionamiento (la lista de operadores pide otro permiso). */
-      operadores: plan.renglones.some((r: any) => r.armar > 0)
+      operadores: items.some((it) => it.porArmar > 0)
         ? await this.db.select({ id: fraccionOperadores.id, nombre: fraccionOperadores.nombre }).from(fraccionOperadores)
           .where(and(eq(fraccionOperadores.activo, true), or(isNull(fraccionOperadores.sucursalId), eq(fraccionOperadores.sucursalId, p.sucursalId))))
           .orderBy(asc(fraccionOperadores.nombre))
@@ -667,7 +689,7 @@ export class PresupuestosController {
 
   @Post(':id/confirmar')
   confirmar(@Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarDto, @Auth() sesion: Sesion) {
-    return this.svc.confirmar(id, dto?.usuarioId, this.opciones(sesion), dto?.operadorId ?? null);
+    return this.svc.confirmar(id, dto?.usuarioId, this.opciones(sesion));
   }
 
   @Post(':id/armar')

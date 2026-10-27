@@ -2666,6 +2666,12 @@ export const presupuestoItems = pgTable('presupuesto_items', {
   cantidad: doublePrecision('cantidad').notNull().default(0),
   /** Lo que el vendedor ARMÓ de verdad. Null = todavía no se armó (= pedida). */
   cantidadArmada: doublePrecision('cantidad_armada'),
+  /**
+   * Paquetes de este renglón que faltaba armar al confirmar (0206): están reservados
+   * como GRANEL (× su tamaño) y se fraccionan al cargar lo armado. Lo reservado del
+   * renglón es siempre `cantidad − porArmar` paquetes más ese granel.
+   */
+  porArmar: integer('por_armar').notNull().default(0),
   /** Precio NETO unitario congelado + condiciones con las que se cotizó. */
   precioLista: doublePrecision('precio_lista').notNull().default(0),
   descuento: doublePrecision('descuento').notNull().default(0),
@@ -3890,9 +3896,10 @@ export const origenCompromisoEnum = pgEnum('origen_compromiso', ['factura', 'man
  * Nace de la factura confirmada de un proveedor diferido (editable, en cuotas
  * si la factura viene partida) o a mano. `pagado` NO se tipea: lo administra
  * el puente de pagos — el pago que salda la factura lo cierra en la misma
- * transacción, y anular/desaplicar ese pago lo reabre. `esEcheq` decide la
+ * transacción, y anular/desaplicar ese pago lo reabre. `echeqId` decide la
  * vitrina (los echeq viven en su sección): en la app era un LIKE sobre el
- * nombre de la forma; acá es un dato.
+ * nombre de la forma; acá es un dato. Un echeq tiene un compromiso por cada
+ * factura que cubre (0205).
  */
 export const proveedorCompromisos = pgTable('proveedor_compromisos', {
   id: serial('id').primaryKey(),
@@ -3904,7 +3911,8 @@ export const proveedorCompromisos = pgTable('proveedor_compromisos', {
   fechaEmision: timestamp('fecha_emision', { withTimezone: true }).notNull().defaultNow(),
   fechaVenc: timestamp('fecha_venc', { withTimezone: true }).notNull(),
   origen: origenCompromisoEnum('origen').notNull().default('manual'),
-  esEcheq: boolean('es_echeq').notNull().default(false),
+  /** El echeq que paga esta parte de la factura (0205). Null = deuda común (Cuentas corrientes). */
+  echeqId: integer('echeq_id').references((): AnyPgColumn => proveedorEcheqs.id, { onDelete: 'set null' }),
   /** "Cuota 2 de 3" cuando la factura vino partida. NULL = único. */
   cuota: integer('cuota'),
   cuotas: integer('cuotas'),
@@ -3917,14 +3925,17 @@ export const proveedorCompromisos = pgTable('proveedor_compromisos', {
   ixPendientes: index('ix_compromisos_pendientes').on(t.pagado, t.fechaVenc),
   ixComprobante: index('ix_compromisos_comprobante').on(t.comprobanteId),
   ixProveedor: index('ix_compromisos_proveedor').on(t.proveedorId, t.pagado),
+  ixEcheq: index('ix_compromisos_echeq').on(t.echeqId),
 }));
 
-export const estadoEcheqEnum = pgEnum('estado_echeq', ['emitido', 'entregado', 'cobrado', 'anulado']);
+/** 'pendiente' (0204): el automático de la factura, que el dueño todavía no confirmó haber hecho. */
+export const estadoEcheqEnum = pgEnum('estado_echeq', ['pendiente', 'emitido', 'entregado', 'cobrado', 'anulado']);
 
 /**
  * Cartera de ECHEQS propios. Nace junto al compromiso cuando el proveedor
- * cobra así (número/banco "a completar") o a mano. 'cobrado' no es etiqueta:
- * ejecuta el pago real imputado a la factura. 'vencido' no es estado — se
+ * cobra así —'pendiente' hasta que se confirma con sus datos reales (0204)—
+ * o a mano, ya emitido, y se imputa a una o varias facturas (sus compromisos,
+ * 0205). 'cobrado' no es etiqueta: ejecuta el pago real imputado a sus facturas. 'vencido' no es estado — se
  * deriva de fechaVenc (un estado tipeable de algo derivable termina mintiendo).
  */
 export const proveedorEcheqs = pgTable('proveedor_echeqs', {
@@ -3937,14 +3948,12 @@ export const proveedorEcheqs = pgTable('proveedor_echeqs', {
   /** A un proveedor o, si es null, a quien diga `destinatario` (0201): uno de los dos, siempre. */
   proveedorId: integer('proveedor_id').references(() => proveedores.id, { onDelete: 'restrict' }),
   destinatario: text('destinatario').notNull().default(''),
-  compromisoId: integer('compromiso_id').references(() => proveedorCompromisos.id, { onDelete: 'set null' }),
   pagoId: integer('pago_id').references(() => proveedorPagos.id, { onDelete: 'set null' }),
   estado: estadoEcheqEnum('estado').notNull().default('emitido'),
   obs: text('obs').notNull().default(''),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixEstado: index('ix_echeqs_estado').on(t.estado, t.fechaVenc),
-  ixCompromiso: index('ix_echeqs_compromiso').on(t.compromisoId),
 }));
 
 /**

@@ -1581,14 +1581,15 @@ export class InventarioService {
     usuarioId?: number | null;
     descripcion: string;
     liberar?: boolean;
-    items: { productoId: number; presentacionId?: number | null; cantidad: number }[];
+    items: { productoId: number; presentacionId?: number | null; cantidad: number; porArmar?: number }[];
   }) {
     const desde: EstadoStock = o.liberar ? 'comprometido' : 'disponible';
     const hacia: EstadoStock = o.liberar ? 'disponible' : 'comprometido';
+    const lineas = await this.lineasDeReserva(tx, o.items || []);
 
     if (!o.liberar) {
       const faltas: string[] = [];
-      for (const it of o.items || []) {
+      for (const it of lineas) {
         const c = Number(it.cantidad) || 0;
         if (c <= 0) continue;
         const presId = it.presentacionId || null;
@@ -1601,7 +1602,7 @@ export class InventarioService {
       if (faltas.length) throw new BadRequestException(`Stock insuficiente para reservar — ${faltas.join(' · ')}`);
     }
 
-    for (const it of o.items || []) {
+    for (const it of lineas) {
       const c = Number(it.cantidad) || 0;
       if (c <= 0) continue;
       const presId = it.presentacionId || null;
@@ -1613,6 +1614,30 @@ export class InventarioService {
         usuarioId: o.usuarioId ?? null, descripcion: o.descripcion,
       });
     }
+  }
+
+  /**
+   * LO QUE UN PEDIDO TIENE APARTADO: de cada renglón, los paquetes ya armados y,
+   * de los que faltaba armar (`porArmar`), su granel. Lo repetido se junta: se
+   * valida y se mueve una vez por producto y paquete.
+   */
+  private async lineasDeReserva(tx: any, items: { productoId: number; presentacionId?: number | null; cantidad: number; porArmar?: number }[]) {
+    const presIds = [...new Set(items.filter((it) => (it.porArmar ?? 0) > 0).map((it) => Number(it.presentacionId)))];
+    const press = presIds.length ? await tx.select().from(presentaciones).where(inArray(presentaciones.id, presIds)) : [];
+    const tamDe = new Map<number, number>(press.map((pr: any): [number, number] => [pr.id, pr.tamKg]));
+    const juntas = new Map<string, { productoId: number; presentacionId: number | null; cantidad: number }>();
+    const sumar = (productoId: number, presentacionId: number | null, cantidad: number) => {
+      const k = `${productoId}:${presentacionId}`;
+      const x = juntas.get(k) ?? { productoId, presentacionId, cantidad: 0 };
+      x.cantidad = this.cant3(x.cantidad + cantidad);
+      juntas.set(k, x);
+    };
+    for (const it of items) {
+      const porArmar = it.porArmar ?? 0;
+      sumar(it.productoId, it.presentacionId || null, (Number(it.cantidad) || 0) - porArmar);
+      if (porArmar > 0) sumar(it.productoId, null, porArmar * (tamDe.get(Number(it.presentacionId)) ?? 0));
+    }
+    return [...juntas.values()];
   }
 
   /**
@@ -2374,9 +2399,13 @@ export class InventarioService {
    * `tamKg` por paquete (la merma va al costo, no al stock).
    *
    * Solo LEE: es la vista previa que se muestra antes de confirmar, y la misma
-   * cuenta la repite `armarPaquetesParaPedido` con candado.
+   * cuenta la repite `paquetesPorArmar` con candado.
    */
-  async planPaquetes(sucursalId: number, items: { productoId: number; presentacionId?: number | null; cantidad: number }[], tx: any = this.db) {
+  async planPaquetes(
+    sucursalId: number, items: { productoId: number; presentacionId?: number | null; cantidad: number }[],
+    tx: any = this.db, conCandado = false,
+  ) {
+    const leer = conCandado ? this.cantConCandado.bind(this) : this.cant.bind(this);
     const juntos = new Map<string, { productoId: number; presentacionId: number; cantidad: number }>();
     for (const it of items || []) {
       const presId = it.presentacionId ?? null;
@@ -2398,10 +2427,10 @@ export class InventarioService {
       const prod = prodDe.get(x.productoId);
       const pres = presDe.get(x.presentacionId);
       if (!prod || prod.tipo !== 'granel' || !pres || pres.productoId !== x.productoId || !(pres.tamKg > 0)) continue;
-      const armados = Math.max(0, await this.cant(tx, x.productoId, sucursalId, x.presentacionId, 'disponible'));
+      const armados = Math.max(0, await leer(tx, x.productoId, sucursalId, x.presentacionId, 'disponible'));
       if (x.cantidad <= armados + 1e-9) continue;
       if (!granelQueda.has(x.productoId)) {
-        granelQueda.set(x.productoId, Math.max(0, await this.cant(tx, x.productoId, sucursalId, null, 'disponible')));
+        granelQueda.set(x.productoId, Math.max(0, await leer(tx, x.productoId, sucursalId, null, 'disponible')));
       }
       const granel = granelQueda.get(x.productoId)!;
       const faltan = Math.ceil(x.cantidad - armados - 1e-9);
@@ -2417,54 +2446,78 @@ export class InventarioService {
   }
 
   /**
-   * ARMA (fracciona) los paquetes que le faltan a un pedido, justo antes de
-   * reservarlo. Misma cuenta que `planPaquetes`, pero con CANDADO en el granel
-   * y en cada paquete (dos confirmaciones a la vez no arman dos veces con el
-   * mismo granel), dentro de la transacción del pedido: si la reserva de
-   * después falla, el fraccionado se deshace con ella.
+   * CUÁNTOS PAQUETES DE CADA RENGLÓN QUEDAN «POR ARMAR» (0206, pedido del
+   * dueño). Confirmar el pedido no fracciona: lo que falta armar se reserva como
+   * GRANEL y se fracciona recién al cargar lo armado, por lo que se armó de
+   * verdad. Antes se fraccionaba al confirmar y, si después no había con qué
+   * armar, quedaba registrado un fraccionado que nunca pasó.
    *
-   * Deja lo mismo que un fraccionado a mano: el movimiento de cada paquete y
-   * UN registro en el historial de fraccionamiento (origen «pedido», con el
-   * código del pedido y quién fraccionó). El operador se pide solo si hay que
-   * armar algo y hay operadores cargados (`operadorDeFraccion`).
+   * Misma cuenta que `planPaquetes`, con candado. Los renglones del mismo
+   * paquete toman primero los ya armados, en el orden del pedido.
    */
-  async armarPaquetesParaPedido(tx: any, o: {
+  async paquetesPorArmar(tx: any, sucursalId: number, items: { id: number; productoId: number; presentacionId: number | null; cantidad: number }[]) {
+    const plan = await this.planPaquetes(sucursalId, items, tx, true);
+    const porArmar = new Map<number, number>();
+    for (const r of plan.renglones) {
+      let hay = r.armados;
+      let armar = r.armar;
+      for (const it of items) {
+        if (!(armar > 0)) break;
+        if (it.productoId !== r.productoId || it.presentacionId !== r.presentacionId) continue;
+        const usa = Math.min(it.cantidad, hay);
+        hay -= usa;
+        const n = Math.min(armar, Math.ceil(it.cantidad - usa - 1e-9));
+        armar -= n;
+        if (n > 0) porArmar.set(it.id, n);
+      }
+    }
+    return porArmar;
+  }
+
+  /**
+   * FRACCIONA LO QUE SE ARMÓ PARA UN PEDIDO (0206): al cargar lo armado, el
+   * granel que estaba reservado para esos paquetes pasa a ser los paquetes, que
+   * siguen reservados (todo en comprometido). Deja lo mismo que un fraccionado
+   * a mano: el movimiento de cada paquete y UN registro en el historial (origen
+   * «pedido», con el código del pedido y quién fraccionó).
+   */
+  async fraccionarParaPedido(tx: any, o: {
     sucursalId: number; codigo: string; operadorId?: number | null; usuarioId?: number | null;
-    items: { productoId: number; presentacionId?: number | null; cantidad: number }[];
+    items: { productoId: number; presentacionId: number; paquetes: number }[];
   }): Promise<string[]> {
-    const plan = await this.planPaquetes(o.sucursalId, o.items, tx);
-    const aArmar = plan.renglones.filter((r: any) => r.armar > 0);
-    if (!aArmar.length) return [];
+    const items = o.items.filter((x) => x.paquetes > 0);
+    if (!items.length) return [];
     const operadorId = await this.operadorDeFraccion(tx, o.operadorId, o.sucursalId, true);
-    const armados: string[] = [];
+    const press = await tx.select().from(presentaciones).where(inArray(presentaciones.id, items.map((x) => x.presentacionId)));
+    const presDe = new Map<number, any>(press.map((pr: any): [number, any] => [pr.id, pr]));
+    const prodDe = await this.productosDe(tx, items.map((x) => x.productoId));
+    const hechos: string[] = [];
     const renglones: { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number }[] = [];
-    for (const r of aArmar) {
-      // Se relee con candado: lo de la vista previa pudo cambiar en el medio.
-      const granel = Math.max(0, await this.cantConCandado(tx, r.productoId, o.sucursalId, null, 'disponible'));
-      const hay = Math.max(0, await this.cantConCandado(tx, r.productoId, o.sucursalId, r.presentacionId, 'disponible'));
-      const faltan = Math.ceil(r.pedidos - hay - 1e-9);
-      const armar = Math.max(0, Math.min(faltan, Math.floor(granel / r.tamKg + 1e-9)));
-      if (!(armar > 0)) continue;
-      const kg = this.cant3(armar * r.tamKg);
-      const base = { productoId: r.productoId, sucursalId: o.sucursalId, estado: 'disponible' as const };
+    for (const x of items) {
+      const pres = presDe.get(x.presentacionId);
+      const kg = this.cant3(x.paquetes * pres.tamKg);
+      const tam = this.fmtTam(pres.tamKg);
+      // El granel apartado para el pedido, con candado: dos «Guardar armado» a la vez no lo usan dos veces.
+      const apartado = await this.cantConCandado(tx, x.productoId, o.sucursalId, null, 'comprometido');
+      if (apartado + 1e-9 < kg && !(await this.stockLibre(tx, x.productoId))) this.sinStock('comprometido', apartado, kg);
+      const base = { productoId: x.productoId, sucursalId: o.sucursalId, estado: 'comprometido' as const };
       await this.addDelta(tx, { ...base, presentacionId: null }, -kg);
-      await this.addDelta(tx, { ...base, presentacionId: r.presentacionId }, armar);
+      await this.addDelta(tx, { ...base, presentacionId: x.presentacionId }, x.paquetes);
       const m = await this.mov(tx, {
-        tipo: 'fraccionamiento', productoId: r.productoId, sucursalId: o.sucursalId,
-        presentacionId: r.presentacionId, signo: 0, cantidad: kg, unidad: 'kg',
-        presLabel: `Granel → ${r.tam}`, usuarioId: o.usuarioId ?? null,
-        descripcion: `${o.codigo}: fraccionó ${kg} kg en ${armar}×${r.tam} para el pedido`,
+        tipo: 'fraccionamiento', productoId: x.productoId, sucursalId: o.sucursalId,
+        presentacionId: x.presentacionId, signo: 0, cantidad: kg, unidad: 'kg',
+        estadoDesde: 'comprometido', estadoHacia: 'comprometido',
+        presLabel: `Granel → ${tam}`, usuarioId: o.usuarioId ?? null,
+        descripcion: `${o.codigo}: fraccionó ${kg} kg en ${x.paquetes}×${tam} para el pedido`,
       });
-      renglones.push({ productoId: r.productoId, presentacionId: r.presentacionId, tamKg: r.tamKg, paquetes: armar, movimientoId: m.id });
-      armados.push(`${r.nombre}: ${armar}×${r.tam} (${kg} kg de granel)`);
+      renglones.push({ productoId: x.productoId, presentacionId: x.presentacionId, tamKg: pres.tamKg, paquetes: x.paquetes, movimientoId: m.id });
+      hechos.push(`${prodDe.get(x.productoId)?.nombre ?? '#' + x.productoId}: ${x.paquetes}×${tam} (${kg} kg de granel)`);
     }
-    if (renglones.length) {
-      await this.registrarFraccionamiento(tx, {
-        origen: 'pedido', sucursalId: o.sucursalId, operadorId: operadorId ?? null, usuarioId: o.usuarioId ?? null,
-        motivo: `Pedido ${o.codigo}`, items: renglones,
-      });
-    }
-    return armados;
+    await this.registrarFraccionamiento(tx, {
+      origen: 'pedido', sucursalId: o.sucursalId, operadorId: operadorId ?? null, usuarioId: o.usuarioId ?? null,
+      motivo: `Pedido ${o.codigo}`, items: renglones,
+    });
+    return hechos;
   }
 
   /**

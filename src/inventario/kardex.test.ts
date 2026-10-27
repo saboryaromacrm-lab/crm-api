@@ -43,6 +43,11 @@ test('fraccionado: los kg salen del suelto y los paquetes entran, con el registr
   assert.deepEqual(r.deltas.map((x) => x.delta), [-2, 4]);
 });
 
+test('fraccionado de un pedido al cargar lo armado (0206): pasa en lo reservado', () => {
+  const m = mov({ tipo: 'fraccionamiento', presentacionId: 8, signo: 0, cantidad: 1, estadoDesde: 'comprometido', estadoHacia: 'comprometido' });
+  assert.deepEqual(d(m, [{ presentacionId: 8, paquetes: 2, tamKg: 0.5 }]), [[0, 'comprometido', -1], [8, 'comprometido', 2]]);
+});
+
 test('saldos hacia atrás y la carga inicial', () => {
   /* Hoy 7. Movimientos: compra 10 (id 1), venta 5 (id 2), compra 2 (id 3). Antes de todo: 0. */
   const k = '1|0|disponible';

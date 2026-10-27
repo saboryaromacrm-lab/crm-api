@@ -27,6 +27,7 @@
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, Get, ForbiddenException, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
+  Logger,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
@@ -35,16 +36,17 @@ import {
 } from 'class-validator';
 import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
-import { CuentasDisponiblesModule, CuentasDisponiblesService } from '../proveedores/cuentas-disponibles.module';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { ABREV_TIPO, etiquetaDoc } from '../common/documentos';
+import { ABREV_TIPO, etiquetaDoc, numeroDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { ECHEQ_EN_CARTERA } from '../proveedores/echeqs';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import {
-  cajaMovimientos, cajaSesiones, comprobantes, gastos, pagoFormas, proveedorAjustes, proveedorCompromisos,
-  proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores, sucursales, usuarios,
+  cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, gastos, pagoFormas,
+  proveedorAjustes, proveedorCompromisos, proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores,
+  sucursales, usuarios, ventaPagos, ventas,
 } from '../db/schema';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -227,10 +229,9 @@ export class CambiarDestinoDto {
 
 @Injectable()
 export class PagosProveedorService {
-  constructor(
-    @Inject(DRIZZLE) private readonly db: Database,
-    private readonly ctasDisp: CuentasDisponiblesService,
-  ) {}
+  private readonly log = new Logger('Pagos');
+
+  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
   /* ==================================================================== *
    * Recálculo — el corazón de la consistencia
@@ -317,8 +318,14 @@ export class PagosProveedorService {
    *
    * Reglas, en las dos direcciones (se autocorrige):
    *  · Factura SALDADA (total + notas − pagado ≤ centavo) → se cierran todos
-   *    sus compromisos pendientes firmados por el pago que la saldó, y sus
-   *    echeqs pasan a cobrados en cascada.
+   *    sus compromisos pendientes firmados por el pago que la saldó. El
+   *    PENDIENTE DE CONFIRMAR (0204) se cae: nadie lo hizo y la factura se
+   *    pagó por otro lado, así que el compromiso deja de ser echeq (si el pago
+   *    se anula, la deuda vuelve a Cuentas corrientes y no a un echeq que no
+   *    existe). El echeq HECHO es un papel en el banco (0205): pasa a cobrado
+   *    con ese pago solo si ES el pago de esta factura —toda su plata va a
+   *    ella y se registró con medio echeq—; si no, sigue en la cartera y al
+   *    debitarse va a cuenta.
    *  · Factura CON SALDO → se reabren los compromisos cuyo cerrador ya no
    *    está: pago anulado/desaplicado, o una NC (pagoId null) ahora anulada.
    *    El compromiso cerrado por un pago QUE SIGUE APLICADO no se toca — es
@@ -337,16 +344,31 @@ export class PagosProveedorService {
     const saldo = money(c.total + ajuste - c.pagado);
 
     if (saldo <= EPS) {
+      const [cerrador] = pagoCerradorId
+        ? await tx.select({ medio: proveedorPagos.medio }).from(proveedorPagos).where(eq(proveedorPagos.id, pagoCerradorId)).limit(1)
+        : [];
       for (const k of comps.filter((x: any) => !x.pagado)) {
+        const [e] = k.echeqId
+          ? await tx.select().from(proveedorEcheqs).where(eq(proveedorEcheqs.id, k.echeqId)).limit(1)
+          : [];
+        const cae = e?.estado === 'pendiente';
+        if (cae) {
+          await tx.update(proveedorEcheqs)
+            .set({ estado: 'anulado', obs: 'No se hizo: la factura se pagó por otro medio.' })
+            .where(eq(proveedorEcheqs.id, e.id));
+        }
         await tx.update(proveedorCompromisos)
-          .set({ pagado: true, pagoId: pagoCerradorId })
+          .set({ pagado: true, pagoId: pagoCerradorId, ...(cae ? { echeqId: null } : {}) })
           .where(eq(proveedorCompromisos.id, k.id));
-        await tx.update(proveedorEcheqs)
-          .set({ estado: 'cobrado', pagoId: pagoCerradorId })
-          .where(and(
-            eq(proveedorEcheqs.compromisoId, k.id),
-            inArray(proveedorEcheqs.estado, ['emitido', 'entregado']),
-          ));
+        if (!e || cae || cerrador?.medio !== 'echeq' || !ECHEQ_EN_CARTERA.includes(e.estado)) continue;
+        const [suyo] = await tx.select({
+          otras: sql<number>`count(*) filter (where comprobante_id is distinct from ${comprobanteId})::int`,
+          suma: sql<number>`coalesce(sum(importe), 0)`,
+        }).from(proveedorCompromisos).where(eq(proveedorCompromisos.echeqId, e.id));
+        if (!suyo.otras && Math.abs(money(suyo.suma) - money(e.importe)) <= EPS) {
+          await tx.update(proveedorEcheqs).set({ estado: 'cobrado', pagoId: pagoCerradorId })
+            .where(and(eq(proveedorEcheqs.id, e.id), inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA)));
+        }
       }
       return;
     }
@@ -366,9 +388,12 @@ export class PagosProveedorService {
       await tx.update(proveedorCompromisos)
         .set({ pagado: false, pagoId: null })
         .where(eq(proveedorCompromisos.id, k.id));
-      await tx.update(proveedorEcheqs)
-        .set({ estado: 'emitido', pagoId: null })
-        .where(and(eq(proveedorEcheqs.compromisoId, k.id), eq(proveedorEcheqs.estado, 'cobrado')));
+      /* El echeq cerrado sin pago propio (lo saldó una NC) vuelve a la cartera. El que tiene su pago
+       * lo sigue teniendo —el banco debitó— y vuelve recién si ese pago se anula (ver `anular`). */
+      if (k.echeqId) {
+        await tx.update(proveedorEcheqs).set({ estado: 'emitido' })
+          .where(and(eq(proveedorEcheqs.id, k.echeqId), eq(proveedorEcheqs.estado, 'cobrado'), isNull(proveedorEcheqs.pagoId)));
+      }
     }
   }
 
@@ -577,9 +602,9 @@ export class PagosProveedorService {
    * mercadería solo puede ir a comprobantes, uno de gastos solo a gastos —
    * listar lo que la aplicación va a rechazar sería ofrecer un botón roto.
    */
-  async documentosPendientes(proveedorId: number, destino?: string) {
+  async documentosPendientes(proveedorId: number, destino?: string, ex: any = this.db) {
     const [gs, cs] = await Promise.all([
-      destino === 'mercaderia' ? [] : this.db.select().from(gastos).where(and(
+      destino === 'mercaderia' ? [] : ex.select().from(gastos).where(and(
         eq(gastos.proveedorId, proveedorId),
         ne(gastos.estado, 'anulado'),
         sql`${gastos.total} - ${gastos.pagado} > ${EPS}`,
@@ -609,7 +634,7 @@ export class PagosProveedorService {
        * que después le llega una ND vuelve a deber, y ese prefiltro la habría
        * escondido.
        */
-      destino === 'gastos' ? [] : this.db.select().from(comprobantes).where(and(
+      destino === 'gastos' ? [] : ex.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
         // LISTA DE TIPOS · documentos pagables. La liquidación (la mitad sin
@@ -623,7 +648,7 @@ export class PagosProveedorService {
     /* Lo que las notas le sumaron o restaron a cada uno de esos documentos. */
     const ajustes = new Map<number, number>();
     if (cs.length) {
-      const notas = await this.db.select({
+      const notas = await ex.select({
         ref: comprobantes.refComprobanteId,
         tipo: comprobantes.tipo,
         total: comprobantes.total,
@@ -639,7 +664,7 @@ export class PagosProveedorService {
     }
 
     return [
-      ...gs.map((g) => ({
+      ...gs.map((g: any) => ({
         tipo: 'gasto' as const,
         docId: g.id,
         fecha: g.fecha,
@@ -650,7 +675,7 @@ export class PagosProveedorService {
         pagado: g.pagado,
         saldo: money(g.total - g.pagado),
       })),
-      ...cs.map((c) => {
+      ...cs.map((c: any) => {
         const ajuste = ajustes.get(c.id) ?? 0;
         return {
           tipo: 'comprobante' as const,
@@ -1039,9 +1064,74 @@ export class PagosProveedorService {
           tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante, opciones.cuotaTomadaId,
         );
       }
+      await this.aplicarCuentaLibre(proveedorId, tx);
       return pago.id;
     });
     return this.get(id);
+  }
+
+  /**
+   * CUENTA LIBRE: LO PAGADO CANCELA LO MÁS VIEJO, DE VERDAD (27/10/2026,
+   * pedido del dueño: «las transferencias que me las tome solas, me las
+   * muestra como pago sin aplicar»). En modo 'libre' la regla ya era FIFO,
+   * pero solo para la antigüedad: la plata quedaba «sin aplicar» y la factura
+   * figuraba impaga entera, también al ir a pagarla. Ahora lo que cada pago
+   * tiene sin aplicar (del más viejo al más nuevo) se aplica a los documentos
+   * impagos de su mundo (del más viejo al más nuevo). Corre cuando entra plata
+   * o deuda. Los fletes no: tienen su propio descuento.
+   *
+   * Cruza sucursales a propósito: en cuenta libre la deuda es del proveedor,
+   * no de un mostrador, y la regla la aplica el sistema, no una persona.
+   *
+   * En un SAVEPOINT: si algo no se puede aplicar, la plata queda sin aplicar
+   * como antes y lo que la llamó (una venta, una factura) sigue su curso.
+   */
+  async aplicarCuentaLibre(proveedorId: number | null | undefined, tx?: any): Promise<void> {
+    if (!proveedorId) return;
+    if (!tx) return this.db.transaction((t) => this.aplicarCuentaLibre(proveedorId, t));
+    try {
+      await tx.transaction(async (sp: any) => {
+        // Candado sobre el proveedor: dos corridas a la vez no reparten la misma plata.
+        const [p] = await sp.select({ modo: proveedores.modoCuenta }).from(proveedores)
+          .where(eq(proveedores.id, proveedorId)).limit(1).for('update');
+        if (p?.modo !== 'libre') return;
+        const pagos = await sp.select({
+          id: proveedorPagos.id, importe: proveedorPagos.importe, aplicado: proveedorPagos.aplicado, destino: proveedorPagos.destino,
+        }).from(proveedorPagos).where(and(
+          eq(proveedorPagos.proveedorId, proveedorId),
+          eq(proveedorPagos.estado, 'activo'),
+          eq(proveedorPagos.esFlete, false),
+          sql`${proveedorPagos.importe} - ${proveedorPagos.aplicado} > ${EPS}`,
+        )).orderBy(proveedorPagos.fecha, proveedorPagos.id);
+        if (!pagos.length) return;
+        const docs = await this.documentosPendientes(proveedorId, undefined, sp);
+        for (const pago of pagos) {
+          let libre = money(pago.importe - pago.aplicado);
+          for (const d of docs) {
+            if (libre <= EPS) break;
+            if (d.saldo <= EPS || (d.tipo === 'gasto') !== (pago.destino === 'gastos')) continue;
+            const importe = money(Math.min(libre, d.saldo));
+            await this.aplicar(sp, pago.id, [d.tipo === 'gasto' ? { gastoId: d.docId, importe } : { comprobanteId: d.docId, importe }], undefined, true);
+            d.saldo = money(d.saldo - importe);
+            libre = money(libre - importe);
+          }
+        }
+      });
+    } catch (e) {
+      this.log.warn(`Cuenta libre del proveedor ${proveedorId}: quedó sin aplicar (${(e as Error).message})`);
+    }
+  }
+
+  /**
+   * Las aplicaciones de un pago que se va a anular porque su plata nunca llegó
+   * (la transferencia de un cliente murió con su venta): se sacan todas, con
+   * los mismos candados y recálculos que `desimputar`.
+   */
+  async quitarAplicaciones(tx: any, pagoId: number) {
+    await tx.select({ id: proveedorPagos.id }).from(proveedorPagos)
+      .where(eq(proveedorPagos.id, pagoId)).limit(1).for('update');
+    const imps = await tx.select().from(proveedorImputaciones).where(eq(proveedorImputaciones.pagoId, pagoId));
+    for (const imp of imps) await this.borrarImputacion(tx, imp);
   }
 
   /**
@@ -1426,27 +1516,31 @@ export class PagosProveedorService {
        *
        * Mismo orden que en `aplicar` (pago → documento) para no abrazarse.
        */
-      if (imp.gastoId) {
-        await tx.select({ id: gastos.id }).from(gastos)
-          .where(eq(gastos.id, imp.gastoId)).limit(1).for('update');
-      }
-      if (imp.comprobanteId) {
-        await tx.select({ id: comprobantes.id }).from(comprobantes)
-          .where(eq(comprobantes.id, imp.comprobanteId)).limit(1).for('update');
-      }
-
-      await tx.delete(proveedorImputaciones).where(eq(proveedorImputaciones.id, imputacionId));
-      await this.recalcularPago(tx, imp.pagoId);
-      if (imp.gastoId) await this.recalcularGasto(tx, imp.gastoId);
-      if (imp.comprobanteId) {
-        await this.recalcularComprobante(tx, imp.comprobanteId);
-        // El puente (0068): la factura recupera saldo → sus compromisos
-        // cerrados por ESTE pago se reabren (y el echeq vuelve a emitido).
-        await this.sincronizarCompromisos(tx, imp.comprobanteId, null);
-      }
+      await this.borrarImputacion(tx, imp);
       return imp.pagoId;
     });
     return this.get(pagoId);
+  }
+
+  /** Borra UNA imputación (con el pago ya tomado): candado del documento, y los tres recálculos. */
+  private async borrarImputacion(tx: any, imp: { id: number; pagoId: number; gastoId: number | null; comprobanteId: number | null }) {
+    if (imp.gastoId) {
+      await tx.select({ id: gastos.id }).from(gastos)
+        .where(eq(gastos.id, imp.gastoId)).limit(1).for('update');
+    }
+    if (imp.comprobanteId) {
+      await tx.select({ id: comprobantes.id }).from(comprobantes)
+        .where(eq(comprobantes.id, imp.comprobanteId)).limit(1).for('update');
+    }
+    await tx.delete(proveedorImputaciones).where(eq(proveedorImputaciones.id, imp.id));
+    await this.recalcularPago(tx, imp.pagoId);
+    if (imp.gastoId) await this.recalcularGasto(tx, imp.gastoId);
+    if (imp.comprobanteId) {
+      await this.recalcularComprobante(tx, imp.comprobanteId);
+      // El puente (0068): la factura recupera saldo → sus compromisos
+      // cerrados por ESTE pago se reabren (y el echeq vuelve a emitido).
+      await this.sincronizarCompromisos(tx, imp.comprobanteId, null);
+    }
   }
 
   /**
@@ -1521,7 +1615,7 @@ export class PagosProveedorService {
       /* El espejo de una transferencia de cliente (0095) no se anula desde
        * acá: quedaría la venta cobrada y el proveedor sin su pago. Se anula
        * el cobro, y ese camino anula los dos juntos. */
-      const origen = await this.ctasDisp.origenDe(tx, id);
+      const origen = await this.origenCuentaDisponible(tx, id);
       if (origen) {
         throw new BadRequestException(
           `Este pago es de una cuenta disponible del proveedor: se anula anulando ${origen}, no desde acá.`,
@@ -1553,8 +1647,7 @@ export class PagosProveedorService {
        * El puente (0068), rama de los compromisos MANUALES: los de factura ya
        * se reabrieron al desaplicar (anular exige aplicado = 0), pero el
        * compromiso manual se cerró con este pago SIN imputación — se reabre
-       * acá, y su echeq cobrado vuelve a emitido. El echeq cobrado "suelto"
-       * (sin compromiso) también revierte por su pagoId.
+       * acá. El echeq cobrado con este pago vuelve a la cartera por su pagoId.
        */
       await tx.update(proveedorCompromisos)
         .set({ pagado: false, pagoId: null })
@@ -1562,8 +1655,34 @@ export class PagosProveedorService {
       await tx.update(proveedorEcheqs)
         .set({ estado: 'emitido', pagoId: null })
         .where(and(eq(proveedorEcheqs.pagoId, id), eq(proveedorEcheqs.estado, 'cobrado')));
+      // Lo que este pago dejó libre lo cubre la otra plata sin aplicar (cuenta libre).
+      await this.aplicarCuentaLibre(p.proveedorId, tx);
     });
     return this.get(id);
+  }
+
+  /**
+   * Si este pago al proveedor es el espejo de una transferencia viva a una
+   * cuenta disponible (0095), de qué cobro vino. Desde Pagos no se anula.
+   */
+  private async origenCuentaDisponible(tx: any, proveedorPagoId: number): Promise<string | null> {
+    const [f] = await tx.select({
+      ventaPagoId: cuentaDisponiblePagos.ventaPagoId, cobranzaPagoId: cuentaDisponiblePagos.cobranzaPagoId, propio: cuentaDisponiblePagos.propio,
+    }).from(cuentaDisponiblePagos)
+      .where(and(eq(cuentaDisponiblePagos.proveedorPagoId, proveedorPagoId), isNull(cuentaDisponiblePagos.anuladoEn)))
+      .limit(1);
+    if (!f) return null;
+    if (f.propio) return 'su pago propio (en Proveedores › Cuentas disponibles › Pagos)';
+    if (f.ventaPagoId) {
+      const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
+        .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
+        .where(eq(ventaPagos.id, f.ventaPagoId)).limit(1);
+      return v ? `la venta ${numeroDoc(v.puntoVenta, v.numero)}` : 'una venta';
+    }
+    const [r] = await tx.select({ puntoVenta: cobranzas.puntoVenta, numero: cobranzas.numero })
+      .from(cobranzaPagos).innerJoin(cobranzas, eq(cobranzas.id, cobranzaPagos.cobranzaId))
+      .where(eq(cobranzaPagos.id, f.cobranzaPagoId!)).limit(1);
+    return r ? `el recibo ${numeroDoc(r.puntoVenta, r.numero)}` : 'un recibo';
   }
 
   /* ==================================================================== *
@@ -1772,7 +1891,6 @@ export class PagosProveedorController {
 }
 
 @Module({
-  imports: [CuentasDisponiblesModule],
   controllers: [PagosProveedorController],
   providers: [PagosProveedorService],
   exports: [PagosProveedorService],

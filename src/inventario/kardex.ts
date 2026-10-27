@@ -48,19 +48,22 @@ export const claveSaldo = (d: { sucursalId: number; presentacionId: number; esta
  *   · `estadoDesde` = `estadoHacia` (ajuste por incidencia): suma o resta según el signo;
  *   · FRACCIONADO: el movimiento guarda los kg; los paquetes, el registro de
  *     fraccionamiento (`items`). Sin registro (anterior a la 0102) y con un
- *     solo paquete, se deduce de los kg y queda marcado `estimado`.
+ *     solo paquete, se deduce de los kg y queda marcado `estimado`. Pasa en
+ *     disponible, salvo el de un pedido al cargar lo armado (0206): ese pasa en
+ *     comprometido, y lo dice su `estadoHacia`.
  */
 export function deltasDe(m: Mov, items: ItemFraccion[] = [], tamPres?: (presId: number) => number | null): { deltas: Delta[]; estimado: boolean } {
   const suc = m.sucursalId ?? 0;
   const c = Number(m.cantidad) || 0;
   if (m.tipo === 'fraccionamiento') {
+    const estado = m.estadoHacia ?? 'disponible';
     if (items.length) {
       const kg = r3(items.reduce((a, i) => a + i.paquetes * i.tamKg, 0));
       return {
         estimado: false,
         deltas: [
-          { sucursalId: suc, presentacionId: 0, estado: 'disponible', delta: -kg },
-          ...items.map((i) => ({ sucursalId: suc, presentacionId: i.presentacionId, estado: 'disponible', delta: i.paquetes })),
+          { sucursalId: suc, presentacionId: 0, estado, delta: -kg },
+          ...items.map((i) => ({ sucursalId: suc, presentacionId: i.presentacionId, estado, delta: i.paquetes })),
         ],
       };
     }
@@ -69,8 +72,8 @@ export function deltasDe(m: Mov, items: ItemFraccion[] = [], tamPres?: (presId: 
       return {
         estimado: true,
         deltas: [
-          { sucursalId: suc, presentacionId: 0, estado: 'disponible', delta: -c },
-          { sucursalId: suc, presentacionId: m.presentacionId, estado: 'disponible', delta: Math.round(c / tam) },
+          { sucursalId: suc, presentacionId: 0, estado, delta: -c },
+          { sucursalId: suc, presentacionId: m.presentacionId, estado, delta: Math.round(c / tam) },
         ],
       };
     }

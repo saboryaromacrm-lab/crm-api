@@ -9,10 +9,13 @@
  *    listan los que NO son echeq — el echeq tiene su propia vitrina, y
  *    mostrarlo en las dos duplicaría gestión y contadores (regla heredada de
  *    la app externa, donde era un LIKE sobre el nombre de la forma; acá es
- *    el dato `esEcheq`).
+ *    el dato `echeqId`).
  *  · ECHEQS: la cartera propia. "Cobrado" no es una etiqueta: ejecuta el
- *    pago real (imputado a su factura si la tiene) vía PagosProveedorService,
- *    que corre el puente y cierra el compromiso en la misma transacción.
+ *    pago real (imputado a las facturas que cubre) vía PagosProveedorService,
+ *    que corre el puente y cierra los compromisos. El que nace con la factura
+ *    espera PENDIENTE DE CONFIRMAR (0204): se confirma con los datos del papel
+ *    o se dice que no se hizo, y entonces la deuda vuelve a Cuentas
+ *    corrientes. El hecho a mano se imputa a una o varias facturas (0205).
  *  · ESTADO DE CUENTA: el mayor DEBE/HABER por proveedor (facturas,
  *    liquidaciones y ND al debe; NC y pagos al haber; gastos al debe;
  *    ajustes con signo), el saldo con la MISMA fórmula que `cuenta()` de
@@ -33,7 +36,7 @@ import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches,
   MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -47,6 +50,9 @@ import { nombreMes } from './facturas-mes.module';
 import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } from '../pagos/pagos.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import {
+  ECHEQ_EN_CARTERA, ECHEQ_VIVOS, deudaACuentaCorriente, faltaCompromiso, imputarEcheqTx, sinFacturaEcheq,
+} from './echeqs';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const EPS = 0.009;
@@ -121,6 +127,26 @@ class BorrarAjusteDto {
   motivo!: string; // el largo se recorta al guardar: sin motivo, un solo mensaje claro
 }
 
+/** CONFIRMAR EL ECHEQ AUTOMÁTICO (0204): los datos del papel que se hizo de verdad. */
+class ConfirmarEcheqDto {
+  @IsString() @MaxLength(40) numero!: string;
+  @IsString() @MaxLength(100) banco!: string;
+  @IsNumber() @Min(0.01) importe!: number;
+  @Matches(SOLO_FECHA, { message: 'La fecha de cobro va como AAAA-MM-DD.' }) fechaVenc!: string;
+  @IsOptional() @Matches(SOLO_FECHA, { message: 'La emisión va como AAAA-MM-DD.' }) fechaEmision?: string;
+  @IsOptional() @IsString() @MaxLength(2000) obs?: string;
+}
+
+/** LAS FACTURAS QUE CUBRE UN ECHEQ (0205): la lista entera; 0 o ausente la saca. */
+class ImputacionEcheqDto {
+  @IsInt() comprobanteId!: number;
+  @IsNumber() @Min(0) importe!: number;
+}
+class ImputarEcheqDto {
+  @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ImputacionEcheqDto)
+  facturas!: ImputacionEcheqDto[];
+}
+
 class EstadoEcheqDto {
   @IsIn(['emitido', 'entregado', 'cobrado', 'anulado']) estado!: string;
 }
@@ -159,15 +185,21 @@ export class FinanzasProveedorService {
       compPv: comprobantes.puntoVenta,
       compNumero: comprobantes.numero,
       importe: proveedorCompromisos.importe,
+      /** Lo que todavía falta (ver `faltaCompromiso`): en el pendiente es lo que se muestra y se paga. */
+      falta: faltaCompromiso,
       fechaEmision: proveedorCompromisos.fechaEmision,
       fechaVenc: proveedorCompromisos.fechaVenc,
       origen: proveedorCompromisos.origen,
-      esEcheq: proveedorCompromisos.esEcheq,
+      /** El echeq que paga esta parte (0205), o null: deuda común de Cuentas corrientes. */
+      echeqId: proveedorCompromisos.echeqId,
       cuota: proveedorCompromisos.cuota,
       cuotas: proveedorCompromisos.cuotas,
       pagado: proveedorCompromisos.pagado,
       pagoId: proveedorCompromisos.pagoId,
       obs: proveedorCompromisos.obs,
+      /** El estado y el número de su echeq: el estado de cuenta dice «pendiente de confirmar» o «Echeq N° …». */
+      echeqEstado: sql<string | null>`(select e.estado::text from proveedor_echeqs e where e.id = proveedor_compromisos.echeq_id)`,
+      echeqNumero: sql<string | null>`(select e.numero from proveedor_echeqs e where e.id = proveedor_compromisos.echeq_id)`,
     };
   }
 
@@ -187,7 +219,7 @@ export class FinanzasProveedorService {
 
   /** La vitrina "Cuentas corrientes": compromisos que NO son echeq. */
   async listarCompromisos(q: { filtro?: string; proveedorId?: number }) {
-    const conds: any[] = [eq(proveedorCompromisos.esEcheq, false)];
+    const conds: any[] = [isNull(proveedorCompromisos.echeqId)];
     const hoy = hoy0();
     const filtro = q.filtro || 'pendientes';
     if (filtro === 'pendientes') conds.push(eq(proveedorCompromisos.pagado, false));
@@ -216,7 +248,7 @@ export class FinanzasProveedorService {
     return {
       filas: filas.map((f) => this.mapCompromiso(f)),
       total: filas.length,
-      totalImporte: money(filas.reduce((a, f) => a + f.importe, 0)),
+      totalImporte: money(filas.reduce((a, f) => a + (f.pagado ? f.importe : f.falta), 0)),
     };
   }
 
@@ -225,15 +257,15 @@ export class FinanzasProveedorService {
     const hoy = hoy0();
     const [r] = await this.db.select({
       vencidosN: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} < ${hoy.toISOString()})::int`,
-      vencidosM: sql<number>`coalesce(sum(${proveedorCompromisos.importe}) filter (where ${proveedorCompromisos.fechaVenc} < ${hoy.toISOString()}), 0)`,
+      vencidosM: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} < ${hoy.toISOString()}), 0)`,
       prox3N: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()})::int`,
-      prox3M: sql<number>`coalesce(sum(${proveedorCompromisos.importe}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()}), 0)`,
+      prox3M: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()}), 0)`,
       semanaN: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()})::int`,
-      semanaM: sql<number>`coalesce(sum(${proveedorCompromisos.importe}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()}), 0)`,
+      semanaM: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()}), 0)`,
       totalN: sql<number>`count(*)::int`,
-      totalM: sql<number>`coalesce(sum(${proveedorCompromisos.importe}), 0)`,
+      totalM: sql<number>`coalesce(sum(${faltaCompromiso}), 0)`,
     }).from(proveedorCompromisos)
-      .where(and(eq(proveedorCompromisos.pagado, false), eq(proveedorCompromisos.esEcheq, false)));
+      .where(and(eq(proveedorCompromisos.pagado, false), isNull(proveedorCompromisos.echeqId), sql`${faltaCompromiso} > ${EPS}`));
     return {
       vencidos: { n: Number(r?.vencidosN) || 0, monto: money(Number(r?.vencidosM) || 0) },
       prox3: { n: Number(r?.prox3N) || 0, monto: money(Number(r?.prox3M) || 0) },
@@ -265,6 +297,7 @@ export class FinanzasProveedorService {
    * cuota de una factura de $1.000 a $99.999 y las alertas de vencimientos y el
    * saldo proyectado pasaban a mentir. Lo pendiente de todas sus cuotas no
    * puede pasar del saldo vivo de la factura (con sus notas descontadas).
+   * Devuelve lo que la factura deja libre para esta cuota (saldo − las otras).
    */
   private async exigirTopeCuotas(comprobanteId: number, proveedorId: number, compromisoId: number, nuevo: number) {
     const docs = await this.pagos.documentosPendientes(proveedorId, 'mercaderia');
@@ -283,6 +316,7 @@ export class FinanzasProveedorService {
         + `esta cuota puede ser de hasta ${Math.max(0, money(saldo - otras)).toFixed(2)}.`,
       );
     }
+    return money(saldo - otras);
   }
 
   async crearCompromisoManual(dto: CompromisoManualDto) {
@@ -304,6 +338,10 @@ export class FinanzasProveedorService {
   async editarCompromiso(id: number, dto: EditarCompromisoDto) {
     const k = await this.getCompromiso(id);
     if (k.pagado) throw new BadRequestException('El compromiso ya se pagó: no se edita — la historia no se reescribe.');
+    /* UN SOLO DATO (0204): el vencimiento de un echeq se cambia desde el echeq, que lleva al compromiso con él. */
+    if (k.echeqId) {
+      throw new BadRequestException('Este vencimiento es un echeq: se cambia desde Proveedores › Echeqs.');
+    }
     if (dto.importe != null && k.comprobanteId) {
       await this.exigirTopeCuotas(k.comprobanteId, k.proveedorId, id, money(dto.importe));
     }
@@ -325,14 +363,17 @@ export class FinanzasProveedorService {
   async borrarCompromiso(id: number) {
     const k = await this.getCompromiso(id);
     if (k.pagado) throw new BadRequestException('El compromiso ya se pagó: quedó como historia del pago.');
+    /* La parte de un echeq hecho es un papel en el banco (0205): se cambia desde sus facturas. */
+    if (k.echeqId && k.echeqEstado !== 'pendiente') {
+      throw new BadRequestException('Este vencimiento es parte de un echeq: se cambia desde Proveedores › Echeqs › Facturas.');
+    }
     await this.db.transaction(async (tx) => {
       /* El echeq que nació con este compromiso queda ANULADO, no huérfano: un
        * echeq "a completar" cuya promesa murió no espera nada. */
-      await tx.update(proveedorEcheqs).set({ estado: 'anulado' })
-        .where(and(
-          eq(proveedorEcheqs.compromisoId, id),
-          inArray(proveedorEcheqs.estado, ['emitido', 'entregado']),
-        ));
+      if (k.echeqId) {
+        await tx.update(proveedorEcheqs).set({ estado: 'anulado' })
+          .where(and(eq(proveedorEcheqs.id, k.echeqId), eq(proveedorEcheqs.estado, 'pendiente')));
+      }
       await tx.delete(proveedorCompromisos).where(eq(proveedorCompromisos.id, id));
     });
     return { ok: true };
@@ -344,16 +385,19 @@ export class FinanzasProveedorService {
    * de pagos cierra el compromiso si la factura queda saldada; para la CUOTA
    * (la factura sigue debiendo) lo cierra este método, que sabe cuál era.
    */
-  async pagarCompromiso(id: number, dto: PagarCompromisoDto, auth: Sesion, desdeEcheq = false) {
+  async pagarCompromiso(id: number, dto: PagarCompromisoDto, auth: Sesion) {
     const k = await this.getCompromiso(id);
     if (k.pagado) throw new BadRequestException('Ese compromiso ya está pagado.');
-    if (k.esEcheq && !desdeEcheq) {
+    if (k.echeqId) {
       throw new BadRequestException('Este compromiso es un echeq: se cobra desde la cartera de Echeqs.');
+    }
+    if (k.falta <= EPS) {
+      throw new BadRequestException('Esa cuota ya está cubierta por lo que se le pagó a la factura: no hay nada que pagar.');
     }
     if (!dto.medio && !dto.formas?.length) {
       throw new BadRequestException('Indicá con qué medio REAL se pagó (la promesa decía cuenta corriente; la plata salió por algún lado).');
     }
-    if (!desdeEcheq) exigirFechaPago(dto.fecha, dto.formas);
+    exigirFechaPago(dto.fecha, dto.formas);
 
     /*
      * LA CUOTA SE TOMA ANTES DE PAGAR (26/9/2026). Antes se miraba `pagado`,
@@ -386,7 +430,7 @@ export class FinanzasProveedorService {
       + (dto.obs?.trim() ? ` · ${dto.obs.trim()}` : '');
     const fecha = dto.fecha ?? aIso(new Date());
 
-    let importePago = money(k.importe);
+    let importePago = money(k.falta);
     let imputaciones: Array<{ comprobanteId: number; importe: number }> | undefined;
     if (k.comprobanteId) {
       /* El saldo VIVO de la factura (con sus notas descontadas): se paga lo
@@ -422,11 +466,6 @@ export class FinanzasProveedorService {
      * cierra este método, que es el único que sabe qué compromiso se pagó. */
     await this.db.update(proveedorCompromisos).set({ pagado: true, pagoId: pago.id })
       .where(eq(proveedorCompromisos.id, id));
-    await this.db.update(proveedorEcheqs).set({ estado: 'cobrado', pagoId: pago.id })
-      .where(and(
-        eq(proveedorEcheqs.compromisoId, id),
-        inArray(proveedorEcheqs.estado, ['emitido', 'entregado']),
-      ));
     return { ...(await this.getCompromiso(id)), pago };
   }
 
@@ -445,22 +484,57 @@ export class FinanzasProveedorService {
       proveedorId: proveedorEcheqs.proveedorId,
       /** A nombre de quién: el proveedor o, si no es proveedor (0201), el nombre escrito a mano. */
       aNombreDe: sql<string>`coalesce(${proveedores.nombre}, ${proveedorEcheqs.destinatario})`,
-      compromisoId: proveedorEcheqs.compromisoId,
+      /** Lo que no cubre de ninguna factura (0205): al cobrarse queda a cuenta. */
+      sinFactura: sinFacturaEcheq,
       pagoId: proveedorEcheqs.pagoId,
       estado: proveedorEcheqs.estado,
       obs: proveedorEcheqs.obs,
     };
   }
 
+  /**
+   * Las facturas que cubre cada echeq (0205): sus compromisos pendientes, con
+   * lo que falta de cada una. Van en la fila: la cartera y el estado de cuenta
+   * las muestran, y la ventana «Facturas» parte de acá.
+   */
+  private async conFacturas<T extends { id: number; fechaVenc: Date }>(filas: T[]) {
+    const ids = filas.map((f) => f.id);
+    const ks = ids.length ? await this.db.select({
+      echeqId: proveedorCompromisos.echeqId,
+      comprobanteId: proveedorCompromisos.comprobanteId,
+      importe: proveedorCompromisos.importe,
+      falta: faltaCompromiso,
+      tipo: comprobantes.tipo, letra: comprobantes.letra, puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero,
+    }).from(proveedorCompromisos)
+      .innerJoin(comprobantes, eq(comprobantes.id, proveedorCompromisos.comprobanteId))
+      .where(and(inArray(proveedorCompromisos.echeqId, ids), eq(proveedorCompromisos.pagado, false)))
+      .orderBy(proveedorCompromisos.id) : [];
+    return filas.map((f) => ({
+      ...f,
+      diasRest: diasHasta(f.fechaVenc),
+      facturas: ks.filter((k) => k.echeqId === f.id).map((k) => ({
+        comprobanteId: k.comprobanteId,
+        etiqueta: etiquetaDoc({ tipo: k.tipo, letra: k.letra, puntoVenta: k.puntoVenta, numero: k.numero, id: k.comprobanteId! }),
+        importe: k.importe,
+        falta: k.falta,
+      })),
+    }));
+  }
+
   async listarEcheqs(q: { filtro?: string; proveedorId?: number; buscar?: string }) {
     const conds: any[] = [];
     const hoy = hoy0();
     const filtro = q.filtro || 'activos';
-    if (filtro === 'activos') conds.push(inArray(proveedorEcheqs.estado, ['emitido', 'entregado']));
+    /* Activos = todo lo que sigue vivo, el pendiente de confirmar incluido (0204) y marcado como tal.
+     * Vencidos y la semana son lo que el banco debita: solo los hechos. */
+    if (filtro === 'activos') conds.push(inArray(proveedorEcheqs.estado, ECHEQ_VIVOS));
+    else if (filtro === 'pendientes') conds.push(eq(proveedorEcheqs.estado, 'pendiente'));
+    /* Los hechos con plata que todavía no cubre ninguna factura: los que se ofrecen al cargar una (0205). */
+    else if (filtro === 'disponibles') conds.push(inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA), sql`${sinFacturaEcheq} > ${EPS}`);
     else if (filtro === 'vencidos') {
-      conds.push(inArray(proveedorEcheqs.estado, ['emitido', 'entregado']), lt(proveedorEcheqs.fechaVenc, hoy));
+      conds.push(inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA), lt(proveedorEcheqs.fechaVenc, hoy));
     } else if (filtro === 'semana') {
-      conds.push(inArray(proveedorEcheqs.estado, ['emitido', 'entregado']));
+      conds.push(inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA));
       conds.push(gte(proveedorEcheqs.fechaVenc, hoy), lt(proveedorEcheqs.fechaVenc, new Date(hoy.getTime() + 8 * 86400000)));
     } else if (filtro === 'cobrados') conds.push(eq(proveedorEcheqs.estado, 'cobrado'));
     else if (filtro === 'anulados') conds.push(eq(proveedorEcheqs.estado, 'anulado'));
@@ -477,7 +551,7 @@ export class FinanzasProveedorService {
       .orderBy(proveedorEcheqs.fechaVenc, desc(proveedorEcheqs.id))
       .limit(500);
     return {
-      filas: filas.map((f) => ({ ...f, diasRest: diasHasta(f.fechaVenc) })),
+      filas: await this.conFacturas(filas),
       total: filas.length,
       totalImporte: money(filas.reduce((a, f) => a + f.importe, 0)),
     };
@@ -485,7 +559,8 @@ export class FinanzasProveedorService {
 
   async statsEcheqs() {
     const hoy = hoy0();
-    const activos = inArray(proveedorEcheqs.estado, ['emitido', 'entregado']);
+    /* Solo los hechos: el pendiente de confirmar (0204) no es plata que se vaya a debitar — va aparte. */
+    const activos = inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA);
     const [r] = await this.db.select({
       activosN: sql<number>`count(*)::int`,
       activosM: sql<number>`coalesce(sum(${proveedorEcheqs.importe}), 0)`,
@@ -512,7 +587,12 @@ export class FinanzasProveedorService {
       .where(activos)
       .orderBy(proveedorEcheqs.fechaVenc, proveedorEcheqs.id)
       .limit(6);
+    const [pend] = await this.db.select({
+      n: sql<number>`count(*)::int`,
+      monto: sql<number>`coalesce(sum(${proveedorEcheqs.importe}), 0)`,
+    }).from(proveedorEcheqs).where(eq(proveedorEcheqs.estado, 'pendiente'));
     return {
+      pendientes: { n: Number(pend?.n) || 0, monto: money(Number(pend?.monto) || 0) },
       activos: { n: Number(r?.activosN) || 0, monto: money(Number(r?.activosM) || 0) },
       vencidos: { n: Number(r?.vencidosN) || 0, monto: money(Number(r?.vencidosM) || 0) },
       prox3: { n: Number(r?.prox3N) || 0, monto: money(Number(r?.prox3M) || 0) },
@@ -528,7 +608,8 @@ export class FinanzasProveedorService {
       .leftJoin(proveedores, eq(proveedores.id, proveedorEcheqs.proveedorId))
       .where(eq(proveedorEcheqs.id, id)).limit(1);
     if (!f) throw new NotFoundException('Echeq inexistente.');
-    return { ...f, diasRest: diasHasta(f.fechaVenc) };
+    const [e] = await this.conFacturas([f]);
+    return e;
   }
 
   async crearEcheq(dto: EcheqDto) {
@@ -559,35 +640,50 @@ export class FinanzasProveedorService {
   async editarEcheq(id: number, dto: EcheqDto) {
     const e = await this.getEcheq(id);
     if (e.estado === 'cobrado') throw new BadRequestException('El echeq ya se cobró: el pago quedó registrado y no se reescribe.');
-    /* El importe del echeq que nació de una factura ES el de su compromiso:
-     * se corrige editando el compromiso (o la factura), no el papel. */
-    if (dto.importe != null && e.compromisoId) {
-      throw new BadRequestException('Este echeq nació de una factura: su importe es el del compromiso.');
-    }
     if (e.estado === 'anulado') throw new BadRequestException('Ese echeq está anulado: no se edita.');
+    if (e.estado === 'pendiente') {
+      throw new BadRequestException('Ese echeq todavía no está confirmado: sus datos se cargan con «Confirmar».');
+    }
+    /* No baja de lo que ya cubre de sus facturas (0205): primero se le sacan facturas. */
+    const cubre = money(e.importe - e.sinFactura);
+    if (dto.importe != null && cubre - money(dto.importe) > EPS) {
+      throw new BadRequestException(
+        `El echeq cubre $ ${cubre.toFixed(2)} de sus facturas: no puede ser de menos. Primero sacale facturas con «Facturas».`,
+      );
+    }
+    const fechaVenc = dto.fechaVenc ? fecha0(dto.fechaVenc) : null;
+    if (fechaVenc || dto.fechaEmision) {
+      this.exigirOrdenFechas(dto.fechaEmision ? fecha0(dto.fechaEmision) : e.fechaEmision, fechaVenc ?? e.fechaVenc);
+    }
     if (dto.numero !== undefined || dto.banco !== undefined) {
       await this.exigirEcheqUnico(dto.numero ?? e.numero, dto.banco ?? e.banco, id);
     }
     /* El nombre del que no es proveedor se corrige; el proveedor de un echeq no se cambia. */
     const destinatario = dto.destinatario !== undefined && !e.proveedorId ? dto.destinatario.replace(/\s+/g, ' ').trim() : undefined;
     if (destinatario === '') throw new BadRequestException('Escribí a nombre de quién va el echeq.');
-    await this.db.update(proveedorEcheqs).set({
-      ...(dto.numero !== undefined ? { numero: dto.numero.trim() } : {}),
-      ...(dto.banco !== undefined ? { banco: dto.banco.trim() } : {}),
-      ...(dto.importe != null && !e.compromisoId ? { importe: money(dto.importe) } : {}),
-      ...(dto.fechaEmision ? { fechaEmision: fecha0(dto.fechaEmision) } : {}),
-      ...(dto.fechaVenc ? { fechaVenc: fecha0(dto.fechaVenc) } : {}),
-      ...(dto.obs !== undefined ? { obs: dto.obs.trim() } : {}),
-      ...(destinatario !== undefined ? { destinatario } : {}),
-    }).where(eq(proveedorEcheqs.id, id));
+    await this.db.transaction(async (tx) => {
+      await tx.update(proveedorEcheqs).set({
+        ...(dto.numero !== undefined ? { numero: dto.numero.trim() } : {}),
+        ...(dto.banco !== undefined ? { banco: dto.banco.trim() } : {}),
+        ...(dto.importe != null ? { importe: money(dto.importe) } : {}),
+        ...(dto.fechaEmision ? { fechaEmision: fecha0(dto.fechaEmision) } : {}),
+        ...(fechaVenc ? { fechaVenc } : {}),
+        ...(dto.obs !== undefined ? { obs: dto.obs.trim() } : {}),
+        ...(destinatario !== undefined ? { destinatario } : {}),
+      }).where(eq(proveedorEcheqs.id, id));
+      /* UN SOLO DATO (0204): la fecha de cobro es el vencimiento de lo que cubre de cada factura. */
+      if (fechaVenc) {
+        await tx.update(proveedorCompromisos).set({ fechaVenc })
+          .where(and(eq(proveedorCompromisos.echeqId, id), eq(proveedorCompromisos.pagado, false)));
+      }
+    });
     return this.getEcheq(id);
   }
 
   /**
    * El cambio de estado del echeq. 'cobrado' es EL momento contable: el banco
-   * debitó — se crea el pago real (medio 'echeq', fecha = la del vencimiento,
-   * que es cuando se debita de verdad) y se aplica a la factura vía su
-   * compromiso. Los demás estados son seguimiento del papel.
+   * debitó — se crea el pago real (ver `cobrarEcheq`). Los demás estados son
+   * seguimiento del papel.
    */
   async estadoEcheq(id: number, estado: string, auth: Sesion) {
     const e = await this.getEcheq(id);
@@ -603,6 +699,9 @@ export class FinanzasProveedorService {
     if (e.estado === 'anulado') {
       throw new BadRequestException('Ese echeq está anulado: no vuelve a la cartera. Si se anuló por error, cargalo de nuevo.');
     }
+    if (e.estado === 'pendiente') {
+      throw new BadRequestException('Ese echeq todavía no está confirmado: primero confirmalo con sus datos reales, o marcá que no lo hiciste.');
+    }
     if (estado === 'cobrado') {
       /* EL BANCO NO LO DEBITA ANTES DE SU FECHA: marcarlo cobrado antes
        * registraba un pago fechado en el futuro (probado: uno de 2031). */
@@ -617,36 +716,284 @@ export class FinanzasProveedorService {
         await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' }).where(eq(proveedorEcheqs.id, id));
         return this.getEcheq(id);
       }
-      if (e.compromisoId) {
-        const k = await this.getCompromiso(e.compromisoId);
-        if (!k.pagado) {
-          await this.pagarCompromiso(k.id, { medio: 'echeq', fecha: aIso(e.fechaVenc) }, auth, true);
-        } else if (k.pagoId) {
-          // El compromiso ya se pagó por otro camino: solo linkear el papel.
-          await this.db.update(proveedorEcheqs).set({ estado: 'cobrado', pagoId: k.pagoId })
-            .where(eq(proveedorEcheqs.id, id));
-        }
-        return this.getEcheq(id);
-      }
       /* A un no proveedor (0201): el banco debitó y no hay cuenta corriente donde imputarlo. */
       if (!e.proveedorId) {
         await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' }).where(eq(proveedorEcheqs.id, id));
         return this.getEcheq(id);
       }
-      // Echeq suelto (sin compromiso): pago a cuenta del proveedor.
-      const pago = await this.pagos.crear({
+      return this.cobrarEcheq(e, auth);
+    }
+    await this.db.transaction(async (tx) => {
+      const [movido] = await tx.update(proveedorEcheqs).set({ estado: estado as any })
+        .where(and(eq(proveedorEcheqs.id, id), eq(proveedorEcheqs.estado, e.estado)))
+        .returning({ id: proveedorEcheqs.id });
+      if (!movido) throw new BadRequestException('El echeq cambió mientras tanto. Actualizá la pantalla.');
+      /* Anulado el papel, sus facturas siguen debiendo (0204): vuelven a Cuentas corrientes. */
+      if (estado === 'anulado') await deudaACuentaCorriente(tx, id);
+    });
+    return this.getEcheq(id);
+  }
+
+  /**
+   * EL BANCO DEBITÓ (0205): sale UN pago por el importe entero del echeq —lo
+   * que de verdad salió del banco—, imputado a lo que todavía falta de cada
+   * factura que cubre. Lo que sobra (era por más, o una factura se pagó por
+   * otro lado) queda a cuenta del proveedor; en cuenta libre va solo a lo más
+   * viejo. El echeq se toma antes de pagar, como la cuota: dos «Cobrar» a la
+   * vez no pagan dos veces, y si el pago falla vuelve a la cartera.
+   */
+  private async cobrarEcheq(e: any, auth: Sesion) {
+    const [tomado] = await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' })
+      .where(and(eq(proveedorEcheqs.id, e.id), inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA)))
+      .returning({ id: proveedorEcheqs.id });
+    if (!tomado) throw new BadRequestException('Ese echeq ya se cobró (o se está cobrando en este momento). Actualizá la pantalla.');
+    let queda = money(e.importe);
+    const imputaciones: Array<{ comprobanteId: number; importe: number }> = [];
+    for (const f of e.facturas) {
+      const importe = money(Math.min(f.falta, queda));
+      if (importe <= EPS) continue;
+      imputaciones.push({ comprobanteId: f.comprobanteId, importe });
+      queda = money(queda - importe);
+    }
+    let pago: any;
+    try {
+      pago = await this.pagos.crear({
         proveedorId: e.proveedorId,
+        ...(imputaciones.length ? { destino: 'mercaderia' as const } : {}),
         importe: money(e.importe),
         medio: 'echeq',
         fecha: aIso(e.fechaVenc),
         concepto: `Cobro de echeq ${e.numero || `#${e.id}`}${e.banco ? ` (${e.banco})` : ''}`,
         usuarioId: auth.usuarioId,
+        imputaciones,
       } as any, auth.sucursalId, esJefe(auth));
-      await this.db.update(proveedorEcheqs).set({ estado: 'cobrado', pagoId: pago.id })
-        .where(eq(proveedorEcheqs.id, id));
-      return this.getEcheq(id);
+    } catch (err) {
+      await this.db.update(proveedorEcheqs).set({ estado: e.estado }).where(eq(proveedorEcheqs.id, e.id));
+      throw err;
     }
-    await this.db.update(proveedorEcheqs).set({ estado: estado as any }).where(eq(proveedorEcheqs.id, id));
+    /* Lo que cubría queda pago con este pago (la factura que quedó saldada ya la cerró el puente). */
+    await this.db.transaction(async (tx) => {
+      await tx.update(proveedorEcheqs).set({ pagoId: pago.id }).where(eq(proveedorEcheqs.id, e.id));
+      await tx.update(proveedorCompromisos).set({ pagado: true, pagoId: pago.id })
+        .where(and(eq(proveedorCompromisos.echeqId, e.id), eq(proveedorCompromisos.pagado, false)));
+    });
+    return this.getEcheq(e.id);
+  }
+
+  /**
+   * LAS FACTURAS QUE CUBRE UN ECHEQ (0205, pedido del dueño: el echeq se hace
+   * antes y la factura llega días después, y muchas veces uno cubre varias).
+   * Se manda la lista entera —0 o ausente la saca— y queda así. En cada
+   * factura el echeq toma el lugar de la promesa que había (ver `hacerLugar`).
+   */
+  async imputarEcheq(id: number, dto: ImputarEcheqDto, usuarioId: number | null) {
+    const e = await this.getEcheq(id);
+    if (!e.proveedorId) throw new BadRequestException('Ese echeq no es a un proveedor: no tiene facturas que cubrir.');
+    if (!ECHEQ_EN_CARTERA.includes(e.estado)) {
+      throw new BadRequestException(e.estado === 'pendiente'
+        ? 'Ese echeq todavía no está confirmado: primero confirmalo con sus datos reales.'
+        : 'Ese echeq ya no está en la cartera: sus facturas no se cambian.');
+    }
+    const nuevo = new Map<number, number>();
+    for (const f of dto.facturas) nuevo.set(f.comprobanteId, money((nuevo.get(f.comprobanteId) ?? 0) + f.importe));
+    const total = money([...nuevo.values()].reduce((a, n) => a + n, 0));
+    if (total - e.importe > EPS) {
+      throw new BadRequestException(`El echeq es de $ ${money(e.importe).toFixed(2)} y las facturas suman $ ${total.toFixed(2)}.`);
+    }
+    await this.db.transaction(async (tx) => {
+      const docs = await this.pagos.documentosPendientes(e.proveedorId!, 'mercaderia', tx);
+      const etiqueta = (c: number) => e.facturas.find((f: any) => f.comprobanteId === c)?.etiqueta
+        ?? docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c)?.etiqueta ?? `comprobante #${c}`;
+      const antes = new Map<number, number>(e.facturas.map((f: any) => [f.comprobanteId, f.importe]));
+      /* Primero lo que baja: lo que se le saca a una factura queda libre para otra en el mismo guardado. */
+      const cambios = [...new Set([...antes.keys(), ...nuevo.keys()])]
+        .map((c) => ({ c, ahora: nuevo.get(c) ?? 0, delta: (nuevo.get(c) ?? 0) - (antes.get(c) ?? 0) }))
+        .sort((a, b) => a.delta - b.delta);
+      for (const { c, ahora } of cambios) {
+        if (ahora <= EPS) {
+          await tx.delete(proveedorCompromisos).where(and(
+            eq(proveedorCompromisos.echeqId, id), eq(proveedorCompromisos.comprobanteId, c), eq(proveedorCompromisos.pagado, false),
+          ));
+          continue;
+        }
+        const doc = docs.find((d: any) => d.tipo === 'comprobante' && d.docId === c);
+        if (!doc) throw new BadRequestException(`${etiqueta(c)} ya no debe nada o no es de este proveedor. Actualizá la pantalla.`);
+        await this.hacerLugar(tx, id, doc, ahora);
+        await imputarEcheqTx(tx, { echeqId: id, proveedorId: e.proveedorId!, comprobanteId: c, importe: ahora });
+      }
+      const legible = (m: Map<number, number>) => [...m].filter(([, n]) => n > EPS)
+        .map(([c, n]) => `${etiqueta(c)} $ ${money(n).toFixed(2)}`).join(' · ') || 'ninguna';
+      await this.audit.registrar([{
+        entidad: 'proveedor', entidadId: e.proveedorId!, ambito: 'Echeqs',
+        campo: `Echeq #${id}: facturas que cubre`,
+        antes: legible(antes),
+        despues: legible(nuevo),
+        usuarioId,
+      }], tx);
+    });
+    return this.getEcheq(id);
+  }
+
+  /**
+   * EL ECHEQ OCUPA EL LUGAR DE LA PROMESA QUE HABÍA (0205). Lo pendiente de una
+   * factura nunca pasa de su saldo: si con esta parte del echeq se pasa, se
+   * achica lo que había —la cuenta corriente, o el echeq automático que nadie
+   * confirmó (que se cae si queda en cero)—, desde lo que vence último. Lo que
+   * cubre otro echeq ya hecho es un papel en el banco y no se toca: si no hay
+   * lugar, no se imputa.
+   */
+  private async hacerLugar(tx: any, echeqId: number, doc: { docId: number; etiqueta: string; saldo: number }, importe: number) {
+    const otros = await tx.select({
+      id: proveedorCompromisos.id,
+      importe: proveedorCompromisos.importe,
+      echeqId: proveedorCompromisos.echeqId,
+      echeqEstado: sql<string | null>`(select e.estado::text from proveedor_echeqs e where e.id = proveedor_compromisos.echeq_id)`,
+    }).from(proveedorCompromisos).where(and(
+      eq(proveedorCompromisos.comprobanteId, doc.docId),
+      eq(proveedorCompromisos.pagado, false),
+      or(isNull(proveedorCompromisos.echeqId), ne(proveedorCompromisos.echeqId, echeqId)),
+    )).orderBy(desc(proveedorCompromisos.fechaVenc), desc(proveedorCompromisos.id));
+    const firme = (k: any) => !!k.echeqId && k.echeqEstado !== 'pendiente';
+    const deOtros = money(otros.filter(firme).reduce((a: number, k: any) => a + k.importe, 0));
+    const lugar = money(doc.saldo - deOtros);
+    if (importe - lugar > EPS) {
+      throw new BadRequestException(
+        `${doc.etiqueta} debe $ ${money(doc.saldo).toFixed(2)}${deOtros > EPS ? ` y otros echeqs ya le cubren $ ${deOtros.toFixed(2)}` : ''}: `
+        + `este puede cubrirle hasta $ ${Math.max(0, lugar).toFixed(2)}.`,
+      );
+    }
+    let exceso = money(otros.reduce((a: number, k: any) => a + k.importe, 0) + importe - doc.saldo);
+    for (const k of otros) {
+      if (exceso <= EPS) break;
+      if (firme(k)) continue;
+      const queda = money(k.importe - Math.min(k.importe, exceso));
+      exceso = money(exceso - (k.importe - queda));
+      if (queda <= EPS) {
+        await tx.delete(proveedorCompromisos).where(eq(proveedorCompromisos.id, k.id));
+        if (k.echeqId) await tx.delete(proveedorEcheqs).where(and(eq(proveedorEcheqs.id, k.echeqId), eq(proveedorEcheqs.estado, 'pendiente')));
+        continue;
+      }
+      await tx.update(proveedorCompromisos).set({ importe: queda }).where(eq(proveedorCompromisos.id, k.id));
+      if (k.echeqId) {
+        await tx.update(proveedorEcheqs).set({ importe: queda })
+          .where(and(eq(proveedorEcheqs.id, k.echeqId), eq(proveedorEcheqs.estado, 'pendiente')));
+      }
+    }
+  }
+
+  /** «Pendiente · $X · cobra 10/11/2026» y parecidos, para la auditoría. */
+  private legibleEcheq(x: { numero?: string; banco?: string; importe: number; fechaVenc: Date }) {
+    const papel = x.numero && !x.numero.startsWith('PEND-') ? `N° ${x.numero}${x.banco ? ` (${x.banco})` : ''} · ` : '';
+    return `${papel}$ ${money(x.importe).toFixed(2)} · cobra ${aIso(new Date(x.fechaVenc)).split('-').reverse().join('/')}`;
+  }
+
+  /**
+   * CONFIRMAR EL ECHEQ AUTOMÁTICO (0204): el dueño lo hizo de verdad, y acá
+   * van los datos del papel; recién ahí pasa a la cartera como emitido. Un
+   * solo dato para cada cosa: la fecha de cobro es el vencimiento de su
+   * compromiso, y si lo hizo por MENOS de lo que decía, el compromiso baja a
+   * ese importe y el resto queda como deuda común en Cuentas corrientes, con
+   * el vencimiento que tenía. Por más no: el echeq paga su factura.
+   */
+  async confirmarEcheq(id: number, dto: ConfirmarEcheqDto, usuarioId: number | null) {
+    const numero = dto.numero.trim();
+    const banco = dto.banco.trim();
+    if (!numero || numero.toUpperCase().startsWith('PEND-')) throw new BadRequestException('Escribí el número real del echeq.');
+    if (!banco || banco.toLowerCase() === 'a definir') throw new BadRequestException('Escribí el banco del echeq.');
+    const importe = money(dto.importe);
+    const fechaVenc = fecha0(dto.fechaVenc);
+    const fechaEmision = dto.fechaEmision ? fecha0(dto.fechaEmision) : hoy0();
+    if (fechaVenc.getTime() < fechaEmision.getTime()) {
+      throw new BadRequestException('La fecha de cobro no puede ser anterior a la emisión del echeq.');
+    }
+    const e = await this.getEcheq(id);
+    if (e.estado !== 'pendiente') throw new BadRequestException('Ese echeq ya no está pendiente de confirmar. Actualizá la pantalla.');
+    // El automático tiene un solo compromiso: la cuota de la factura con la que nació.
+    const [suyo] = await this.db.select({ id: proveedorCompromisos.id }).from(proveedorCompromisos)
+      .where(eq(proveedorCompromisos.echeqId, id)).orderBy(desc(proveedorCompromisos.id)).limit(1);
+    const k = suyo ? await this.getCompromiso(suyo.id) : null;
+    if (k) {
+      if (k.pagado) throw new BadRequestException('Esa factura ya se pagó: el echeq no hace falta.');
+      if (importe - k.importe > EPS) {
+        throw new BadRequestException(
+          `El echeq paga esta factura: puede ser de hasta $ ${money(k.importe).toFixed(2)}. Si hiciste uno por más, cargá la diferencia como otro echeq.`,
+        );
+      }
+      this.exigirOrdenFechas(k.fechaEmision, fechaVenc);
+    }
+    /* El resto nunca pasa de lo que la factura todavía debe: si se pagó una parte por otro lado,
+     * no vuelve a Cuentas corrientes una deuda que ya no existe. */
+    const libre = k?.comprobanteId ? await this.exigirTopeCuotas(k.comprobanteId, k.proveedorId, k.id, importe) : Infinity;
+    const resto = k ? Math.max(0, money(Math.min(k.importe, libre) - importe)) : 0;
+    await this.exigirEcheqUnico(numero, banco, id);
+
+    await this.db.transaction(async (tx) => {
+      /* EL PRIMERO GANA: dos «Confirmar» a la vez, o el pago que saldó la factura mientras tanto. */
+      const [tomado] = await tx.update(proveedorEcheqs).set({
+        estado: 'emitido', numero, banco, importe, fechaEmision, fechaVenc, obs: (dto.obs ?? '').trim(),
+      }).where(and(eq(proveedorEcheqs.id, id), eq(proveedorEcheqs.estado, 'pendiente')))
+        .returning({ id: proveedorEcheqs.id });
+      if (!tomado) throw new BadRequestException('Ese echeq ya se confirmó o se dio de baja mientras tanto. Actualizá la pantalla.');
+      if (k) {
+        const [vivo] = await tx.update(proveedorCompromisos).set({ importe, fechaVenc })
+          .where(and(eq(proveedorCompromisos.id, k.id), eq(proveedorCompromisos.pagado, false)))
+          .returning({ id: proveedorCompromisos.id });
+        if (!vivo) throw new BadRequestException('Esa factura se pagó mientras tanto: el echeq no hace falta. Actualizá la pantalla.');
+        if (resto > EPS) {
+          await tx.insert(proveedorCompromisos).values({
+            proveedorId: k.proveedorId,
+            comprobanteId: k.comprobanteId,
+            importe: resto,
+            fechaEmision: k.fechaEmision,
+            fechaVenc: k.fechaVenc,
+            origen: k.origen,
+            cuota: k.cuota,
+            cuotas: k.cuotas,
+            obs: `Lo que no cubrió el echeq N° ${numero} (${banco}).`,
+          });
+        }
+      }
+      if (e.proveedorId) {
+        await this.audit.registrar([{
+          entidad: 'proveedor', entidadId: e.proveedorId, ambito: 'Echeqs',
+          campo: `Echeq #${id} confirmado`,
+          antes: `Pendiente · ${this.legibleEcheq(e)}`,
+          despues: this.legibleEcheq({ numero, banco, importe, fechaVenc })
+            + (resto > EPS ? ` · el resto ($ ${resto.toFixed(2)}) quedó en Cuentas corrientes` : ''),
+          usuarioId,
+        }], tx);
+      }
+    });
+    return this.getEcheq(id);
+  }
+
+  /**
+   * «NO LO HICE» (0204): el echeq automático no se hizo. Se da de baja —queda
+   * en Anulados con el porqué— y la deuda vuelve a Cuentas corrientes como
+   * deuda común: no se pierde, se paga como se pague.
+   */
+  async descartarEcheq(id: number, usuarioId: number | null) {
+    const e = await this.getEcheq(id);
+    if (e.estado !== 'pendiente') {
+      throw new BadRequestException('Solo se da de baja así un echeq pendiente de confirmar; uno ya emitido se anula.');
+    }
+    await this.db.transaction(async (tx) => {
+      const [tomado] = await tx.update(proveedorEcheqs)
+        .set({ estado: 'anulado', obs: 'No se hizo: la deuda volvió a Cuentas corrientes.' })
+        .where(and(eq(proveedorEcheqs.id, id), eq(proveedorEcheqs.estado, 'pendiente')))
+        .returning({ id: proveedorEcheqs.id });
+      if (!tomado) throw new BadRequestException('Ese echeq ya se confirmó o se dio de baja mientras tanto. Actualizá la pantalla.');
+      await deudaACuentaCorriente(tx, id);
+      if (e.proveedorId) {
+        await this.audit.registrar([{
+          entidad: 'proveedor', entidadId: e.proveedorId, ambito: 'Echeqs',
+          campo: `Echeq #${id}: no se hizo`,
+          antes: `Pendiente · ${this.legibleEcheq(e)}`,
+          despues: 'Dado de baja: la deuda volvió a Cuentas corrientes',
+          usuarioId,
+        }], tx);
+      }
+    });
     return this.getEcheq(id);
   }
 
@@ -675,6 +1022,10 @@ export class FinanzasProveedorService {
     if (e.estado === 'cobrado' || e.pagoId) {
       throw new BadRequestException('El echeq ya se cobró: tiene un pago atrás. Anulá el pago primero si está mal.');
     }
+    if (e.estado === 'pendiente') {
+      throw new BadRequestException('Un echeq pendiente no se borra: marcá «No lo hice» y la deuda vuelve a Cuentas corrientes.');
+    }
+    /* Lo que cubría de sus facturas vuelve a Cuentas corrientes: la FK de `echeq_id` lo suelta (SET NULL). */
     await this.db.delete(proveedorEcheqs).where(eq(proveedorEcheqs.id, id));
     return { ok: true };
   }
@@ -691,7 +1042,7 @@ export class FinanzasProveedorService {
    * bug de "los números no cuadran entre pantallas" de la app vieja.
    */
   async edocGlobal() {
-    const [compAgg, gastoAgg, pagoAgg, ajusteAgg, compromAgg, provs] = await Promise.all([
+    const [compAgg, gastoAgg, pagoAgg, ajusteAgg, compromAgg, echeqAgg, provs] = await Promise.all([
       this.db.select({
         proveedorId: comprobantes.proveedorId,
         deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
@@ -718,10 +1069,17 @@ export class FinanzasProveedorService {
       }).from(proveedorAjustes).groupBy(proveedorAjustes.proveedorId),
       this.db.select({
         proveedorId: proveedorCompromisos.proveedorId,
-        pendiente: sql<number>`coalesce(sum(${proveedorCompromisos.importe}), 0)`,
+        pendiente: sql<number>`coalesce(sum(${faltaCompromiso}), 0)`,
       }).from(proveedorCompromisos)
         .where(eq(proveedorCompromisos.pagado, false))
         .groupBy(proveedorCompromisos.proveedorId),
+      /* Lo que los echeqs hechos no cubren de ninguna factura (0205): igual se va a debitar. */
+      this.db.select({
+        proveedorId: proveedorEcheqs.proveedorId,
+        sinFactura: sql<number>`coalesce(sum(${sinFacturaEcheq}), 0)`,
+      }).from(proveedorEcheqs)
+        .where(inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA))
+        .groupBy(proveedorEcheqs.proveedorId),
       this.db.select({
         id: proveedores.id, nombre: proveedores.nombre, diasPago: proveedores.diasPago,
         modoCuenta: proveedores.modoCuenta, medioHabitual: proveedores.medioHabitual,
@@ -765,6 +1123,7 @@ export class FinanzasProveedorService {
       new Map(xs.filter((x) => x.proveedorId != null).map((x) => [x.proveedorId as number, x]));
     const mComp = porId(compAgg); const mGasto = porId(gastoAgg);
     const mPago = porId(pagoAgg); const mAjuste = porId(ajusteAgg); const mComprom = porId(compromAgg);
+    const mEcheq = porId(echeqAgg);
 
     const hoy = hoy0();
     const filas: any[] = [];
@@ -773,7 +1132,7 @@ export class FinanzasProveedorService {
       const gastosTot = money(Number(mGasto.get(p.id)?.deuda) || 0);
       const pagado = money(Number(mPago.get(p.id)?.pagado) || 0);
       const ajustes = money(Number(mAjuste.get(p.id)?.ajustes) || 0);
-      const pendientes = money(Number(mComprom.get(p.id)?.pendiente) || 0);
+      const pendientes = money((Number(mComprom.get(p.id)?.pendiente) || 0) + (Number(mEcheq.get(p.id)?.sinFactura) || 0));
       if (!mercaderia && !gastosTot && !pagado && !ajustes && !pendientes) continue;
       /*
        * ESTA VITRINA ES LA CUENTA POR PAGAR DE LA MERCADERÍA (decisión del
@@ -826,7 +1185,7 @@ export class FinanzasProveedorService {
       .where(eq(proveedores.id, proveedorId)).limit(1);
     if (!prov) throw new NotFoundException('Proveedor inexistente.');
 
-    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit, deCuentaDisp] = await Promise.all([
+    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit, deCuentaDisp, echeqs] = await Promise.all([
       this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -883,6 +1242,8 @@ export class FinanzasProveedorService {
       }).from(cuentaDisponiblePagos)
         .innerJoin(cuentasDisponibles, eq(cuentasDisponibles.id, cuentaDisponiblePagos.cuentaId))
         .where(and(eq(cuentasDisponibles.proveedorId, proveedorId), isNull(cuentaDisponiblePagos.anuladoEn))),
+      /* Los echeqs que todavía no se debitaron (0205), con las facturas que cubren. */
+      this.listarEcheqs({ filtro: 'activos', proveedorId }),
     ]);
 
     const formasPorPago = new Map<number, any[]>();
@@ -1114,6 +1475,7 @@ export class FinanzasProveedorService {
       pagosSinAplicar,
       docsPendientes,
       compromisos: compromisos.map((k) => this.mapCompromiso(k)),
+      echeqs: echeqs.filas,
       cuentas,
     };
   }
@@ -1249,6 +1611,19 @@ export class EcheqsController {
       throw new ForbiddenException('Marcar un echeq como cobrado registra el pago: necesita permiso de pagos a proveedores.');
     }
     return this.svc.estadoEcheq(id, dto.estado, auth);
+  }
+  @Post(':id/confirmar') confirmar(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: ConfirmarEcheqDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.confirmarEcheq(id, dto, auth.usuarioId ?? null);
+  }
+  @Patch(':id/facturas') facturas(
+    @Param('id', ParseIntPipe) id: number, @Body() dto: ImputarEcheqDto, @Auth() auth: Sesion,
+  ) {
+    return this.svc.imputarEcheq(id, dto, auth.usuarioId ?? null);
+  }
+  @Post(':id/no-se-hizo') descartar(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
+    return this.svc.descartarEcheq(id, auth.usuarioId ?? null);
   }
   @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrarEcheq(id); }
 }

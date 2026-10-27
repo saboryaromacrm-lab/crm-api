@@ -8,6 +8,7 @@ import {
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { facturaLecturas, productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
 import { esNombreCoffit, sincronizarProveedorCoffit } from '../productos/proveedorCoffit';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
@@ -100,6 +101,7 @@ export class ProveedoresService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly audit: AuditoriaService,
+    private readonly pagos: PagosProveedorService,
   ) {}
 
   /** La foto legible de lo auditable de la ficha, para comparar antes/después. */
@@ -254,6 +256,9 @@ export class ProveedoresService {
     }).where(eq(proveedores.id, id)).returning();
     if (cambiaCuit) await this.engancharFacturas(p);
     if (cambiaNombre && esNombreCoffit(p.nombre)) await sincronizarProveedorCoffit(this.db);
+    /* En cuenta libre lo pagado va a lo más viejo (27/10/2026): guardar la ficha
+     * aplica lo que haya quedado sin aplicar (también al pasarlo a cuenta libre). */
+    await this.pagos.aplicarCuentaLibre(id);
 
     /* AUDITORÍA (0086): la identidad y la ficha comercial, campo por campo.
      * Se compara la FOTO legible antes/después — solo lo que cambió deja fila. */
@@ -619,7 +624,7 @@ export class ProveedoresController {
 }
 
 @Module({
-  imports: [AuditoriaModule],
+  imports: [AuditoriaModule, PagosModule],
   controllers: [ProveedoresController],
   providers: [ProveedoresService],
   exports: [ProveedoresService],

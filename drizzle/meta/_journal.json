@@ -1429,6 +1429,27 @@
       "when": 1793365200000,
       "tag": "0203_formato_display",
       "breakpoints": true
+    },
+    {
+      "idx": 204,
+      "version": "7",
+      "when": 1793451600000,
+      "tag": "0204_echeq_pendiente",
+      "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "7",
+      "when": 1793538000000,
+      "tag": "0205_echeq_varias_facturas",
+      "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "7",
+      "when": 1793624400000,
+      "tag": "0206_pedido_por_armar",
+      "breakpoints": true
     }
   ]
 }

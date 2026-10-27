@@ -3817,6 +3817,11 @@ export class VentasService {
     if (pre.reservado) {
       const preItems = await tx.select().from(presupuestoItems)
         .where(eq(presupuestoItems.presupuestoId, pre.id));
+      /* Los paquetes por armar se fraccionan al cargar lo armado (0206): sin eso la
+       * venta saldría con paquetes que el sistema no tiene. */
+      if (preItems.some((it: any) => it.porArmar > 0 && it.cantidadArmada == null)) {
+        throw new BadRequestException(`${pre.codigo} tiene paquetes por fraccionar: cargá lo armado antes de cerrarlo.`);
+      }
       // Con la sucursal DEL PRESUPUESTO: es donde está lo comprometido.
       await this.inv.reservarItems(tx, {
         sucursalId: pre.sucursalId, usuarioId: usuarioId ?? null, liberar: true,

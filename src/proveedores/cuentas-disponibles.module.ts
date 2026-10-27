@@ -40,6 +40,8 @@ import { alias } from 'drizzle-orm/pg-core';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { numeroDoc } from '../common/documentos';
+import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import {
   clientes, cobranzaPagos, cobranzas, cuentaDisponiblePagos, cuentasDisponibles,
   proveedorCuentas, proveedorPagos, proveedores, usuarios, ventaPagos, ventas,
@@ -52,7 +54,6 @@ const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_CUENTAS_BANCARIAS = 5;
 
 const fechaDe = (s?: string) => (s ? new Date(`${s}T00:00:00`) : undefined);
-const nro = (pv: string, n: number) => `${pv}-${String(n ?? 0).padStart(8, '0')}`;
 
 /* --------------------------------- DTOs --------------------------------- */
 
@@ -125,7 +126,10 @@ export interface ContextoCobro {
 
 @Injectable()
 export class CuentasDisponiblesService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly pagosProv: PagosProveedorService,
+  ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
 
@@ -447,8 +451,8 @@ export class CuentasDisponiblesService {
     }
 
     /* El espejo en la cuenta del proveedor: un pago a cuenta, sin caja (la
-     * plata no salió de ningún cajón) y sin aplicar — cuando se cargue la
-     * factura, Pagos avisa que hay plata sin aplicar, como con cualquier pago. */
+     * plata no salió de ningún cajón). Sin aplicar, salvo en cuenta libre: ahí
+     * va solo a lo más viejo que se le debe (27/10/2026). */
     const destino = prov.proveeGastos && !prov.proveeMercaderia ? 'gastos' : 'mercaderia';
     const [pp] = await tx.insert(proveedorPagos).values({
       proveedorId: c.proveedorId,
@@ -472,6 +476,7 @@ export class CuentasDisponiblesService {
       proveedorPagoId: pp.id,
       usuarioId: ctx.usuarioId ?? null,
     });
+    await this.pagosProv.aplicarCuentaLibre(c.proveedorId, tx);
 
     return {
       referencia: `${prov.nombre} · ${c.titular} · ${c.cbuAlias}`,
@@ -532,6 +537,7 @@ export class CuentasDisponiblesService {
         cuentaId: c.id, importe, fecha, propio: true, proveedorPagoId: pp.id, usuarioId,
         observaciones: [ref, obs].filter(Boolean).join(' · '),
       });
+      await this.pagosProv.aplicarCuentaLibre(c.proveedorId, tx);
     });
     return this.get(id);
   }
@@ -577,7 +583,9 @@ export class CuentasDisponiblesService {
    * La venta (o el recibo) se anula: sus transferencias mueren con ella, y con
    * cada una su espejo en la cuenta del proveedor. Si el espejo ya se aplicó
    * a una factura, se frena TODO: desaplicar a escondidas sería mover plata
-   * de la cuenta del proveedor sin que nadie lo decida.
+   * de la cuenta del proveedor sin que nadie lo decida. Salvo en CUENTA LIBRE
+   * (27/10/2026): ahí lo aplicó el sistema solo, y la plata que nunca llegó
+   * sale de la factura sola; la otra plata sin aplicar ocupa su lugar.
    */
   private async anularPagos(tx: any, cond: any, motivo: string, como = 'Anulado con su cobro') {
     const filas = await tx.select({
@@ -586,10 +594,16 @@ export class CuentasDisponiblesService {
     }).from(cuentaDisponiblePagos).where(and(cond, isNull(cuentaDisponiblePagos.anuladoEn))).for('update');
     if (!filas.length) return 0;
 
+    const libres = new Set<number>();
     for (const f of filas) {
       const [pp] = await tx.select().from(proveedorPagos)
         .where(eq(proveedorPagos.id, f.proveedorPagoId)).limit(1).for('update');
-      if (pp && pp.aplicado > EPS) {
+      const [cuenta] = pp ? await tx.select({ modo: proveedores.modoCuenta }).from(proveedores)
+        .where(eq(proveedores.id, pp.proveedorId)).limit(1) : [];
+      if (pp && pp.aplicado > EPS && cuenta?.modo === 'libre') {
+        await this.pagosProv.quitarAplicaciones(tx, pp.id);
+        libres.add(pp.proveedorId);
+      } else if (pp && pp.aplicado > EPS) {
         const [c] = await tx.select({ titular: cuentasDisponibles.titular, proveedorId: cuentasDisponibles.proveedorId })
           .from(cuentasDisponibles).where(eq(cuentasDisponibles.id, f.cuentaId)).limit(1);
         const [prov] = await tx.select({ nombre: proveedores.nombre }).from(proveedores)
@@ -608,6 +622,7 @@ export class CuentasDisponiblesService {
     }
     await tx.update(cuentaDisponiblePagos).set({ anuladoEn: new Date() })
       .where(inArray(cuentaDisponiblePagos.id, filas.map((f: any) => f.id)));
+    for (const proveedorId of libres) await this.pagosProv.aplicarCuentaLibre(proveedorId, tx);
     return filas.length;
   }
 
@@ -623,30 +638,6 @@ export class CuentasDisponiblesService {
       .map((x: any) => x.id);
     if (!ids.length) return 0;
     return this.anularPagos(tx, inArray(cuentaDisponiblePagos.cobranzaPagoId, ids), motivo);
-  }
-
-  /**
-   * Para el candado de Pagos: si este pago al proveedor es el espejo de una
-   * transferencia viva, devuelve de qué cobro vino. Desde ahí no se anula.
-   */
-  async origenDe(tx: any, proveedorPagoId: number): Promise<string | null> {
-    const [f] = await tx.select({
-      ventaPagoId: cuentaDisponiblePagos.ventaPagoId, cobranzaPagoId: cuentaDisponiblePagos.cobranzaPagoId, propio: cuentaDisponiblePagos.propio,
-    }).from(cuentaDisponiblePagos)
-      .where(and(eq(cuentaDisponiblePagos.proveedorPagoId, proveedorPagoId), isNull(cuentaDisponiblePagos.anuladoEn)))
-      .limit(1);
-    if (!f) return null;
-    if (f.propio) return 'su pago propio (en Proveedores › Cuentas disponibles › Pagos)';
-    if (f.ventaPagoId) {
-      const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
-        .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
-        .where(eq(ventaPagos.id, f.ventaPagoId)).limit(1);
-      return v ? `la venta ${nro(v.puntoVenta, v.numero)}` : 'una venta';
-    }
-    const [r] = await tx.select({ puntoVenta: cobranzas.puntoVenta, numero: cobranzas.numero })
-      .from(cobranzaPagos).innerJoin(cobranzas, eq(cobranzas.id, cobranzaPagos.cobranzaId))
-      .where(eq(cobranzaPagos.id, f.cobranzaPagoId!)).limit(1);
-    return r ? `el recibo ${nro(r.puntoVenta, r.numero)}` : 'un recibo';
   }
 
   /* ------------------------------ Pagos ------------------------------ */
@@ -712,9 +703,9 @@ export class CuentasDisponiblesService {
       documento: f.propio
         ? { clase: 'propio', id: f.id, tipo: 'propio', etiqueta: 'Transferencia propia' }
         : f.ventaId
-        ? { clase: 'venta', id: f.ventaId, tipo: f.ventaTipo, etiqueta: nro(f.ventaPuntoVenta!, f.ventaNumero!) }
+        ? { clase: 'venta', id: f.ventaId, tipo: f.ventaTipo, etiqueta: numeroDoc(f.ventaPuntoVenta!, f.ventaNumero!) }
         : f.cobranzaId
-          ? { clase: 'recibo', id: f.cobranzaId, tipo: 'recibo', etiqueta: nro(f.cobranzaPuntoVenta!, f.cobranzaNumero!) }
+          ? { clase: 'recibo', id: f.cobranzaId, tipo: 'recibo', etiqueta: numeroDoc(f.cobranzaPuntoVenta!, f.cobranzaNumero!) }
           : null,
     }));
     const vivos = lista.filter((x) => !x.anuladoEn);
@@ -822,6 +813,7 @@ export class CuentasDisponiblesController {
 }
 
 @Module({
+  imports: [PagosModule],
   controllers: [CuentasDisponiblesController],
   providers: [CuentasDisponiblesService],
   exports: [CuentasDisponiblesService],

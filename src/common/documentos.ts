@@ -36,6 +36,9 @@ export const ABREV_TIPO: Record<string, string> = {
  *
  * El relleno a 8 dígitos es el del papel: así lo imprime ARCA y así se busca.
  */
+/** «0001-00001234»: punto de venta y número de una venta o un recibo. */
+export const numeroDoc = (pv: string, n: number) => `${pv}-${String(n ?? 0).padStart(8, '0')}`;
+
 export const etiquetaDoc = (c: {
   tipo: string;
   letra?: string | null;
