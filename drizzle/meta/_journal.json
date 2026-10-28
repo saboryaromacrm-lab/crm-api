@@ -1450,6 +1450,13 @@
       "when": 1793624400000,
       "tag": "0206_pedido_por_armar",
       "breakpoints": true
+    },
+    {
+      "idx": 207,
+      "version": "7",
+      "when": 1793628000000,
+      "tag": "0207_cuentas_propias",
+      "breakpoints": true
     }
   ]
 }

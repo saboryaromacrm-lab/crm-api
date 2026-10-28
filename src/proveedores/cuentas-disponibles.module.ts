@@ -42,6 +42,7 @@ import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { numeroDoc } from '../common/documentos';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { cuentaDeTransferencia } from '../pagos/cuentas-propias';
 import {
   clientes, cobranzaPagos, cobranzas, cuentaDisponiblePagos, cuentasDisponibles,
   proveedorCuentas, proveedorPagos, proveedores, usuarios, ventaPagos, ventas,
@@ -80,9 +81,11 @@ export class CrearCuentaDto {
 export class PagoPropioDto {
   @IsNumber() @Min(0.01, { message: 'El importe tiene que ser mayor a 0.' }) @Max(1_000_000_000) importe!: number;
   @IsOptional() @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha?: string;
-  /** El número de operación o desde qué cuenta salió: va en la referencia del pago. */
+  /** El número de operación: va en la referencia del pago. */
   @IsOptional() @IsString() @MaxLength(120) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
+  /** De qué cuenta propia salió la transferencia (0207). */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
 }
 
 export class AnularPagoPropioDto {
@@ -504,6 +507,7 @@ export class CuentasDisponiblesService {
     }
     const ref = String(dto.referencia ?? '').trim();
     const obs = String(dto.observaciones ?? '').trim();
+    const cuentaPropiaId = await cuentaDeTransferencia(this.db, 'transferencia', dto.cuentaPropiaId);
     await this.db.transaction(async (tx) => {
       const [c] = await tx.select().from(cuentasDisponibles).where(eq(cuentasDisponibles.id, id)).limit(1).for('update');
       if (!c) throw new NotFoundException('Esa cuenta disponible no existe.');
@@ -532,6 +536,7 @@ export class CuentasDisponiblesService {
         usuarioId,
         estado: 'activo',
         observaciones: obs,
+        cuentaPropiaId,
       }).returning({ id: proveedorPagos.id });
       await tx.insert(cuentaDisponiblePagos).values({
         cuentaId: c.id, importe, fecha, propio: true, proveedorPagoId: pp.id, usuarioId,

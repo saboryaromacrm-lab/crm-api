@@ -211,6 +211,8 @@ class PagoDto {
   @IsOptional() @IsString() referencia?: string;
   /** Efectivo por transferencia (0175): quién transfirió a cambio de nuestro efectivo; va con medio transferencia. */
   @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
+  /** De qué cuenta propia salió la transferencia (0207). */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
   /** Turno de caja del que sale el efectivo (genera el egreso). */
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -982,6 +984,7 @@ export class GastosService {
         fecha: dto.pagoInmediato.fecha,
         referencia: dto.pagoInmediato.referencia,
         cambioPor: dto.pagoInmediato.cambioPor,
+        cuentaPropiaId: dto.pagoInmediato.cuentaPropiaId,
         concepto: (descripcion ?? dto.descripcion ?? '').trim() || `Gasto #${creado.id}`,
         sucursalId: sucursalId ?? undefined,
         cajaSesionId: dto.pagoInmediato.cajaSesionId,
@@ -1261,6 +1264,7 @@ export class GastosService {
       fecha: dto.fecha,
       referencia: dto.referencia,
       cambioPor: dto.cambioPor,
+      cuentaPropiaId: dto.cuentaPropiaId,
       concepto: g.descripcion || `Gasto #${g.id}`,
       sucursalId: g.sucursalId ?? undefined,
       cajaSesionId: dto.cajaSesionId,

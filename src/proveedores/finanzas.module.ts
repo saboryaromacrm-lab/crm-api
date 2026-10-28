@@ -43,7 +43,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
 import { segunCorte, sinIvaHasta, ZONA_AR } from '../cafeteria/cuenta';
 import {
-  comprobantes, cuentaDisponiblePagos, cuentasDisponibles, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas,
+  comprobantes, cuentaDisponiblePagos, cuentasDisponibles, cuentasPropias, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
 } from '../db/schema';
 import { nombreMes } from './facturas-mes.module';
@@ -106,6 +106,8 @@ class PagarCompromisoDto {
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) obs?: string;
+  /** De qué cuenta propia salió la transferencia de un solo medio (0207); en partes, lo dice cada una. */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
 }
 
 /** LAS FACTURAS QUE CUBRE UN ECHEQ (0205): la lista entera; 0 o ausente la saca. */
@@ -457,6 +459,7 @@ export class FinanzasProveedorService {
       importe: importePago,
       medio: dto.formas?.length ? undefined : dto.medio,
       formas: dto.formas,
+      cuentaPropiaId: dto.cuentaPropiaId,
       fecha,
       concepto,
       referencia: dto.referencia,
@@ -1255,16 +1258,22 @@ export class FinanzasProveedorService {
         cajaSesionId: proveedorPagos.cajaSesionId,
         esFlete: proveedorPagos.esFlete,
         cambioPor: proveedorPagos.cambioPor,
+        cuentaPropiaNombre: cuentasPropias.nombre,
         usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
         sucursalNombre: sql<string>`coalesce(${sucursales.nombre}, '')`,
       }).from(proveedorPagos)
         .leftJoin(usuarios, eq(usuarios.id, proveedorPagos.usuarioId))
         .leftJoin(sucursales, eq(sucursales.id, proveedorPagos.sucursalId))
+        .leftJoin(cuentasPropias, eq(cuentasPropias.id, proveedorPagos.cuentaPropiaId))
         .where(and(
           eq(proveedorPagos.proveedorId, proveedorId), eq(proveedorPagos.estado, 'activo'),
         )),
       this.db.select().from(proveedorAjustes).where(eq(proveedorAjustes.proveedorId, proveedorId)),
-      this.db.select().from(pagoFormas)
+      this.db.select({
+        pagoId: pagoFormas.pagoId, medio: pagoFormas.medio, importe: pagoFormas.importe, fecha: pagoFormas.fecha,
+        cuentaPropiaNombre: cuentasPropias.nombre,
+      }).from(pagoFormas)
+        .leftJoin(cuentasPropias, eq(cuentasPropias.id, pagoFormas.cuentaPropiaId))
         .where(inArray(pagoFormas.pagoId,
           this.db.select({ id: proveedorPagos.id }).from(proveedorPagos)
             .where(and(eq(proveedorPagos.proveedorId, proveedorId), eq(proveedorPagos.estado, 'activo'))) as any)),
@@ -1295,7 +1304,7 @@ export class FinanzasProveedorService {
     const formasPorPago = new Map<number, any[]>();
     for (const f of formasTodas) {
       const arr = formasPorPago.get(f.pagoId) ?? [];
-      arr.push({ medio: f.medio, importe: f.importe, fecha: f.fecha });
+      arr.push({ medio: f.medio, importe: f.importe, fecha: f.fecha, cuentaPropiaNombre: f.cuentaPropiaNombre });
       formasPorPago.set(f.pagoId, arr);
     }
 
@@ -1406,6 +1415,8 @@ export class FinanzasProveedorService {
         esFlete: p.esFlete,
         /* Efectivo por transferencia (0175): quién hizo el cambio. */
         cambioPor: p.cambioPor,
+        /* De qué cuenta propia salió la transferencia (0207); en un pago mixto, en cada parte. */
+        cuentaPropiaNombre: p.cuentaPropiaNombre,
         formas,
         /* El pago se puede ANULAR desde el mayor, y solo si no tiene nada
          * aplicado: `sinAplicar` es lo que la pantalla mira para no ofrecer un

@@ -31,6 +31,7 @@ import { InventarioService } from '../inventario/inventario.service';
 import { costosFormato } from '../inventario/pricing';
 import { PreciosModule, PreciosService, aplicarCambioCosto } from '../precios/precios.module';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { cuentaDeTransferencia } from '../pagos/cuentas-propias';
 
 const TIPOS = ['orden_compra', 'remito', 'factura', 'liquidacion', 'nota_credito', 'nota_debito'] as const;
 
@@ -170,6 +171,8 @@ class PagoContadoDto {
   medio?: string;
   @IsOptional() @IsInt() cajaSesionId?: number;
   @IsOptional() @IsString() referencia?: string;
+  /** De qué cuenta propia salió la transferencia (0207). */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
 }
 
 /** Pago de sucursal YA registrado que este comprobante toma (total o parcial). */
@@ -1105,6 +1108,15 @@ export class ComprobantesService {
     }
   }
 
+  /**
+   * La cuenta propia del contado por transferencia (0207), validada ANTES de
+   * cargar: el pago va después del commit, y sin cuenta la factura quedaría
+   * cargada con deuda por un dato que faltaba en la pantalla.
+   */
+  private async exigirCuentaDelContado(pc?: PagoContadoDto) {
+    if (pc && Number(pc.importe) > 0) await cuentaDeTransferencia(this.db, pc.medio ?? 'efectivo', pc.cuentaPropiaId);
+  }
+
   /*
    * EL PAGO EN EL MISMO ACTO, después del commit del comprobante y a propósito.
    *
@@ -1150,6 +1162,7 @@ export class ComprobantesService {
         fecha: args.fecha,
         concepto: args.concepto,
         referencia: args.pagoContado?.referencia,
+        cuentaPropiaId: args.pagoContado?.cuentaPropiaId,
         sucursalId: args.sucursalId ?? undefined,
         cajaSesionId: args.pagoContado?.cajaSesionId,
         usuarioId: args.usuarioId,
@@ -1354,6 +1367,7 @@ export class ComprobantesService {
       throw new BadRequestException('Los compromisos de pago y los echeqs son de una factura o liquidación confirmada.');
     }
     const promesas = this.normalizarCompromisos(dto, total);
+    await this.exigirCuentaDelContado(dto.pagoContado);
 
     /**
      * El mismo comprobante no se carga dos veces. El índice único de la base es
@@ -2314,6 +2328,7 @@ export class ComprobantesService {
     }
 
     const promesas = this.normalizarCompromisos(dto, pieReal.total);
+    await this.exigirCuentaDelContado(dto.pagoContado);
 
     // La etiqueta del remito, capturada ANTES de convertirlo: es el rastro.
     const etiquetaRemito = etiquetaDoc(c);

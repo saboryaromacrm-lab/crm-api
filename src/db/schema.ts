@@ -3455,6 +3455,21 @@ export const estadoPagoProvEnum = pgEnum('estado_pago_prov', ['activo', 'anulado
  */
 export const destinoPagoProvEnum = pgEnum('destino_pago_prov', ['mercaderia', 'gastos']);
 
+/**
+ * MIS CUENTAS (0207): las cuentas propias de las que sale una transferencia
+ * (Mercado Pago, un banco…). Se cargan en Cash Flow › Configuración; con al
+ * menos una activa, todo pago por transferencia dice de cuál salió. No se
+ * borran: se desactivan. El nombre no se repite sin mirar mayúsculas (índice
+ * sobre `lower(nombre)`, en la migración).
+ */
+export const cuentasPropias = pgTable('cuentas_propias', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull(),
+  /** Alias, CVU o lo que sirva para reconocerla. */
+  detalle: text('detalle').notNull().default(''),
+  activa: boolean('activa').notNull().default(true),
+});
+
 export const proveedorPagos = pgTable('proveedor_pagos', {
   id: serial('id').primaryKey(),
   /** La hora exacta en que la plata salió del cajón. Es dato de control. */
@@ -3503,6 +3518,8 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
    * que recibió el proveedor) pero la plata salió como efectivo. Null = no.
    */
   cambioPor: text('cambio_por'),
+  /** De qué cuenta propia salió (0207): solo un pago por transferencia de un solo medio. */
+  cuentaPropiaId: integer('cuenta_propia_id').references(() => cuentasPropias.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixProveedor: index('ix_proveedor_pagos_proveedor').on(t.proveedorId, t.estado),
   ixFecha: index('ix_proveedor_pagos_fecha').on(t.fecha),
@@ -4099,6 +4116,8 @@ export const pagoFormas = pgTable('pago_formas', {
   medio: medioPagoEnum('medio').notNull().default('efectivo'),
   importe: doublePrecision('importe').notNull().default(0),
   fecha: timestamp('fecha', { withTimezone: true }),
+  /** De qué cuenta propia salió esta parte, si es una transferencia (0207). */
+  cuentaPropiaId: integer('cuenta_propia_id').references(() => cuentasPropias.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixPago: index('ix_pago_formas_pago').on(t.pagoId),
 }));

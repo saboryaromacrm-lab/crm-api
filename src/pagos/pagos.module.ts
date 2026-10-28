@@ -43,8 +43,9 @@ import { ABREV_TIPO, etiquetaDoc, numeroDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ECHEQ_EN_CARTERA } from '../proveedores/echeqs';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
+import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia } from './cuentas-propias';
 import {
-  cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, gastos, pagoFormas,
+  cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, cuentasPropias, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores,
   sucursales, usuarios, ventaPagos, ventas,
 } from '../db/schema';
@@ -84,6 +85,8 @@ export class FormaPagoDto {
   @IsIn(MEDIOS as unknown as string[]) medio!: string;
   @IsNumber() @Min(0.01, { message: 'Cada parte del pago tiene que ser mayor a 0.' }) importe!: number;
   @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'La fecha de la parte va como AAAA-MM-DD.' }) fecha?: string;
+  /** De qué cuenta propia salió, si la parte es una transferencia (0207). */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
 }
 
 /**
@@ -158,6 +161,8 @@ export class CrearPagoDto {
    * si viene `cajaSesionId`).
    */
   @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
+  /** De qué cuenta propia salió la transferencia de un solo medio (0207; ver `cuentaDeTransferencia`). */
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
 }
 
 export class ImputarDto {
@@ -185,6 +190,8 @@ export class ListarPagosDto {
   @IsOptional() @IsBooleanString() esFlete?: string;
   /** Solo el efectivo por transferencia (0175): «cuánto cambié y con quién». */
   @IsOptional() @IsBooleanString() cambio?: string;
+  /** Lo que salió de una cuenta propia (0207), también como parte de un pago mixto. */
+  @IsOptional() @Matches(/^\d+$/) cuentaPropiaId?: string;
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
@@ -437,6 +444,8 @@ export class PagosProveedorService {
       estado: proveedorPagos.estado,
       observaciones: proveedorPagos.observaciones,
       cambioPor: proveedorPagos.cambioPor,
+      cuentaPropiaId: proveedorPagos.cuentaPropiaId,
+      cuentaPropiaNombre: cuentasPropias.nombre,
     };
   }
 
@@ -444,7 +453,8 @@ export class PagosProveedorService {
     return this.db.select(this.selectPago).from(proveedorPagos)
       .leftJoin(proveedores, eq(proveedores.id, proveedorPagos.proveedorId))
       .leftJoin(sucursales, eq(sucursales.id, proveedorPagos.sucursalId))
-      .leftJoin(usuarios, eq(usuarios.id, proveedorPagos.usuarioId));
+      .leftJoin(usuarios, eq(usuarios.id, proveedorPagos.usuarioId))
+      .leftJoin(cuentasPropias, eq(cuentasPropias.id, proveedorPagos.cuentaPropiaId));
   }
 
   async list(q: any = {}) {
@@ -463,6 +473,11 @@ export class PagosProveedorService {
     if (q.hasta) conds.push(sql`${proveedorPagos.fecha} <= ${new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`).toISOString()}`);
     if (q.esFlete === 'true' || q.esFlete === true) conds.push(eq(proveedorPagos.esFlete, true));
     if (q.cambio === 'true' || q.cambio === true) conds.push(isNotNull(proveedorPagos.cambioPor));
+    if (q.cuentaPropiaId) {
+      const cuenta = Number(q.cuentaPropiaId);
+      conds.push(or(eq(proveedorPagos.cuentaPropiaId, cuenta), sql`exists (select 1 from pago_formas f
+        where f.pago_id = ${proveedorPagos.id} and f.cuenta_propia_id = ${cuenta})`));
+    }
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
       conds.push(eq(proveedorPagos.estado, 'activo'));
@@ -490,16 +505,20 @@ export class PagosProveedorService {
     }));
   }
 
-  /** `{ pagoId => [{medio, importe, fecha}] }` — el split multi-forma, en una consulta. */
+  /** `{ pagoId => [{medio, importe, fecha, cuentaPropiaNombre}] }` — el split multi-forma, en una consulta. */
   private async formasDe(ids: number[]) {
-    const porId = new Map<number, Array<{ medio: string; importe: number; fecha: Date | null }>>();
+    const porId = new Map<number, Array<{ medio: string; importe: number; fecha: Date | null; cuentaPropiaNombre: string | null }>>();
     if (!ids.length) return porId;
-    const filas = await this.db.select().from(pagoFormas)
+    const filas = await this.db.select({
+      pagoId: pagoFormas.pagoId, medio: pagoFormas.medio, importe: pagoFormas.importe, fecha: pagoFormas.fecha,
+      cuentaPropiaNombre: cuentasPropias.nombre,
+    }).from(pagoFormas)
+      .leftJoin(cuentasPropias, eq(cuentasPropias.id, pagoFormas.cuentaPropiaId))
       .where(inArray(pagoFormas.pagoId, ids))
       .orderBy(pagoFormas.id);
     for (const f of filas) {
       const arr = porId.get(f.pagoId) ?? [];
-      arr.push({ medio: f.medio, importe: f.importe, fecha: f.fecha });
+      arr.push({ medio: f.medio, importe: f.importe, fecha: f.fecha, cuentaPropiaNombre: f.cuentaPropiaNombre });
       porId.set(f.pagoId, arr);
     }
     return porId;
@@ -863,11 +882,12 @@ export class PagosProveedorService {
      * parte, para que los listados simples sigan teniendo qué mostrar sin
      * agregar sobre el split.
      */
-    const formas = (dto.formas ?? []).map((f) => ({
+    const formas = await Promise.all((dto.formas ?? []).map(async (f) => ({
       medio: f.medio as any,
       importe: money(f.importe),
       fecha: f.fecha ? new Date(`${f.fecha}T00:00:00`) : null,
-    }));
+      cuentaPropiaId: await cuentaDeTransferencia(this.db, f.medio, f.cuentaPropiaId),
+    })));
     if (formas.length) {
       const suma = money(formas.reduce((a, f) => a + f.importe, 0));
       if (Math.abs(suma - importe) > EPS) {
@@ -883,6 +903,8 @@ export class PagosProveedorService {
     if (cambioPor && (formas.length || medio !== 'transferencia')) {
       throw new BadRequestException('El efectivo por transferencia es un pago de un solo medio, por transferencia.');
     }
+    /* MIS CUENTAS (0207): de cuál salió la transferencia. En un pago mixto lo dice cada parte. */
+    const cuentaPropiaId = formas.length ? null : await cuentaDeTransferencia(this.db, medio, dto.cuentaPropiaId, cambioPor);
     /** Lo que sale del CAJÓN: la parte en efectivo del split — o todo, si el
      *  pago es simple y en efectivo (también el efectivo que se cambió por la
      *  transferencia). Es lo único que el arqueo tiene que ver. */
@@ -1034,12 +1056,13 @@ export class PagosProveedorService {
         estado: 'activo',
         observaciones: (dto.observaciones ?? '').trim(),
         cambioPor,
+        cuentaPropiaId,
       }).returning();
 
       // El split del pago, en la misma transacción que su cabecera.
       if (formas.length) {
         await tx.insert(pagoFormas).values(formas.map((f) => ({
-          pagoId: pago.id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined,
+          pagoId: pago.id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined, cuentaPropiaId: f.cuentaPropiaId,
         })));
       }
 
@@ -1891,8 +1914,8 @@ export class PagosProveedorController {
 }
 
 @Module({
-  controllers: [PagosProveedorController],
-  providers: [PagosProveedorService],
+  controllers: [PagosProveedorController, CuentasPropiasController],
+  providers: [PagosProveedorService, CuentasPropiasService],
   exports: [PagosProveedorService],
 })
 export class PagosModule {}
