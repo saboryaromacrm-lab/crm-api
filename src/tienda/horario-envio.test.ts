@@ -33,6 +33,27 @@ test('por cerrar o cerrado: sin «lo antes posible»', () => {
   assert.ok(agendaEnvios(SEMANA, SIN, ar('2026-10-23T12:20')).pronto);
 });
 
+test('abierto, por cerrar y cerrado: a qué hora cierra y cuándo vuelve a abrir', () => {
+  const abierto = agendaEnvios(SEMANA, SIN, ar('2026-10-23T12:20')); // viernes, cierra 13:00
+  assert.equal(abierto.abierto, true);
+  assert.equal(hora(abierto.cierra!), '13:00');
+  assert.equal(abierto.abre, null);
+  const siesta = agendaEnvios(SEMANA, SIN, ar('2026-10-23T14:00'));
+  assert.equal(siesta.abierto, false);
+  assert.equal(siesta.abre, new Date('2026-10-23T17:00:00-03:00').toISOString());
+  const sabadoNoche = agendaEnvios(SEMANA, SIN, ar('2026-10-24T21:30'));
+  assert.equal(sabadoNoche.abre, new Date('2026-10-26T08:00:00-03:00').toISOString(), 'el domingo está cerrado: abre el lunes');
+  const madrugada = agendaEnvios(SEMANA, SIN, ar('2026-10-23T06:00'));
+  assert.equal(madrugada.abre, new Date('2026-10-23T08:00:00-03:00').toISOString());
+  assert.equal(agendaEnvios(SEMANA, SIN, ar('2026-10-23T13:00')).abierto, false, 'a la hora de cierre ya está cerrado');
+});
+
+test('un feriado cerrado hoy: cerrado aunque sea horario de semana, abre el próximo día', () => {
+  const a = agendaEnvios(SEMANA, excepcionesDe([{ fecha: '2026-10-23', abre: false, horario: '' }]), ar('2026-10-23T10:00'));
+  assert.equal(a.abierto, false);
+  assert.equal(a.abre, new Date('2026-10-24T08:00:00-03:00').toISOString());
+});
+
 test('tres días con horario, salteando el domingo cerrado; de noche hoy ya no tiene franjas', () => {
   const a = agendaEnvios(SEMANA, SIN, ar('2026-10-24T20:50')); // sábado
   assert.deepEqual(a.dias.map((d) => d.fecha), ['2026-10-26', '2026-10-27', '2026-10-28']);
@@ -54,6 +75,7 @@ test('un feriado cerrado saca el día; abierto con otro horario, lo cambia', () 
 test('sin horario cargado: «lo antes posible» y nada más', () => {
   const a = agendaEnvios({}, SIN, ar('2026-10-23T03:00'));
   assert.equal(a.conHorario, false);
+  assert.equal(a.abierto, null, 'sin horario no se sabe: no hay aviso de cerrado');
   assert.ok(a.pronto);
   assert.deepEqual(a.dias, []);
 });

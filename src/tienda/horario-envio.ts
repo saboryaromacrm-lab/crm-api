@@ -33,6 +33,12 @@ export interface Franja { desde: string; hasta: string }
 export interface AgendaEnvios {
   /** Hay horario cargado: sin él, no hay franjas ni se sabe si está abierto. */
   conHorario: boolean;
+  /** Abierto ahora (null = sin horario, no se sabe). Para el aviso del checkout (28/10/2026). */
+  abierto: boolean | null;
+  /** Abierto: a qué hora cierra este tramo. */
+  cierra: string | null;
+  /** Cerrado: cuándo vuelve a abrir (null si no abre en los próximos días). */
+  abre: string | null;
   /** «Lo antes posible», o null si ahora no se puede (cerrado o por cerrar). */
   pronto: Franja | null;
   dias: { fecha: string; franjas: Franja[] }[];
@@ -76,7 +82,7 @@ export function agendaEnvios(semana: Partial<Record<string, string>>, excepcione
     hasta: new Date(ahora.getTime() + PRONTO_MIN.hasta * MINUTO).toISOString(),
   });
   const conHorario = CLAVE_DIA.some((d) => tramosDe(semana[d]).length > 0);
-  if (!conHorario) return { conHorario, pronto: prontoDesde(), dias: [] };
+  if (!conHorario) return { conHorario, abierto: null, cierra: null, abre: null, pronto: prontoDesde(), dias: [] };
 
   const p = partesArgentina(ahora);
   const hoy = `${p.year}-${dd(p.month)}-${dd(p.day)}`;
@@ -88,6 +94,14 @@ export function agendaEnvios(semana: Partial<Record<string, string>>, excepcione
   };
 
   const pronto = tramosEl(hoy).some(([a, b]) => a <= ya && ya + PRONTO_MIN.hasta <= b) ? prontoDesde() : null;
+  /* Abierto ahora y hasta cuándo; cerrado, cuándo vuelve a abrir. */
+  const actual = tramosEl(hoy).find(([a, b]) => a <= ya && ya < b);
+  let abre: string | null = null;
+  for (let i = 0; !actual && !abre && i < DIAS_BUSQUEDA; i++) {
+    const fecha = sumarDias(hoy, i);
+    const t = tramosEl(fecha).find(([a]) => i > 0 || a > ya);
+    if (t) abre = instante(fecha, t[0]);
+  }
   const dias: AgendaEnvios['dias'] = [];
   for (let i = 0; i < DIAS_BUSQUEDA && dias.length < DIAS_AGENDA; i++) {
     const fecha = sumarDias(hoy, i);
@@ -101,7 +115,7 @@ export function agendaEnvios(semana: Partial<Record<string, string>>, excepcione
     }
     if (franjas.length) dias.push({ fecha, franjas });
   }
-  return { conHorario, pronto, dias };
+  return { conHorario, abierto: !!actual, cierra: actual ? instante(hoy, actual[1]) : null, abre, pronto, dias };
 }
 
 /** Lo que eligió el cliente, contra la agenda de AHORA: lo que queda guardado en el pedido, o por qué no vale. */
