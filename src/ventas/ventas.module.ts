@@ -385,6 +385,16 @@ export function letraFacturaPara(cliente: { condicionIva: string }, config: Reco
  */
 const SIGNO_NC = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)`;
 
+/* LO QUE VINO DE LA TIENDA ONLINE (28/10/2026, pedido del dueño): el pedido del
+ * sitio, de las dos tiendas o de una (`p` es el presupuesto). Sin `modo_tienda`
+ * son los mayoristas de antes de la tienda minorista (0173). */
+const DE_TIENDA = {
+  tienda: sql``,
+  minorista: sql` and p.modo_tienda = 'minorista'`,
+  mayorista: sql` and coalesce(p.modo_tienda, 'mayorista') <> 'minorista'`,
+};
+const esDeTienda = (origen?: string): origen is keyof typeof DE_TIENDA => !!origen && origen in DE_TIENDA;
+
 /**
  * UN CLIENTE DE «RETIROS SIN COSTO» NO COMPRA (0146): lo que se lleva es un
  * retiro (`retiros`), que no toca caja, ventas, ARCA ni IVA. Si un ticket suyo
@@ -800,12 +810,8 @@ export class VentasService {
      * y NO la hizo el cajero en la caja. */
     if (q.origen === 'pos') conds.push(sql`${ventas.presupuestoId} is null`);
     if (q.origen === 'presupuesto') conds.push(sql`${ventas.presupuestoId} is not null`);
-    /* LO QUE VINO DE LA TIENDA ONLINE (28/10/2026, pedido del dueño): el pedido
-     * del sitio, de las dos tiendas o de una. Sin `modo_tienda` son los
-     * mayoristas de antes de la tienda minorista (0173). */
-    const deTienda = { tienda: sql``, minorista: sql` and p.modo_tienda = 'minorista'`, mayorista: sql` and coalesce(p.modo_tienda, 'mayorista') <> 'minorista'` };
-    if (q.origen && q.origen in deTienda) {
-      conds.push(sql`exists (select 1 from presupuestos p where p.id = ${ventas.presupuestoId} and p.origen = 'web'${deTienda[q.origen as keyof typeof deTienda]})`);
+    if (esDeTienda(q.origen)) {
+      conds.push(sql`exists (select 1 from presupuestos p where p.id = ${ventas.presupuestoId} and p.origen = 'web'${DE_TIENDA[q.origen]})`);
     }
     /*
      * QR MERCADO PAGO, APARTE (3/10/2026, pedido del dueño): el cobro con el QR
@@ -869,7 +875,7 @@ export class VentasService {
     /** La mercadería con IVA de los renglones (la NC resta) y en cuántos tickets: por lista y por modalidad. */
     const IMPORTE_LISTA = sql<number>`coalesce(sum(${ventaItems.subtotal} * (1 + coalesce(${ventaItems.iva}, 21) / 100.0) * ${SIGNO_NC}), 0)`;
     const TICKETS_LISTA = sql<number>`count(distinct ${ventaItems.ventaId}) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`;
-    const [filas, [tot], porMedio, [fac], porLista, porModalidad, [ren], mpTipos, porSucursal] = await Promise.all([
+    const [filas, [tot], porMedio, [fac], porLista, porModalidad, [ren], mpTipos, porSucursal, porTienda] = await Promise.all([
       this.db.select({
         v: ventas,
         // Factura a un CUIT (0125): en el listado se ve a quién se facturó, no «Consumidor Final».
@@ -1011,6 +1017,19 @@ export class VentasService {
         .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
         .where(vivas)
         .groupBy(ventas.sucursalId),
+
+      /* POR TIENDA (28/10/2026), solo en Ventas online: cada tienda con la misma
+       * cuenta que «Vendido» y sus tickets. */
+      esDeTienda(q.origen)
+        ? this.db.select({
+          tienda: sql<string>`(select coalesce(p.modo_tienda, 'mayorista') from presupuestos p where p.id = ${ventas.presupuestoId})`,
+          importe: sql<number>`coalesce(sum(${ventas.total} * ${SIGNO_NC}), 0)`,
+          tickets: sql<number>`count(*) filter (where ${ventas.tipo}::text not like 'nota_credito%')::int`,
+        }).from(ventas)
+          .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
+          .where(vivas)
+          .groupBy(sql`1`)
+        : [],
     ]);
 
     const ids = filas.map((f) => f.v.id);
@@ -1145,6 +1164,13 @@ export class VentasService {
             liquidado: l, liquidaciones: Number(fac?.liquidaciones) || 0, pctLiquidado: pct(l),
           };
         })(),
+        /* Cada tienda con su % de lo vendido y su ticket promedio (solo en Ventas online). */
+        porTienda: porTienda
+          .map((x) => {
+            const importe = money(Number(x.importe)); const tk = Number(x.tickets) || 0;
+            return { tienda: x.tienda, importe, tickets: tk, promedio: tk ? money(importe / tk) : 0, pct: plata > 0 ? Math.round((importe / plata) * 1000) / 10 : null };
+          })
+          .sort((a, b) => b.importe - a.importe),
         /* Cada sucursal con su % de lo vendido y su ticket promedio, de mayor a menor. */
         porSucursal: porSucursal
           .map((x) => {
