@@ -800,6 +800,13 @@ export class VentasService {
      * y NO la hizo el cajero en la caja. */
     if (q.origen === 'pos') conds.push(sql`${ventas.presupuestoId} is null`);
     if (q.origen === 'presupuesto') conds.push(sql`${ventas.presupuestoId} is not null`);
+    /* LO QUE VINO DE LA TIENDA ONLINE (28/10/2026, pedido del dueño): el pedido
+     * del sitio, de las dos tiendas o de una. Sin `modo_tienda` son los
+     * mayoristas de antes de la tienda minorista (0173). */
+    const deTienda = { tienda: sql``, minorista: sql` and p.modo_tienda = 'minorista'`, mayorista: sql` and coalesce(p.modo_tienda, 'mayorista') <> 'minorista'` };
+    if (q.origen && q.origen in deTienda) {
+      conds.push(sql`exists (select 1 from presupuestos p where p.id = ${ventas.presupuestoId} and p.origen = 'web'${deTienda[q.origen as keyof typeof deTienda]})`);
+    }
     /*
      * QR MERCADO PAGO, APARTE (3/10/2026, pedido del dueño): el cobro con el QR
      * de la caja se guarda como `qr` con la referencia «MP <operación>» (ver
@@ -869,6 +876,9 @@ export class VentasService {
         clienteNombre: sql<string>`coalesce(${ventas.receptor}->>'nombre', ${clientes.nombre})`,
         sucursalNombre: sucursales.nombre,
         cajeroNombre: usuarios.nombre,
+        /* El pedido del que nació y, si vino del sitio, de qué tienda (28/10/2026). */
+        pedidoCodigo: sql<string | null>`(select p.codigo from presupuestos p where p.id = ${ventas.presupuestoId})`,
+        tienda: sql<string | null>`(select coalesce(p.modo_tienda, 'mayorista') from presupuestos p where p.id = ${ventas.presupuestoId} and p.origen = 'web')`,
       }).from(ventas)
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
@@ -1041,7 +1051,7 @@ export class VentasService {
       (notas as any[]).map((n) => [Number(n.refVentaId), Number(n.total) || 0]),
     );
     return {
-      filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre }) => {
+      filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre, pedidoCodigo, tienda }) => {
         const a = agg.find((x: any) => x.ventaId === v.id);
         const cobrado = imput.get(v.id) ?? 0;
         const acreditado = acreditadoDe.get(v.id) ?? 0;
@@ -1074,6 +1084,9 @@ export class VentasService {
           listas: a?.listas ?? [],
           /** De mostrador o nacida de un pedido: la pantalla lo distingue. */
           origen: v.presupuestoId ? 'presupuesto' : 'pos',
+          pedidoCodigo,
+          /** De qué tienda online vino ('minorista' | 'mayorista'), o null. */
+          tienda,
         };
       }),
       // `total` es de lo que MATCHEA (incluidas las anuladas): es el universo
@@ -5397,7 +5410,7 @@ export class VentasController {
       desde, hasta, q,
       estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
       medioPago: uno(medioPago, [...MEDIOS, 'qr_mp'], 'Medio de pago'),
-      origen: uno(origen, ['pos', 'presupuesto'], 'Origen'),
+      origen: uno(origen, ['pos', 'presupuesto', 'tienda', 'minorista', 'mayorista'], 'Origen'),
       sucursalId: esJefe(sesion) ? num(sucursalId) : sesion.sucursalId,
       usuarioId: num(usuarioId),
       clienteId: num(clienteId), cajaSesionId: num(cajaSesionId),
