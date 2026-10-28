@@ -38,7 +38,7 @@ import {
 } from '../db/schema';
 import { ALICUOTAS_IVA } from '../common/iva';
 import { agruparPor, grupo } from '../common/agrupar';
-import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
+import { Auth, CualquierUsuario, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
 import { ClientesModule, ClientesService } from '../clientes/clientes.module';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -94,6 +94,18 @@ const SECCIONES_VENTAS = [
 
 /** Redondeo monetario a 2 decimales (evita el arrastre de flotantes). */
 export const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * CUENTA CORRIENTE VENCIDA (28/10/2026, pedido del dueño). Cada comprobante
+ * vence en su `vencimientoPago` (la venta + los días de plazo del cliente);
+ * sin plazo vence el mismo día de la venta. Se cuenta en días de Argentina:
+ * el atraso arranca al día siguiente del vencimiento.
+ */
+const ZONA_AR = 'America/Argentina/Buenos_Aires';
+const diaAr = (d: Date) => d.toLocaleDateString('sv-SE', { timeZone: ZONA_AR });
+export function diasDeAtraso(v: { fecha: Date; vencimientoPago: Date | null }, hoy = diaAr(new Date())) {
+  return Math.max(0, Math.round((Date.parse(hoy) - Date.parse(diaAr(v.vencimientoPago ?? v.fecha))) / 86400000));
+}
 
 /** El precio de una oferta se carga CON IVA; las cuentas van en neto. */
 const netoDe = (precioFinal: number, iva: number) => (Number(precioFinal) || 0) / (1 + (Number(iva) || 0) / 100);
@@ -1505,6 +1517,7 @@ export class VentasService {
      * sigue siendo un peso de verdad.
      */
     let perdonado = 0;
+    const hoy = diaAr(new Date());
     const comprobantes = pendientes.map((v) => {
       const cobrado = imput.get(v.id) ?? 0;
       const nc = acreditado.get(v.id) ?? 0;
@@ -1513,7 +1526,7 @@ export class VentasService {
       const saldo = crudo > 0 && crudo <= tolerancia + 1e-9 ? 0 : crudo;
       if (saldo === 0 && crudo > 0) perdonado = money(perdonado + crudo);
       /* Mayorista (1/10/2026): se cobra solo con `mediosMayorista`. */
-      return { ...v, cobrado, acreditado: money(nc), saldo, mayorista: !!regla && !!v.mayorista };
+      return { ...v, cobrado, acreditado: money(nc), saldo, mayorista: !!regla && !!v.mayorista, diasAtraso: diasDeAtraso(v, hoy) };
     });
 
     // El saldo global incluye lo cobrado "a cuenta" (no imputado a un documento),
@@ -1529,10 +1542,18 @@ export class VentasService {
     // cliente debe un centavo que ningún comprobante de la lista reclama.
     const saldo = money(facturado - acreditadoTotal - cobradoTotal - perdonado);
     const disponible = cliente.limiteCredito > 0 ? money(cliente.limiteCredito - saldo) : null;
+    const impagos = comprobantes.filter((c) => c.saldo > 0.009);
+    const vencidos = impagos.filter((c) => c.diasAtraso > 0);
+    /* Lo cobrado «a cuenta» (sin imputar) paga primero lo más viejo, que es lo
+     * vencido: por eso lo vencido nunca pasa del saldo global. */
+    const vencido = Math.max(0, Math.min(saldo, money(vencidos.reduce((a, c) => a + c.saldo, 0))));
 
     return {
       clienteId,
       saldo,
+      vencido,
+      /** Días de atraso del comprobante vencido más viejo (0 = al día). */
+      diasAtraso: vencido > 0 ? Math.max(...vencidos.map((c) => c.diasAtraso)) : 0,
       facturado: money(facturado),
       acreditado: money(acreditadoTotal),
       cobrado: money(cobradoTotal),
@@ -1540,8 +1561,38 @@ export class VentasService {
       disponible,
       /** Con qué se cobran las facturas mayoristas (vacío = sin restricción). */
       mediosMayorista: regla?.permitidos ?? [],
-      comprobantes: comprobantes.filter((c) => c.saldo > 0.009),
+      comprobantes: impagos,
     };
+  }
+
+  /**
+   * LOS CLIENTES CON LA CUENTA CORRIENTE VENCIDA (28/10/2026), para el banner
+   * de administración. La consulta solo achica la lista a los que tienen algún
+   * comprobante vencido sin saldar; lo vencido de cada uno sale de `cuenta`,
+   * la misma cuenta que ve la ficha del cliente.
+   */
+  async cuentasVencidas() {
+    const r = await this.db.execute(sql`
+      select v.cliente_id as id, c.nombre, c.telefono
+      from ventas v join clientes c on c.id = v.cliente_id
+      where v.estado = 'confirmada' and v.condicion_pago = 'cuenta_corriente' and v.tipo::text not like 'nota_credito%'
+        and (coalesce(v.vencimiento_pago, v.fecha) at time zone ${ZONA_AR})::date < (now() at time zone ${ZONA_AR})::date
+        and v.total
+          - coalesce((select sum(ci.importe) from cobranza_imputaciones ci join cobranzas co on co.id = ci.cobranza_id
+                      where ci.venta_id = v.id and co.estado = 'confirmada'), 0)
+          - coalesce((select sum(n.total) from ventas n
+                      where n.ref_venta_id = v.id and n.estado = 'confirmada' and n.condicion_pago = 'cuenta_corriente'
+                        and n.tipo::text like 'nota_credito%'), 0) > 0.009
+      group by v.cliente_id, c.nombre, c.telefono`);
+    const clientes = (await Promise.all((r.rows as any[]).map(async (c) => {
+      const cta = await this.cuenta(c.id);
+      return {
+        clienteId: c.id, nombre: c.nombre, telefono: c.telefono,
+        vencido: cta.vencido, diasAtraso: cta.diasAtraso, saldo: cta.saldo,
+        comprobantes: cta.comprobantes.filter((x) => x.diasAtraso > 0).length,
+      };
+    }))).filter((c) => c.vencido > 0).sort((a, b) => b.vencido - a.vencido);
+    return { clientes, total: money(clientes.reduce((a, c) => a + c.vencido, 0)) };
   }
 
   /* ------------------------------ Catálogo POS ------------------------------ */
@@ -5392,6 +5443,13 @@ export class VentasController {
 
   @Get('cuenta/:clienteId')
   cuenta(@Param('clienteId', ParseIntPipe) clienteId: number) { return this.svc.cuenta(clienteId); }
+
+  /** El banner de cuentas vencidas: lo ve administración (admin y superadmin), esté en la pantalla que esté. */
+  @Get('cuentas-vencidas') @CualquierUsuario()
+  cuentasVencidas(@Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('Las cuentas vencidas las ve administración.');
+    return this.svc.cuentasVencidas();
+  }
 
   /**
    * El listado de la pantalla Ventas: filtros + paginado + totales del filtro.
