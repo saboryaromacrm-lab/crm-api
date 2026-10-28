@@ -7,6 +7,8 @@
  *
  *   · ABIERTO, sin clave ni sesión (`@Publico`): es todo suyo.
  *   · SIN costos, proveedores ni markups: solo lo que se vende.
+ *   · Con las MARCAS y su logo (28/10/2026, para armar piezas gráficas): cada
+ *     producto dice su `marcaId`.
  *
  * NO TOCA AL SISTEMA: solo lee, y reusa el mismo armado de precios que el ERP
  * (`bootstrapCatalogo`, con los costos ocultos), así un precio de acá es el
@@ -20,10 +22,11 @@ import { Controller, Get, Inject, Injectable, Module, Req, Res } from '@nestjs/c
 import { eq } from 'drizzle-orm';
 import { Publico } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { stock, sucursales, webImagenes } from '../db/schema';
+import { marcas, stock, sucursales, webImagenes } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
 import { ListasModule, ListasService } from '../listas/listas.module';
+import { rutaImagen } from '../web/ruta-imagen';
 
 const VIGENCIA_MS = 60_000;
 const r3 = (n: unknown) => Math.round((Number(n) || 0) * 1000) / 1000;
@@ -43,7 +46,7 @@ export class CatalogoExternoService {
   /**
    * El catálogo vigente, como texto JSON: el guardado si tiene menos de un
    * minuto; si no, uno nuevo (una sola cuenta a la vez). `base` es la dirección
-   * de esta API, para devolver las fotos subidas con su URL completa.
+   * de esta API, para devolver las fotos y los logos subidos con su URL completa.
    */
   async json(base: string): Promise<string> {
     if (!this.cache || this.cache.hasta <= Date.now()) {
@@ -57,9 +60,11 @@ export class CatalogoExternoService {
     const c = this.cache!;
     let texto = c.texto.get(base);
     if (!texto) {
+      const url = (x: string) => (x.startsWith('tienda/') ? base + x : x);
       texto = JSON.stringify({
         ...c.datos,
-        productos: c.datos.productos.map((p: any) => (p.imagen.startsWith('tienda/') ? { ...p, imagen: base + p.imagen } : p)),
+        marcas: c.datos.marcas.map((m: any) => ({ ...m, logo: url(m.logo) })),
+        productos: c.datos.productos.map((p: any) => ({ ...p, imagen: url(p.imagen) })),
       });
       c.texto.set(base, texto);
     }
@@ -67,7 +72,7 @@ export class CatalogoExternoService {
   }
 
   private async armar() {
-    const [{ productos }, cat, sucs, filasStock, imgs] = await Promise.all([
+    const [{ productos }, cat, sucs, filasStock, imgs, filasMarcas] = await Promise.all([
       this.inv.bootstrapCatalogo(false, true),
       this.listas.catalogo(),
       this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales).where(eq(sucursales.activa, true)),
@@ -75,6 +80,7 @@ export class CatalogoExternoService {
         productoId: stock.productoId, presentacionId: stock.presentacionId, sucursalId: stock.sucursalId, cantidad: stock.cantidad,
       }).from(stock).where(eq(stock.estado, 'disponible' as any)),
       this.db.select({ tipo: webImagenes.tipo, refId: webImagenes.refId, actualizadoEn: webImagenes.actualizadoEn }).from(webImagenes),
+      this.db.select({ id: marcas.id, nombre: marcas.nombre }).from(marcas),
     ]);
 
     /* Stock disponible: forma (producto:presentación) → sucursal → cantidad. Solo sucursales activas. */
@@ -92,9 +98,11 @@ export class CatalogoExternoService {
       return Object.fromEntries(sucs.map((x) => [String(x.id), m[x.id] ?? 0]));
     };
 
-    /* La foto subida en el módulo Web (ruta relativa a la API); si no hay, la URL externa del producto. */
-    const fotoSubida = new Map(imgs.filter((i) => i.tipo === 'producto')
-      .map((i) => [i.refId, `tienda/imagenes/producto/${i.refId}?v=${new Date(i.actualizadoEn).getTime()}`]));
+    /* Lo subido en el módulo Web (ruta relativa a la API): la foto de cada producto y el logo de cada marca. */
+    const subida = (tipo: string) => new Map(imgs.filter((i) => i.tipo === tipo)
+      .map((i) => [i.refId, rutaImagen(tipo, i.refId, i.actualizadoEn)]));
+    const fotoSubida = subida('producto');
+    const logoSubido = subida('marca');
 
     const precios = (ls: any[]) => (ls ?? []).map((l) => ({
       listaId: l.listaId,
@@ -120,6 +128,7 @@ export class CatalogoExternoService {
         codigo: p.codigoPropio || '',
         codigoBarras: p.codigoBarras || '',
         dun: p.dun || '',
+        marcaId: p.marcaId ?? null,
         marca: p.marca || '',
         categoria: p.categoria || '',
         subcategoria: p.subcategoria || '',
@@ -142,10 +151,19 @@ export class CatalogoExternoService {
       }))
       .sort((a: any, b: any) => a.nombre.localeCompare(b.nombre, 'es'));
 
+    /* Las marcas que tienen algún producto en el catálogo, con su logo ('' = sin logo cargado). */
+    const productosDe = new Map<number, number>();
+    for (const p of lista) if (p.marcaId) productosDe.set(p.marcaId, (productosDe.get(p.marcaId) ?? 0) + 1);
+    const marcasConProductos = filasMarcas
+      .filter((m) => productosDe.has(m.id))
+      .map((m) => ({ id: m.id, nombre: m.nombre, logo: logoSubido.get(m.id) ?? '', productos: productosDe.get(m.id) }))
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+
     return {
       generado: new Date().toISOString(),
       cantidad: lista.length,
       sucursales: sucs,
+      marcas: marcasConProductos,
       listas: cat.listas.filter((l: any) => l.activa)
         .map((l: any) => ({ id: l.id, nombre: l.nombre, modalidad: l.modalidad, orden: l.orden })),
       productos: lista,
