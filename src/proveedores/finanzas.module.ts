@@ -594,6 +594,21 @@ export class FinanzasProveedorService {
       n: sql<number>`count(*)::int`,
       monto: sql<number>`coalesce(sum(${proveedorEcheqs.importe}), 0)`,
     }).from(proveedorEcheqs).where(eq(proveedorEcheqs.estado, 'pendiente'));
+    /* COMPROMETIDO POR MES (28/10/2026, pedido del dueño): lo que va a debitar
+     * cada mes, hechos y pendientes de confirmar por separado. Lo vencido sin
+     * cobrar de meses anteriores todavía sale de la cuenta: va en el mes actual. */
+    const mesAr = (f: any) => sql`to_char(${f} at time zone 'America/Argentina/Buenos_Aires', 'YYYY-MM')`;
+    const mes = sql<string>`greatest(${mesAr(proveedorEcheqs.fechaVenc)}, ${mesAr(sql`now()`)})`;
+    const esPend = sql`${proveedorEcheqs.estado} = 'pendiente'`;
+    const porMes = await this.db.select({
+      mes,
+      hechosN: sql<number>`count(*) filter (where not ${esPend})::int`,
+      hechos: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where not ${esPend}), 0)`,
+      pendientesN: sql<number>`count(*) filter (where ${esPend})::int`,
+      pendientes: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where ${esPend}), 0)`,
+      atrasados: sql<number>`count(*) filter (where ${mesAr(proveedorEcheqs.fechaVenc)} < ${mesAr(sql`now()`)})::int`,
+    }).from(proveedorEcheqs).where(inArray(proveedorEcheqs.estado, ECHEQ_VIVOS))
+      .groupBy(mes).orderBy(mes);
     return {
       pendientes: { n: Number(pend?.n) || 0, monto: money(Number(pend?.monto) || 0) },
       activos: { n: Number(r?.activosN) || 0, monto: money(Number(r?.activosM) || 0) },
@@ -602,6 +617,13 @@ export class FinanzasProveedorService {
       semana: { n: Number(r?.semanaN) || 0, monto: money(Number(r?.semanaM) || 0) },
       porBanco: porBanco.map((b) => ({ banco: b.banco, n: Number(b.n) || 0, monto: money(Number(b.monto) || 0) })),
       proximos: proximos.map((f) => ({ ...f, diasRest: diasHasta(f.fechaVenc) })),
+      porMes: porMes.map((m) => ({
+        mes: m.mes,
+        hechos: { n: Number(m.hechosN) || 0, monto: money(Number(m.hechos) || 0) },
+        pendientes: { n: Number(m.pendientesN) || 0, monto: money(Number(m.pendientes) || 0) },
+        /** Cuántos debitaban en meses anteriores y siguen sin cobrar (solo en el mes actual). */
+        atrasados: Number(m.atrasados) || 0,
+      })),
     };
   }
 
