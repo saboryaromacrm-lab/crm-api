@@ -51,6 +51,7 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { productosSinMovimiento } from './sin-movimiento';
 import { datosBajosStock } from './bajos-stock';
 import { coherenciaStock, kardexProducto } from './kardex-consulta';
+import { sinStockDesde } from './sin-stock-desde';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { eq, sql } from 'drizzle-orm';
 import {
@@ -394,6 +395,18 @@ export class MovimientosController {
   @Permiso('almacen.operaciones', 'compras.historial')
   coherencia(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
     return coherenciaStock(this.db, soloSuSucursal(sesion) ?? (sucursalId ? Number(sucursalId) : null));
+  }
+
+  /**
+   * SIN STOCK DESDE CUÁNDO (29/10/2026): de cada artículo en 0 en cada local, el
+   * día que se quedó sin stock y si se lo pidió después. Lo usa la consulta de
+   * existencias (Alt+F3), así que lo abre quien abre esa consulta. Son fechas
+   * y pedidos, sin plata.
+   */
+  @Get('sin-stock-desde')
+  @Permiso('ventas.pos', 'almacen.existencias', 'compras.productos')
+  sinStock() {
+    return sinStockDesde(this.db);
   }
 
   /** El historial completo del stock: solo quien tiene el libro del almacén. */
