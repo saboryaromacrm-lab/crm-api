@@ -57,6 +57,7 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 import { conPermisosBase } from '../auth/permisos-base';
 import { esNotaCredito, etiquetaVenta, letraDe } from './etiqueta';
 import { descuentoCuponNeto } from '../cupones/reglas';
+import { mediosDeDescuento, mediosLegibles, normalizarMedios, pagoFueraDeLista } from './medios-descuento';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -463,7 +464,8 @@ type DescuentoResuelto = {
   nombre: string;
   porcentaje: number;
   listaId: number;
-  medioPago: string | null;
+  /** Con qué se puede pagar (0208); vacío = cualquier forma. */
+  medios: string[];
 };
 
 /**
@@ -2176,7 +2178,7 @@ export class VentasService {
       }
       porLista.set(d.listaId, {
         id: d.id, nombre: d.nombre, porcentaje: Number(d.porcentaje) || 0,
-        listaId: d.listaId, medioPago: d.medioPago ?? null,
+        listaId: d.listaId, medios: mediosDeDescuento(d),
       });
     }
     return porLista;
@@ -3440,7 +3442,7 @@ export class VentasService {
      * CONFIRMACIÓN —que es por donde cobra la caja— parte de renglones ya
      * guardados y los lee de la base. Los dos caminos tienen que pasar por
      * este mismo candado. */
-    aplicables: Iterable<{ id: number; nombre: string; medioPago: string | null }>,
+    aplicables: Iterable<{ id: number; nombre: string; medios: string[] }>,
   ) {
     // Solo los que de verdad GANARON en algún renglón: uno que quedó tapado por
     // el descuento del cliente no bajó un peso, y no tiene por qué condicionar
@@ -3449,18 +3451,20 @@ export class VentasService {
     if (!aplicados.size) return;
 
     for (const d of aplicables) {
-      if (!d.medioPago || !aplicados.has(d.id)) continue;
+      if (!d.medios.length || !aplicados.has(d.id)) continue;
+      // 0208: puede ser una lista («efectivo o transferencia»); repartir entre ellos cumple.
+      const con = mediosLegibles(d.medios);
       if (condicionPago !== 'contado') {
         throw new BadRequestException(
-          `El descuento "${d.nombre}" solo vale pagando al contado con ${d.medioPago}. `
+          `El descuento "${d.nombre}" solo vale pagando al contado con ${con}. `
           + 'Quitalo o cambiá la condición de pago.',
         );
       }
-      const otro = (pagos ?? []).find((p) => Number(p.importe) > 0 && p.medio !== d.medioPago);
+      const otro = pagoFueraDeLista(d.medios, pagos);
       if (otro) {
         throw new BadRequestException(
-          `El descuento "${d.nombre}" exige que TODA la venta se pague con ${d.medioPago}, `
-          + `y se está usando "${otro.medio}". Sacá el descuento o cobrá todo con ${d.medioPago}.`,
+          `El descuento "${d.nombre}" exige que TODA la venta se pague con ${con}, `
+          + `y se está usando "${mediosLegibles([otro.medio])}". Sacá el descuento o cobrá todo con ${con}.`,
         );
       }
     }
@@ -3501,7 +3505,7 @@ export class VentasService {
         );
       }
     }
-    this.validarMediosPagoDescuentos(items, condicionPago, pagos, filas);
+    this.validarMediosPagoDescuentos(items, condicionPago, pagos, filas.map((d) => ({ id: d.id, nombre: d.nombre, medios: mediosDeDescuento(d) })));
   }
 
   /**
@@ -5714,7 +5718,9 @@ class DescuentoDto {
   @IsOptional() @IsString() @Matches(SOLO_FECHA, { message: 'El vencimiento va como AAAA-MM-DD.' }) vence?: string;
   /** Lunes → domingo, '1' = vale ese día; vacío = todos los días (igual que las ofertas). */
   @IsOptional() @IsString() @Matches(/^$|^[01]{7}$/, { message: 'Los días van como siete 0 y 1, de lunes a domingo.' }) dias?: string;
-  /** Vacío/ausente = cualquier forma de pago (por eso `''` entra en la lista). */
+  /** 0208: con qué se puede pagar; vacío = cualquier forma. Manda sobre `medioPago`. */
+  @IsOptional() @IsArray() @ArrayMaxSize(MEDIOS.length) @IsIn(MEDIOS as unknown as string[], { each: true }) mediosPago?: string[];
+  /** El de antes (un solo medio): lo sigue mandando el ERP viejo durante el deploy. */
   @IsOptional() @IsIn(['', ...MEDIOS] as unknown as string[]) medioPago?: string;
   @IsOptional() @IsInt() listaId?: number;
   /** Ausente o null = TODAS las sucursales. */
@@ -5726,6 +5732,23 @@ class DescuentoDto {
 }
 
 const pct2 = (v: unknown) => Math.round((Number(v) || 0) * 100) / 100;
+
+/** Los medios pedidos en el body (0208), o undefined si no vino ninguno de los dos campos. */
+const mediosDelDto = (dto: DescuentoDto): string[] | undefined => {
+  if (dto.mediosPago !== undefined) return normalizarMedios(dto.mediosPago ?? []);
+  if (dto.medioPago !== undefined) return dto.medioPago ? [dto.medioPago] : [];
+  return undefined;
+};
+/**
+ * Las dos columnas a partir de la lista: `medios_pago` manda y `medio_pago`
+ * (sin uso desde 0208) se escribe solo si hay UN medio, para el contenedor
+ * viejo durante el deploy. Con varios queda nula: el viejo no lo limitaría,
+ * y es solo el rato del cambio de contenedor.
+ */
+const columnasMedios = (medios: string[]) => ({
+  mediosPago: medios.join(','),
+  medioPago: (medios.length === 1 ? medios[0] : null) as any,
+});
 /** El nombre de la pareja en efectivo: es el que ve la cajera en el desplegable. */
 const nombreEfectivo = (nombre: string) => `${nombre} (efectivo)`;
 
@@ -5754,9 +5777,9 @@ export class DescuentosService {
   }
 
   /** El % en efectivo pedido (0 = sin pareja), validado contra el general. */
-  private porcentajeEfectivo(pe: number, porcentaje: number, medioPago: string | null) {
+  private porcentajeEfectivo(pe: number, porcentaje: number, mediosPago: string) {
     if (!pe) return 0;
-    if (medioPago) {
+    if (mediosPago) {
       throw new BadRequestException('El % en efectivo es para un descuento de cualquier forma de pago: este ya pide un medio.');
     }
     if (pe <= porcentaje) {
@@ -5774,7 +5797,7 @@ export class DescuentosService {
   /** La pareja de antes que quedó suelta al sacarle el % (ya se había usado): se vuelve a enlazar. */
   private suelta(nombre: string) {
     return this.db.select().from(descuentos)
-      .where(and(eq(descuentos.nombre, nombreEfectivo(nombre)), sql`${descuentos.efectivoDeId} is null`, eq(descuentos.medioPago, 'efectivo')))
+      .where(and(eq(descuentos.nombre, nombreEfectivo(nombre)), sql`${descuentos.efectivoDeId} is null`, eq(descuentos.mediosPago, 'efectivo')))
       .limit(1).then((r) => r[0]);
   }
 
@@ -5815,18 +5838,18 @@ export class DescuentosService {
       porcentaje: pct2(dto.porcentaje),
       vence: vencimientoDe(dto.vence),
       dias: diasDe(dto.dias),
-      medioPago: (dto.medioPago || null) as any,
+      ...columnasMedios(mediosDelDto(dto) ?? []),
       listaId,
       sucursalId: dto.sucursalId ?? null,
       requiereAdmin: !!dto.requiereAdmin,
       activo: dto.activo !== false,
     };
-    const pe = this.porcentajeEfectivo(pct2(dto.porcentajeEfectivo), campos.porcentaje, campos.medioPago);
+    const pe = this.porcentajeEfectivo(pct2(dto.porcentajeEfectivo), campos.porcentaje, campos.mediosPago);
     const vieja = pe ? await this.suelta(nombre) : undefined;
     if (pe) await this.nombreLibre(nombreEfectivo(nombre), vieja ? [vieja.id] : []);
     return this.db.transaction(async (tx) => {
       const [d] = await tx.insert(descuentos).values(campos).returning();
-      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, medioPago: 'efectivo' as any, efectivoDeId: d.id };
+      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, ...columnasMedios(['efectivo']), efectivoDeId: d.id };
       if (pe && vieja) await tx.update(descuentos).set(copia).where(eq(descuentos.id, vieja.id));
       else if (pe) await tx.insert(descuentos).values(copia);
       return d;
@@ -5847,7 +5870,7 @@ export class DescuentosService {
       // `vence` se distingue de "no lo mandaron": una cadena vacía lo BORRA.
       vence: dto.vence !== undefined ? vencimientoDe(dto.vence) : actual.vence,
       dias: dto.dias !== undefined ? diasDe(dto.dias) : actual.dias,
-      medioPago: dto.medioPago !== undefined ? ((dto.medioPago || null) as any) : actual.medioPago,
+      ...columnasMedios(mediosDelDto(dto) ?? mediosDeDescuento(actual)),
       listaId,
       sucursalId: dto.sucursalId !== undefined ? (dto.sucursalId ?? null) : actual.sucursalId,
       requiereAdmin: dto.requiereAdmin != null ? !!dto.requiereAdmin : actual.requiereAdmin,
@@ -5856,7 +5879,7 @@ export class DescuentosService {
     // Sin mandarlo (activar, desactivar), la pareja sigue con su %.
     const pe = this.porcentajeEfectivo(
       dto.porcentajeEfectivo !== undefined ? pct2(dto.porcentajeEfectivo) : (pareja?.porcentaje ?? 0),
-      campos.porcentaje, campos.medioPago,
+      campos.porcentaje, campos.mediosPago,
     );
     const vieja = pe && !pareja ? await this.suelta(nombre) : undefined;
     const destino = pareja ?? vieja;
@@ -5866,7 +5889,7 @@ export class DescuentosService {
     const parejaUsada = !pe && pareja ? (await this.usos([pareja.id])) > 0 : false;
     await this.db.transaction(async (tx) => {
       await tx.update(descuentos).set(campos).where(eq(descuentos.id, id));
-      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, medioPago: 'efectivo' as any, efectivoDeId: id };
+      const copia = { ...campos, nombre: nombreEfectivo(nombre), porcentaje: pe, ...columnasMedios(['efectivo']), efectivoDeId: id };
       if (pe && destino) await tx.update(descuentos).set(copia).where(eq(descuentos.id, destino.id));
       else if (pe) await tx.insert(descuentos).values(copia);
       else if (pareja && parejaUsada) await tx.update(descuentos).set({ activo: false, efectivoDeId: null }).where(eq(descuentos.id, pareja.id));

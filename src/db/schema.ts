@@ -2248,7 +2248,17 @@ export const descuentos = pgTable('descuentos', {
    * domingo ('0010000' = solo los miércoles). Vacío = todos los días.
    */
   dias: text('dias').notNull().default(''),
-  /** Nulo = cualquier forma de pago. Si tiene valor, el pago debe ser ÍNTEGRO. */
+  /**
+   * CON QUÉ SE PUEDE PAGAR (0208): lista separada por comas, '' = cualquier
+   * forma. Si tiene medios, el pago es al contado y TODO con medios de la
+   * lista (repartido entre ellos está bien). Ver ventas/medios-descuento.ts.
+   */
+  mediosPago: text('medios_pago').notNull().default(''),
+  /**
+   * SIN USO desde 0208 (era UN solo medio). Se sigue escribiendo cuando hay un
+   * único medio para que el contenedor viejo funcione durante el deploy;
+   * borrarla en una migración posterior.
+   */
   medioPago: medioPagoEnum('medio_pago'),
   listaId: integer('lista_id').notNull().references(() => listasVenta.id, { onDelete: 'restrict' }),
   sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'cascade' }),
