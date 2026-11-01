@@ -1464,6 +1464,13 @@
       "when": 1793714400000,
       "tag": "0208_descuentos_varios_medios",
       "breakpoints": true
+    },
+    {
+      "idx": 209,
+      "version": "7",
+      "when": 1793800800000,
+      "tag": "0209_indicadores",
+      "breakpoints": true
     }
   ]
 }

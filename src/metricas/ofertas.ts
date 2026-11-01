@@ -40,7 +40,8 @@ const tamPaquete = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${S
 
 /* ============================== 1. EL DESGLOSE ============================== */
 
-async function desglose(c: PoolClient, f: Filtro) {
+/** También lo usa Gerencia › Indicadores (solo su % de descuentos). */
+export async function desglose(c: PoolClient, f: Filtro) {
   const w = donde(f, 'd');
   const wo = donde(f, 'o');
   const [conceptos, ofertas] = await Promise.all([

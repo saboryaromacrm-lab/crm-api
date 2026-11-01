@@ -41,6 +41,7 @@ import { RetirosModule } from './retiros/retiros.module';
 import { FeriadosModule } from './feriados/feriados.module';
 import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
+import { IndicadoresModule } from './indicadores/indicadores.module';
 import { AsesorModule } from './asesor/asesor.module';
 import { IngredientesModule } from './cafeteria/ingredientes.module';
 // TEMPORAL (0138): se borra junto con su panel cuando el stock real esté bien.
@@ -59,6 +60,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     MetricasModule,
     CashflowModule,
     ResultadosModule,
+    IndicadoresModule,
     AsesorModule,
     RetirosModule,
     FeriadosModule,

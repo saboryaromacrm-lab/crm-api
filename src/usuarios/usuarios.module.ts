@@ -255,6 +255,8 @@ export const CATALOGO_PERMISOS = [
     secciones: [
       { clave: 'gerencia.usuarios', nombre: 'Usuarios y roles' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
+      /* 0209: los números del negocio SOLO en % (sin montos), para la encargada. Cambiar los objetivos es solo del superadmin. */
+      { clave: 'gerencia.indicadores', nombre: 'Indicadores (solo porcentajes)' },
       /* Métricas, Cash Flow, Auditoría (0144) y Resultados (0152) no están acá a propósito: solo el superadmin. */
     ],
     acciones: [],
