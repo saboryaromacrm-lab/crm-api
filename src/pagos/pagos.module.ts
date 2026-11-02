@@ -27,7 +27,7 @@
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, Get, ForbiddenException, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
-  Logger,
+  Logger, type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
@@ -235,10 +235,36 @@ export class CambiarDestinoDto {
 /* ------------------------------- Servicio ------------------------------- */
 
 @Injectable()
-export class PagosProveedorService {
+export class PagosProveedorService implements OnApplicationBootstrap {
   private readonly log = new Logger('Pagos');
 
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+
+  /**
+   * LA CUENTA LIBRE SE PONE AL DÍA AL ARRANCAR (2/11/2026, pedido del dueño:
+   * «PECANES es cuenta libre, no le debo nada y me sale la compra sin pagar»).
+   * `aplicarCuentaLibre` corre cuando entra plata o deuda de ESE proveedor; la
+   * plata que ya estaba sin aplicar antes de que existiera la regla (27/10), o
+   * la de un proveedor que no volvió a moverse, quedaba sin aplicar: la factura
+   * seguía impaga y su compromiso en Cuentas corrientes como vencido. Al
+   * arrancar (o sea, en cada deploy) se recorren todos los de cuenta libre. Es
+   * idempotente: lo ya aplicado no se vuelve a tocar. Fuera del arranque, para
+   * no demorar que la API conteste.
+   */
+  onApplicationBootstrap() {
+    setTimeout(() => { void this.ponerAlDiaCuentasLibres(); }, 15_000);
+  }
+
+  async ponerAlDiaCuentasLibres() {
+    try {
+      const libres = await this.db.select({ id: proveedores.id }).from(proveedores)
+        .where(eq(proveedores.modoCuenta, 'libre'));
+      for (const p of libres) await this.aplicarCuentaLibre(p.id);
+      if (libres.length) this.log.log(`Cuenta libre: ${libres.length} proveedor(es) puestos al día.`);
+    } catch (e) {
+      this.log.warn(`Cuenta libre: no se pudo poner al día al arrancar (${(e as Error).message})`);
+    }
+  }
 
   /* ==================================================================== *
    * Recálculo — el corazón de la consistencia
