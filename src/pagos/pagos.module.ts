@@ -1695,7 +1695,7 @@ export class PagosProveedorService {
       .where(and(eq(cuentaDisponiblePagos.proveedorPagoId, proveedorPagoId), isNull(cuentaDisponiblePagos.anuladoEn)))
       .limit(1);
     if (!f) return null;
-    if (f.propio) return 'su pago propio (en Proveedores › Cuentas disponibles › Pagos)';
+    if (f.propio) return 'su pago propio o de un tercero (en Proveedores › Cuentas disponibles › Pagos)';
     if (f.ventaPagoId) {
       const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
         .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))

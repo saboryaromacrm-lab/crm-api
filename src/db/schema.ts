@@ -4105,6 +4105,8 @@ export const cuentaDisponiblePagos = pgTable('cuenta_disponible_pagos', {
   ventaPagoId: integer('venta_pago_id').references(() => ventaPagos.id, { onDelete: 'restrict' }),
   cobranzaPagoId: integer('cobranza_pago_id').references(() => cobranzaPagos.id, { onDelete: 'restrict' }),
   propio: boolean('propio').notNull().default(false),
+  /** Pago no-cliente que salió de la cuenta de OTRA persona (0211): su nombre. Vacío = cuenta de Sabor y Aroma. */
+  tercero: text('tercero').notNull().default(''),
   /** Su espejo en la cuenta del proveedor. */
   proveedorPagoId: integer('proveedor_pago_id').notNull().references(() => proveedorPagos.id, { onDelete: 'restrict' }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),

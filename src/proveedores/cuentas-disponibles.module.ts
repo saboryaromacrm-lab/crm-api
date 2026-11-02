@@ -86,6 +86,8 @@ export class PagoPropioDto {
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** De qué cuenta propia salió la transferencia (0207). */
   @IsOptional() @IsInt() cuentaPropiaId?: number;
+  /** La transferencia la hizo OTRA persona desde su cuenta (0211): su nombre. Con esto no se pide cuenta propia. */
+  @IsOptional() @IsString() @MaxLength(80) tercero?: string;
 }
 
 export class AnularPagoPropioDto {
@@ -507,7 +509,12 @@ export class CuentasDisponiblesService {
     }
     const ref = String(dto.referencia ?? '').trim();
     const obs = String(dto.observaciones ?? '').trim();
-    const cuentaPropiaId = await cuentaDeTransferencia(this.db, 'transferencia', dto.cuentaPropiaId);
+    /* DE UN TERCERO (0211, pedido del dueño): la plata salió de la cuenta de
+     * otra persona. Mismo camino que el pago propio, pero no sale de ninguna
+     * cuenta de Sabor y Aroma: no se pide ni se guarda cuenta propia. */
+    const tercero = String(dto.tercero ?? '').trim().replace(/\s+/g, ' ');
+    if (dto.tercero !== undefined && tercero.length < 2) throw new BadRequestException('Escribí quién hizo la transferencia.');
+    const cuentaPropiaId = tercero ? null : await cuentaDeTransferencia(this.db, 'transferencia', dto.cuentaPropiaId);
     await this.db.transaction(async (tx) => {
       const [c] = await tx.select().from(cuentasDisponibles).where(eq(cuentasDisponibles.id, id)).limit(1).for('update');
       if (!c) throw new NotFoundException('Esa cuenta disponible no existe.');
@@ -531,15 +538,17 @@ export class CuentasDisponiblesService {
         importe,
         destino: prov.proveeGastos && !prov.proveeMercaderia ? 'gastos' : 'mercaderia',
         aplicado: 0,
-        concepto: `Pago propio a la cuenta disponible · ${c.titular}`,
-        referencia: `${c.titular} · ${c.cbuAlias}${ref ? ` · ${ref}` : ''}`,
+        concepto: tercero
+          ? `Pago de un tercero (${tercero}) a la cuenta disponible · ${c.titular}`
+          : `Pago propio a la cuenta disponible · ${c.titular}`,
+        referencia: `${c.titular} · ${c.cbuAlias}${tercero ? ` · transfirió ${tercero}` : ''}${ref ? ` · ${ref}` : ''}`,
         usuarioId,
         estado: 'activo',
         observaciones: obs,
         cuentaPropiaId,
       }).returning({ id: proveedorPagos.id });
       await tx.insert(cuentaDisponiblePagos).values({
-        cuentaId: c.id, importe, fecha, propio: true, proveedorPagoId: pp.id, usuarioId,
+        cuentaId: c.id, importe, fecha, propio: true, tercero, proveedorPagoId: pp.id, usuarioId,
         observaciones: [ref, obs].filter(Boolean).join(' · '),
       });
       await this.pagosProv.aplicarCuentaLibre(c.proveedorId, tx);
@@ -670,6 +679,7 @@ export class CuentasDisponiblesService {
       observaciones: cuentaDisponiblePagos.observaciones,
       anuladoEn: cuentaDisponiblePagos.anuladoEn,
       propio: cuentaDisponiblePagos.propio,
+      tercero: cuentaDisponiblePagos.tercero,
       cuentaId: cuentaDisponiblePagos.cuentaId,
       proveedorId: cuentasDisponibles.proveedorId,
       proveedorNombre: proveedores.nombre,
@@ -704,9 +714,10 @@ export class CuentasDisponiblesService {
       cuentaId: f.cuentaId, proveedorId: f.proveedorId, proveedorNombre: f.proveedorNombre,
       titular: f.titular, cbuAlias: f.cbuAlias, usuarioNombre: f.usuarioNombre,
       propio: f.propio,
-      clienteNombre: f.propio ? 'Pago propio' : (f.ventaCliente ?? f.cobranzaCliente ?? ''),
+      tercero: f.tercero,
+      clienteNombre: f.propio ? (f.tercero ? `Tercero: ${f.tercero}` : 'Pago propio') : (f.ventaCliente ?? f.cobranzaCliente ?? ''),
       documento: f.propio
-        ? { clase: 'propio', id: f.id, tipo: 'propio', etiqueta: 'Transferencia propia' }
+        ? { clase: 'propio', id: f.id, tipo: 'propio', etiqueta: f.tercero ? 'Transferencia de un tercero' : 'Transferencia propia' }
         : f.ventaId
         ? { clase: 'venta', id: f.ventaId, tipo: f.ventaTipo, etiqueta: numeroDoc(f.ventaPuntoVenta!, f.ventaNumero!) }
         : f.cobranzaId

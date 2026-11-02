@@ -1478,6 +1478,13 @@
       "when": 1793887200000,
       "tag": "0210_sesion_recordada",
       "breakpoints": true
+    },
+    {
+      "idx": 211,
+      "version": "7",
+      "when": 1793890800000,
+      "tag": "0211_pago_tercero_cuenta",
+      "breakpoints": true
     }
   ]
 }
