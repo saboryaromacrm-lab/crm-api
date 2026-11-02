@@ -42,6 +42,7 @@ import {
 import { DENOMINACIONES } from '../caja/caja.module';
 import { TURNO_TARDE_DESDE } from '../inventario/inventario.service';
 import { type EstadoTurno, estadoTurno } from './planilla';
+import { cerrarHastaSql } from '../caja/plazo';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
@@ -119,8 +120,6 @@ export { esConceptoCambio, esConceptoDeposito } from './conceptos';
 
 const TIPOS = ['ingreso', 'egreso'] as const;
 const CLASES = ['gasto', 'movimiento'] as const;
-/** Más de esto abierta, la caja de un local se avisa como olvidada. */
-const HORAS_CAJA_ABIERTA = 24;
 
 /* ------------------------------ DTOs ------------------------------ */
 class InicioDto {
@@ -351,13 +350,18 @@ export class CashflowService {
 
   /* ------------------------------ Resumen ------------------------------ */
 
-  /** Las cajas de los locales abiertas hace más de 24 h (un cierre olvidado: el sobre no llega). */
+  /**
+   * Las cajas de los locales que pasaron su último día para cerrar (0212: el
+   * plazo de cada turno; la de todos los días, desde el día siguiente al que
+   * abrió). Es un cierre olvidado: el sobre no llega.
+   */
   private async cajasAbiertas() {
     const r = await this.db.execute(sql`
       select cs.id, cs.sucursal_id as "sucursalId", su.nombre as sucursal, cs.apertura, u.nombre as usuario,
-        round(extract(epoch from (now() - cs.apertura)) / 3600)::int as horas
+        cs.plazo_dias as "plazoDias", ${cerrarHastaSql('cs')}::text as "cerrarHasta",
+        (${hoyAr()}::date - ${cerrarHastaSql('cs')})::int as "diasVencida"
       from caja_sesiones cs join sucursales su on su.id = cs.sucursal_id left join usuarios u on u.id = cs.usuario_id
-      where cs.estado = 'abierta' and cs.apertura < now() - (${HORAS_CAJA_ABIERTA} || ' hours')::interval
+      where cs.estado = 'abierta' and ${cerrarHastaSql('cs')} < ${hoyAr()}::date
       order by cs.apertura`);
     return r.rows;
   }
@@ -604,7 +608,9 @@ export class CashflowService {
    * sus turnos de caja de ese día y en qué quedó cada uno (`estadoTurno`). Un
    * local sin turno ese día figura «sin caja». Un turno abierto de un día
    * anterior aparece también en los días siguientes, hasta hoy: es justo el
-   * que hay que ver. Dos consultas (locales y turnos), sin N+1.
+   * que hay que ver. El de VARIOS días (0212) aparece en todos los que abarcó,
+   * también ya cerrado: esos días el local no figura «sin caja». Dos consultas
+   * (locales y turnos), sin N+1.
    */
   async planilla(diaIn?: string) {
     const hoy = hoyAr();
@@ -618,6 +624,7 @@ export class CashflowService {
         select cs.id, cs.sucursal_id as "sucursalId", cs.estado, cs.apertura, cs.cierre,
           (cs.apertura at time zone ${ZONA})::date::text as "aperturaDia",
           (cs.cierre at time zone ${ZONA})::date::text as "cierreDia",
+          cs.plazo_dias as "plazoDias", ${cerrarHastaSql('cs')}::text as "cerrarHasta",
           extract(hour from cs.apertura at time zone ${ZONA}) < ${TURNO_TARDE_DESDE} as manana,
           coalesce(cs.envio_efectivo, 0) as envio, cs.fondo_queda as "fondoQueda", cs.diferencia as "diferenciaCajero",
           coalesce(uc.nombre, ua.nombre, '') as cajero,
@@ -629,6 +636,7 @@ export class CashflowService {
         left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
         where (${desdeDia('cs.apertura', dia)} and ${hastaDia('cs.apertura', dia)})
           or (cs.estado = 'abierta' and ${hastaDia('cs.apertura', dia)})
+          or (cs.plazo_dias > 1 and ${hastaDia('cs.apertura', dia)} and ${desdeDia('cs.cierre', dia)})
         order by cs.apertura`),
     ]);
     const fechaInicio = caja?.fechaInicio ?? null;
@@ -640,8 +648,12 @@ export class CashflowService {
       const t = {
         id: Number(x.id), estado: estadoTurno({ ...x, envio }, fechaInicio),
         turno: x.manana ? 'mañana' : 'tarde', apertura: iso(x.apertura), cierre: iso(x.cierre),
-        /** Abierta desde un día anterior: el cierre olvidado. */
+        /** Abierta desde un día anterior: el día que abrió. */
         deOtroDia: x.aperturaDia !== dia ? x.aperturaDia : null,
+        plazoDias: Number(x.plazoDias) || 1,
+        cerrarHasta: x.cerrarHasta,
+        /** Abierta y ese día ya había pasado su último día para cerrar: el cierre olvidado. */
+        vencida: x.estado === 'abierta' && x.cerrarHasta < dia,
         cajero: x.cajero, envio, fondoQueda: x.fondoQueda == null ? null : money(x.fondoQueda),
         diferenciaCajero: x.estado === 'cerrada' ? money(x.diferenciaCajero) : null,
         contado: x.contado == null ? null : money(x.contado),
@@ -659,8 +671,8 @@ export class CashflowService {
       dia, hoy, cashflowDesde: fechaInicio, locales,
       resumen: {
         abiertas: cuenta('abierta').length,
-        /** De esas, las abiertas desde un día anterior: el cierre olvidado. */
-        olvidadas: cuenta('abierta').filter((t) => t.deOtroDia).length,
+        /** De esas, las que pasaron su último día para cerrar: el cierre olvidado. */
+        olvidadas: cuenta('abierta').filter((t) => t.vencida).length,
         sinRendir: sinRendir.length, sinRendirTotal: money(sinRendir.reduce((a, t) => a + t.envio, 0)),
         rendidas: cuenta('rendida').length + cuenta('no_corresponde').length,
         sinCaja: locales.filter((l) => !l.turnos.length).length,

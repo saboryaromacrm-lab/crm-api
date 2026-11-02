@@ -1485,6 +1485,13 @@
       "when": 1793890800000,
       "tag": "0211_pago_tercero_cuenta",
       "breakpoints": true
+    },
+    {
+      "idx": 212,
+      "version": "7",
+      "when": 1793894400000,
+      "tag": "0212_cierre_caja_dias",
+      "breakpoints": true
     }
   ]
 }

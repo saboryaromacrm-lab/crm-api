@@ -140,6 +140,12 @@ export const sucursales = pgTable('sucursales', {
    * La Distribuidora no lo puede apagar: surte la tienda online, que es mayorista.
    */
   vendeMayorista: boolean('vende_mayorista').notNull().default(true),
+  /**
+   * CADA CUÁNTOS DÍAS SE CIERRA LA CAJA (0212), de 1 (todos los días) a 7. El
+   * turno copia este número al abrir (`cajaSesiones.plazoDias`): cambiarlo no
+   * mueve el vencimiento de una caja ya abierta. Ver `caja/plazo.ts`.
+   */
+  cierreCadaDias: integer('cierre_cada_dias').notNull().default(1),
 }, (t) => ({
   /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
    * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
@@ -2121,6 +2127,8 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   fondoQueda: doublePrecision('fondo_queda'),
   /** Los billetes que van en el SOBRE (0130); lo que queda en la caja es `billetes` menos estos. */
   billetesEnvio: jsonb('billetes_envio'),
+  /** El plazo con el que abrió (0212): se cierra a más tardar el día de la apertura + plazo − 1. */
+  plazoDias: integer('plazo_dias').notNull().default(1),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
   /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el

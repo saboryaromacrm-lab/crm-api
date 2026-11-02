@@ -7,6 +7,7 @@ import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
+import { PLAZO_MAX_DIAS } from '../caja/plazo';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import {
   cajaSesiones, conteos, enviosCafeteria, gastosRecurrentes, incidencias, pedidosCafeteria, presupuestos, productos, sesiones, stock,
@@ -26,6 +27,8 @@ class UpsertSucursalDto {
   @IsOptional() @IsNumber() @Min(0, { message: 'El fondo de caja no puede ser negativo.' }) @Max(100_000_000) fondoCaja?: number;
   /** Trabaja la venta mayorista (0150). Sin el campo, queda como estaba. */
   @IsOptional() @IsBoolean() vendeMayorista?: boolean;
+  /** Cada cuántos días se cierra la caja (0212). Rige desde la próxima apertura. */
+  @IsOptional() @IsInt() @Min(1) @Max(PLAZO_MAX_DIAS, { message: `La caja se cierra como mucho cada ${PLAZO_MAX_DIAS} días.` }) cierreCadaDias?: number;
 }
 
 /**
@@ -45,10 +48,16 @@ export const normalizarPuntoVentaFiscal = (v: unknown) => {
 const CAMPOS_SUCURSAL = {
   nombre: 'Nombre', tipo: 'Tipo', puntoVenta: 'Punto de venta ARCA', direccion: 'Domicilio',
   facturaElectronica: 'Factura electrónica', fondoCaja: 'Fondo de caja', vendeMayorista: 'Vende mayorista',
+  cierreCadaDias: 'Cierre de caja',
 } as const;
+/** «Todos los días» o «Cada 3 días». */
+const textoCierreCaja = (n: unknown) => (Number(n) > 1 ? `Cada ${Number(n)} días` : 'Todos los días');
 const textoSucursal = (s: Record<string, any>) => Object.fromEntries(Object.keys(CAMPOS_SUCURSAL).map((k) => {
   const v = s[k];
-  return [k, typeof v === 'boolean' ? (v ? 'Sí' : 'No') : k === 'fondoCaja' ? `$${(Number(v) || 0).toLocaleString('es-AR')}` : String(v ?? '')];
+  if (typeof v === 'boolean') return [k, v ? 'Sí' : 'No'];
+  if (k === 'fondoCaja') return [k, `$${(Number(v) || 0).toLocaleString('es-AR')}`];
+  if (k === 'cierreCadaDias') return [k, textoCierreCaja(v)];
+  return [k, String(v ?? '')];
 }));
 
 @Injectable()
@@ -88,9 +97,15 @@ export class SucursalesService {
    * sucursales con el mismo punto de venta pedirían el mismo próximo número a
    * ARCA y se pisarían, y un error de índice único no explica nada de eso.
    */
-  private async normalizar(dto: UpsertSucursalDto, idPropio?: number, actual?: { facturaElectronica: boolean; tipo: string; vendeMayorista: boolean }) {
-    const puntoVenta = normalizarPuntoVentaFiscal(dto.puntoVenta);
-    const direccion = (dto.direccion ?? '').trim();
+  private async normalizar(
+    dto: UpsertSucursalDto, idPropio?: number,
+    actual?: { facturaElectronica: boolean; tipo: string; vendeMayorista: boolean; puntoVenta: string; direccion: string },
+  ) {
+    /* Sin el campo, queda como estaba (2/11/2026): la fila de Sucursales guarda
+     * de a un dato (mayorista, cierre de caja) y no puede borrar de rebote el
+     * punto de venta ni el domicilio que no mandó. */
+    const puntoVenta = dto.puntoVenta !== undefined ? normalizarPuntoVentaFiscal(dto.puntoVenta) : (actual?.puntoVenta ?? '');
+    const direccion = dto.direccion !== undefined ? dto.direccion.trim() : (actual?.direccion ?? '');
     /*
      * FACTURA ELECTRÓNICA (0124): sin el campo queda como estaba; sin punto de
      * venta se apaga sola (no hay con qué facturar). Encenderla pide las dos
@@ -130,13 +145,14 @@ export class SucursalesService {
     }
     return {
       nombre: dto.nombre.trim(),
-      tipo: dto.tipo ?? ('express' as const),
+      tipo: tipo as 'distribuidora' | 'express',
       puntoVenta,
       direccion,
       facturaElectronica,
       // Sin el campo, el fondo queda como estaba: editar el nombre no lo borra.
       ...(dto.fondoCaja !== undefined ? { fondoCaja: Math.round(Number(dto.fondoCaja) * 100) / 100 } : {}),
       ...(dto.vendeMayorista !== undefined ? { vendeMayorista: dto.vendeMayorista } : {}),
+      ...(dto.cierreCadaDias !== undefined ? { cierreCadaDias: dto.cierreCadaDias } : {}),
     };
   }
 

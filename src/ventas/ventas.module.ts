@@ -3577,7 +3577,10 @@ export class VentasService {
     // "turno inexistente" que el cajero no puede interpretar.
     if (cajaSesionId) {
       const sugerido = await this.caja.getOpcional(cajaSesionId);
-      if (sugerido && sugerido.estado === 'abierta' && sugerido.sucursalId === sucursalId) return sugerido;
+      if (sugerido && sugerido.estado === 'abierta' && sugerido.sucursalId === sucursalId) {
+        this.caja.exigirEnPlazo(sugerido);
+        return sugerido;
+      }
     }
     return this.caja.exigirTurno(sucursalId, condicionPago === 'contado' && !!config.cajaObligatoria);
   }

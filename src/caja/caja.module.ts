@@ -27,6 +27,7 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import { type ConceptoRegla, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
+import { diaEnPalabras, plazoDelTurno } from './plazo';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cashflowConceptos, cobranzaPagos, cobranzas, gastoCategorias, mpCobros,
   proveedorImputaciones, proveedorPagos, sucursales, ventaPagos, ventas,
@@ -334,6 +335,27 @@ export class CajaService {
     return c ?? null;
   }
 
+  /** El turno abierto con su plazo para cerrar (0212): lo que muestran la caja y el punto de venta. */
+  async actualConPlazo(sucursalId: number) {
+    const c = await this.actual(sucursalId);
+    return c ? { ...c, plazo: plazoDelTurno(c) } : null;
+  }
+
+  /**
+   * UNA CAJA DE VARIOS DÍAS VENCIDA NO VENDE NI COBRA (0212, decisión del
+   * dueño): hasta que se cierre, nada más se cuelga de ese turno. Es lo que
+   * garantiza que ninguna quede abierta sin rendir.
+   */
+  exigirEnPlazo(turno: { apertura: Date | string; plazoDias?: number | null }) {
+    const p = plazoDelTurno(turno);
+    if (p.bloquea) {
+      throw new BadRequestException(
+        `La caja de este local se cierra cada ${p.plazoDias} días y se tenía que cerrar el ${diaEnPalabras(p.cerrarHasta)}. `
+        + 'Cerrala desde Ventas › Caja para seguir vendiendo; después abrís una nueva.',
+      );
+    }
+  }
+
   async list(q: { sucursalId?: number; estado?: string; limit?: number; desde?: string; hasta?: string }) {
     const conds: any[] = [];
     if (q.sucursalId) conds.push(eq(cajaSesiones.sucursalId, Number(q.sucursalId)));
@@ -575,7 +597,7 @@ export class CajaService {
    * fondo y la pantalla seguía creyendo que no había).
    */
   async datosApertura(sucursalId: number) {
-    const [suc] = await this.db.select({ fondo: sucursales.fondoCaja })
+    const [suc] = await this.db.select({ fondo: sucursales.fondoCaja, cierreCadaDias: sucursales.cierreCadaDias })
       .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     const [ultimo] = await this.db.select({
       id: cajaSesiones.id, cierre: cajaSesiones.cierre, fondoQueda: cajaSesiones.fondoQueda,
@@ -591,6 +613,8 @@ export class CajaService {
       ultimoCierre: ultimo?.cierre ?? null,
       /** Lo que se propone (y lo que el cajero confirma): lo que quedó, o el fondo fijo. */
       propuesto: dejadoEnCaja ?? fondoFijo,
+      /** El plazo con que abriría hoy (0212) y su último día para cerrar. */
+      plazo: plazoDelTurno({ apertura: new Date(), plazoDias: suc?.cierreCadaDias }),
     };
   }
 
@@ -661,6 +685,7 @@ export class CajaService {
           montoInicial,
           estado: 'abierta',
           observaciones: dto.observaciones ?? '',
+          plazoDias: ap.plazo.plazoDias,
         }).returning();
         /* La primera apertura FIJA el fondo (solo si nadie lo cargó antes). */
         if (fondo == null) {
@@ -1054,13 +1079,15 @@ export class CajaService {
 
   /**
    * Turno válido para operar en una sucursal. Lo usa la venta: si la caja es
-   * obligatoria y no hay turno, la venta se rechaza acá y no a mitad de camino.
+   * obligatoria y no hay turno, o la caja de varios días ya venció (0212), la
+   * venta se rechaza acá y no a mitad de camino.
    */
   async exigirTurno(sucursalId: number, obligatoria: boolean) {
     const abierta = await this.actual(sucursalId);
     if (!abierta && obligatoria) {
       throw new BadRequestException('No hay un turno de caja abierto en esta sucursal. Abrí la caja para vender.');
     }
+    if (abierta) this.exigirEnPlazo(abierta);
     return abierta;
   }
 }
@@ -1092,7 +1119,7 @@ export class CajaController {
    */
   @Get('actual/:sucursalId')
   @Permiso('ventas.caja', 'ventas.pos')
-  actual(@Param('sucursalId', ParseIntPipe) sucursalId: number) { return this.svc.actual(sucursalId); }
+  actual(@Param('sucursalId', ParseIntPipe) sucursalId: number) { return this.svc.actualConPlazo(sucursalId); }
 
   /*
    * LAS LECTURAS TAMBIÉN SON POR SUCURSAL. Las cuatro escrituras ya comparaban

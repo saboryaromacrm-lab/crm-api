@@ -275,6 +275,8 @@ export class CobranzasService {
      */
     const hayEfectivo = pagos.some((p) => p.medio === 'efectivo');
     const turno = await this.caja.actual(sucursalId);
+    /* Una caja de varios días vencida (0212) no cobra hasta que se cierre. */
+    if (turno) this.caja.exigirEnPlazo(turno);
     if (hayEfectivo && !!config.cajaObligatoria && !turno) {
       throw new BadRequestException(
         'No hay un turno de caja abierto en esta sucursal, y el efectivo de un recibo tiene que entrar a una caja. Abrí la caja y volvé a cobrar.',
