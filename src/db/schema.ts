@@ -345,6 +345,12 @@ export const sesiones = pgTable('sesiones', {
    * la caja abierta toda la noche en una máquina compartida.
    */
   expiraEn: timestamp('expira_en', { withTimezone: true }).notNull(),
+  /**
+   * La ventana de inactividad DE ESTA sesión (0210): 12 h para todos; 30 días
+   * solo para el superadmin que entra desde la app instalada en un equipo que
+   * no es terminal de sucursal (ver `SesionesService.crear`).
+   */
+  vidaHoras: integer('vida_horas').notNull().default(12),
   userAgent: text('user_agent').notNull().default(''),
 }, (t) => ({
   ixToken: uniqueIndex('ix_sesiones_token').on(t.tokenHash),

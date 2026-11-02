@@ -1471,6 +1471,13 @@
       "when": 1793800800000,
       "tag": "0209_indicadores",
       "breakpoints": true
+    },
+    {
+      "idx": 210,
+      "version": "7",
+      "when": 1793887200000,
+      "tag": "0210_sesion_recordada",
+      "breakpoints": true
     }
   ]
 }

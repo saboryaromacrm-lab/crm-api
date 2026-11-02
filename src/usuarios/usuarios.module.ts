@@ -21,7 +21,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sucursales, usuarios } from '../db/schema';
-import { SesionesService } from '../auth/sesiones.service';
+import { HORAS_VIDA_RECORDADA, SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { PERMISOS_BASE, conPermisosBase } from '../auth/permisos-base';
@@ -807,7 +807,14 @@ export class UsuariosService {
      * contexto de trabajo de todo el turno, y del lado del servidor deja de
      * poder cambiarse editando un número.
      */
-    const token = await this.sesiones.crear(u.id, suc.id, userAgent);
+    /*
+     * SESIÓN RECORDADA (0210, pedido del dueño): el superadmin que entra desde
+     * la app instalada (el ERP lo avisa con `recordar`) queda adentro 30 días
+     * de inactividad en vez de 12 h. Nunca en una terminal registrada: esa es
+     * la PC del mostrador, y ahí el que abre a la mañana entraría como el dueño.
+     */
+    const recordada = o?.recordar === true && r?.clave === 'superadmin' && !terminal;
+    const token = await this.sesiones.crear(u.id, suc.id, userAgent, recordada ? HORAS_VIDA_RECORDADA : undefined);
     // Barrido oportunista de las vencidas: pasa una vez por login, que es
     // exactamente la frecuencia que este sistema necesita. Un cron para esto
     // sería una pieza más que mantener.
@@ -831,6 +838,8 @@ export class UsuariosService {
       /* Para que el POS pueda mostrar "Caja 2" en el encabezado sin volver a
        * preguntar quién es este equipo. */
       terminal: terminal ? { id: terminal.id, nombre: terminal.nombre } : null,
+      /* Para que el ERP guarde la copia del navegador por el mismo plazo. */
+      recordada,
     };
   }
 

@@ -23,11 +23,17 @@ import { conPermisosBase } from './permisos-base';
 const HORAS_VIDA = 12;
 
 /**
+ * LA SESIÓN RECORDADA DEL SUPERADMIN (0210, pedido del dueño): desde la app
+ * instalada en SU celular o SU PC no quiere volver a entrar cada día. Vence
+ * igual por inactividad, pero a los 30 días. Los demás roles siguen en 12 h.
+ */
+export const HORAS_VIDA_RECORDADA = 30 * 24;
+
+/*
  * Solo se estira el vencimiento cuando queda menos de la mitad de la ventana.
  * Escribir en cada request sería un UPDATE por cada llamada del sistema — el POS
  * hace varias por venta.
  */
-const REFRESCAR_DEBAJO_DE_HORAS = HORAS_VIDA / 2;
 
 const hashDe = (token: string) => createHash('sha256').update(token).digest('hex');
 const enHoras = (h: number) => new Date(Date.now() + h * 3600_000);
@@ -37,13 +43,14 @@ export class SesionesService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
   /** Crea la sesión y devuelve el token EN CLARO — la única vez que existe. */
-  async crear(usuarioId: number, sucursalId: number, userAgent = ''): Promise<string> {
+  async crear(usuarioId: number, sucursalId: number, userAgent = '', vidaHoras = HORAS_VIDA): Promise<string> {
     const token = randomBytes(32).toString('base64url');
     await this.db.insert(sesiones).values({
       tokenHash: hashDe(token),
       usuarioId,
       sucursalId,
-      expiraEn: enHoras(HORAS_VIDA),
+      expiraEn: enHoras(vidaHoras),
+      vidaHoras,
       userAgent: userAgent.slice(0, 300),
     });
     return token;
@@ -62,6 +69,7 @@ export class SesionesService {
       .select({
         sesionId: sesiones.id,
         expiraEn: sesiones.expiraEn,
+        vidaHoras: sesiones.vidaHoras,
         usuarioId: usuarios.id,
         nombre: usuarios.nombre,
         activo: usuarios.activo,
@@ -99,10 +107,14 @@ export class SesionesService {
       return null;
     }
 
+    /* La ventana larga es SOLO del superadmin: si al dueño de una sesión
+     * recordada le cambian el rol, vuelve a las 12 h de todos en la request
+     * siguiente, sin esperar a que se le venzan los 30 días. */
+    const vida = f.rolClave === 'superadmin' ? (f.vidaHoras || HORAS_VIDA) : HORAS_VIDA;
     const faltaHoras = (f.expiraEn.getTime() - Date.now()) / 3600_000;
-    if (faltaHoras < REFRESCAR_DEBAJO_DE_HORAS) {
+    if (faltaHoras < vida / 2 || faltaHoras > vida) {
       await this.db.update(sesiones)
-        .set({ expiraEn: enHoras(HORAS_VIDA), ultimoUso: new Date() })
+        .set({ expiraEn: enHoras(vida), vidaHoras: vida, ultimoUso: new Date() })
         .where(eq(sesiones.id, f.sesionId));
     }
 
