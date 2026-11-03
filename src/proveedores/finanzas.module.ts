@@ -182,6 +182,106 @@ export class FinanzasProveedorService {
    * Compromisos
    * ==================================================================== */
 
+  /**
+   * Lo que suma y resta en la cuenta de cada proveedor (o de uno): la base del
+   * saldo. Una sola definición para el estado de cuenta y Cuentas corrientes.
+   */
+  private async movimientosCuenta(proveedorId?: number) {
+    const de = (col: any) => (proveedorId ? eq(col, proveedorId) : undefined);
+    const [compAgg, gastoAgg, pagoAgg, ajusteAgg] = await Promise.all([
+      this.db.select({
+        proveedorId: comprobantes.proveedorId,
+        deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
+      }).from(comprobantes)
+        .where(and(eq(comprobantes.estado, 'confirmado'), de(comprobantes.proveedorId)))
+        .groupBy(comprobantes.proveedorId),
+      this.db.select({
+        proveedorId: gastos.proveedorId,
+        deuda: sql<number>`coalesce(sum(${gastos.total}), 0)`,
+        impagaDesde: sql<string | null>`min(${gastos.fecha}) filter (where ${gastos.total} - ${gastos.pagado} > ${EPS})`,
+      }).from(gastos)
+        .where(and(ne(gastos.estado, 'anulado'), sql`${gastos.proveedorId} is not null`, de(gastos.proveedorId)))
+        .groupBy(gastos.proveedorId),
+      this.db.select({
+        proveedorId: proveedorPagos.proveedorId,
+        pagado: sql<number>`coalesce(sum(${proveedorPagos.importe}), 0)`,
+        ultimoPago: sql<string | null>`max(${proveedorPagos.fecha})`,
+      }).from(proveedorPagos)
+        .where(and(eq(proveedorPagos.estado, 'activo'), sql`${proveedorPagos.proveedorId} is not null`, de(proveedorPagos.proveedorId)))
+        .groupBy(proveedorPagos.proveedorId),
+      this.db.select({
+        proveedorId: proveedorAjustes.proveedorId,
+        ajustes: sql<number>`coalesce(sum(${proveedorAjustes.importe}), 0)`,
+      }).from(proveedorAjustes).where(de(proveedorAjustes.proveedorId)).groupBy(proveedorAjustes.proveedorId),
+    ]);
+    const porId = <T extends { proveedorId: number | null }>(xs: T[]) =>
+      new Map(xs.filter((x) => x.proveedorId != null).map((x) => [x.proveedorId as number, x]));
+    const comp = porId(compAgg); const gasto = porId(gastoAgg); const pago = porId(pagoAgg); const ajuste = porId(ajusteAgg);
+    const partes = (id: number) => ({
+      mercaderia: money(Number(comp.get(id)?.deuda) || 0),
+      gastos: money(Number(gasto.get(id)?.deuda) || 0),
+      pagado: money(Number(pago.get(id)?.pagado) || 0),
+      ajustes: money(Number(ajuste.get(id)?.ajustes) || 0),
+    });
+    return {
+      comp, gasto, pago, ajuste, partes,
+      saldo: (id: number) => {
+        const x = partes(id);
+        return money(x.mercaderia + x.gastos + x.ajustes - x.pagado);
+      },
+    };
+  }
+
+  /**
+   * LO QUE YA ESTÁ PAGADO A CUENTA (3/11/2026, pedido del dueño: «en Cuentas
+   * corrientes me tiene que mostrar la deuda que tengo con el proveedor»).
+   *
+   * Lo que falta de cada vencimiento sale de su factura (`faltaCompromiso`),
+   * que solo ve los pagos aplicados a ESA factura. Un pago a cuenta (el del
+   * Cash Flow, uno sin facturas tildadas) o un ajuste bajan el saldo del
+   * proveedor pero no tocan ninguna factura, y Cuentas corrientes seguía
+   * mostrando la deuda entera. Regla: lo que el proveedor tiene en Cuentas
+   * corrientes no puede pasar de lo que de verdad se le debe (su saldo, menos
+   * lo que ya está en echeqs). Lo que sobra está cubierto por lo pagado a
+   * cuenta, y cubre primero lo que vence antes, como el estado de cuenta.
+   * Es un cálculo, no una marca: si se anula ese pago, la deuda vuelve sola.
+   *
+   * Devuelve cada vencimiento pendiente con lo que de verdad falta.
+   */
+  private async pendientesConCuenta(proveedorId?: number) {
+    const [ks, mov] = await Promise.all([
+      this.db.select({
+        id: proveedorCompromisos.id, proveedorId: proveedorCompromisos.proveedorId,
+        echeqId: proveedorCompromisos.echeqId, fechaVenc: proveedorCompromisos.fechaVenc, falta: faltaCompromiso,
+      }).from(proveedorCompromisos)
+        .where(and(eq(proveedorCompromisos.pagado, false), proveedorId ? eq(proveedorCompromisos.proveedorId, proveedorId) : undefined))
+        .orderBy(proveedorCompromisos.fechaVenc, proveedorCompromisos.id),
+      this.movimientosCuenta(proveedorId),
+    ]);
+    const porProv = new Map<number, typeof ks>();
+    for (const k of ks) porProv.set(k.proveedorId, [...(porProv.get(k.proveedorId) ?? []), k]);
+    const res = new Map<number, { proveedorId: number; echeqId: number | null; fechaVenc: Date; falta: number; cubierto: number }>();
+    for (const [prov, lista] of porProv) {
+      const comunes = lista.filter((k) => k.echeqId == null);
+      const enEcheqs = lista.filter((k) => k.echeqId != null).reduce((a, k) => a + Number(k.falta), 0);
+      const tope = Math.max(0, money(mov.saldo(prov) - enEcheqs));
+      let aCuenta = Math.max(0, money(comunes.reduce((a, k) => a + Number(k.falta), 0) - tope));
+      for (const k of lista) {
+        const falta = money(Number(k.falta));
+        const cubierto = k.echeqId == null ? money(Math.min(falta, aCuenta)) : 0;
+        aCuenta = money(aCuenta - cubierto);
+        res.set(k.id, { proveedorId: prov, echeqId: k.echeqId, fechaVenc: k.fechaVenc, falta: money(falta - cubierto), cubierto });
+      }
+    }
+    return res;
+  }
+
+  /** La fila con lo que de verdad falta y lo que ya cubre lo pagado a cuenta (`cubiertoACuenta`). */
+  private conCuenta<T extends { id: number; pagado: boolean; falta: number }>(f: T, pend: Map<number, { falta: number; cubierto: number }>) {
+    const p = f.pagado ? undefined : pend.get(f.id);
+    return p ? { ...f, falta: p.falta, cubiertoACuenta: p.cubierto } : { ...f, cubiertoACuenta: 0 };
+  }
+
   private selectCompromiso() {
     return {
       id: proveedorCompromisos.id,
@@ -246,13 +346,19 @@ export class FinanzasProveedorService {
     // 'todos': sin filtro por pagado
     if (q.proveedorId) conds.push(eq(proveedorCompromisos.proveedorId, q.proveedorId));
 
-    const filas = await this.db.select(this.selectCompromiso())
-      .from(proveedorCompromisos)
-      .leftJoin(proveedores, eq(proveedores.id, proveedorCompromisos.proveedorId))
-      .leftJoin(comprobantes, eq(comprobantes.id, proveedorCompromisos.comprobanteId))
-      .where(and(...conds))
-      .orderBy(proveedorCompromisos.fechaVenc, proveedorCompromisos.id)
-      .limit(500);
+    const [crudas, pend] = await Promise.all([
+      this.db.select(this.selectCompromiso())
+        .from(proveedorCompromisos)
+        .leftJoin(proveedores, eq(proveedores.id, proveedorCompromisos.proveedorId))
+        .leftJoin(comprobantes, eq(comprobantes.id, proveedorCompromisos.comprobanteId))
+        .where(and(...conds))
+        .orderBy(proveedorCompromisos.fechaVenc, proveedorCompromisos.id)
+        .limit(500),
+      this.pendientesConCuenta(q.proveedorId),
+    ]);
+    // Los pendientes muestran solo lo que todavía se debe; «Todos» muestra también lo ya cubierto.
+    const filas = crudas.map((f) => this.conCuenta(f, pend))
+      .filter((f) => f.pagado || filtro === 'todos' || f.falta > EPS);
     return {
       filas: filas.map((f) => this.mapCompromiso(f)),
       total: filas.length,
@@ -260,25 +366,20 @@ export class FinanzasProveedorService {
     };
   }
 
-  /** Las alarmas de la sección y del sidebar (excluye echeqs — tienen las suyas). */
+  /** Las alarmas de la sección y del sidebar (excluye echeqs — tienen las suyas), con lo pagado a cuenta descontado. */
   async statsCompromisos() {
-    const hoy = hoy0();
-    const [r] = await this.db.select({
-      vencidosN: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} < ${hoy.toISOString()})::int`,
-      vencidosM: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} < ${hoy.toISOString()}), 0)`,
-      prox3N: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()})::int`,
-      prox3M: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 4 * 86400000).toISOString()}), 0)`,
-      semanaN: sql<number>`count(*) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()})::int`,
-      semanaM: sql<number>`coalesce(sum(${faltaCompromiso}) filter (where ${proveedorCompromisos.fechaVenc} >= ${hoy.toISOString()} and ${proveedorCompromisos.fechaVenc} < ${new Date(hoy.getTime() + 8 * 86400000).toISOString()}), 0)`,
-      totalN: sql<number>`count(*)::int`,
-      totalM: sql<number>`coalesce(sum(${faltaCompromiso}), 0)`,
-    }).from(proveedorCompromisos)
-      .where(and(eq(proveedorCompromisos.pagado, false), isNull(proveedorCompromisos.echeqId), sql`${faltaCompromiso} > ${EPS}`));
+    const hoy = hoy0().getTime();
+    const dia = 86400000;
+    const ks = [...(await this.pendientesConCuenta()).values()].filter((k) => k.echeqId == null && k.falta > EPS);
+    const suma = (pred: (t: number) => boolean) => {
+      const xs = ks.filter((k) => pred(k.fechaVenc.getTime()));
+      return { n: xs.length, monto: money(xs.reduce((a, k) => a + k.falta, 0)) };
+    };
     return {
-      vencidos: { n: Number(r?.vencidosN) || 0, monto: money(Number(r?.vencidosM) || 0) },
-      prox3: { n: Number(r?.prox3N) || 0, monto: money(Number(r?.prox3M) || 0) },
-      semana: { n: Number(r?.semanaN) || 0, monto: money(Number(r?.semanaM) || 0) },
-      total: { n: Number(r?.totalN) || 0, monto: money(Number(r?.totalM) || 0) },
+      vencidos: suma((t) => t < hoy),
+      prox3: suma((t) => t >= hoy && t < hoy + 4 * dia),
+      semana: suma((t) => t >= hoy && t < hoy + 8 * dia),
+      total: suma(() => true),
     };
   }
 
@@ -289,7 +390,7 @@ export class FinanzasProveedorService {
       .leftJoin(comprobantes, eq(comprobantes.id, proveedorCompromisos.comprobanteId))
       .where(eq(proveedorCompromisos.id, id)).limit(1);
     if (!f) throw new NotFoundException('Compromiso inexistente.');
-    return this.mapCompromiso(f);
+    return this.mapCompromiso(this.conCuenta(f, f.pagado ? new Map() : await this.pendientesConCuenta(f.proveedorId)));
   }
 
   /** El vencimiento no puede ser anterior a la emisión (27/9/2026). */
@@ -400,7 +501,9 @@ export class FinanzasProveedorService {
       throw new BadRequestException('Este compromiso es un echeq: se cobra desde la cartera de Echeqs.');
     }
     if (k.falta <= EPS) {
-      throw new BadRequestException('Esa cuota ya está cubierta por lo que se le pagó a la factura: no hay nada que pagar.');
+      throw new BadRequestException(k.cubiertoACuenta > EPS
+        ? 'Esa cuota ya está cubierta por lo que se le pagó a cuenta (o por un ajuste): no hay nada que pagar.'
+        : 'Esa cuota ya está cubierta por lo que se le pagó a la factura: no hay nada que pagar.');
     }
     if (!dto.medio && !dto.formas?.length) {
       throw new BadRequestException('Indicá con qué medio REAL se pagó (la promesa decía cuenta corriente; la plata salió por algún lado).');
@@ -1095,37 +1198,9 @@ export class FinanzasProveedorService {
    * bug de "los números no cuadran entre pantallas" de la app vieja.
    */
   async edocGlobal() {
-    const [compAgg, gastoAgg, pagoAgg, ajusteAgg, compromAgg, echeqAgg, provs] = await Promise.all([
-      this.db.select({
-        proveedorId: comprobantes.proveedorId,
-        deuda: sql<number>`coalesce(sum(case when ${comprobantes.tipo} in ('factura','liquidacion','nota_debito') then ${comprobantes.total} when ${comprobantes.tipo} = 'nota_credito' then -${comprobantes.total} else 0 end), 0)`,
-      }).from(comprobantes)
-        .where(eq(comprobantes.estado, 'confirmado'))
-        .groupBy(comprobantes.proveedorId),
-      this.db.select({
-        proveedorId: gastos.proveedorId,
-        deuda: sql<number>`coalesce(sum(${gastos.total}), 0)`,
-        impagaDesde: sql<string | null>`min(${gastos.fecha}) filter (where ${gastos.total} - ${gastos.pagado} > ${EPS})`,
-      }).from(gastos)
-        .where(and(ne(gastos.estado, 'anulado'), sql`${gastos.proveedorId} is not null`))
-        .groupBy(gastos.proveedorId),
-      this.db.select({
-        proveedorId: proveedorPagos.proveedorId,
-        pagado: sql<number>`coalesce(sum(${proveedorPagos.importe}), 0)`,
-        ultimoPago: sql<string | null>`max(${proveedorPagos.fecha})`,
-      }).from(proveedorPagos)
-        .where(and(eq(proveedorPagos.estado, 'activo'), sql`${proveedorPagos.proveedorId} is not null`))
-        .groupBy(proveedorPagos.proveedorId),
-      this.db.select({
-        proveedorId: proveedorAjustes.proveedorId,
-        ajustes: sql<number>`coalesce(sum(${proveedorAjustes.importe}), 0)`,
-      }).from(proveedorAjustes).groupBy(proveedorAjustes.proveedorId),
-      this.db.select({
-        proveedorId: proveedorCompromisos.proveedorId,
-        pendiente: sql<number>`coalesce(sum(${faltaCompromiso}), 0)`,
-      }).from(proveedorCompromisos)
-        .where(eq(proveedorCompromisos.pagado, false))
-        .groupBy(proveedorCompromisos.proveedorId),
+    const [mov, pend, echeqAgg, provs] = await Promise.all([
+      this.movimientosCuenta(),
+      this.pendientesConCuenta(),
       /* Lo que los echeqs hechos no cubren de ninguna factura (0205): igual se va a debitar. */
       this.db.select({
         proveedorId: proveedorEcheqs.proveedorId,
@@ -1172,20 +1247,16 @@ export class FinanzasProveedorService {
       if (!prev || c.fecha < prev) impagaComp.set(c.proveedorId, c.fecha);
     }
 
-    const porId = <T extends { proveedorId: number | null }>(xs: T[]) =>
-      new Map(xs.filter((x) => x.proveedorId != null).map((x) => [x.proveedorId as number, x]));
-    const mComp = porId(compAgg); const mGasto = porId(gastoAgg);
-    const mPago = porId(pagoAgg); const mAjuste = porId(ajusteAgg); const mComprom = porId(compromAgg);
-    const mEcheq = porId(echeqAgg);
+    const mEcheq = new Map(echeqAgg.filter((x) => x.proveedorId != null).map((x) => [x.proveedorId as number, x]));
+    /* Lo comprometido, con lo pagado a cuenta ya descontado (ver `pendientesConCuenta`). */
+    const mComprom = new Map<number, number>();
+    for (const k of pend.values()) mComprom.set(k.proveedorId, money((mComprom.get(k.proveedorId) ?? 0) + k.falta));
 
     const hoy = hoy0();
     const filas: any[] = [];
     for (const p of provs) {
-      const mercaderia = money(Number(mComp.get(p.id)?.deuda) || 0);
-      const gastosTot = money(Number(mGasto.get(p.id)?.deuda) || 0);
-      const pagado = money(Number(mPago.get(p.id)?.pagado) || 0);
-      const ajustes = money(Number(mAjuste.get(p.id)?.ajustes) || 0);
-      const pendientes = money((Number(mComprom.get(p.id)?.pendiente) || 0) + (Number(mEcheq.get(p.id)?.sinFactura) || 0));
+      const { mercaderia, gastos: gastosTot, pagado, ajustes } = mov.partes(p.id);
+      const pendientes = money((mComprom.get(p.id) ?? 0) + (Number(mEcheq.get(p.id)?.sinFactura) || 0));
       if (!mercaderia && !gastosTot && !pagado && !ajustes && !pendientes) continue;
       /*
        * ESTA VITRINA ES LA CUENTA POR PAGAR DE LA MERCADERÍA (decisión del
@@ -1196,14 +1267,14 @@ export class FinanzasProveedorService {
        * escondería deuda real el día que alguien le destilde "provee
        * mercadería" a un proveedor que ya tiene facturas cargadas.
        */
-      if (!p.proveeMercaderia && !mComp.has(p.id)) continue;
-      const saldo = money(mercaderia + gastosTot + ajustes - pagado);
+      if (!p.proveeMercaderia && !mov.comp.has(p.id)) continue;
+      const saldo = mov.saldo(p.id);
 
       let estado: 'a_favor' | 'al_dia' | 'pendiente' | 'vencido' = 'al_dia';
       if (saldo < -EPS) estado = 'a_favor';
       else if (saldo > EPS) {
         estado = 'pendiente';
-        const desdeRaw = impagaComp.get(p.id) ?? mGasto.get(p.id)?.impagaDesde ?? null;
+        const desdeRaw = impagaComp.get(p.id) ?? mov.gasto.get(p.id)?.impagaDesde ?? null;
         if (desdeRaw && p.diasPago != null && p.diasPago > 0) {
           const desde = new Date(desdeRaw);
           if (!Number.isNaN(desde.getTime())
@@ -1222,7 +1293,7 @@ export class FinanzasProveedorService {
         saldo,
         compromisosPendientes: pendientes,
         saldoProyectado: money(saldo - pendientes),
-        ultimoPago: mPago.get(p.id)?.ultimoPago ?? null,
+        ultimoPago: mov.pago.get(p.id)?.ultimoPago ?? null,
         estado,
       });
     }
@@ -1238,7 +1309,7 @@ export class FinanzasProveedorService {
       .where(eq(proveedores.id, proveedorId)).limit(1);
     if (!prov) throw new NotFoundException('Proveedor inexistente.');
 
-    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit, deCuentaDisp, echeqs] = await Promise.all([
+    const [comps, gs, pgs, ajs, formasTodas, compromisos, cuentas, docsPendientes, corteCoffit, deCuentaDisp, echeqs, pend] = await Promise.all([
       this.db.select().from(comprobantes).where(and(
         eq(comprobantes.proveedorId, proveedorId),
         eq(comprobantes.estado, 'confirmado'),
@@ -1303,6 +1374,8 @@ export class FinanzasProveedorService {
         .where(and(eq(cuentasDisponibles.proveedorId, proveedorId), isNull(cuentaDisponiblePagos.anuladoEn))),
       /* Los echeqs que todavía no se debitaron (0205), con las facturas que cubren. */
       this.listarEcheqs({ filtro: 'activos', proveedorId }),
+      /* Lo que falta de cada vencimiento, con lo pagado a cuenta descontado (ver `pendientesConCuenta`). */
+      this.pendientesConCuenta(proveedorId),
     ]);
 
     const formasPorPago = new Map<number, any[]>();
@@ -1535,7 +1608,7 @@ export class FinanzasProveedorService {
       totales,
       pagosSinAplicar,
       docsPendientes,
-      compromisos: compromisos.map((k) => this.mapCompromiso(k)),
+      compromisos: compromisos.map((k) => this.mapCompromiso(this.conCuenta(k, pend))).filter((k) => k.falta > EPS),
       echeqs: echeqs.filas,
       cuentas,
     };
