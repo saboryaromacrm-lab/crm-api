@@ -1506,6 +1506,13 @@
       "when": 1793901600000,
       "tag": "0214_dias_cierre_caja",
       "breakpoints": true
+    },
+    {
+      "idx": 215,
+      "version": "7",
+      "when": 1793905200000,
+      "tag": "0215_cuenta_a_mano",
+      "breakpoints": true
     }
   ]
 }

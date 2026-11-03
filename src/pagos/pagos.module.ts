@@ -43,7 +43,7 @@ import { ABREV_TIPO, etiquetaDoc, numeroDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ECHEQ_EN_CARTERA } from '../proveedores/echeqs';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
-import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia } from './cuentas-propias';
+import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia, nombreCuentaSql } from './cuentas-propias';
 import {
   cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, cuentasPropias, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores,
@@ -87,6 +87,8 @@ export class FormaPagoDto {
   @IsOptional() @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'La fecha de la parte va como AAAA-MM-DD.' }) fecha?: string;
   /** De qué cuenta propia salió, si la parte es una transferencia (0207). */
   @IsOptional() @IsInt() cuentaPropiaId?: number;
+  /** O de otra cuenta, escrita a mano (0215). */
+  @IsOptional() @IsString() @MaxLength(80) cuentaAMano?: string;
 }
 
 /**
@@ -163,6 +165,8 @@ export class CrearPagoDto {
   @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
   /** De qué cuenta propia salió la transferencia de un solo medio (0207; ver `cuentaDeTransferencia`). */
   @IsOptional() @IsInt() cuentaPropiaId?: number;
+  /** O de otra cuenta, escrita a mano (0215). */
+  @IsOptional() @IsString() @MaxLength(80) cuentaAMano?: string;
 }
 
 export class ImputarDto {
@@ -471,7 +475,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       observaciones: proveedorPagos.observaciones,
       cambioPor: proveedorPagos.cambioPor,
       cuentaPropiaId: proveedorPagos.cuentaPropiaId,
-      cuentaPropiaNombre: cuentasPropias.nombre,
+      cuentaPropiaNombre: nombreCuentaSql('proveedor_pagos'),
     };
   }
 
@@ -537,7 +541,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
     if (!ids.length) return porId;
     const filas = await this.db.select({
       pagoId: pagoFormas.pagoId, medio: pagoFormas.medio, importe: pagoFormas.importe, fecha: pagoFormas.fecha,
-      cuentaPropiaNombre: cuentasPropias.nombre,
+      cuentaPropiaNombre: nombreCuentaSql('pago_formas'),
     }).from(pagoFormas)
       .leftJoin(cuentasPropias, eq(cuentasPropias.id, pagoFormas.cuentaPropiaId))
       .where(inArray(pagoFormas.pagoId, ids))
@@ -912,7 +916,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       medio: f.medio as any,
       importe: money(f.importe),
       fecha: f.fecha ? new Date(`${f.fecha}T00:00:00`) : null,
-      cuentaPropiaId: await cuentaDeTransferencia(this.db, f.medio, f.cuentaPropiaId),
+      ...await cuentaDeTransferencia(this.db, f.medio, f),
     })));
     if (formas.length) {
       const suma = money(formas.reduce((a, f) => a + f.importe, 0));
@@ -930,7 +934,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       throw new BadRequestException('El efectivo por transferencia es un pago de un solo medio, por transferencia.');
     }
     /* MIS CUENTAS (0207): de cuál salió la transferencia. En un pago mixto lo dice cada parte. */
-    const cuentaPropiaId = formas.length ? null : await cuentaDeTransferencia(this.db, medio, dto.cuentaPropiaId, cambioPor);
+    const cuenta = formas.length ? { cuentaPropiaId: null, cuentaAMano: null } : await cuentaDeTransferencia(this.db, medio, dto, cambioPor);
     /** Lo que sale del CAJÓN: la parte en efectivo del split — o todo, si el
      *  pago es simple y en efectivo (también el efectivo que se cambió por la
      *  transferencia). Es lo único que el arqueo tiene que ver. */
@@ -1082,13 +1086,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
         estado: 'activo',
         observaciones: (dto.observaciones ?? '').trim(),
         cambioPor,
-        cuentaPropiaId,
+        ...cuenta,
       }).returning();
 
       // El split del pago, en la misma transacción que su cabecera.
       if (formas.length) {
         await tx.insert(pagoFormas).values(formas.map((f) => ({
-          pagoId: pago.id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined, cuentaPropiaId: f.cuentaPropiaId,
+          pagoId: pago.id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined, cuentaPropiaId: f.cuentaPropiaId, cuentaAMano: f.cuentaAMano,
         })));
       }
 

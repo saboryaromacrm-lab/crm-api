@@ -3545,6 +3545,8 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
   cambioPor: text('cambio_por'),
   /** De qué cuenta propia salió (0207): solo un pago por transferencia de un solo medio. */
   cuentaPropiaId: integer('cuenta_propia_id').references(() => cuentasPropias.id, { onDelete: 'restrict' }),
+  /** 0215: otra cuenta, escrita a mano («la de mi hermano»), en vez de una de Mis cuentas. */
+  cuentaAMano: text('cuenta_a_mano'),
 }, (t) => ({
   ixProveedor: index('ix_proveedor_pagos_proveedor').on(t.proveedorId, t.estado),
   ixFecha: index('ix_proveedor_pagos_fecha').on(t.fecha),
@@ -4145,6 +4147,8 @@ export const pagoFormas = pgTable('pago_formas', {
   fecha: timestamp('fecha', { withTimezone: true }),
   /** De qué cuenta propia salió esta parte, si es una transferencia (0207). */
   cuentaPropiaId: integer('cuenta_propia_id').references(() => cuentasPropias.id, { onDelete: 'restrict' }),
+  /** 0215: otra cuenta, escrita a mano, en vez de una de Mis cuentas. */
+  cuentaAMano: text('cuenta_a_mano'),
 }, (t) => ({
   ixPago: index('ix_pago_formas_pago').on(t.pagoId),
 }));

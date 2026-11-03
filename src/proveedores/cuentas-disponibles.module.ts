@@ -514,7 +514,7 @@ export class CuentasDisponiblesService {
      * cuenta de Sabor y Aroma: no se pide ni se guarda cuenta propia. */
     const tercero = String(dto.tercero ?? '').trim().replace(/\s+/g, ' ');
     if (dto.tercero !== undefined && tercero.length < 2) throw new BadRequestException('Escribí quién hizo la transferencia.');
-    const cuentaPropiaId = tercero ? null : await cuentaDeTransferencia(this.db, 'transferencia', dto.cuentaPropiaId);
+    const { cuentaPropiaId } = tercero ? { cuentaPropiaId: null } : await cuentaDeTransferencia(this.db, 'transferencia', { cuentaPropiaId: dto.cuentaPropiaId });
     await this.db.transaction(async (tx) => {
       const [c] = await tx.select().from(cuentasDisponibles).where(eq(cuentasDisponibles.id, id)).limit(1).for('update');
       if (!c) throw new NotFoundException('Esa cuenta disponible no existe.');

@@ -173,6 +173,8 @@ class PagoContadoDto {
   @IsOptional() @IsString() referencia?: string;
   /** De qué cuenta propia salió la transferencia (0207). */
   @IsOptional() @IsInt() cuentaPropiaId?: number;
+  /** O de otra cuenta, escrita a mano (0215). */
+  @IsOptional() @IsString() @MaxLength(80) cuentaAMano?: string;
 }
 
 /** Pago de sucursal YA registrado que este comprobante toma (total o parcial). */
@@ -1114,7 +1116,7 @@ export class ComprobantesService {
    * cargada con deuda por un dato que faltaba en la pantalla.
    */
   private async exigirCuentaDelContado(pc?: PagoContadoDto) {
-    if (pc && Number(pc.importe) > 0) await cuentaDeTransferencia(this.db, pc.medio ?? 'efectivo', pc.cuentaPropiaId);
+    if (pc && Number(pc.importe) > 0) await cuentaDeTransferencia(this.db, pc.medio ?? 'efectivo', pc);
   }
 
   /*
@@ -1163,6 +1165,7 @@ export class ComprobantesService {
         concepto: args.concepto,
         referencia: args.pagoContado?.referencia,
         cuentaPropiaId: args.pagoContado?.cuentaPropiaId,
+        cuentaAMano: args.pagoContado?.cuentaAMano,
         sucursalId: args.sucursalId ?? undefined,
         cajaSesionId: args.pagoContado?.cajaSesionId,
         usuarioId: args.usuarioId,

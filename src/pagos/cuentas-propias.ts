@@ -31,27 +31,41 @@ export class CuentaPropiaDto {
   @IsOptional() @IsBoolean() activa?: boolean;
 }
 
+/** Lo que el pago dice de su cuenta: una de Mis cuentas o, en su lugar, otra escrita a mano (0215). */
+export type CuentaElegida = { cuentaPropiaId?: number | null; cuentaAMano?: string | null };
+
 /**
- * De qué cuenta propia salió una transferencia: el id que se guarda en el pago
- * (o en la parte del pago mixto). No es transferencia, o es efectivo por
- * transferencia → null. Con cuentas cargadas, elegir una es obligatorio y tiene
- * que estar activa.
+ * De qué cuenta salió una transferencia: lo que se guarda en el pago (o en la
+ * parte del pago mixto). No es transferencia, o es efectivo por transferencia
+ * → nada. Con cuentas cargadas, decirlo es obligatorio: una cuenta activa o
+ * OTRA CUENTA ESCRITA A MANO (0215, «la de mi hermano»), que no se agrega a
+ * Mis cuentas y queda asentada en el pago.
  */
 export async function cuentaDeTransferencia(
-  db: Pick<Database, 'select'>, medio: string, cuentaId?: number | null, cambioPor?: string | null,
-): Promise<number | null> {
-  if (medio !== 'transferencia' || cambioPor) return null;
-  if (cuentaId) {
+  db: Pick<Database, 'select'>, medio: string, elegida: CuentaElegida = {}, cambioPor?: string | null,
+): Promise<{ cuentaPropiaId: number | null; cuentaAMano: string | null }> {
+  const nada = { cuentaPropiaId: null, cuentaAMano: null };
+  if (medio !== 'transferencia' || cambioPor) return nada;
+  const aMano = String(elegida.cuentaAMano ?? '').trim().replace(/\s+/g, ' ');
+  if (elegida.cuentaAMano != null && !elegida.cuentaPropiaId) {
+    if (aMano.length < 2) throw new BadRequestException('Escribí de qué cuenta salió la transferencia (por ejemplo «Cuenta de mi hermano»).');
+    return { cuentaPropiaId: null, cuentaAMano: aMano };
+  }
+  if (elegida.cuentaPropiaId) {
     const [c] = await db.select({ id: cuentasPropias.id }).from(cuentasPropias)
-      .where(and(eq(cuentasPropias.id, cuentaId), eq(cuentasPropias.activa, true))).limit(1);
+      .where(and(eq(cuentasPropias.id, elegida.cuentaPropiaId), eq(cuentasPropias.activa, true))).limit(1);
     if (!c) throw new BadRequestException('Esa cuenta no existe o está desactivada: elegí otra.');
-    return c.id;
+    return { cuentaPropiaId: c.id, cuentaAMano: null };
   }
   const [hay] = await db.select({ id: cuentasPropias.id }).from(cuentasPropias)
     .where(eq(cuentasPropias.activa, true)).limit(1);
   if (hay) throw new BadRequestException('Elegí de qué cuenta tuya salió la transferencia.');
-  return null;
+  return nada;
 }
+
+/** El nombre a mostrar: la de Mis cuentas, o la escrita a mano marcada como tal (`alias` = tabla del pago o de la parte). */
+export const nombreCuentaSql = (alias: 'proveedor_pagos' | 'pago_formas') =>
+  sql<string | null>`coalesce(${sql.raw('cuentas_propias.nombre')}, ${sql.raw(`${alias}.cuenta_a_mano`)} || ' (a mano)')`;
 
 @Injectable()
 export class CuentasPropiasService {

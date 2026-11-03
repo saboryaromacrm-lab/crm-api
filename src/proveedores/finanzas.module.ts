@@ -48,6 +48,7 @@ import {
 } from '../db/schema';
 import { nombreMes } from './facturas-mes.module';
 import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } from '../pagos/pagos.module';
+import { nombreCuentaSql } from '../pagos/cuentas-propias';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import {
@@ -108,6 +109,8 @@ class PagarCompromisoDto {
   @IsOptional() @IsString() @MaxLength(300) obs?: string;
   /** De qué cuenta propia salió la transferencia de un solo medio (0207); en partes, lo dice cada una. */
   @IsOptional() @IsInt() cuentaPropiaId?: number;
+  /** O de otra cuenta, escrita a mano (0215). */
+  @IsOptional() @IsString() @MaxLength(80) cuentaAMano?: string;
 }
 
 /** LAS FACTURAS QUE CUBRE UN ECHEQ (0205): la lista entera; 0 o ausente la saca. */
@@ -460,6 +463,7 @@ export class FinanzasProveedorService {
       medio: dto.formas?.length ? undefined : dto.medio,
       formas: dto.formas,
       cuentaPropiaId: dto.cuentaPropiaId,
+      cuentaAMano: dto.cuentaAMano,
       fecha,
       concepto,
       referencia: dto.referencia,
@@ -1258,7 +1262,7 @@ export class FinanzasProveedorService {
         cajaSesionId: proveedorPagos.cajaSesionId,
         esFlete: proveedorPagos.esFlete,
         cambioPor: proveedorPagos.cambioPor,
-        cuentaPropiaNombre: cuentasPropias.nombre,
+        cuentaPropiaNombre: nombreCuentaSql('proveedor_pagos'),
         usuarioNombre: sql<string>`coalesce(${usuarios.nombre}, '')`,
         sucursalNombre: sql<string>`coalesce(${sucursales.nombre}, '')`,
       }).from(proveedorPagos)
@@ -1271,7 +1275,7 @@ export class FinanzasProveedorService {
       this.db.select().from(proveedorAjustes).where(eq(proveedorAjustes.proveedorId, proveedorId)),
       this.db.select({
         pagoId: pagoFormas.pagoId, medio: pagoFormas.medio, importe: pagoFormas.importe, fecha: pagoFormas.fecha,
-        cuentaPropiaNombre: cuentasPropias.nombre,
+        cuentaPropiaNombre: nombreCuentaSql('pago_formas'),
       }).from(pagoFormas)
         .leftJoin(cuentasPropias, eq(cuentasPropias.id, pagoFormas.cuentaPropiaId))
         .where(inArray(pagoFormas.pagoId,
