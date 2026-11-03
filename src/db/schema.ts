@@ -25,6 +25,7 @@ import {
   type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
+import type { RepartoLocal } from '../resultados/reglas';
 
 /* ---------------- Enums ---------------- */
 export const tipoProductoEnum = pgEnum('tipo_producto', ['granel', 'entero']);
@@ -3145,6 +3146,8 @@ export const gastos = pgTable('gastos', {
   recurrenteId: integer('recurrente_id'),
   /** El mes al que corresponde (0152, devengado; día 1). Vacío = el mes de `fecha`. */
   periodo: date('periodo', { mode: 'string' }),
+  /** 0216: repartido entre locales por % (copiado de su gasto fijo). Con reparto no hay local. */
+  reparto: jsonb('reparto').$type<RepartoLocal[] | null>(),
   /** La NC de un gasto (0115): contra qué gasto descuenta. Su saldo baja por la NC. */
   refGastoId: integer('ref_gasto_id'),
   observaciones: text('observaciones').notNull().default(''),
@@ -3597,6 +3600,11 @@ export const gastosRecurrentes = pgTable('gastos_recurrentes', {
   diaVencimiento: integer('dia_vencimiento').notNull().default(10),
   activo: boolean('activo').notNull().default(true),
   observaciones: text('observaciones').notNull().default(''),
+  /** 0216: desde qué mes corre (día 1) y hasta cuál (null = sigue). En esos meses el estado de resultados pone el estimado si no hay gasto cargado. */
+  desde: date('desde', { mode: 'string' }).notNull(),
+  hasta: date('hasta', { mode: 'string' }),
+  /** 0216: repartido entre locales por % ([{ sucursalId, pct }], suma 100). Manda sobre el local. */
+  reparto: jsonb('reparto').$type<RepartoLocal[] | null>(),
 }, (t) => ({
   ixActivo: index('ix_gastos_recurrentes_activo').on(t.activo),
 }));
@@ -4265,6 +4273,8 @@ export const empleados = pgTable('empleados', {
   baja: date('baja', { mode: 'string' }),
   observaciones: text('observaciones').notNull().default(''),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  /** 0216: el sueldo repartido entre locales por % (un empleado compartido). Con reparto no hay local. */
+  reparto: jsonb('reparto').$type<RepartoLocal[] | null>(),
 });
 
 /** El sueldo bruto y el % de cargas del empleador, vigentes desde un mes (día 1). */

@@ -49,6 +49,9 @@ import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { PagosModule, PagosProveedorService, esAdminPagos, exigirFechaPago } from '../pagos/pagos.module';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import { PERMISO_RESULTADOS } from '../resultados/permiso';
+import { MESES_FRECUENCIA, sumarMeses } from '../resultados/reglas';
+import { RepartoDto, exigirReparto } from '../resultados/reparto';
+import { hoyAr } from '../cafeteria/cuenta';
 
 /**
  * LAS FECHAS DEL GASTO (27/9/2026). Se aceptaba un gasto fechado en 2035 y un
@@ -148,11 +151,6 @@ function normalizarNumero(n?: string | null) {
 function normalizarTexto(t?: string | null) {
   return String(t ?? '').toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim();
 }
-
-/** Meses que cubre cada frecuencia: define cuándo un gasto fijo vuelve a tocar. */
-const MESES_FRECUENCIA: Record<string, number> = {
-  mensual: 1, bimestral: 2, trimestral: 3, semestral: 6, anual: 12,
-};
 
 const TIPOS_DOC = ['factura', 'ticket', 'recibo', 'nota_credito', 'otro'] as const;
 
@@ -358,7 +356,26 @@ class RecurrenteDto {
   @IsOptional() @IsInt() @Min(1) @Max(31) diaVencimiento?: number;
   @IsOptional() activo?: boolean;
   @IsOptional() @IsString() observaciones?: string;
+  /** 0216: desde qué mes corre ('AAAA-MM'). */
+  @IsOptional() @Matches(/^\d{4}-(0[1-9]|1[0-2])$/, { message: '«Desde» va como AAAA-MM.' }) desde?: string;
+  /** 0216: repartido entre locales por %; vacío = sin reparto (manda el local). */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => RepartoDto) reparto?: RepartoDto[] | null;
 }
+
+/** El mes actual, día 1 ('AAAA-MM-01'). */
+const mesActual = () => `${hoyAr().slice(0, 7)}-01`;
+/** 'AAAA-MM-01' corrido `n` meses. */
+const correrMes = (dia: string, n: number) => `${sumarMeses(dia.slice(0, 7), n)}-01`;
+/**
+ * DAR DE BAJA UN GASTO FIJO (0216): deja de contar desde el mes en que se da de
+ * baja, así que su último mes es el anterior (o el anterior a `desde`, si
+ * todavía no había empezado: «nunca corrió»).
+ */
+const hastaAlDarDeBaja = (desde: string) => {
+  const anterior = correrMes(mesActual(), -1);
+  const antesDeEmpezar = correrMes(desde, -1);
+  return anterior > antesDeEmpezar ? anterior : antesDeEmpezar;
+};
 
 /* ------------------------------- Servicio ------------------------------- */
 
@@ -1037,7 +1054,11 @@ export class GastosService {
      * eso cambiaba el resumen por sucursal y cambiaba qué pagos lo pueden
      * explicar. En el ALTA sí se clava, porque ahí el documento nace.
      */
-    if (dto.sucursalId !== undefined && esJefe(sesion)) patch.sucursalId = dto.sucursalId ?? null;
+    if (dto.sucursalId !== undefined && esJefe(sesion)) {
+      patch.sucursalId = dto.sucursalId ?? null;
+      /* Elegir un local deja sin efecto el reparto por % que trajo de su gasto fijo (0216). */
+      if (patch.sucursalId != null) patch.reparto = null;
+    }
     // El negocio es imputación, no importe: se puede corregir aunque haya pagos.
     if (dto.negocio) patch.negocio = dto.negocio;
 
@@ -1433,11 +1454,15 @@ export class GastosService {
     await this.validarRecurrente(dto, true);
     const [c] = await this.db.select().from(gastoCategorias).where(eq(gastoCategorias.id, Number(dto.categoriaId))).limit(1);
     if (!c) throw new BadRequestException('Elegí el rubro del gasto fijo.');
+    const reparto = await exigirReparto(this.db, dto.reparto);
     const [r] = await this.db.insert(gastosRecurrentes).values({
       nombre,
       categoriaId: c.id,
       proveedorId: dto.proveedorId ?? null,
-      sucursalId: dto.sucursalId ?? null,
+      sucursalId: reparto ? null : dto.sucursalId ?? null,
+      reparto,
+      desde: dto.desde ? `${dto.desde}-01` : mesActual(),
+      hasta: dto.activo === false ? hastaAlDarDeBaja(dto.desde ? `${dto.desde}-01` : mesActual()) : null,
       importeEstimado: money(dto.importeEstimado ?? 0),
       frecuencia: (dto.frecuencia ?? 'mensual') as any,
       diaVencimiento: Math.min(Math.max(Number(dto.diaVencimiento) || 10, 1), 31),
@@ -1460,10 +1485,24 @@ export class GastosService {
     if (dto.categoriaId != null) patch.categoriaId = Number(dto.categoriaId);
     if (dto.proveedorId !== undefined) patch.proveedorId = dto.proveedorId ?? null;
     if (dto.sucursalId !== undefined) patch.sucursalId = dto.sucursalId ?? null;
+    if (dto.reparto !== undefined) {
+      patch.reparto = await exigirReparto(this.db, dto.reparto, r.reparto ?? null);
+      if (patch.reparto) patch.sucursalId = null;
+    } else if (patch.sucursalId != null) patch.reparto = null;
     if (dto.importeEstimado != null) patch.importeEstimado = money(dto.importeEstimado);
     if (dto.frecuencia != null) patch.frecuencia = dto.frecuencia;
     if (dto.diaVencimiento != null) patch.diaVencimiento = Math.min(Math.max(Number(dto.diaVencimiento) || 10, 1), 31);
-    if (dto.activo != null) patch.activo = !!dto.activo;
+    if (dto.activo != null) {
+      patch.activo = !!dto.activo;
+      /* Dar de baja la corta desde este mes (ver `hastaAlDarDeBaja`); reactivarla la reabre. */
+      if (!dto.activo && r.activo) patch.hasta = hastaAlDarDeBaja(dto.desde ? `${dto.desde}-01` : r.desde);
+      if (dto.activo) patch.hasta = null;
+    }
+    if (dto.desde) patch.desde = `${dto.desde}-01`;
+    const hasta = patch.hasta !== undefined ? patch.hasta : r.hasta;
+    if (hasta && correrMes(patch.desde ?? r.desde, -1) > hasta) {
+      throw new BadRequestException('«Desde» no puede ser posterior al último mes en que corrió (está dado de baja).');
+    }
     if (dto.observaciones != null) patch.observaciones = String(dto.observaciones).trim();
     if (Object.keys(patch).length) await this.db.update(gastosRecurrentes).set(patch).where(eq(gastosRecurrentes.id, id));
     return { ok: true };
@@ -1514,7 +1553,10 @@ export class GastosService {
 
     const pendientes: any[] = [];
     const yaEstan: any[] = [];
+    const mes = `${periodo}-01`;
     for (const p of plantillas) {
+      /* Fuera de los meses en que corre (0216), ni se ofrece. */
+      if (mes < p.desde || (p.hasta && mes > p.hasta)) continue;
       /*
        * DESDE CUÁNDO UNA EMISIÓN ANTERIOR TODAVÍA CUBRE ESTE PERÍODO. Mensual:
        * solo la de este mismo mes. Bimestral: también la del mes pasado. De ahí
@@ -1575,7 +1617,9 @@ export class GastosService {
         numero: '',
         proveedorId: x.plantilla.proveedorId,
         categoriaId: x.plantilla.categoriaId,
-        sucursalId: x.plantilla.sucursalId,
+        sucursalId: x.plantilla.reparto ? null : x.plantilla.sucursalId,
+        /* Copiado (0216): cambiar la plantilla después no reescribe la historia. */
+        reparto: x.plantilla.reparto ?? null,
         descripcion: `${x.plantilla.nombre} · ${periodo}`,
         condicionPago: 'cuenta_corriente' as const,
         vencimiento: x.vencimiento,

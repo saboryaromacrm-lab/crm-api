@@ -101,6 +101,8 @@ export function tasaVigente(
 export type Sueldo = { desde: string; bruto: number; cargas: number }; // desde 'AAAA-MM'
 export type Empleado = {
   id: number; nombre: string; sucursalId: number | null;
+  /** 0216: repartido entre locales por %. */
+  reparto?: RepartoLocal[] | null;
   alta: string; baja: string | null; // 'AAAA-MM-DD'
   sueldos: Sueldo[];
 };
@@ -134,6 +136,58 @@ export function costoEmpleadoMes(e: Empleado, mes: string) {
 }
 
 /* ------------------------------ amortizaciones ------------------------------ */
+
+/* ------------------------------ reparto por % (0216) ------------------------------ */
+
+export type RepartoLocal = { sucursalId: number; pct: number };
+
+/**
+ * UN GASTO REPARTIDO ENTRE LOCALES POR PORCENTAJE (un alquiler o un sueldo
+ * compartido). Vacío = sin reparto. Si hay: dos locales o más, sin repetir,
+ * cada uno con más de 0 % y entre todos 100 %. Devuelve el reparto limpio
+ * (ordenado por local, % con dos decimales) o el motivo por el que no vale.
+ */
+export function normalizarReparto(reparto: RepartoLocal[] | null | undefined): { reparto: RepartoLocal[] | null } | { error: string } {
+  if (!reparto?.length) return { reparto: null };
+  const limpio = reparto.map((x) => ({ sucursalId: Number(x.sucursalId), pct: r2(Number(x.pct)) }))
+    .sort((a, b) => a.sucursalId - b.sucursalId);
+  if (limpio.length < 2) return { error: 'Para repartir por porcentaje elegí al menos dos locales (con uno solo, elegí ese local).' };
+  if (new Set(limpio.map((x) => x.sucursalId)).size !== limpio.length) return { error: 'Un local aparece dos veces en el reparto.' };
+  if (limpio.some((x) => !(x.pct > 0))) return { error: 'Cada local del reparto tiene que llevar más de 0 %.' };
+  const suma = r2(limpio.reduce((a, x) => a + x.pct, 0));
+  if (Math.abs(suma - 100) > 0.01) return { error: `Los porcentajes suman ${suma} %: tienen que sumar 100 %.` };
+  return { reparto: limpio };
+}
+
+/** Los pesos de `repartir` a partir de un reparto por %. */
+export const pesosDeReparto = (reparto: RepartoLocal[]) => new Map(reparto.map((x) => [x.sucursalId, x.pct]));
+
+/* ------------------------------ gastos fijos sin cargar (0216) ------------------------------ */
+
+/** Meses que cubre cada frecuencia: define cuándo un gasto fijo vuelve a tocar. */
+export const MESES_FRECUENCIA: Record<string, number> = {
+  mensual: 1, bimestral: 2, trimestral: 3, semestral: 6, anual: 12,
+};
+
+export type GastoFijo = {
+  id: number; nombre: string; rubro: number; sucursalId: number | null; reparto: RepartoLocal[] | null;
+  importe: number; frecuencia: string; desde: string; hasta: string | null; // 'AAAA-MM'
+};
+
+/**
+ * LO QUE UN GASTO FIJO PONE EN UN MES SIN GASTO CARGADO: su estimado, si el
+ * mes está entre su `desde` y su `hasta` y no está cubierto por un gasto que
+ * generó. Un bimestral (o trimestral…) no se cuenta entero cada mes: va su
+ * parte por mes (importe / meses); el mes de un gasto cargado y los que ese
+ * gasto cubre (los `meses − 1` siguientes) ya están pagos. `emitidos`: los
+ * meses ('AAAA-MM') de sus gastos no anulados. 0 = no corresponde.
+ */
+export function estimadoFijoMes(f: GastoFijo, mes: string, emitidos: Set<string> | undefined): number {
+  if (mes < f.desde || (f.hasta && mes > f.hasta) || !(f.importe > 0)) return 0;
+  const meses = MESES_FRECUENCIA[f.frecuencia] ?? 1;
+  for (let i = 0; i < meses; i++) if (emitidos?.has(sumarMeses(mes, -i))) return 0;
+  return r2(f.importe / meses);
+}
 
 export type Bien = { id: number; nombre: string; sucursalId: number | null; valor: number; alta: string; vidaMeses: number; baja: string | null };
 

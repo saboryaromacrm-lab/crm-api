@@ -19,6 +19,15 @@
  *     · El posnet igual que la municipal, repartido por lo cobrado con tarjeta.
  *       Mercado Pago va siempre con su comisión real (sin IVA: se recupera).
  *
+ *   GASTOS FIJOS SIN CARGAR (0216). Un gasto fijo que corre ese mes y no tiene
+ *   gasto cargado pone su estimado (`estimadoFijoMes`), como si se hubiera
+ *   generado; el gasto real lo reemplaza solo. No estiman los rubros que ya
+ *   tienen su propio estimado (IIBB, tasa municipal, comisiones), los que no
+ *   entran (Ganancias, «fuera») ni los de sueldos si hay planilla.
+ *
+ *   REPARTO POR % (0216). Un gasto, un gasto fijo o un empleado repartido entre
+ *   locales va a cada uno por su porcentaje, antes que por su local.
+ *
  *   SUELDOS. Si hay empleados cargados para el mes, manda la planilla (sueldo
  *   + cargas + 1/12 de aguinaldo) y lo cargado en el rubro Sueldos no se suma
  *   (serían los pagos: contarlos sería duplicar). Sin empleados, lo cargado.
@@ -28,8 +37,9 @@
  *   Ganancias; con «solo lo facturado», la parte proporcional a lo facturado.
  */
 import {
-  ADMINISTRACION, SIN_LOCAL, amortizacionMes, cascada, costoEmpleadoMes, escalaDelAnio, gananciasDelAnio,
-  hechosVacios, r2, repartir, sumarHechos, tasaVigente, type Bien, type Empleado, type Escala, type Hechos, type Tasa,
+  ADMINISTRACION, SIN_LOCAL, amortizacionMes, cascada, costoEmpleadoMes, escalaDelAnio, estimadoFijoMes, gananciasDelAnio,
+  hechosVacios, pesosDeReparto, r2, repartir, sumarHechos, tasaVigente,
+  type Bien, type Empleado, type Escala, type GastoFijo, type Hechos, type RepartoLocal, type Tasa,
 } from './reglas';
 
 type Fila = Record<string, any>;
@@ -41,7 +51,11 @@ export type HechosLeidos = {
 export type Catalogos = {
   rubros: Rubro[]; empleados: Empleado[]; bienes: Bien[]; tasas: Tasa[]; escalas: Escala[];
   config: { amortizaciones: boolean; gananciasBase: 'facturado' | 'todo' };
+  /** Los gastos fijos y los meses en que tienen gasto cargado (0216). */
+  fijos: GastoFijo[]; emitidos: Map<number, Set<string>>;
 };
+/** Los papeles de rubro que tienen su propio estimado o no entran: un gasto fijo de esos no estima (0216). */
+const SIN_ESTIMADO_FIJO = new Set(['iibb', 'municipalidad', 'comisiones', 'ganancias', 'fuera']);
 type Origen = 'estimado' | 'real' | 'mixto';
 
 /** La comisión de Mercado Pago viene con IVA; el IVA se recupera (crédito fiscal). */
@@ -88,6 +102,8 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     const info = {
       sueldosIgnorados: 0, excluidos: {} as Record<string, number>, mpSinDato: 0,
       empleadosSinSueldo: [] as string[], sinTasaMunicipal: [] as number[],
+      /** Gastos fijos que todavía no se cargaron: cuentan con su estimado (0216). */
+      fijosEstimados: [] as { id: number; nombre: string; importe: number }[],
     };
 
     /* 1 · Ventas, costo y cargos. */
@@ -110,7 +126,10 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
       pesoVentas.set(b, x.ventasLista - x.descuentos - x.notasCredito + x.cargos);
       pesoFacturado.set(b, x.facturado);
     }
-    const aBalde = (suc: number | null, importe: number, reparte: boolean, poner: (x: Hechos, v: number) => void) => {
+    const aBalde = (
+      suc: number | null, importe: number, reparte: boolean, poner: (x: Hechos, v: number) => void, reparto?: RepartoLocal[] | null,
+    ) => {
+      if (reparto?.length) { for (const [b, v] of repartir(importe, pesosDeReparto(reparto))) poner(de(b), v); return; }
       if (suc != null) { poner(de(suc), importe); return; }
       if (!reparte) { poner(de(ADMINISTRACION), importe); return; }
       for (const [b, v] of repartir(importe, pesoVentas)) poner(de(b), v);
@@ -123,22 +142,38 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
       comisiones: { porLocal: new Map<number, number>(), comun: { hay: false, importe: 0 } },
     };
     const sueldosCargados: Fila[] = [];
-    for (const g of idx.gastos.get(mes) ?? []) {
+    const ponerGasto = (g: Fila) => {
       const rubro = rubroDe.get(g.rubro);
       const papel = rubro?.resultado ?? 'normal';
       const clave = String(g.rubro);
+      const reparto = g.reparto as RepartoLocal[] | null;
       if (papel === 'iibb' || papel === 'municipalidad' || papel === 'comisiones') {
         const r = real[papel];
-        if (g.suc == null) { r.comun.hay = true; r.comun.importe = r2(r.comun.importe + g.importe); }
+        if (reparto?.length) for (const [b, v] of repartir(g.importe, pesosDeReparto(reparto))) sumar(r.porLocal, b, v);
+        else if (g.suc == null) { r.comun.hay = true; r.comun.importe = r2(r.comun.importe + g.importe); }
         else sumar(r.porLocal, g.suc, g.importe);
       } else if (papel === 'sueldos') sueldosCargados.push(g);
       else if (papel === 'ganancias' || papel === 'fuera') info.excluidos[clave] = r2((info.excluidos[clave] ?? 0) + g.importe);
       else if (papel === 'financiero') {
-        aBalde(g.suc, g.importe, rubro?.reparte ?? true, (x, v) => { x.financieros[clave] = r2((x.financieros[clave] ?? 0) + v); });
+        aBalde(g.suc, g.importe, rubro?.reparte ?? true, (x, v) => { x.financieros[clave] = r2((x.financieros[clave] ?? 0) + v); }, reparto);
       } else {
         const grupo = rubro?.tipo === 'fijo' ? 'fijos' : 'variables';
-        aBalde(g.suc, g.importe, rubro?.reparte ?? true, (x, v) => { x[grupo][clave] = r2((x[grupo][clave] ?? 0) + v); });
+        aBalde(g.suc, g.importe, rubro?.reparte ?? true, (x, v) => { x[grupo][clave] = r2((x[grupo][clave] ?? 0) + v); }, reparto);
       }
+    };
+    for (const g of idx.gastos.get(mes) ?? []) ponerGasto(g);
+
+    /* 2 bis · Los gastos fijos sin gasto cargado este mes: su estimado (0216). */
+    const costos = cat.empleados
+      .map((e) => ({ e, c: costoEmpleadoMes(e, mes) }))
+      .filter((x): x is { e: Empleado; c: NonNullable<ReturnType<typeof costoEmpleadoMes>> } => x.c != null);
+    for (const f of cat.fijos) {
+      const papel = rubroDe.get(f.rubro)?.resultado ?? 'normal';
+      if (SIN_ESTIMADO_FIJO.has(papel) || (papel === 'sueldos' && costos.length)) continue;
+      const importe = estimadoFijoMes(f, mes, cat.emitidos.get(f.id));
+      if (!importe) continue;
+      ponerGasto({ suc: f.sucursalId, rubro: f.rubro, importe, reparto: f.reparto });
+      info.fijosEstimados.push({ id: f.id, nombre: f.nombre, importe });
     }
 
     /* 3 · Ingresos Brutos: estimado por lo facturado; el real, de la empresa entera. */
@@ -184,18 +219,15 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     }
 
     /* 6 · Sueldos: la planilla, o lo cargado en el rubro si no hay planilla. */
-    const costos = cat.empleados
-      .map((e) => ({ e, c: costoEmpleadoMes(e, mes) }))
-      .filter((x): x is { e: Empleado; c: NonNullable<ReturnType<typeof costoEmpleadoMes>> } => x.c != null);
     const origenSueldos: 'empleados' | 'gastos' | 'nada' = costos.length ? 'empleados' : sueldosCargados.length ? 'gastos' : 'nada';
     if (costos.length) {
       for (const { e, c } of costos) {
         if (c.sinSueldo) info.empleadosSinSueldo.push(e.nombre);
-        aBalde(e.sucursalId, c.total, rubroSueldos?.reparte ?? true, (x, v) => { x.sueldos += v; });
+        aBalde(e.sucursalId, c.total, rubroSueldos?.reparte ?? true, (x, v) => { x.sueldos += v; }, e.reparto);
       }
       info.sueldosIgnorados = r2(sueldosCargados.reduce((a, g) => a + g.importe, 0));
     } else {
-      for (const g of sueldosCargados) aBalde(g.suc, g.importe, rubroDe.get(g.rubro)?.reparte ?? true, (x, v) => { x.sueldos += v; });
+      for (const g of sueldosCargados) aBalde(g.suc, g.importe, rubroDe.get(g.rubro)?.reparte ?? true, (x, v) => { x.sueldos += v; }, g.reparto);
     }
 
     /* 7 · Amortizaciones (si están encendidas): las sin local se reparten por ventas. */

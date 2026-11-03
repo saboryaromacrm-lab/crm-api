@@ -89,13 +89,13 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
       where ${RANGO('m.fecha')} and m.tipo in ('merma','vencido','defectuoso','ajuste') and m.costo_unitario > 0
       group by 1, 2`, p),
     c.query(`
-      select to_char(${MES_GASTO}, 'YYYY-MM') as mes, g.sucursal_id as suc, g.categoria_id as rubro,
+      select to_char(${MES_GASTO}, 'YYYY-MM') as mes, g.sucursal_id as suc, g.categoria_id as rubro, g.reparto,
         coalesce(sum(g.total - case when g.letra = 'A' then g.iva else 0 end - g.perc_dgi - g.perc_dgr), 0) as importe,
         count(*)::int as cantidad
       from gastos g
       where g.estado <> 'anulado' and g.negocio <> 'cafeteria'
         and ${MES_GASTO} >= $1::date and ${MES_GASTO} < $2::date
-      group by 1, 2, 3`, p),
+      group by 1, 2, 3, 4`, p),
     /* Percepciones de IIBB sufridas (compras y gastos): pago a cuenta del impuesto. */
     c.query(`
       select mes, coalesce(sum(importe), 0) as importe from (
@@ -118,7 +118,7 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
   ]);
   const num = (rows: any[]) => rows.map((x) => {
     const o: any = { ...x };
-    for (const k of Object.keys(o)) if (k !== 'mes' && k !== 'medio' && k !== 'nota' && o[k] != null) o[k] = N(o[k]);
+    for (const k of Object.keys(o)) if (k !== 'mes' && k !== 'medio' && k !== 'nota' && k !== 'reparto' && o[k] != null) o[k] = N(o[k]);
     return o;
   });
   return {
@@ -129,10 +129,10 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
 
 /** La configuración y los catálogos que usa la cuenta (todo chico). */
 export async function leerCatalogos(c: PoolClient, anioDesde: number) {
-  const [rubros, sucs, emps, sueldos, bienes, tasas, escalas, config] = await Promise.all([
+  const [rubros, sucs, emps, sueldos, bienes, tasas, escalas, config, fijos, emitidos] = await Promise.all([
     c.query(`select id, nombre, tipo::text as tipo, resultado, reparte, activa, orden from gasto_categorias order by orden, nombre`),
     c.query(`select id, nombre, activa from sucursales order by id`),
-    c.query(`select id, nombre, cuil, sucursal_id, to_char(alta, 'YYYY-MM-DD') as alta, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
+    c.query(`select id, nombre, cuil, sucursal_id, reparto, to_char(alta, 'YYYY-MM-DD') as alta, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
              from empleados order by nombre`),
     c.query(`select id, empleado_id, to_char(desde, 'YYYY-MM') as desde, bruto, cargas from empleado_sueldos order by empleado_id, desde`),
     c.query(`select id, nombre, sucursal_id, valor, to_char(alta, 'YYYY-MM-DD') as alta, vida_meses, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
@@ -140,7 +140,19 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
     c.query(`select id, concepto, sucursal_id, medio, porcentaje, minimo, to_char(desde, 'YYYY-MM') as desde from resultados_tasas order by concepto, desde`),
     c.query(`select anio, tramos, deducciones from ganancias_escalas where anio >= $1 - 5 order by anio`, [anioDesde]),
     c.query(`select valor from resultados_config where id = 1`),
+    /* Los gastos fijos (0216): en los meses en que corren y no tienen gasto cargado, va su estimado. */
+    c.query(`select id, nombre, categoria_id, sucursal_id, reparto, importe_estimado, frecuencia::text as frecuencia,
+               to_char(desde, 'YYYY-MM') as desde, to_char(hasta, 'YYYY-MM') as hasta
+             from gastos_recurrentes order by nombre`),
+    c.query(`select distinct g.recurrente_id as id, to_char(${MES_GASTO}, 'YYYY-MM') as mes
+             from gastos g where g.recurrente_id is not null and g.estado <> 'anulado'`),
   ]);
+  const emitidosDe = new Map<number, Set<string>>();
+  for (const e of emitidos.rows) {
+    const set = emitidosDe.get(e.id) ?? new Set<string>();
+    set.add(e.mes);
+    emitidosDe.set(e.id, set);
+  }
   const sueldosDe = new Map<number, any[]>();
   for (const s of sueldos.rows) {
     const l = sueldosDe.get(s.empleado_id) ?? [];
@@ -152,7 +164,7 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
     rubros: rubros.rows.map((r: any) => ({ ...r, reparte: !!r.reparte, activa: !!r.activa })),
     sucursales: sucs.rows.map((s: any) => ({ id: s.id, nombre: s.nombre, activa: !!s.activa })),
     empleados: emps.rows.map((e: any) => ({
-      id: e.id, nombre: e.nombre, cuil: e.cuil, sucursalId: e.sucursal_id, alta: e.alta, baja: e.baja,
+      id: e.id, nombre: e.nombre, cuil: e.cuil, sucursalId: e.sucursal_id, reparto: e.reparto ?? null, alta: e.alta, baja: e.baja,
       observaciones: e.observaciones, sueldos: sueldosDe.get(e.id) ?? [],
     })),
     bienes: bienes.rows.map((b: any) => ({
@@ -164,6 +176,11 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
       porcentaje: N(t.porcentaje), minimo: N(t.minimo), desde: t.desde,
     })),
     escalas: escalas.rows.map((e: any) => ({ anio: N(e.anio), tramos: e.tramos ?? [], deducciones: e.deducciones ?? {} })),
+    fijos: fijos.rows.map((f: any) => ({
+      id: f.id, nombre: f.nombre, rubro: f.categoria_id, sucursalId: f.sucursal_id, reparto: f.reparto ?? null,
+      importe: N(f.importe_estimado), frecuencia: f.frecuencia, desde: f.desde, hasta: f.hasta,
+    })),
+    emitidos: emitidosDe,
     config: {
       amortizaciones: cfg.amortizaciones === true,
       gananciasBase: cfg.gananciasBase === 'todo' ? 'todo' as const : 'facturado' as const,

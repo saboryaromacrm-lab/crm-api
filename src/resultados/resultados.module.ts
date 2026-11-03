@@ -45,6 +45,7 @@ import { MetricasModule, MetricasService } from '../metricas/metricas.module';
 import { leerCatalogos, leerHechos, leerObjetivos } from './datos';
 import { ADMINISTRACION, SIN_LOCAL, armarEstado } from './estado';
 import { PERMISO_RESULTADOS } from './permiso';
+import { RepartoDto, exigirReparto } from './reparto';
 import { MES_RE, diasDelMes, mesesEntre, r2, sumarMeses, totalDeducciones } from './reglas';
 
 /** El período más largo que se deja pedir (Ganancias suma desde enero del primer año). */
@@ -114,6 +115,8 @@ class EmpleadoDto {
   @IsOptional() @Matches(FECHA_RE, { message: 'El alta va como AAAA-MM-DD.' }) alta?: string;
   @IsOptional() @Matches(FECHA_RE, { message: 'La baja va como AAAA-MM-DD.' }) baja?: string | null;
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
+  /** 0216: el sueldo repartido entre locales por %; vacío = sin reparto (manda el local). */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => RepartoDto) reparto?: RepartoDto[] | null;
   /* Al dar de alta: su primer sueldo (desde el mes del alta). */
   @IsOptional() @IsNumber() @Min(0) @Max(1e10) bruto?: number;
   @IsOptional() @IsNumber() @Min(0) @Max(100) cargas?: number;
@@ -156,6 +159,12 @@ export class ResultadosService {
     const [x] = await this.db.select({ id: sucursales.id }).from(sucursales).where(eq(sucursales.id, id)).limit(1);
     if (!x) throw new BadRequestException('Sucursal inválida.');
     return x.id;
+  }
+
+  /** «Express 1 50 % · Express 2 50 %» para la auditoría. */
+  private async textoReparto(reparto: { sucursalId: number; pct: number }[]) {
+    const sucs = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales);
+    return reparto.map((x) => `${sucs.find((y) => y.id === x.sucursalId)?.nombre ?? `#${x.sucursalId}`} ${pct(x.pct)}`).join(' · ');
   }
 
   /* ============================ el reporte ============================ */
@@ -228,8 +237,20 @@ export class ResultadosService {
     }
     if (!cat.empleados.length) {
       out.push({ tono: 'warn', texto: meses.some((m) => m.origen.sueldos === 'gastos')
-        ? 'No hay empleados cargados: los sueldos salen de lo cargado en el rubro Sueldos de Gastos (sin aguinaldo proporcional). Cargalos en Gastos › Gastos fijos y sueldos › Sueldos.'
-        : 'No hay sueldos: ni empleados cargados ni gastos en el rubro Sueldos. El resultado sale mejor de lo que es. Cargalos en Gastos › Gastos fijos y sueldos › Sueldos.' });
+        ? 'No hay empleados cargados: los sueldos salen de lo cargado en el rubro Sueldos de Gastos (sin aguinaldo proporcional). Cargalos en Gerencia › Resultados › Configuración › Sueldos.'
+        : 'No hay sueldos: ni empleados cargados ni gastos en el rubro Sueldos. El resultado sale mejor de lo que es. Cargalos en Gerencia › Resultados › Configuración › Sueldos.' });
+    }
+    /* Los gastos fijos que todavía no se cargaron (0216): cuentan con su estimado. */
+    const estimados = new Map<number, { nombre: string; importe: number }>();
+    for (const m of meses) for (const f of m.info.fijosEstimados ?? []) {
+      const x = estimados.get(f.id) ?? { nombre: f.nombre, importe: 0 };
+      x.importe += f.importe;
+      estimados.set(f.id, x);
+    }
+    if (estimados.size) {
+      const lista = [...estimados.values()];
+      out.push({ tono: 'info', texto: `Incluye ${pesos(lista.reduce((a, x) => a + x.importe, 0))} de gastos fijos que todavía no se cargaron, con su importe estimado: `
+        + `${lista.map((x) => `${x.nombre} ${pesos(x.importe)}`).join(' · ')}. Cuando cargues (o generes) el gasto real, lo reemplaza.` });
     }
     const ignorados = suma((m) => m.info.sueldosIgnorados);
     if (ignorados > 0.009) out.push({ tono: 'info', texto: `${pesos(ignorados)} cargados en el rubro Sueldos de Gastos no se suman: manda la planilla de empleados (son los pagos; sumarlos sería contar dos veces).` });
@@ -421,10 +442,11 @@ export class ResultadosService {
     if (!dto.alta) throw new BadRequestException('Poné la fecha de alta.');
     if (dto.bruto == null) throw new BadRequestException('Poné el sueldo bruto.');
     if (dto.baja && dto.baja < dto.alta) throw new BadRequestException('La baja no puede ser anterior al alta.');
-    const sucursalId = await this.sucursalValida(dto.sucursalId);
+    const reparto = await exigirReparto(this.db, dto.reparto);
+    const sucursalId = reparto ? null : await this.sucursalValida(dto.sucursalId);
     const id = await this.db.transaction(async (tx) => {
       const [e] = await tx.insert(empleados).values({
-        nombre, cuil: (dto.cuil ?? '').trim(), sucursalId, alta: dto.alta!, baja: dto.baja ?? null,
+        nombre, cuil: (dto.cuil ?? '').trim(), sucursalId, reparto, alta: dto.alta!, baja: dto.baja ?? null,
         observaciones: (dto.observaciones ?? '').trim(),
       }).returning({ id: empleados.id });
       await tx.insert(empleadoSueldos).values({
@@ -434,6 +456,7 @@ export class ResultadosService {
     });
     await this.auditar(s, 'empleado', id, 'Resultados · Sueldos', nombre, [
       ['Alta', '', dto.alta!], ['Sueldo bruto', '', `${pesos(dto.bruto!)} + ${pct(dto.cargas ?? 0)} de cargas`],
+      ...(reparto ? [['Reparto', '', await this.textoReparto(reparto)] as [string, string, string]] : []),
     ]);
     return this.empleados();
   }
@@ -445,8 +468,19 @@ export class ResultadosService {
     const cambios: [string, string, string][] = [];
     if (dto.nombre != null && dto.nombre.trim() && dto.nombre.trim() !== e.nombre) { patch.nombre = dto.nombre.trim(); cambios.push(['Nombre', e.nombre, patch.nombre]); }
     if (dto.cuil != null && dto.cuil.trim() !== e.cuil) { patch.cuil = dto.cuil.trim(); cambios.push(['CUIL', e.cuil, patch.cuil]); }
-    if (dto.sucursalId !== undefined && (dto.sucursalId ?? null) !== (e.sucursalId ?? null)) {
-      patch.sucursalId = await this.sucursalValida(dto.sucursalId);
+    if (dto.reparto !== undefined) {
+      const reparto = await exigirReparto(this.db, dto.reparto, e.reparto ?? null);
+      if (JSON.stringify(reparto) !== JSON.stringify(e.reparto ?? null)) {
+        patch.reparto = reparto;
+        cambios.push(['Reparto', e.reparto ? await this.textoReparto(e.reparto) : '', reparto ? await this.textoReparto(reparto) : '(sin reparto)']);
+      }
+    }
+    const repartoFinal = patch.reparto !== undefined ? patch.reparto : e.reparto;
+    const sucursalPedida = repartoFinal?.length ? null : dto.sucursalId;
+    if ((dto.sucursalId !== undefined || repartoFinal?.length) && (sucursalPedida ?? null) !== (e.sucursalId ?? null)) {
+      patch.sucursalId = await this.sucursalValida(sucursalPedida);
+      /* Un local deja sin efecto el reparto por %. */
+      if (patch.sucursalId != null && e.reparto && patch.reparto === undefined) patch.reparto = null;
       cambios.push(['Local', e.sucursalId ? `#${e.sucursalId}` : 'Varios / Administración', patch.sucursalId ? `#${patch.sucursalId}` : 'Varios / Administración']);
     }
     if (dto.alta && dto.alta !== e.alta) { patch.alta = dto.alta; cambios.push(['Alta', e.alta, dto.alta]); }

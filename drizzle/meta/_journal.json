@@ -1513,6 +1513,13 @@
       "when": 1793905200000,
       "tag": "0215_cuenta_a_mano",
       "breakpoints": true
+    },
+    {
+      "idx": 216,
+      "version": "7",
+      "when": 1793908800000,
+      "tag": "0216_gastos_fijos_resultados",
+      "breakpoints": true
     }
   ]
 }
