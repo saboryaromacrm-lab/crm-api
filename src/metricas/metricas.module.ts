@@ -26,7 +26,7 @@
  * puede asignar desde la pantalla de roles; solo pasa el comodín `*`.
  */
 import {
-  BadRequestException, Body, Controller, Get, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit, Post, Query,
+  BadRequestException, Body, Controller, Delete, Get, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { IsIn, IsOptional } from 'class-validator';
@@ -49,6 +49,7 @@ import { reporteStock, valorizarStock } from './stock';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
 import { reporteOfertas } from './ofertas';
+import { GuardarAnteriorDto, guardarAnterior, localesConAnterior, quitarAnterior, reporteAnterior } from './anterior';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
 export const PERMISO_METRICAS = 'gerencia.metricas';
@@ -195,6 +196,25 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
     const [a, b] = this.dosPeriodos({ ...q, sucursalId: undefined });
     return this.leer((c) => reporteVariaciones(c, a, b));
   }
+
+  /**
+   * Sistema anterior (0213): los meses del sistema viejo contra los del ERP, por
+   * local. Sin local, solo qué locales tienen algo subido.
+   */
+  anterior(q: any) {
+    const suc = Number(q.sucursalId);
+    return this.leer(async (c) => (Number.isInteger(suc) && suc > 0 ? reporteAnterior(c, suc) : { locales: await localesConAnterior(c) }));
+  }
+
+  /** Lo único que escribe este módulo fuera de sus resúmenes: es carga del dueño, no un dato derivado. */
+  private async escribir<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
+    const c = await this.pool.connect();
+    try { return await fn(c); } finally { c.release(); }
+  }
+
+  guardarAnterior(dto: GuardarAnteriorDto) { return this.escribir((c) => guardarAnterior(c, dto)); }
+
+  quitarAnterior(sucursalId: number, mes: string) { return this.escribir((c) => quitarAnterior(c, sucursalId, mes)); }
 
   stock(q: any) {
     const suc = Number(q.sucursalId);
@@ -354,6 +374,11 @@ export class MetricasController {
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
   @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
   @Get('ofertas') ofertas(@Query() q: any) { return this.svc.ofertas(q); }
+  @Get('anterior') anterior(@Query() q: any) { return this.svc.anterior(q); }
+  @Post('anterior') guardarAnterior(@Body() dto: GuardarAnteriorDto) { return this.svc.guardarAnterior(dto); }
+  @Delete('anterior/:sucursalId/:mes') quitarAnterior(@Param('sucursalId', ParseIntPipe) sucursalId: number, @Param('mes') mes: string) {
+    return this.svc.quitarAnterior(sucursalId, mes);
+  }
 
   /** El botón «Sincronizar»: por defecto, hoy y ayer (un instante). */
   @Post('sincronizar')

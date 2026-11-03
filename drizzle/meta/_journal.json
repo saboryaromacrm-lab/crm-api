@@ -1492,6 +1492,13 @@
       "when": 1793894400000,
       "tag": "0212_cierre_caja_dias",
       "breakpoints": true
+    },
+    {
+      "idx": 213,
+      "version": "7",
+      "when": 1793898000000,
+      "tag": "0213_metricas_sistema_anterior",
+      "breakpoints": true
     }
   ]
 }
