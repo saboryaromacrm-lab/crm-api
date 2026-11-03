@@ -899,6 +899,8 @@ export class VentasService {
         /* El pedido del que nació y, si vino del sitio, de qué tienda (28/10/2026). */
         pedidoCodigo: sql<string | null>`(select p.codigo from presupuestos p where p.id = ${ventas.presupuestoId})`,
         tienda: sql<string | null>`(select coalesce(p.modo_tienda, 'mayorista') from presupuestos p where p.id = ${ventas.presupuestoId} and p.origen = 'web')`,
+        /* Cómo se entregó el pedido: retiro | cadete | camioneta (3/11/2026). */
+        entrega: sql<string | null>`(select p.entrega from presupuestos p where p.id = ${ventas.presupuestoId})`,
       }).from(ventas)
         .innerJoin(clientes, eq(clientes.id, ventas.clienteId))
         .leftJoin(sucursales, eq(sucursales.id, ventas.sucursalId))
@@ -1084,7 +1086,7 @@ export class VentasService {
       (notas as any[]).map((n) => [Number(n.refVentaId), Number(n.total) || 0]),
     );
     return {
-      filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre, pedidoCodigo, tienda }) => {
+      filas: filas.map(({ v, clienteNombre, sucursalNombre, cajeroNombre, pedidoCodigo, tienda, entrega }) => {
         const a = agg.find((x: any) => x.ventaId === v.id);
         const cobrado = imput.get(v.id) ?? 0;
         const acreditado = acreditadoDe.get(v.id) ?? 0;
@@ -1120,6 +1122,8 @@ export class VentasService {
           pedidoCodigo,
           /** De qué tienda online vino ('minorista' | 'mayorista'), o null. */
           tienda,
+          /** Cómo se entregó el pedido del que nació ('retiro' | 'cadete' | 'camioneta'), o null. */
+          entrega,
         };
       }),
       // `total` es de lo que MATCHEA (incluidas las anuladas): es el universo
