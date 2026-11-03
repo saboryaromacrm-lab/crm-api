@@ -2,12 +2,14 @@ import {
   BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module, NotFoundException,
   Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import {
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min,
+} from 'class-validator';
 import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
-import { PLAZO_MAX_DIAS } from '../caja/plazo';
+import { ordenarDias, textoDiasCierre } from '../caja/plazo';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
 import {
   cajaSesiones, conteos, enviosCafeteria, gastosRecurrentes, incidencias, pedidosCafeteria, presupuestos, productos, sesiones, stock,
@@ -27,8 +29,10 @@ class UpsertSucursalDto {
   @IsOptional() @IsNumber() @Min(0, { message: 'El fondo de caja no puede ser negativo.' }) @Max(100_000_000) fondoCaja?: number;
   /** Trabaja la venta mayorista (0150). Sin el campo, queda como estaba. */
   @IsOptional() @IsBoolean() vendeMayorista?: boolean;
-  /** Cada cuántos días se cierra la caja (0212). Rige desde la próxima apertura. */
-  @IsOptional() @IsInt() @Min(1) @Max(PLAZO_MAX_DIAS, { message: `La caja se cierra como mucho cada ${PLAZO_MAX_DIAS} días.` }) cierreCadaDias?: number;
+  /** Los días de la semana en que se cierra la caja (0214), 1 = lunes … 7 = domingo. Rige desde la próxima apertura. */
+  @IsOptional() @IsArray() @ArrayNotEmpty({ message: 'Elegí al menos un día de cierre de caja.' }) @ArrayMaxSize(7)
+  @IsInt({ each: true }) @Min(1, { each: true }) @Max(7, { each: true })
+  diasCierre?: number[];
 }
 
 /**
@@ -48,15 +52,13 @@ export const normalizarPuntoVentaFiscal = (v: unknown) => {
 const CAMPOS_SUCURSAL = {
   nombre: 'Nombre', tipo: 'Tipo', puntoVenta: 'Punto de venta ARCA', direccion: 'Domicilio',
   facturaElectronica: 'Factura electrónica', fondoCaja: 'Fondo de caja', vendeMayorista: 'Vende mayorista',
-  cierreCadaDias: 'Cierre de caja',
+  diasCierre: 'Días de cierre de caja',
 } as const;
-/** «Todos los días» o «Cada 3 días». */
-const textoCierreCaja = (n: unknown) => (Number(n) > 1 ? `Cada ${Number(n)} días` : 'Todos los días');
 const textoSucursal = (s: Record<string, any>) => Object.fromEntries(Object.keys(CAMPOS_SUCURSAL).map((k) => {
   const v = s[k];
   if (typeof v === 'boolean') return [k, v ? 'Sí' : 'No'];
   if (k === 'fondoCaja') return [k, `$${(Number(v) || 0).toLocaleString('es-AR')}`];
-  if (k === 'cierreCadaDias') return [k, textoCierreCaja(v)];
+  if (k === 'diasCierre') return [k, textoDiasCierre(v)];
   return [k, String(v ?? '')];
 }));
 
@@ -152,7 +154,7 @@ export class SucursalesService {
       // Sin el campo, el fondo queda como estaba: editar el nombre no lo borra.
       ...(dto.fondoCaja !== undefined ? { fondoCaja: Math.round(Number(dto.fondoCaja) * 100) / 100 } : {}),
       ...(dto.vendeMayorista !== undefined ? { vendeMayorista: dto.vendeMayorista } : {}),
-      ...(dto.cierreCadaDias !== undefined ? { cierreCadaDias: dto.cierreCadaDias } : {}),
+      ...(dto.diasCierre !== undefined ? { diasCierre: ordenarDias(dto.diasCierre) } : {}),
     };
   }
 

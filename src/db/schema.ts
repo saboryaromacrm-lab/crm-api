@@ -141,11 +141,12 @@ export const sucursales = pgTable('sucursales', {
    */
   vendeMayorista: boolean('vende_mayorista').notNull().default(true),
   /**
-   * CADA CUÁNTOS DÍAS SE CIERRA LA CAJA (0212), de 1 (todos los días) a 7. El
-   * turno copia este número al abrir (`cajaSesiones.plazoDias`): cambiarlo no
-   * mueve el vencimiento de una caja ya abierta. Ver `caja/plazo.ts`.
+   * LOS DÍAS DE LA SEMANA EN QUE SE CIERRA LA CAJA (0214): 1 = lunes … 7 =
+   * domingo; los siete = todos los días. El turno guarda al abrir su último
+   * día (`cajaSesiones.cerrarHasta`): cambiar esto no mueve una caja ya
+   * abierta. Ver `caja/plazo.ts`.
    */
-  cierreCadaDias: integer('cierre_cada_dias').notNull().default(1),
+  diasCierre: integer('dias_cierre').array().notNull().default(sql`'{1,2,3,4,5,6,7}'`),
 }, (t) => ({
   /* Dos sucursales con el mismo punto de venta pedirían el mismo próximo
    * número a ARCA y se pisarían. Parcial: el vacío es válido y se repite. */
@@ -2127,8 +2128,8 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   fondoQueda: doublePrecision('fondo_queda'),
   /** Los billetes que van en el SOBRE (0130); lo que queda en la caja es `billetes` menos estos. */
   billetesEnvio: jsonb('billetes_envio'),
-  /** El plazo con el que abrió (0212): se cierra a más tardar el día de la apertura + plazo − 1. */
-  plazoDias: integer('plazo_dias').notNull().default(1),
+  /** El último día para cerrarla, fijado al abrir (0214): el próximo día de cierre del local. Vacío = local de todos los días. */
+  cerrarHasta: date('cerrar_hasta', { mode: 'string' }),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
   /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el

@@ -27,7 +27,7 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import { type ConceptoRegla, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
-import { diaEnPalabras, plazoDelTurno } from './plazo';
+import { cerrarHastaDe, diaEnPalabras, plazoDelTurno } from './plazo';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cashflowConceptos, cobranzaPagos, cobranzas, gastoCategorias, mpCobros,
   proveedorImputaciones, proveedorPagos, sucursales, ventaPagos, ventas,
@@ -342,15 +342,15 @@ export class CajaService {
   }
 
   /**
-   * UNA CAJA DE VARIOS DÍAS VENCIDA NO VENDE NI COBRA (0212, decisión del
-   * dueño): hasta que se cierre, nada más se cuelga de ese turno. Es lo que
-   * garantiza que ninguna quede abierta sin rendir.
+   * UNA CAJA CON DÍAS DE CIERRE VENCIDA NO VENDE NI COBRA (0212 y 0214,
+   * decisión del dueño): hasta que se cierre, nada más se cuelga de ese
+   * turno. Es lo que garantiza que ninguna quede abierta sin rendir.
    */
-  exigirEnPlazo(turno: { apertura: Date | string; plazoDias?: number | null }) {
+  exigirEnPlazo(turno: { apertura: Date | string; cerrarHasta?: string | null }) {
     const p = plazoDelTurno(turno);
     if (p.bloquea) {
       throw new BadRequestException(
-        `La caja de este local se cierra cada ${p.plazoDias} días y se tenía que cerrar el ${diaEnPalabras(p.cerrarHasta)}. `
+        `Esta caja se tenía que cerrar el ${diaEnPalabras(p.cerrarHasta)}, que es día de cierre de este local. `
         + 'Cerrala desde Ventas › Caja para seguir vendiendo; después abrís una nueva.',
       );
     }
@@ -597,7 +597,7 @@ export class CajaService {
    * fondo y la pantalla seguía creyendo que no había).
    */
   async datosApertura(sucursalId: number) {
-    const [suc] = await this.db.select({ fondo: sucursales.fondoCaja, cierreCadaDias: sucursales.cierreCadaDias })
+    const [suc] = await this.db.select({ fondo: sucursales.fondoCaja, diasCierre: sucursales.diasCierre })
       .from(sucursales).where(eq(sucursales.id, sucursalId)).limit(1);
     const [ultimo] = await this.db.select({
       id: cajaSesiones.id, cierre: cajaSesiones.cierre, fondoQueda: cajaSesiones.fondoQueda,
@@ -613,8 +613,8 @@ export class CajaService {
       ultimoCierre: ultimo?.cierre ?? null,
       /** Lo que se propone (y lo que el cajero confirma): lo que quedó, o el fondo fijo. */
       propuesto: dejadoEnCaja ?? fondoFijo,
-      /** El plazo con que abriría hoy (0212) y su último día para cerrar. */
-      plazo: plazoDelTurno({ apertura: new Date(), plazoDias: suc?.cierreCadaDias }),
+      /** Hasta qué día quedaría abierta si se abre hoy (0214): el próximo día de cierre del local. */
+      plazo: plazoDelTurno({ apertura: new Date(), cerrarHasta: cerrarHastaDe(suc?.diasCierre) }),
     };
   }
 
@@ -685,7 +685,7 @@ export class CajaService {
           montoInicial,
           estado: 'abierta',
           observaciones: dto.observaciones ?? '',
-          plazoDias: ap.plazo.plazoDias,
+          cerrarHasta: ap.plazo.programada ? ap.plazo.cerrarHasta : null,
         }).returning();
         /* La primera apertura FIJA el fondo (solo si nadie lo cargó antes). */
         if (fondo == null) {
