@@ -26,11 +26,27 @@ import { totalesCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, facturacionesMesFacturas, gastos, marcas, productoProveedores,
-  productos, proveedores, stock, ventaItems, ventaPagos, ventas,
+  productos, proveedores, stock, sucursales, ventaItems, ventaPagos, ventas,
 } from '../db/schema';
 import { costosFormato, escalaPaquete, formatoActivo, formatoDeCosto } from '../inventario/pricing';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** Venta, costo congelado y los dos márgenes de un grupo de renglones (un producto o un local). */
+const margenesDe = (f: { ventaNeta: number; ventaCosteada: number; costo: number | null; ivaAbsorbido: number | null }) => {
+  const margenReal = f.costo != null ? r2(f.ventaCosteada - f.costo) : null;
+  return {
+    ventaNeta: r2(f.ventaNeta),
+    /** La venta de los renglones CON costo: la única base honesta del margen. */
+    ventaCosteada: r2(f.ventaCosteada),
+    costo: f.costo != null ? r2(f.costo) : null,
+    margenReal,
+    margenAparente: margenReal != null ? r2(margenReal + (f.ivaAbsorbido ?? 0)) : null,
+    ivaAbsorbido: r2(f.ivaAbsorbido ?? 0),
+    /** % del margen real sobre la venta costeada (la "ganancia real"). */
+    margenRealPct: margenReal != null && f.ventaCosteada > 0 ? r2((margenReal / f.ventaCosteada) * 100) : null,
+  };
+};
 
 /** 'AAAA-MM-DD' → Date local (T00:00:00: sin la T se corre un día — trampa conocida). */
 const dia = (v?: string) => {
@@ -53,8 +69,11 @@ export class RentabilidadService {
     const hastaEx = new Date(hastaInc.getFullYear(), hastaInc.getMonth(), hastaInc.getDate() + 1);
     const suc = q.sucursalId || null;
 
-    const [filasVenta, fiscalVentas, filasCompra, filaGastos, financiacion, coffit, provRows, prods, ms, cs] = await Promise.all([
-      this.ventasPorProducto(desde, hastaEx, suc),
+    const [filasVenta, filasSucursal, sucs, fiscalVentas, filasCompra, filaGastos, financiacion, coffit, provRows, prods, ms, cs] = await Promise.all([
+      this.ventasAgrupadas(desde, hastaEx, suc, 'producto'),
+      // Con un local elegido, la comparación entre locales no hace falta.
+      suc ? Promise.resolve([]) : this.ventasAgrupadas(desde, hastaEx, null, 'sucursal'),
+      this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa }).from(sucursales).orderBy(asc(sucursales.id)),
       this.fiscalVentas(desde, hastaEx, suc),
       this.comprasPorProveedor(desde, hastaEx),
       this.creditoGastos(desde, hastaEx),
@@ -93,13 +112,11 @@ export class RentabilidadService {
     /* ---- Margen por producto (congelado) + totales ---- */
     const infoProd = new Map(prods.map((p) => [p.id, p]));
     const porProductoOut = filasVenta.map((f: any) => {
-      const p: any = infoProd.get(f.productoId) ?? {};
-      const h = hoyDe.get(f.productoId);
-      const margenReal = f.costo != null ? r2(f.ventaCosteada - f.costo) : null;
-      const margenAparente = margenReal != null ? r2(margenReal + (f.ivaAbsorbido ?? 0)) : null;
+      const p: any = infoProd.get(f.clave) ?? {};
+      const h = hoyDe.get(f.clave);
       return {
-        productoId: f.productoId,
-        nombre: p.nombre ?? `#${f.productoId}`,
+        productoId: f.clave,
+        nombre: p.nombre ?? `#${f.clave}`,
         marcaId: p.marcaId ?? null,
         marca: nombreMarca.get(p.marcaId) ?? '',
         categoriaId: p.categoriaId ?? null,
@@ -107,15 +124,7 @@ export class RentabilidadService {
         proveedorId: h?.proveedorId ?? null,
         proveedor: nombreProv.get(h?.proveedorId as number) ?? '',
         unidades: r2(f.unidades),
-        ventaNeta: r2(f.ventaNeta),
-        /** La venta de los renglones CON costo: la única base honesta del margen. */
-        ventaCosteada: r2(f.ventaCosteada),
-        costo: f.costo != null ? r2(f.costo) : null,
-        margenReal,
-        margenAparente,
-        ivaAbsorbido: r2(f.ivaAbsorbido ?? 0),
-        /** % del margen real sobre la venta costeada (la "ganancia real"). */
-        margenRealPct: margenReal != null && f.ventaCosteada > 0 ? r2((margenReal / f.ventaCosteada) * 100) : null,
+        ...margenesDe(f),
         /** Vendido como sin factura (congelado) — el filtro del panel. */
         sinFactura: !!f.sinFactura,
         /** % del formato activo HOY, para leer la config sin abrir el producto. */
@@ -134,6 +143,17 @@ export class RentabilidadService {
       margenAparente: r2(sum((x) => x.margenAparente ?? 0)),
       ivaAbsorbido: r2(sum((x) => x.ivaAbsorbido)),
     };
+    /* ---- Lo mismo por local (3/11/2026, pedido del dueño): solo con «Todas» ---- */
+    const nombreSuc = new Map(sucs.map((x) => [x.id, x.nombre]));
+    const porSucursal = filasSucursal.map((f: any) => ({
+      sucursalId: f.clave,
+      nombre: nombreSuc.get(f.clave) ?? 'Sin sucursal',
+      ...margenesDe(f),
+      participacion: totales.ventaNeta !== 0 ? r2((f.ventaNeta / totales.ventaNeta) * 100) : 0,
+      renglones: f.renglones,
+      conCosto: f.conCosto,
+    })).sort((a: any, b: any) => b.ventaNeta - a.ventaNeta);
+
     const sf = porProductoOut.filter((x) => x.sinFactura);
     const sinFactura = {
       productos: sf.length,
@@ -228,6 +248,9 @@ export class RentabilidadService {
         conCosto: filasVenta.reduce((a: number, f: any) => a + f.conCosto, 0),
       },
       totales,
+      /** Para el filtro: las activas (0143). Una desactivada con ventas igual figura en `porSucursal`. */
+      sucursales: sucs.filter((x) => x.activa).map(({ id, nombre }) => ({ id, nombre })),
+      porSucursal,
       sinFactura,
       /** Lo que entró por financiar, aparte de lo que entró por vender (0100). */
       recargoCuotas,
@@ -245,8 +268,8 @@ export class RentabilidadService {
     };
   }
 
-  /** Venta neta, costo congelado e IVA absorbido, agrupados por producto. */
-  private async ventasPorProducto(desde: Date, hastaEx: Date, sucursalId: number | null) {
+  /** Venta neta, costo congelado e IVA absorbido, agrupados por producto o por local (`clave`). */
+  private async ventasAgrupadas(desde: Date, hastaEx: Date, sucursalId: number | null, por: 'producto' | 'sucursal') {
     const conds = [
       gte(ventas.fecha, desde), lt(ventas.fecha, hastaEx),
       // Ni borradores ni anuladas: lo primero no es una venta todavía, lo
@@ -261,8 +284,9 @@ export class RentabilidadService {
      * quedaría medido sobre plata que volvió al cliente. */
     const signo = sql`(case when ${ventas.tipo}::text like 'nota_credito%' then -1 else 1 end)`;
     const noEsNota = sql`${ventas.tipo}::text not like 'nota_credito%'`;
+    const clave = por === 'producto' ? sql<number>`${ventaItems.productoId}` : sql<number>`coalesce(${ventas.sucursalId}, 0)`;
     return this.db.select({
-      productoId: ventaItems.productoId,
+      clave,
       unidades: sql<number>`sum(${ventaItems.cantidad} * ${signo})`,
       ventaNeta: sql<number>`sum(${ventaItems.subtotal} * ${signo})`,
       /* El margen solo puede medirse donde hay costo congelado: la venta de
@@ -278,7 +302,7 @@ export class RentabilidadService {
     }).from(ventaItems)
       .innerJoin(ventas, eq(ventaItems.ventaId, ventas.id))
       .where(and(...conds))
-      .groupBy(ventaItems.productoId);
+      .groupBy(clave);
   }
 
   /** El débito fiscal: IVA de las ventas con factura (el ticket no declara). */
