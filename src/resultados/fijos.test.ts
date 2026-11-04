@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { armarEstado, type Catalogos, type HechosLeidos } from './estado';
-import { estimadoFijoMes, normalizarReparto, type GastoFijo } from './reglas';
+import { estimadoFijoMes, normalizarReparto, r2, type GastoFijo } from './reglas';
 
 const ALQUILER: GastoFijo = {
   id: 1, nombre: 'Alquiler Express 1', rubro: 10, sucursalId: 2, reparto: null,
@@ -114,4 +114,20 @@ test('armado: los sueldos se abren por empleado (la parte de cada local) y lo co
   assert.equal(b2.sueldos, 950_000);
   assert.deepEqual(r.meses[0].total.hechos.sueldosPor, { e9: 1_000_000, e3: 600_000 });
   assert.equal(b2.cobradoTarjeta, 80_000);
+});
+
+test('armado: en el mes en curso la planilla y los fijos estimados cuentan los días que pasaron', () => {
+  const emp = {
+    id: 1, nombre: 'Julio', sucursalId: 2, reparto: null, aguinaldo: false,
+    alta: '2026-01-01', baja: null, sueldos: [{ desde: '2026-01', bruto: 3_000_000, cargas: 0 }],
+  };
+  const cat = catalogos({ empleados: [emp], fijos: [ALQUILER] });
+  const curso = armarEstado(vacios(), cat, ['2026-11'], new Set(['2026-11']), '', '2026-11-04');
+  const h = curso.meses[0].total.hechos;
+  assert.equal(h.sueldos, 400_000, '4 de 30 días');
+  assert.equal(curso.meses[0].total.cascada.otrosFijos, r2(500_000 * 4 / 30));
+  assert.deepEqual(curso.meses[0].enCurso, { dias: 4, de: 30 });
+  const cerrado = armarEstado(vacios(), cat, ['2026-10'], new Set(['2026-10']), '', '2026-11-04');
+  assert.equal(cerrado.meses[0].total.hechos.sueldos, 3_000_000, 'un mes cerrado va entero');
+  assert.equal(cerrado.meses[0].enCurso, null);
 });

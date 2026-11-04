@@ -199,7 +199,7 @@ export class ResultadosService {
         reporteIva(c, { desde: `${desde}-01`, hasta: ultimoDia, sucursalId: null },
           { importe: Number(v.ivaSaldoInicial) || 0, mes: String(v.ivaSaldoMes ?? '') }),
       ]);
-      const { meses, avisosGanancias } = armarEstado(hechos, cat, calculo, new Set(pedidos), foco);
+      const { meses, avisosGanancias } = armarEstado(hechos, cat, calculo, new Set(pedidos), foco, hoy);
       const ivaDe = new Map(iva.meses.map((m: any) => [m.mes, m]));
       const conIva = meses.map((m) => {
         const i: any = ivaDe.get(m.mes) ?? {};
@@ -235,7 +235,15 @@ export class ResultadosService {
     const nombreSuc = (id: number) => cat.sucursales.find((s: any) => s.id === id)?.nombre ?? `#${id}`;
     const nombreRubro = (id: string) => cat.rubros.find((r: any) => String(r.id) === id)?.nombre ?? `#${id}`;
     const suma = (f: (m: any) => number) => meses.reduce((a, m) => a + f(m), 0);
-    if (enCurso) out.push({ tono: 'info', texto: 'El último mes está en curso: los números son hasta hoy.' });
+    const curso = meses.find((m) => m.enCurso)?.enCurso;
+    if (enCurso) {
+      out.push({
+        tono: 'info',
+        texto: curso
+          ? `El último mes está en curso: los números son hasta hoy, y los sueldos, gastos fijos estimados y amortizaciones cuentan ${curso.dias} de ${curso.de} días, para compararlos con lo vendido. Lo cargado en Gastos va entero.`
+          : 'El último mes está en curso: los números son hasta hoy.',
+      });
+    }
     const sinCosto = suma((m) => m.total.hechos.sinCosto);
     if (sinCosto > 0) {
       out.push({ tono: 'warn', texto: `${sinCosto} renglón(es) vendidos sin costo cargado (${pesos(suma((m) => m.total.hechos.ventaSinCosto))} de venta): su costo no está en el costo de la mercadería vendida y el margen sale de más.` });

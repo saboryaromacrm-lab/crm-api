@@ -37,7 +37,7 @@
  *   Ganancias; con «solo lo facturado», la parte proporcional a lo facturado.
  */
 import {
-  ADMINISTRACION, SIN_LOCAL, amortizacionMes, cascada, costoEmpleadoMes, escalaDelAnio, estimadoFijoMes, gananciasDelAnio,
+  ADMINISTRACION, SIN_LOCAL, amortizacionMes, cascada, costoEmpleadoMes, diasDelMes, escalaDelAnio, estimadoFijoMes, gananciasDelAnio,
   hechosVacios, pesosDeReparto, r2, repartir, sumarHechos, tasaVigente,
   type Bien, type Empleado, type Escala, type GastoFijo, type Hechos, type RepartoLocal, type Tasa,
 } from './reglas';
@@ -89,7 +89,13 @@ function conReal(
   return { valores: out, origen: quedanEstimados ? 'mixto' : 'real' };
 }
 
-export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: string[], mesesPedidos: Set<string>, foco = '') {
+/**
+ * `hoy` ('AAAA-MM-DD', 4/11/2026): en el MES EN CURSO los sueldos de la
+ * planilla, los gastos fijos estimados y las amortizaciones cuentan solo los
+ * días que pasaron (al 4 de un mes de 30, 4/30), para compararlos con las
+ * ventas de esos mismos días. Lo cargado de verdad en Gastos va entero.
+ */
+export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: string[], mesesPedidos: Set<string>, foco = '', hoy = '') {
   const rubroDe = new Map(cat.rubros.map((r) => [r.id, r]));
   const rubroSueldos = cat.rubros.find((r) => r.resultado === 'sueldos');
   const idx = {
@@ -175,13 +181,18 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     for (const g of idx.gastos.get(mes) ?? []) ponerGasto(g);
 
     /* 2 bis · Los gastos fijos sin gasto cargado este mes: su estimado (0216). */
+    const enCurso = hoy.length === 10 && mes === hoy.slice(0, 7);
+    const dias = enCurso ? Number(hoy.slice(8, 10)) : diasDelMes(mes);
+    const parteMes = dias / diasDelMes(mes);
+    /* En curso: el empleado trabajó hasta hoy (o hasta su baja, si fue antes). */
+    const hastaHoy = (e: Empleado) => (enCurso && (!e.baja || e.baja > hoy) ? { ...e, baja: hoy } : e);
     const costos = cat.empleados
-      .map((e) => ({ e, c: costoEmpleadoMes(e, mes) }))
+      .map((e) => ({ e, c: costoEmpleadoMes(hastaHoy(e), mes) }))
       .filter((x): x is { e: Empleado; c: NonNullable<ReturnType<typeof costoEmpleadoMes>> } => x.c != null);
     for (const f of cat.fijos) {
       const papel = rubroDe.get(f.rubro)?.resultado ?? 'normal';
       if (SIN_ESTIMADO_FIJO.has(papel) || (papel === 'sueldos' && costos.length)) continue;
-      const importe = estimadoFijoMes(f, mes, cat.emitidos.get(f.id));
+      const importe = r2(estimadoFijoMes(f, mes, cat.emitidos.get(f.id)) * parteMes);
       if (!importe) continue;
       ponerGasto({ suc: f.sucursalId, rubro: f.rubro, importe, reparto: f.reparto });
       info.fijosEstimados.push({ id: f.id, nombre: f.nombre, importe });
@@ -249,7 +260,7 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     /* 7 · Amortizaciones (si están encendidas): las sin local se reparten por ventas. */
     if (cat.config.amortizaciones) {
       for (const b of cat.bienes) {
-        const v = amortizacionMes(b, mes);
+        const v = r2(amortizacionMes(b, mes) * parteMes);
         if (v) aBalde(b.sucursalId, v, true, (x, val) => { x.amortizaciones += val; });
       }
     }
@@ -266,6 +277,7 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
       mes, baldes: lista, total: { hechos: total, cascada: cascada(total) },
       origen: { iibb: iibb.origen, municipalidad: muni.origen, comisiones: posnet.origen, sueldos: origenSueldos },
       percepcionesIibb: r2(percIibb), info,
+      enCurso: enCurso ? { dias, de: diasDelMes(mes) } : null,
     };
   });
 
