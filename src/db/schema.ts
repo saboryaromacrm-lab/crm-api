@@ -4275,6 +4275,8 @@ export const empleados = pgTable('empleados', {
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   /** 0216: el sueldo repartido entre locales por % (un empleado compartido). Con reparto no hay local. */
   reparto: jsonb('reparto').$type<RepartoLocal[] | null>(),
+  /** 0217: le corresponde aguinaldo (Resultados le suma 1/12 por mes). */
+  aguinaldo: boolean('aguinaldo').notNull().default(true),
 });
 
 /** El sueldo bruto y el % de cargas del empleador, vigentes desde un mes (día 1). */

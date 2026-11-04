@@ -1520,6 +1520,13 @@
       "when": 1793908800000,
       "tag": "0216_gastos_fijos_resultados",
       "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "7",
+      "when": 1793912400000,
+      "tag": "0217_empleado_aguinaldo",
+      "breakpoints": true
     }
   ]
 }

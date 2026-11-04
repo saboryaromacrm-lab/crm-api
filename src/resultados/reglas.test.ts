@@ -61,6 +61,11 @@ test('sueldo devengado: bruto + cargas + 1/12 de aguinaldo, proporcional a los d
   assert.equal(costoEmpleadoMes(e, '2026-09'), null, 'antes del alta no cuesta');
   assert.equal(costoEmpleadoMes({ ...e, baja: '2026-12-31' }, '2027-01'), null, 'después de la baja tampoco');
   assert.equal(costoEmpleadoMes({ ...e, sueldos: [] }, '2026-11')!.sinSueldo, true);
+  /* 0217: al que no le corresponde aguinaldo, sin el 1/12; sin el dato, con (como antes). */
+  const sinAg = costoEmpleadoMes({ ...e, aguinaldo: false }, '2026-11')!;
+  assert.equal(sinAg.aguinaldo, 0);
+  assert.equal(sinAg.total, 1250000);
+  assert.equal(costoEmpleadoMes({ ...e, aguinaldo: true }, '2026-11')!.total, 1354166.67);
 });
 
 test('amortización en línea recta, del mes de alta hasta completar la vida o la baja', () => {

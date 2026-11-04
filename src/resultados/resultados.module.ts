@@ -117,6 +117,8 @@ class EmpleadoDto {
   @IsOptional() @IsString() @MaxLength(300) observaciones?: string;
   /** 0216: el sueldo repartido entre locales por %; vacío = sin reparto (manda el local). */
   @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => RepartoDto) reparto?: RepartoDto[] | null;
+  /** 0217: le corresponde aguinaldo (por defecto, sí). */
+  @IsOptional() @IsBoolean() aguinaldo?: boolean;
   /* Al dar de alta: su primer sueldo (desde el mes del alta). */
   @IsOptional() @IsNumber() @Min(0) @Max(1e10) bruto?: number;
   @IsOptional() @IsNumber() @Min(0) @Max(100) cargas?: number;
@@ -447,7 +449,7 @@ export class ResultadosService {
     const id = await this.db.transaction(async (tx) => {
       const [e] = await tx.insert(empleados).values({
         nombre, cuil: (dto.cuil ?? '').trim(), sucursalId, reparto, alta: dto.alta!, baja: dto.baja ?? null,
-        observaciones: (dto.observaciones ?? '').trim(),
+        observaciones: (dto.observaciones ?? '').trim(), aguinaldo: dto.aguinaldo ?? true,
       }).returning({ id: empleados.id });
       await tx.insert(empleadoSueldos).values({
         empleadoId: e.id, desde: `${dto.alta!.slice(0, 7)}-01`, bruto: r2(dto.bruto!), cargas: r2(dto.cargas ?? 0), usuarioId: s.usuarioId,
@@ -456,6 +458,7 @@ export class ResultadosService {
     });
     await this.auditar(s, 'empleado', id, 'Resultados · Sueldos', nombre, [
       ['Alta', '', dto.alta!], ['Sueldo bruto', '', `${pesos(dto.bruto!)} + ${pct(dto.cargas ?? 0)} de cargas`],
+      ...(dto.aguinaldo === false ? [['Aguinaldo', '', 'no le corresponde'] as [string, string, string]] : []),
       ...(reparto ? [['Reparto', '', await this.textoReparto(reparto)] as [string, string, string]] : []),
     ]);
     return this.empleados();
@@ -486,6 +489,10 @@ export class ResultadosService {
     if (dto.alta && dto.alta !== e.alta) { patch.alta = dto.alta; cambios.push(['Alta', e.alta, dto.alta]); }
     if (dto.baja !== undefined && (dto.baja ?? null) !== (e.baja ?? null)) { patch.baja = dto.baja ?? null; cambios.push(['Baja', e.baja ?? '', dto.baja ?? '(sin baja)']); }
     if (dto.observaciones != null && dto.observaciones.trim() !== e.observaciones) patch.observaciones = dto.observaciones.trim();
+    if (dto.aguinaldo != null && dto.aguinaldo !== e.aguinaldo) {
+      patch.aguinaldo = dto.aguinaldo;
+      cambios.push(['Aguinaldo', e.aguinaldo ? 'le corresponde' : 'no le corresponde', dto.aguinaldo ? 'le corresponde' : 'no le corresponde']);
+    }
     const alta = patch.alta ?? e.alta;
     const baja = patch.baja !== undefined ? patch.baja : e.baja;
     if (baja && baja < alta) throw new BadRequestException('La baja no puede ser anterior al alta.');

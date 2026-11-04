@@ -132,7 +132,7 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
   const [rubros, sucs, emps, sueldos, bienes, tasas, escalas, config, fijos, emitidos] = await Promise.all([
     c.query(`select id, nombre, tipo::text as tipo, resultado, reparte, activa, orden from gasto_categorias order by orden, nombre`),
     c.query(`select id, nombre, activa from sucursales order by id`),
-    c.query(`select id, nombre, cuil, sucursal_id, reparto, to_char(alta, 'YYYY-MM-DD') as alta, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
+    c.query(`select id, nombre, cuil, sucursal_id, reparto, aguinaldo, to_char(alta, 'YYYY-MM-DD') as alta, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
              from empleados order by nombre`),
     c.query(`select id, empleado_id, to_char(desde, 'YYYY-MM') as desde, bruto, cargas from empleado_sueldos order by empleado_id, desde`),
     c.query(`select id, nombre, sucursal_id, valor, to_char(alta, 'YYYY-MM-DD') as alta, vida_meses, to_char(baja, 'YYYY-MM-DD') as baja, observaciones
@@ -164,7 +164,7 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
     rubros: rubros.rows.map((r: any) => ({ ...r, reparte: !!r.reparte, activa: !!r.activa })),
     sucursales: sucs.rows.map((s: any) => ({ id: s.id, nombre: s.nombre, activa: !!s.activa })),
     empleados: emps.rows.map((e: any) => ({
-      id: e.id, nombre: e.nombre, cuil: e.cuil, sucursalId: e.sucursal_id, reparto: e.reparto ?? null, alta: e.alta, baja: e.baja,
+      id: e.id, nombre: e.nombre, cuil: e.cuil, sucursalId: e.sucursal_id, reparto: e.reparto ?? null, aguinaldo: e.aguinaldo !== false, alta: e.alta, baja: e.baja,
       observaciones: e.observaciones, sueldos: sueldosDe.get(e.id) ?? [],
     })),
     bienes: bienes.rows.map((b: any) => ({

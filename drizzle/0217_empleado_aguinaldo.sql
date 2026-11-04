@@ -1,0 +1,11 @@
+-- ===========================================================================
+-- 0217 · EMPLEADO CON O SIN AGUINALDO (4/11/2026, pedido del dueño)
+-- ===========================================================================
+-- «Permitime marcar si le corresponde o no aguinaldo.» Resultados le suma a
+-- cada sueldo 1/12 de aguinaldo por mes (sueldo + cargas); hay empleados a los
+-- que no les corresponde (en negro, por ejemplo) y ese 1/12 inflaba el costo.
+--
+-- Por defecto SÍ: es lo que el sistema hacía con todos, así que ningún mes ya
+-- mirado cambia hasta que se le saque a alguien.
+-- ===========================================================================
+ALTER TABLE "empleados" ADD COLUMN IF NOT EXISTS "aguinaldo" boolean NOT NULL DEFAULT true;

@@ -103,6 +103,8 @@ export type Empleado = {
   id: number; nombre: string; sucursalId: number | null;
   /** 0216: repartido entre locales por %. */
   reparto?: RepartoLocal[] | null;
+  /** 0217: le corresponde aguinaldo. Sin el dato, sí (como antes de la 0217). */
+  aguinaldo?: boolean;
   alta: string; baja: string | null; // 'AAAA-MM-DD'
   sueldos: Sueldo[];
 };
@@ -121,8 +123,9 @@ export function parteDelMes(alta: string, baja: string | null, mes: string): num
 /**
  * EL COSTO DE UN EMPLEADO EN EL MES (devengado): sueldo bruto + cargas del
  * empleador + 1/12 de aguinaldo sobre los dos (así junio y diciembre no
- * muestran una pérdida falsa). Proporcional a los días si entró o se fue en
- * el mes. Sin sueldo cargado para ese mes → 0 y `sinSueldo`.
+ * muestran una pérdida falsa) — salvo al que no le corresponde (0217).
+ * Proporcional a los días si entró o se fue en el mes. Sin sueldo cargado
+ * para ese mes → 0 y `sinSueldo`.
  */
 export function costoEmpleadoMes(e: Empleado, mes: string) {
   const parte = parteDelMes(e.alta, e.baja, mes);
@@ -131,7 +134,7 @@ export function costoEmpleadoMes(e: Empleado, mes: string) {
   if (!s) return { parte, bruto: 0, cargas: 0, aguinaldo: 0, total: 0, sinSueldo: true };
   const bruto = N(s.bruto) * parte;
   const cargas = bruto * N(s.cargas) / 100;
-  const aguinaldo = (bruto + cargas) / 12;
+  const aguinaldo = e.aguinaldo === false ? 0 : (bruto + cargas) / 12;
   return { parte, bruto: r2(bruto), cargas: r2(cargas), aguinaldo: r2(aguinaldo), total: r2(bruto + cargas + aguinaldo), sinSueldo: false };
 }
 
