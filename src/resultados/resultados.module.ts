@@ -220,6 +220,8 @@ export class ResultadosService {
         rubros: cat.rubros,
         config: cat.config,
         planilla: { empleados: cat.empleados.length, bienes: cat.bienes.length },
+        /* Para abrir «Sueldos y cargas» por empleado (4/11/2026): sin los sueldos, que ya van en cada mes. */
+        empleados: cat.empleados.map((e: any) => ({ id: e.id, nombre: e.nombre, sucursalId: e.sucursalId, reparto: e.reparto ?? null, aguinaldo: e.aguinaldo !== false })),
         meses: conIva,
         objetivos,
         avisos: this.avisos(conIva.filter((m) => m.mes >= foco), cat, avisosGanancias, hasta === mesHoy),

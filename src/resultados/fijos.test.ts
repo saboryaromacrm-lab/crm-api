@@ -100,3 +100,18 @@ test('armado: las diferencias de inventario son optativas (apagadas no tocan el 
   assert.equal(sin.ajustesFuera, 50_000);
   assert.equal(sin.mermas, 1_000, 'las mermas se cuentan igual');
 });
+
+test('armado: los sueldos se abren por empleado (la parte de cada local) y lo cobrado con tarjeta queda como base', () => {
+  const karen = {
+    id: 9, nombre: 'Karen', sucursalId: null, reparto: [{ sucursalId: 2, pct: 35 }, { sucursalId: 4, pct: 65 }],
+    alta: '2026-01-01', baja: null, aguinaldo: false, sueldos: [{ desde: '2026-01', bruto: 1_000_000, cargas: 0 }],
+  };
+  const ale = { ...karen, id: 3, nombre: 'Ale', sucursalId: 2, reparto: null, sueldos: [{ desde: '2026-01', bruto: 600_000, cargas: 0 }] };
+  const h = { ...vacios(), tarjetas: [{ mes: '2026-10', suc: 2, medio: 'tarjeta_debito', importe: 80_000 }] };
+  const r = armarEstado(h, catalogos({ empleados: [karen, ale] }), ['2026-10'], new Set(['2026-10']));
+  const b2 = r.meses[0].baldes.find((b) => b.balde === 2)!.hechos;
+  assert.deepEqual(b2.sueldosPor, { e9: 350_000, e3: 600_000 });
+  assert.equal(b2.sueldos, 950_000);
+  assert.deepEqual(r.meses[0].total.hechos.sueldosPor, { e9: 1_000_000, e3: 600_000 });
+  assert.equal(b2.cobradoTarjeta, 80_000);
+});

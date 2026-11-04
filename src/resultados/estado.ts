@@ -217,6 +217,7 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     const pesoTarjetas = new Map<number, number>();
     for (const f of idx.tarjetas.get(mes) ?? []) {
       sumar(pesoTarjetas, f.suc, f.importe);
+      de(f.suc).cobradoTarjeta += f.importe;
       const t = tasaVigente(cat.tasas, 'tarjeta', mes, { medio: f.medio });
       if (t) sumar(estPosnet, f.suc, r2(f.importe * t.porcentaje / 100));
     }
@@ -234,11 +235,15 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     if (costos.length) {
       for (const { e, c } of costos) {
         if (c.sinSueldo) info.empleadosSinSueldo.push(e.nombre);
-        aBalde(e.sucursalId, c.total, rubroSueldos?.reparte ?? true, (x, v) => { x.sueldos += v; }, e.reparto);
+        const clave = `e${e.id}`;
+        aBalde(e.sucursalId, c.total, rubroSueldos?.reparte ?? true, (x, v) => { x.sueldos += v; x.sueldosPor[clave] = r2((x.sueldosPor[clave] ?? 0) + v); }, e.reparto);
       }
       info.sueldosIgnorados = r2(sueldosCargados.reduce((a, g) => a + g.importe, 0));
     } else {
-      for (const g of sueldosCargados) aBalde(g.suc, g.importe, rubroDe.get(g.rubro)?.reparte ?? true, (x, v) => { x.sueldos += v; }, g.reparto);
+      for (const g of sueldosCargados) {
+        const clave = `r${g.rubro}`;
+        aBalde(g.suc, g.importe, rubroDe.get(g.rubro)?.reparte ?? true, (x, v) => { x.sueldos += v; x.sueldosPor[clave] = r2((x.sueldosPor[clave] ?? 0) + v); }, g.reparto);
+      }
     }
 
     /* 7 · Amortizaciones (si están encendidas): las sin local se reparten por ventas. */
