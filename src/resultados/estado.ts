@@ -50,7 +50,8 @@ export type HechosLeidos = {
 };
 export type Catalogos = {
   rubros: Rubro[]; empleados: Empleado[]; bienes: Bien[]; tasas: Tasa[]; escalas: Escala[];
-  config: { amortizaciones: boolean; gananciasBase: 'facturado' | 'todo' };
+  /** `diferenciasInventario`: si los ajustes y controles de stock entran al margen (sin el dato, sí). */
+  config: { amortizaciones: boolean; gananciasBase: 'facturado' | 'todo'; diferenciasInventario?: boolean };
   /** Los gastos fijos y los meses en que tienen gasto cargado (0216). */
   fijos: GastoFijo[]; emitidos: Map<number, Set<string>>;
 };
@@ -115,7 +116,17 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     }
     for (const f of idx.extras.get(mes) ?? []) { const x = de(f.suc); x.cargos += f.cargos; x.recargos += f.recargos; }
     for (const f of idx.fiscal.get(mes) ?? []) { const x = de(f.suc); x.facturado += f.facturado; x.ivaSinFactura += f.iva_sin_factura; }
-    for (const f of idx.stock.get(mes) ?? []) { const x = de(f.suc); x.mermas += f.perdidas; x.ajustesStock += f.ajustes; }
+    /*
+     * Las diferencias de inventario son optativas (4/11/2026, pedido del dueño:
+     * «muchas veces son ajustes que así nomás hago»). Apagadas no tocan el
+     * margen ni Ganancias; se guardan aparte para avisar cuánto quedó afuera.
+     */
+    const cuentaAjustes = cat.config.diferenciasInventario !== false;
+    for (const f of idx.stock.get(mes) ?? []) {
+      const x = de(f.suc);
+      x.mermas += f.perdidas;
+      if (cuentaAjustes) x.ajustesStock += f.ajustes; else x.ajustesFuera += f.ajustes;
+    }
     for (const f of idx.retiros.get(mes) ?? []) de(f.suc).retiros += f.costo;
 
     /* Los pesos del reparto: ventas netas, lo facturado y lo cobrado con tarjeta de cada balde. */

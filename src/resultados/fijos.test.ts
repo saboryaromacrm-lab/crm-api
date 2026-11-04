@@ -88,3 +88,15 @@ test('armado: un empleado compartido reparte su sueldo por % y un fijo de IIBB n
   assert.equal(Math.round((sueldo(2) + sueldo(4)) * 100), Math.round(r.meses[0].total.hechos.sueldos * 100));
   assert.deepEqual(r.meses[0].info.fijosEstimados, []);
 });
+
+test('armado: las diferencias de inventario son optativas (apagadas no tocan el margen y se avisan aparte)', () => {
+  const h = { ...vacios(), stock: [{ mes: '2026-10', suc: 2, perdidas: 1_000, ajustes: 50_000 }] };
+  const balde = (r: ReturnType<typeof armarEstado>) => r.meses[0].baldes.find((b) => b.balde === 2)!.hechos;
+  const con = balde(armarEstado(h, catalogos(), ['2026-10'], new Set(['2026-10'])));
+  assert.equal(con.ajustesStock, 50_000, 'sin el dato se cuentan, como antes');
+  assert.equal(con.ajustesFuera, 0);
+  const sin = balde(armarEstado(h, catalogos({ config: { amortizaciones: false, gananciasBase: 'todo', diferenciasInventario: false } }), ['2026-10'], new Set(['2026-10'])));
+  assert.equal(sin.ajustesStock, 0);
+  assert.equal(sin.ajustesFuera, 50_000);
+  assert.equal(sin.mermas, 1_000, 'las mermas se cuentan igual');
+});

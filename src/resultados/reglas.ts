@@ -288,13 +288,14 @@ export type Hechos = {
   facturado: number; // neto facturado: la base de IIBB y de la tasa municipal
   ivaSinFactura: number; // el IVA de lo vendido sin factura (el resultado de IVA «de gestión»)
   comisionesMp: number; // la parte de Mercado Pago dentro de `comisiones`
+  ajustesFuera: number; // las diferencias de inventario que NO se cuentan (casilla apagada, 4/11/2026)
 };
 
 export const hechosVacios = (): Hechos => ({
   ventasLista: 0, descuentos: 0, notasCredito: 0, cargos: 0, cmv: 0, mermas: 0, ajustesStock: 0,
   iibb: 0, municipalidad: 0, comisiones: 0, variables: {}, sueldos: 0, fijos: {}, amortizaciones: 0,
   recargos: 0, financieros: {}, retiros: 0, sinCosto: 0, ventaSinCosto: 0,
-  facturado: 0, ivaSinFactura: 0, comisionesMp: 0,
+  facturado: 0, ivaSinFactura: 0, comisionesMp: 0, ajustesFuera: 0,
 });
 
 const sumaDe = (o: Record<string, number>) => Object.values(o).reduce((a, v) => a + N(v), 0);

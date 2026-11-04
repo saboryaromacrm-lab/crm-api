@@ -80,6 +80,7 @@ class RubroDto {
 class ConfigDto {
   @IsOptional() @IsBoolean() amortizaciones?: boolean;
   @IsOptional() @IsIn(['facturado', 'todo']) gananciasBase?: 'facturado' | 'todo';
+  @IsOptional() @IsBoolean() diferenciasInventario?: boolean;
 }
 
 class TramoDto {
@@ -267,6 +268,10 @@ export class ResultadosService {
     const ex = Object.entries(excl).filter(([, v]) => Math.abs(v) > 0.009);
     if (ex.length) out.push({ tono: 'info', texto: `No entran (por cómo está marcado su rubro): ${ex.map(([k, v]) => `${nombreRubro(k)} ${pesos(v)}`).join(' · ')}.` });
     for (const t of avisosGanancias) out.push({ tono: 'warn', texto: t });
+    const fuera = suma((m) => m.total.hechos.ajustesFuera);
+    if (Math.abs(fuera) >= 0.5) {
+      out.push({ tono: 'info', texto: `Las diferencias de inventario (ajustes y controles) no se cuentan: quedaron afuera ${pesos(Math.abs(fuera))} ${fuera > 0 ? 'de sobrante' : 'de faltante'}. Se cambia con la casilla de arriba del cuadro.` });
+    }
     if (cat.config.amortizaciones && !cat.bienes.length) out.push({ tono: 'info', texto: 'Las amortizaciones están encendidas pero no hay bienes de uso cargados.' });
     return out;
   }
@@ -358,6 +363,11 @@ export class ResultadosService {
     if (dto.amortizaciones != null && dto.amortizaciones !== (antes.amortizaciones === true)) {
       valor.amortizaciones = dto.amortizaciones;
       cambios.push(['Amortizaciones', antes.amortizaciones ? 'Sí' : 'No', dto.amortizaciones ? 'Sí' : 'No']);
+    }
+    if (dto.diferenciasInventario != null && dto.diferenciasInventario !== (antes.diferenciasInventario !== false)) {
+      valor.diferenciasInventario = dto.diferenciasInventario;
+      const txt = (b: boolean) => (b ? 'Se cuentan' : 'No se cuentan');
+      cambios.push(['Diferencias de inventario', txt(antes.diferenciasInventario !== false), txt(dto.diferenciasInventario)]);
     }
     if (dto.gananciasBase && dto.gananciasBase !== (antes.gananciasBase ?? 'facturado')) {
       valor.gananciasBase = dto.gananciasBase;

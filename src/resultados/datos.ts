@@ -184,6 +184,7 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
     config: {
       amortizaciones: cfg.amortizaciones === true,
       gananciasBase: cfg.gananciasBase === 'todo' ? 'todo' as const : 'facturado' as const,
+      diferenciasInventario: cfg.diferenciasInventario !== false,
     },
   };
 }
