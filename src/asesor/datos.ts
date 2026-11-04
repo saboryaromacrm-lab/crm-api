@@ -618,7 +618,7 @@ export async function producto(c: PoolClient, texto: string) {
       WHERE pp.producto_id = ANY($1) AND pp.usar_para_precio) x WHERE n <= 3`, [ids]),
     () => c.query(`SELECT * FROM (SELECT ph.producto_id, coalesce(lv.nombre, '') AS lista, to_char(ph.fecha AT TIME ZONE '${ZONA}', 'YYYY-MM-DD') AS fecha,
         ph.precio::float8, ph.precio_anterior::float8 AS antes, row_number() OVER (PARTITION BY ph.producto_id, ph.lista_id ORDER BY ph.fecha DESC) AS n
-      FROM precio_historial ph LEFT JOIN listas_venta lv ON lv.id = ph.lista_id WHERE ph.producto_id = ANY($1)) x WHERE n = 1`, [ids]),
+      FROM precio_historial ph LEFT JOIN listas_venta lv ON lv.id = ph.lista_id WHERE ph.producto_id = ANY($1) AND ph.presentacion_id IS NULL) x WHERE n = 1`, [ids]),
     () => c.query(`SELECT pl.producto_id, coalesce(lv.nombre, '') || coalesce(' · ' || pr.tam_kg || ' kg', '') AS lista
       FROM producto_listas pl LEFT JOIN listas_venta lv ON lv.id = pl.lista_id LEFT JOIN presentaciones pr ON pr.id = pl.presentacion_id
       WHERE pl.producto_id = ANY($1) AND pl.modo_precio = 'precio'`, [ids]));

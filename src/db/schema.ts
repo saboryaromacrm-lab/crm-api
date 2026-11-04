@@ -1059,6 +1059,8 @@ export const origenPrecioEnum = pgEnum('origen_precio', [
 export const precioHistorial = pgTable('precio_historial', {
   id: serial('id').primaryKey(),
   productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'cascade' }),
+  /** 0218: NULL = el producto suelto; con id = el precio de ESE paquete fraccionado. */
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'cascade' }),
   listaId: integer('lista_id').notNull().references(() => listasVenta.id, { onDelete: 'cascade' }),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   /** Null = alta: no había precio anterior contra el cual medir el %. */

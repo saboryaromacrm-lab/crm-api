@@ -20,3 +20,12 @@ CREATE TABLE IF NOT EXISTS "ajustes_markup" (
   "deshecho_por" integer REFERENCES "usuarios"("id") ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS "ix_ajustes_markup_creado" ON "ajustes_markup" ("creado_en" DESC);
+
+-- ---------------------------------------------------------------------------
+-- EL PRECIO DE LOS PAQUETES TAMBIÉN VA AL HISTORIAL. Hasta acá
+-- `precio_historial` era solo del producto suelto, así que cambiar el markup
+-- de un paquete no dejaba rastro y la CAJA abierta no recibía el aviso de
+-- «cambiaron los precios»: seguía cobrando el paquete al precio viejo.
+-- NULL = el producto suelto (todo lo anterior); con id = ese paquete.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "precio_historial" ADD COLUMN IF NOT EXISTS "presentacion_id" integer REFERENCES "presentaciones"("id") ON DELETE CASCADE;

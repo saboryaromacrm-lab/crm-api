@@ -25,18 +25,20 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize, ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, CualquierUsuario, Permiso, Sesion } from '../auth/auth.decoradores';
 import { tienePermiso } from '../auth/auth.guard';
 import {
-  ajustesMarkup, listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
+  ajustesMarkup, listasVenta, marcas, modalidadesVenta, precioHistorial, presentaciones, productoListas,
   productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
-import { costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
+import { costoNetoPresentacion, costoPrecioEntry, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+/** Cómo se nombra un paquete: «500 g», «1 kg». */
+const etiquetaTam = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${kg} kg`);
 
 /**
  * CÓMO QUEDA UN FORMATO DE COMPRA DESPUÉS DE UN CAMBIO DE COSTO (26/9/2026).
@@ -85,18 +87,16 @@ export class HistorialPreciosService {
   /** Lo que hace falta para derivar un precio de góndola, leído una vez. */
   private async datosDePrecio(productoIds: number[]) {
     const cfg = await this.cfg.get('ventas');
-    const [prods, formatos, plistas, listas] = await Promise.all([
+    const [prods, formatos, plistas, listas, pres] = await Promise.all([
       this.db.select().from(productos).where(inArray(productos.id, productoIds)),
       this.db.select().from(productoProveedores).where(inArray(productoProveedores.productoId, productoIds)),
-      /* Las del producto SUELTO. La evolución de precios es por (producto,
-       * lista): si entraran las filas de los paquetes habría dos precios para la
-       * misma clave y el historial registraría cualquiera de los dos. El precio
-       * de los paquetes todavía no lleva historial — está anotado en /info. */
-      this.db.select().from(productoListas)
-        .where(and(inArray(productoListas.productoId, productoIds), isNull(productoListas.presentacionId))),
+      /* Las del producto suelto Y las de sus paquetes (0218): cada una es su
+       * propio precio, por (producto, paquete, lista). */
+      this.db.select().from(productoListas).where(inArray(productoListas.productoId, productoIds)),
       this.db.select().from(listasVenta).where(eq(listasVenta.activa, true)),
+      this.db.select().from(presentaciones).where(inArray(presentaciones.productoId, productoIds)),
     ]);
-    return { cfg, prods, formatos, plistas, listas };
+    return { cfg, prods, formatos, plistas, listas, pres };
   }
 
   /**
@@ -105,9 +105,10 @@ export class HistorialPreciosService {
    * proyección de la factura) — la misma cuenta para las dos cosas.
    */
   private calcularPrecios(d: Awaited<ReturnType<HistorialPreciosService['datosDePrecio']>>, formatos: any[]) {
-    const { cfg, prods, plistas, listas } = d;
+    const { cfg, prods, plistas, listas, pres } = d;
     const listasVivas = new Set(listas.map((l) => l.id));
-    const out: { productoId: number; listaId: number; precio: number }[] = [];
+    const tamDe = new Map(pres.map((x) => [x.id, x.tamKg]));
+    const out: { productoId: number; presentacionId: number | null; listaId: number; precio: number }[] = [];
     for (const p of prods) {
       // La BASE del precio (0072), no el costo real: el historial registra el
       // precio que la etiqueta mostró, y la etiqueta se arma con esta base.
@@ -118,10 +119,15 @@ export class HistorialPreciosService {
       const redondeo = p.redondeo ?? cfg.redondeoPrecio;
       for (const pl of plistas.filter((x) => x.productoId === p.id)) {
         if (!listasVivas.has(pl.listaId)) continue;
+        const presentacionId = pl.presentacionId ?? null;
+        if (presentacionId != null && !tamDe.has(presentacionId)) continue;
+        // El paquete cuesta el kilo × su tamaño con la merma del fraccionado:
+        // la misma cuenta que el inventario y la caja (`costoNetoPresentacion`).
+        const costo = presentacionId == null ? cn : costoNetoPresentacion(cn, tamDe.get(presentacionId)!, p.merma);
         // El precio que se registra es el FINAL UNITARIO, venga de un markup o
         // de un precio definido — la unidad es la base comparable en el tiempo.
-        const pv = precioVentaFila(cn, pl as any, { iva: p.iva, redondeo });
-        out.push({ productoId: p.id, listaId: pl.listaId, precio: pv.finalUnitario });
+        const pv = precioVentaFila(costo, pl as any, { iva: p.iva, redondeo });
+        out.push({ productoId: p.id, presentacionId, listaId: pl.listaId, precio: pv.finalUnitario });
       }
     }
     return out;
@@ -143,12 +149,13 @@ export class HistorialPreciosService {
     const antes = this.calcularPrecios(d, d.formatos);
     const simulados = simular(d.formatos.map((f) => ({ ...f })));
     const despues = this.calcularPrecios(d, simulados);
-    const precio = (arr: typeof antes, p: number, l: number) => arr.find((x) => x.productoId === p && x.listaId === l)?.precio ?? null;
+    /* El piso es del producto suelto: los paquetes no entran en esta proyección. */
+    const precio = (arr: typeof antes, p: number, l: number) => arr.find((x) => x.productoId === p && x.presentacionId == null && x.listaId === l)?.precio ?? null;
     const activas = [...d.listas].sort((a, b) => a.orden - b.orden);
     const base = activas.find((l) => l.id === d.cfg.listaBaseId) ?? activas[0] ?? null;
     return d.prods.map((p) => {
       const suyas = d.plistas
-        .filter((pl) => pl.productoId === p.id && activas.some((l) => l.id === pl.listaId))
+        .filter((pl) => pl.productoId === p.id && pl.presentacionId == null && activas.some((l) => l.id === pl.listaId))
         .sort((a, b) => (activas.find((l) => l.id === a.listaId)!.orden) - (activas.find((l) => l.id === b.listaId)!.orden));
       const piso = suyas.find((pl) => pl.listaId === base?.id) ?? suyas[suyas.length - 1] ?? null;
       const formatoAntes = formatoActivo(d.formatos.filter((f) => f.productoId === p.id));
@@ -184,24 +191,26 @@ export class HistorialPreciosService {
     const actuales = await this.preciosActuales(ids);
     // El último precio registrado de cada producto×lista, en UNA consulta.
     const ultimos = await this.db.execute(sql`
-      SELECT DISTINCT ON (producto_id, lista_id) producto_id, lista_id, precio
+      SELECT DISTINCT ON (producto_id, presentacion_id, lista_id) producto_id, presentacion_id, lista_id, precio
       FROM precio_historial
       WHERE producto_id IN (${sql.join(ids.map((i) => sql`${i}`), sql`, `)})
-      ORDER BY producto_id, lista_id, id DESC
+      ORDER BY producto_id, presentacion_id, lista_id, id DESC
     `);
+    const clave = (productoId: number, presentacionId: number | null, listaId: number) => `${productoId}:${presentacionId ?? ''}:${listaId}`;
     const ultimo = new Map(
-      (ultimos.rows as any[]).map((r) => [`${r.producto_id}:${r.lista_id}`, Number(r.precio)]),
+      (ultimos.rows as any[]).map((r) => [clave(r.producto_id, r.presentacion_id, r.lista_id), Number(r.precio)]),
     );
 
     const filas = actuales
       .filter((a) => {
-        const prev = ultimo.get(`${a.productoId}:${a.listaId}`);
+        const prev = ultimo.get(clave(a.productoId, a.presentacionId, a.listaId));
         return prev === undefined || Math.abs(prev - a.precio) > 0.005;
       })
       .map((a) => {
-        const prev = ultimo.get(`${a.productoId}:${a.listaId}`);
+        const prev = ultimo.get(clave(a.productoId, a.presentacionId, a.listaId));
         return {
           productoId: a.productoId,
+          presentacionId: a.presentacionId,
           listaId: a.listaId,
           precioAnterior: prev === undefined ? null : prev,
           precio: money(a.precio),
@@ -261,7 +270,9 @@ export class HistorialPreciosService {
     const [tanda] = await this.db
       .select({ n: sql<number>`count(distinct ${precioHistorial.productoId})::int` })
       .from(precioHistorial)
-      .where(eq(precioHistorial.fecha, ultimo.fecha));
+      /* La tanda se compara en la base: la fecha que llega a JS pierde los
+       * microsegundos y la igualdad no daba nunca (el cartel decía «1 producto»). */
+      .where(sql`${precioHistorial.fecha} = (SELECT fecha FROM precio_historial WHERE id = ${ultimo.id})`);
 
     return { ...ultimo, productos: Number(tanda?.n) || 1 };
   }
@@ -295,9 +306,12 @@ export class HistorialPreciosService {
         listaNombre: listasVenta.nombre,
         modalidad: modalidadesVenta.nombre,
         usuario: usuarios.nombre,
+        tamKg: presentaciones.tamKg,
+        codigoPaquete: presentaciones.codigoBarras,
       })
       .from(precioHistorial)
       .innerJoin(productos, eq(productos.id, precioHistorial.productoId))
+      .leftJoin(presentaciones, eq(presentaciones.id, precioHistorial.presentacionId))
       .leftJoin(marcas, eq(marcas.id, productos.marcaId))
       .innerJoin(listasVenta, eq(listasVenta.id, precioHistorial.listaId))
       .innerJoin(modalidadesVenta, eq(modalidadesVenta.id, listasVenta.modalidadId))
@@ -306,8 +320,12 @@ export class HistorialPreciosService {
       .orderBy(desc(precioHistorial.id))
       .limit(Math.min(q.limit ?? 500, 2000));
 
-    return filas.map((f) => ({
+    return filas.map(({ tamKg, codigoPaquete, ...f }) => ({
       ...f,
+      /* El paquete se nombra con su tamaño y se busca por SU código de barras. */
+      forma: tamKg == null ? null : etiquetaTam(tamKg),
+      producto: tamKg == null ? f.producto : `${f.producto} · ${etiquetaTam(tamKg)}`,
+      codigo: tamKg == null ? f.codigo : (codigoPaquete || f.codigo),
       lista: `${f.modalidad} ${f.listaNumero}${f.listaNombre ? ` · ${f.listaNombre}` : ''}`,
       // El % acá y no en cada pantalla: una sola definición del número.
       variacion: f.precioAnterior && f.precioAnterior > 0
@@ -503,6 +521,18 @@ export class PreciosService {
       .filter(Boolean) as CambioMarkup[];
   }
 
+  /**
+   * EL PRECIO DE PARTIDA (0218): antes de mover markups, el historial anota el
+   * precio actual de lo que todavía no tiene ninguno —los paquetes, que hasta
+   * la 0218 no llevaban historial—. Así el cambio queda con su «antes» y no
+   * como un alta. Lo que ya tiene historial al día no suma nada.
+   */
+  private async precioDePartida(filaIds: number[], usuarioId: number | null) {
+    if (!filaIds.length) return;
+    const r = await this.db.selectDistinct({ productoId: productoListas.productoId }).from(productoListas).where(inArray(productoListas.id, filaIds));
+    await this.evolucion.snapshot(r.map((x) => x.productoId), 'formato_venta', { detalle: 'Precio de partida', usuarioId });
+  }
+
   /** Escribe los markups de una vez (un solo UPDATE con VALUES). */
   private async escribirMarkups(db: any, filas: { id: number; valor: number }[]) {
     if (!filas.length) return;
@@ -520,6 +550,7 @@ export class PreciosService {
     if (dto.cambios.length > 5000) throw new BadRequestException('Demasiadas filas en una sola actualización (máximo 5000).');
     const finales = await this.cambiosAplicables(this.db, dto.cambios);
     if (!finales.length) return { ok: true, actualizados: 0 };
+    await this.precioDePartida(finales.map((f) => f.id), dto.usuarioId ?? null);
     await this.escribirMarkups(this.db, finales);
     await this.evolucion.snapshot(
       [...new Set(finales.map((f) => f.productoId))],
@@ -534,6 +565,7 @@ export class PreciosService {
   /** Aplica el ajuste y lo guarda con el markup de antes de cada fila, todo o nada. */
   async ajustarMarkups(dto: AjusteMarkupDto, usuarioId: number | null) {
     const descripcion = dto.descripcion.trim();
+    await this.precioDePartida(dto.cambios.map((c) => c.id).filter(Number.isInteger), usuarioId);
     const res = await this.db.transaction(async (tx) => {
       const finales = await this.cambiosAplicables(tx, dto.cambios, true);
       if (!finales.length) return null;

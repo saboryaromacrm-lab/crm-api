@@ -550,7 +550,7 @@ export class CafeteriaService {
         productoId: precioHistorial.productoId,
         fecha: sql<Date>`max(${precioHistorial.fecha})`.as('fecha'),
       }).from(precioHistorial)
-        .where(eq(precioHistorial.listaId, lista.id))
+        .where(and(eq(precioHistorial.listaId, lista.id), isNull(precioHistorial.presentacionId)))
         .groupBy(precioHistorial.productoId),
     );
 
