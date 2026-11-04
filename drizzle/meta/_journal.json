@@ -1527,6 +1527,13 @@
       "when": 1793912400000,
       "tag": "0217_empleado_aguinaldo",
       "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "7",
+      "when": 1793998800000,
+      "tag": "0218_ajustes_markup",
+      "breakpoints": true
     }
   ]
 }

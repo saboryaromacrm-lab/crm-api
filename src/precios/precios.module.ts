@@ -19,18 +19,18 @@
  * habilita la auditoría y el **deshacer por lote**.
  */
 import {
-  Body, Controller, Get, Inject, Injectable, Module, BadRequestException, Param, Post, Query,
+  Body, Controller, Get, Inject, Injectable, Module, BadRequestException, NotFoundException, Param, ParseIntPipe, Post, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min, ValidateNested,
+  ArrayMaxSize, ArrayNotEmpty, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, CualquierUsuario, Permiso, Sesion } from '../auth/auth.decoradores';
 import { tienePermiso } from '../auth/auth.guard';
 import {
-  listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
+  ajustesMarkup, listasVenta, marcas, modalidadesVenta, precioHistorial, productoListas,
   productoProveedorCostos, productoProveedores, productos, proveedores, usuarios,
 } from '../db/schema';
 import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
@@ -357,6 +357,22 @@ class ActualizarMargenesDto {
   @IsOptional() @IsInt() usuarioId?: number;
 }
 
+/** Tope de filas de un ajuste: una lista entera del catálogo con sus paquetes cabe holgada. */
+const MAX_FILAS_AJUSTE = 20000;
+
+/**
+ * AJUSTE DE MARKUPS (0218, 4/11/2026): las filas elegidas en Listas de precios
+ * con su markup nuevo, en una sola transacción y guardado para deshacerlo.
+ * `descripcion`: a qué se aplicó y cómo («Minorista · Fraccionados 500 g · +5 puntos»).
+ */
+class AjusteMarkupDto {
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(MAX_FILAS_AJUSTE) @ValidateNested({ each: true }) @Type(() => CambioMargenDto)
+  cambios!: CambioMargenDto[];
+  @IsString() @MaxLength(500) descripcion!: string;
+}
+
+type CambioMarkup = { id: number; valor: number; productoId: number; antes: number };
+
 @Injectable()
 export class PreciosService {
   constructor(
@@ -465,42 +481,117 @@ export class PreciosService {
    * persona y un % masivo no debe pisarlo. Mueve la góndola, así que registra
    * evolución de precios (origen `formato_venta`).
    */
-  async actualizarMargenes(dto: ActualizarMargenesDto) {
-    const cambios = dto.cambios.filter((c) => Number.isInteger(c.id) && Number.isFinite(c.valor));
-    if (!cambios.length) throw new BadRequestException('No hay cambios para aplicar.');
-    if (cambios.length > 5000) throw new BadRequestException('Demasiadas filas en una sola actualización (máximo 5000).');
-
-    const ids = [...new Set(cambios.map((c) => c.id))];
-    const actuales = await this.db.select().from(productoListas).where(inArray(productoListas.id, ids));
-    const porId = new Map(actuales.map((f) => [f.id, f]));
-
-    // Solo filas reales, en modo markup y con un valor efectivamente distinto.
-    const finales = cambios
+  /**
+   * De los cambios pedidos, los que se aplican: filas que existen, en modo
+   * markup (el precio definido a mano no se pisa con un %) y con un valor
+   * efectivamente distinto. Con `bloquear`, dentro de una transacción: nadie
+   * cambia esas filas entre la lectura y la escritura.
+   */
+  private async cambiosAplicables(db: any, cambios: { id: number; valor: number }[], bloquear = false): Promise<CambioMarkup[]> {
+    const validos = cambios.filter((c) => Number.isInteger(c.id) && Number.isFinite(c.valor));
+    if (!validos.length) return [];
+    const consulta = db.select().from(productoListas).where(inArray(productoListas.id, [...new Set(validos.map((c) => c.id))]));
+    const actuales = await (bloquear ? consulta.for('update') : consulta);
+    const porId = new Map<number, any>(actuales.map((f: any) => [f.id, f]));
+    return validos
       .map((c) => {
         const a = porId.get(c.id);
         if (!a || a.modoPrecio === 'precio') return null;
         const nuevo = money(Math.max(0, c.valor));
-        return Math.abs(nuevo - a.markup) < 0.005 ? null : { id: c.id, valor: nuevo, productoId: a.productoId };
+        return Math.abs(nuevo - a.markup) < 0.005 ? null : { id: c.id, valor: nuevo, productoId: a.productoId, antes: a.markup };
       })
-      .filter(Boolean) as { id: number; valor: number; productoId: number }[];
-    if (!finales.length) return { ok: true, actualizados: 0 };
+      .filter(Boolean) as CambioMarkup[];
+  }
 
-    const valores = sql.join(
-      finales.map((f) => sql`(${f.id}::int, ${f.valor}::double precision)`),
-      sql`, `,
-    );
-    await this.db.execute(sql`
+  /** Escribe los markups de una vez (un solo UPDATE con VALUES). */
+  private async escribirMarkups(db: any, filas: { id: number; valor: number }[]) {
+    if (!filas.length) return;
+    const valores = sql.join(filas.map((f) => sql`(${f.id}::int, ${f.valor}::double precision)`), sql`, `);
+    await db.execute(sql`
       UPDATE producto_listas AS t
       SET markup = v.valor
       FROM (VALUES ${valores}) AS v(id, valor)
       WHERE t.id = v.id
     `);
+  }
+
+  async actualizarMargenes(dto: ActualizarMargenesDto) {
+    if (!dto.cambios.some((c) => Number.isInteger(c.id) && Number.isFinite(c.valor))) throw new BadRequestException('No hay cambios para aplicar.');
+    if (dto.cambios.length > 5000) throw new BadRequestException('Demasiadas filas en una sola actualización (máximo 5000).');
+    const finales = await this.cambiosAplicables(this.db, dto.cambios);
+    if (!finales.length) return { ok: true, actualizados: 0 };
+    await this.escribirMarkups(this.db, finales);
     await this.evolucion.snapshot(
       [...new Set(finales.map((f) => f.productoId))],
       'formato_venta',
       { detalle: dto.motivo ?? 'Actualización masiva de márgenes', usuarioId: dto.usuarioId ?? null },
     );
     return { ok: true, actualizados: finales.length };
+  }
+
+  /* -------------------------- Ajustes de markup (0218) -------------------------- */
+
+  /** Aplica el ajuste y lo guarda con el markup de antes de cada fila, todo o nada. */
+  async ajustarMarkups(dto: AjusteMarkupDto, usuarioId: number | null) {
+    const descripcion = dto.descripcion.trim();
+    const res = await this.db.transaction(async (tx) => {
+      const finales = await this.cambiosAplicables(tx, dto.cambios, true);
+      if (!finales.length) return null;
+      await this.escribirMarkups(tx, finales);
+      const [a] = await tx.insert(ajustesMarkup).values({
+        usuarioId, descripcion,
+        filas: finales.map((f) => ({ id: f.id, antes: f.antes, despues: f.valor })),
+      }).returning({ id: ajustesMarkup.id });
+      return { id: a.id, finales };
+    });
+    if (!res) return { ok: true, id: null, actualizados: 0 };
+    await this.evolucion.snapshot(
+      res.finales.map((f) => f.productoId), 'formato_venta',
+      { detalle: `Ajuste de markups #${res.id}: ${descripcion}`, usuarioId },
+    );
+    return { ok: true, id: res.id, actualizados: res.finales.length };
+  }
+
+  /** Los últimos ajustes, con quién los hizo y si ya se deshicieron. */
+  async ajustesMarkup(limit = 30) {
+    const r: any = await this.db.execute(sql`
+      SELECT a.id, a.creado_en AS "creadoEn", a.descripcion, jsonb_array_length(a.filas) AS filas,
+             u.nombre AS usuario, a.deshecho_en AS "deshechoEn", d.nombre AS "deshechoPor"
+      FROM ajustes_markup a
+      LEFT JOIN usuarios u ON u.id = a.usuario_id
+      LEFT JOIN usuarios d ON d.id = a.deshecho_por
+      ORDER BY a.id DESC
+      LIMIT ${Math.min(100, Math.max(1, Math.trunc(limit) || 30))}
+    `);
+    return r.rows ?? r;
+  }
+
+  /**
+   * DESHACER UN AJUSTE: vuelve el markup de antes a las filas que siguen con el
+   * que dejó el ajuste. La que alguien cambió después, la que ahora va con
+   * precio definido o la que ya no existe se saltea y se cuenta.
+   */
+  async deshacerAjusteMarkup(id: number, usuarioId: number | null) {
+    const res = await this.db.transaction(async (tx) => {
+      const [a] = await tx.select().from(ajustesMarkup).where(eq(ajustesMarkup.id, id)).for('update');
+      if (!a) throw new NotFoundException('Ese ajuste no existe.');
+      if (a.deshechoEn) throw new BadRequestException('Ese ajuste ya se deshizo.');
+      const actuales = a.filas.length
+        ? await tx.select().from(productoListas).where(inArray(productoListas.id, a.filas.map((f) => f.id))).for('update')
+        : [];
+      const porId = new Map<number, any>(actuales.map((f: any) => [f.id, f]));
+      const vuelven = a.filas.filter((f) => {
+        const x = porId.get(f.id);
+        return x && x.modoPrecio !== 'precio' && Math.abs(x.markup - f.despues) < 0.005;
+      });
+      await this.escribirMarkups(tx, vuelven.map((f) => ({ id: f.id, valor: f.antes })));
+      await tx.update(ajustesMarkup).set({ deshechoEn: new Date(), deshechoPor: usuarioId }).where(eq(ajustesMarkup.id, id));
+      return { a, vuelven, productoIds: vuelven.map((f) => porId.get(f.id).productoId as number) };
+    });
+    if (res.productoIds.length) {
+      await this.evolucion.snapshot(res.productoIds, 'reversion', { detalle: `Se deshizo el ajuste de markups #${id}: ${res.a.descripcion}`, usuarioId });
+    }
+    return { ok: true, revertidos: res.vuelven.length, salteados: res.a.filas.length - res.vuelven.length };
   }
 
   /* -------------------------- Proveedor activo -------------------------- */
@@ -833,6 +924,11 @@ export class PreciosController {
 
   @Post('costos') costos(@Body() dto: ActualizarCostosDto) { return this.svc.actualizarCostos(dto); }
   @Post('margenes') margenes(@Body() dto: ActualizarMargenesDto) { return this.svc.actualizarMargenes(dto); }
+  @Get('ajustes-markup') ajustesMarkup(@Query('limit') limit?: string) { return this.svc.ajustesMarkup(Number(limit) || 30); }
+  @Post('ajustes-markup') ajustarMarkups(@Body() dto: AjusteMarkupDto, @Auth() s: Sesion) { return this.svc.ajustarMarkups(dto, s.usuarioId ?? null); }
+  @Post('ajustes-markup/:id/deshacer') deshacerAjuste(@Param('id', ParseIntPipe) id: number, @Auth() s: Sesion) {
+    return this.svc.deshacerAjusteMarkup(id, s.usuarioId ?? null);
+  }
   @Post('revertir/:lote') revertir(@Param('lote') lote: string) { return this.svc.revertirLote(lote); }
 }
 

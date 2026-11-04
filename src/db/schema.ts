@@ -4516,3 +4516,19 @@ export const asesorFechas = pgTable('asesor_fechas', {
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 });
+
+/**
+ * 0218 · AJUSTES DE MARKUP (4/11/2026): cada ajuste masivo de Listas de precios
+ * con el markup de antes y de después de cada fila, para poder deshacerlo.
+ */
+export const ajustesMarkup = pgTable('ajustes_markup', {
+  id: serial('id').primaryKey(),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  descripcion: text('descripcion').notNull().default(''),
+  filas: jsonb('filas').$type<{ id: number; antes: number; despues: number }[]>().notNull(),
+  deshechoEn: timestamp('deshecho_en', { withTimezone: true }),
+  deshechoPor: integer('deshecho_por').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixCreado: index('ix_ajustes_markup_creado').on(t.creadoEn),
+}));
