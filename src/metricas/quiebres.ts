@@ -1,5 +1,6 @@
 /**
- * MÉTRICAS · QUIEBRES DE STOCK (4/11/2026, pedido del dueño)
+ * ALMACÉN › QUIEBRES DE STOCK (4/11/2026, pedido del dueño; nació en Métricas
+ * y se mudó a Almacén el mismo día — la cuenta vive acá por el pool propio)
  * ============================================================================
  * «¿En alguna parte del ERP puedo ver quiebres de stock?» Lo que había era la
  * foto de hoy (qué está en 0 y desde cuándo). Esto es el PERÍODO: de cada

@@ -161,6 +161,8 @@ export const CATALOGO_PERMISOS = [
       /* Qué mercadería está quieta hace 7/14/21/30 días, por local (7/10/2026). */
       { clave: 'almacen.sin-movimiento', nombre: 'Productos sin movimiento' },
       { clave: 'almacen.bajos', nombre: 'Bajos en stock (por proveedor)' },
+      /* Cuántas veces y cuántos días sin stock en un período, y lo que se dejó de vender (4/11/2026). */
+      { clave: 'almacen.quiebres', nombre: 'Quiebres de stock (con la venta perdida)' },
       { clave: 'almacen.cafeteria', nombre: 'Coffit (envíos)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la

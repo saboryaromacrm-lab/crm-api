@@ -385,7 +385,6 @@ export class MetricasController {
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
   @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
   @Get('ofertas') ofertas(@Query() q: any) { return this.svc.ofertas(q); }
-  @Get('quiebres') quiebres(@Query() q: any) { return this.svc.quiebres(q); }
   @Get('anterior') anterior(@Query() q: any) { return this.svc.anterior(q); }
   @Post('anterior') guardarAnterior(@Body() dto: GuardarAnteriorDto) { return this.svc.guardarAnterior(dto); }
   @Delete('anterior/:sucursalId/:mes') quitarAnterior(@Param('sucursalId', ParseIntPipe) sucursalId: number, @Param('mes') mes: string) {
@@ -410,6 +409,15 @@ export class MontosProveedoresController {
   @Get() montos(@Query() q: any) { return this.svc.montos(q); }
 }
 
+/** Almacén › Quiebres de stock (4/11/2026): sobre el pool propio de Métricas, con la llave de su sección. */
+@Controller('quiebres-stock')
+@Permiso('almacen.quiebres')
+export class QuiebresStockController {
+  constructor(private readonly svc: MetricasService) {}
+
+  @Get() quiebres(@Query() q: any) { return this.svc.quiebres(q); }
+}
+
 /** Ventas › Variaciones: lee los resúmenes de Métricas, con la llave de su sección (sin costos). */
 @Controller('ventas-variaciones')
 @Permiso('ventas.variaciones')
@@ -420,7 +428,7 @@ export class VariacionesController {
 }
 
 @Module({
-  controllers: [MetricasController, MontosProveedoresController, VariacionesController],
+  controllers: [MetricasController, MontosProveedoresController, QuiebresStockController, VariacionesController],
   providers: [MetricasService],
   exports: [MetricasService],
 })
