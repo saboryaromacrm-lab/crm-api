@@ -634,7 +634,12 @@ export class FinanzasProveedorService {
     }));
   }
 
-  async listarEcheqs(q: { filtro?: string; proveedorId?: number; buscar?: string }) {
+  /**
+   * `recientes` (4/11/2026, pedido del dueño, para Proveedores › Echeqs): de la
+   * fecha de cobro más lejana a la más vieja, sin importar el estado. Sin eso,
+   * de la más próxima en adelante: el orden de quien elige un echeq para pagar.
+   */
+  async listarEcheqs(q: { filtro?: string; proveedorId?: number; buscar?: string; recientes?: boolean }) {
     const conds: any[] = [];
     const hoy = hoy0();
     const filtro = q.filtro || 'activos';
@@ -661,7 +666,7 @@ export class FinanzasProveedorService {
       .from(proveedorEcheqs)
       .leftJoin(proveedores, eq(proveedores.id, proveedorEcheqs.proveedorId))
       .where(conds.length ? and(...conds) : undefined)
-      .orderBy(proveedorEcheqs.fechaVenc, desc(proveedorEcheqs.id))
+      .orderBy(...(q.recientes ? [desc(proveedorEcheqs.fechaVenc)] : [proveedorEcheqs.fechaVenc]), desc(proveedorEcheqs.id))
       .limit(500);
     return {
       filas: await this.conFacturas(filas),
@@ -1728,8 +1733,9 @@ export class EcheqsController {
     @Query('filtro') filtro?: string,
     @Query('proveedorId') proveedorId?: string,
     @Query('buscar') buscar?: string,
+    @Query('orden') orden?: string,
   ) {
-    return this.svc.listarEcheqs({ filtro, proveedorId: proveedorId ? Number(proveedorId) : undefined, buscar });
+    return this.svc.listarEcheqs({ filtro, proveedorId: proveedorId ? Number(proveedorId) : undefined, buscar, recientes: orden === 'recientes' });
   }
   @Get('stats') stats() { return this.svc.statsEcheqs(); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.getEcheq(id); }
