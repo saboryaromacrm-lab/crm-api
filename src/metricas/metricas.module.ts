@@ -49,6 +49,7 @@ import { reporteStock, valorizarStock } from './stock';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
 import { reporteOfertas } from './ofertas';
+import { reporteQuiebres } from './quiebres';
 import { GuardarAnteriorDto, guardarAnterior, localesConAnterior, quitarAnterior, reporteAnterior } from './anterior';
 
 /** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
@@ -62,6 +63,8 @@ const TOPE_LECTURA_MS = 15_000;
 const TOPE_SYNC_MS = 120_000;
 /** El período más largo que se deja pedir: 3 años (con resúmenes sigue siendo instantáneo). */
 const MAX_DIAS = 1100;
+/** Quiebres de stock lee los movimientos (no un resumen): hasta un año por consulta. */
+const MAX_DIAS_QUIEBRES = 366;
 
 const diaValido = (v?: string) => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
 
@@ -135,6 +138,14 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
 
   /** Ofertas y descuentos (0189): del precio de lista a la venta neta, y si cada oferta es rentable. */
   ofertas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteOfertas(c, f)); }
+
+  /** Quiebres de stock (4/11/2026): cuántas veces y cuántos días sin stock, y lo que se dejó de vender. */
+  quiebres(q: any) {
+    const f = this.filtro(q);
+    const dias = (Date.parse(`${f.hasta}T00:00:00Z`) - Date.parse(`${f.desde}T00:00:00Z`)) / 86_400_000 + 1;
+    if (dias > MAX_DIAS_QUIEBRES) throw new BadRequestException('Los quiebres de stock se miran de a un año como mucho: elegí un período más corto.');
+    return this.leer((c) => reporteQuiebres(c, f));
+  }
 
   /** Resultados IVA (3/10/2026): facturado contra sin factura y la posición de IVA mes a mes. */
   iva(q: any) {
@@ -374,6 +385,7 @@ export class MetricasController {
   @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
   @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
   @Get('ofertas') ofertas(@Query() q: any) { return this.svc.ofertas(q); }
+  @Get('quiebres') quiebres(@Query() q: any) { return this.svc.quiebres(q); }
   @Get('anterior') anterior(@Query() q: any) { return this.svc.anterior(q); }
   @Post('anterior') guardarAnterior(@Body() dto: GuardarAnteriorDto) { return this.svc.guardarAnterior(dto); }
   @Delete('anterior/:sucursalId/:mes') quitarAnterior(@Param('sucursalId', ParseIntPipe) sucursalId: number, @Param('mes') mes: string) {

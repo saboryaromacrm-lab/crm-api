@@ -128,3 +128,58 @@ export function incoherencias(inicial: Map<string, number>, tolerancia = 0.0005)
   }
   return out;
 }
+
+/* ---------------------------------------------------------------------------
+ * EL DISPONIBLE DE CADA PRODUCTO, MOVIMIENTO A MOVIMIENTO. Lo comparten «Sin
+ * stock desde cuándo» (inventario) y el reporte de quiebres de stock (métricas):
+ * los dos siguen el stock que se puede vender, artículo por artículo.
+ * ------------------------------------------------------------------------- */
+
+/** Un movimiento con lo que movió en DISPONIBLE. */
+export interface MovConDeltas { id: number; fecha: string | Date; tipo: string; deltas: Delta[] }
+
+/** Los movimientos que pueden tocar el disponible (el fraccionado siempre: sus paquetes van en el registro). */
+export const SQL_MOVS_DISPONIBLE = `producto_id IS NOT NULL
+  AND (estado_desde = 'disponible' OR estado_hacia = 'disponible' OR tipo = 'fraccionamiento')`;
+
+/**
+ * Filas de `movimientos` (columnas: id, fecha, producto_id, tipo, sucursal_id,
+ * presentacion_id, signo, cantidad, estado_desde, estado_hacia) y de
+ * `fraccionamiento_items` → por producto, cada movimiento con lo que movió en
+ * disponible, en el orden en que llegaron las filas. Los que no lo tocan, afuera.
+ */
+export function disponiblePorProducto(movRows: any[], itemRows: any[], tamPres: (presId: number) => number | null) {
+  const items = new Map<number, ItemFraccion[]>();
+  for (const it of itemRows) {
+    const l = items.get(Number(it.movimiento_id)) ?? [];
+    l.push({ presentacionId: Number(it.presentacion_id), paquetes: Number(it.paquetes), tamKg: Number(it.tam_kg) });
+    items.set(Number(it.movimiento_id), l);
+  }
+  const out = new Map<number, MovConDeltas[]>();
+  for (const m of movRows) {
+    const { deltas } = deltasDe({
+      id: Number(m.id), tipo: m.tipo, sucursalId: m.sucursal_id, presentacionId: m.presentacion_id, signo: Number(m.signo),
+      cantidad: Number(m.cantidad), estadoDesde: m.estado_desde, estadoHacia: m.estado_hacia,
+    }, items.get(Number(m.id)) ?? [], tamPres);
+    const solo = deltas.filter((d) => d.estado === 'disponible');
+    if (!solo.length) continue;
+    const pid = Number(m.producto_id);
+    const l = out.get(pid) ?? [];
+    l.push({ id: Number(m.id), fecha: m.fecha, tipo: m.tipo, deltas: solo });
+    out.set(pid, l);
+  }
+  return out;
+}
+
+/** Filas de `stock` en disponible (producto_id, sucursal_id, presentacion_id, cantidad) → el de hoy, por producto y clave. */
+export function disponibleHoy(stockRows: any[]) {
+  const out = new Map<number, Map<string, number>>();
+  for (const s of stockRows) {
+    const pid = Number(s.producto_id);
+    const k = claveSaldo({ sucursalId: Number(s.sucursal_id), presentacionId: Number(s.presentacion_id ?? 0), estado: 'disponible' });
+    const m = out.get(pid) ?? new Map<string, number>();
+    m.set(k, r3((m.get(k) ?? 0) + Number(s.cantidad)));
+    out.set(pid, m);
+  }
+  return out;
+}

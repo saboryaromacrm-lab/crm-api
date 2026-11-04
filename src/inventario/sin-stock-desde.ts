@@ -29,14 +29,13 @@
  */
 import { sql } from 'drizzle-orm';
 import type { Database } from '../db/drizzle';
-import { claveSaldo, deltasDe, type Delta, type ItemFraccion } from './kardex';
+import { SQL_MOVS_DISPONIBLE, claveSaldo, disponibleHoy, disponiblePorProducto, type MovConDeltas } from './kardex';
+
+export type { MovConDeltas };
 
 const EPS = 1e-9;
 const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 const filas = (r: any) => (r.rows ?? r) as any[];
-
-/** Un movimiento con lo que movió (para la cuenta pura). */
-export interface MovConDeltas { id: number; fecha: string | Date; tipo: string; deltas: Delta[] }
 
 /** Desde cuándo está sin stock: el movimiento, y si el número no es confiable (`contar`). */
 export interface Quiebre { mov: MovConDeltas; contar: boolean }
@@ -94,16 +93,16 @@ export interface SinStockDesde {
 }
 
 export async function sinStockDesde(db: Database) {
-  const [prods, pres, sucs, stockRows, movRows] = await Promise.all([
+  const [prods, pres, sucs, stockRows, movRows, itemRows] = await Promise.all([
     db.execute(sql`SELECT id FROM productos WHERE estado <> 'archivado' AND solo_cafeteria = false`),
     db.execute(sql`SELECT id, producto_id, tam_kg FROM presentaciones`),
     db.execute(sql`SELECT id FROM sucursales WHERE activa = true`),
     db.execute(sql`SELECT producto_id, sucursal_id, presentacion_id, cantidad FROM stock WHERE estado = 'disponible'`),
     db.execute(sql`SELECT id, fecha, producto_id, tipo::text AS tipo, sucursal_id, presentacion_id, signo, cantidad,
         estado_desde::text AS estado_desde, estado_hacia::text AS estado_hacia
-      FROM movimientos
-      WHERE producto_id IS NOT NULL AND (estado_desde = 'disponible' OR estado_hacia = 'disponible' OR tipo = 'fraccionamiento')
+      FROM movimientos WHERE ${sql.raw(SQL_MOVS_DISPONIBLE)}
       ORDER BY id`),
+    db.execute(sql`SELECT movimiento_id, presentacion_id, paquetes, tam_kg FROM fraccionamiento_items`),
   ]);
   const tam = new Map(filas(pres).map((p) => [Number(p.id), Number(p.tam_kg)]));
   const presDe = new Map<number, number[]>();
@@ -111,41 +110,9 @@ export async function sinStockDesde(db: Database) {
   const sucIds = filas(sucs).map((s) => Number(s.id));
   const enCatalogo = new Set(filas(prods).map((p) => Number(p.id)));
 
-  /* El stock disponible de hoy, por producto y clave. */
-  const hoyDe = new Map<number, Map<string, number>>();
-  for (const s of filas(stockRows)) {
-    const pid = Number(s.producto_id);
-    const k = claveSaldo({ sucursalId: Number(s.sucursal_id), presentacionId: Number(s.presentacion_id ?? 0), estado: 'disponible' });
-    const m = hoyDe.get(pid) ?? new Map<string, number>();
-    m.set(k, r3((m.get(k) ?? 0) + Number(s.cantidad)));
-    hoyDe.set(pid, m);
-  }
-
-  /* Los movimientos por producto, con lo que movieron (el fraccionado lleva su registro de paquetes). */
-  const fracc = filas(movRows).filter((m) => m.tipo === 'fraccionamiento').map((m) => Number(m.id));
-  const items = new Map<number, ItemFraccion[]>();
-  for (let i = 0; i < fracc.length; i += 5000) {
-    const lote = fracc.slice(i, i + 5000);
-    for (const it of filas(await db.execute(sql`
-      SELECT movimiento_id, presentacion_id, paquetes, tam_kg FROM fraccionamiento_items WHERE movimiento_id IN ${lote}`))) {
-      const l = items.get(Number(it.movimiento_id)) ?? [];
-      l.push({ presentacionId: Number(it.presentacion_id), paquetes: Number(it.paquetes), tamKg: Number(it.tam_kg) });
-      items.set(Number(it.movimiento_id), l);
-    }
-  }
-  const movsDe = new Map<number, MovConDeltas[]>();
-  for (const m of filas(movRows)) {
-    const { deltas } = deltasDe({
-      id: Number(m.id), tipo: m.tipo, sucursalId: m.sucursal_id, presentacionId: m.presentacion_id, signo: Number(m.signo),
-      cantidad: Number(m.cantidad), estadoDesde: m.estado_desde, estadoHacia: m.estado_hacia,
-    }, items.get(Number(m.id)) ?? [], (p) => tam.get(p) ?? null);
-    const solo = deltas.filter((d) => d.estado === 'disponible');
-    if (!solo.length) continue;
-    const pid = Number(m.producto_id);
-    const l = movsDe.get(pid) ?? [];
-    l.push({ id: Number(m.id), fecha: m.fecha, tipo: m.tipo, deltas: solo });
-    movsDe.set(pid, l);
-  }
+  /* El stock disponible de hoy y los movimientos de cada producto con lo que movieron (ver kardex.ts). */
+  const hoyDe = disponibleHoy(filas(stockRows));
+  const movsDe = disponiblePorProducto(filas(movRows), filas(itemRows), (p) => tam.get(p) ?? null);
 
   /* Por producto: qué está sin stock (el suelto y cada paquete, en cada sucursal activa) y desde cuándo. */
   const out = new Map<string, SinStockDesde>();

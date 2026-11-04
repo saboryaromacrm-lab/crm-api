@@ -36,7 +36,7 @@ const MAX_OFERTAS = 200;
 
 const claveArt = (p: number, pr: number) => `${p}-${pr}`;
 /** «500 g», «1,5 kg»: el paquete por su tamaño, como en Fraccionamiento. */
-const tamPaquete = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${String(kg).replace('.', ',')} kg`);
+export const tamPaquete = (kg: number) => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${String(kg).replace('.', ',')} kg`);
 
 /* ============================== 1. EL DESGLOSE ============================== */
 
