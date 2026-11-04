@@ -635,11 +635,12 @@ export class FinanzasProveedorService {
   }
 
   /**
-   * `recientes` (4/11/2026, pedido del dueño, para Proveedores › Echeqs): de la
-   * fecha de cobro más lejana a la más vieja, sin importar el estado. Sin eso,
-   * de la más próxima en adelante: el orden de quien elige un echeq para pagar.
+   * `proximos` (4/11/2026, pedido del dueño, para Proveedores › Echeqs): arriba
+   * el próximo a debitarse y de ahí en adelante; al final los que ya pasaron su
+   * fecha, el más viejo último. Sin importar el estado. Sin eso, por fecha de la
+   * más vieja a la más nueva: el orden de quien elige un echeq para pagar.
    */
-  async listarEcheqs(q: { filtro?: string; proveedorId?: number; buscar?: string; recientes?: boolean }) {
+  async listarEcheqs(q: { filtro?: string; proveedorId?: number; buscar?: string; proximos?: boolean }) {
     const conds: any[] = [];
     const hoy = hoy0();
     const filtro = q.filtro || 'activos';
@@ -666,7 +667,9 @@ export class FinanzasProveedorService {
       .from(proveedorEcheqs)
       .leftJoin(proveedores, eq(proveedores.id, proveedorEcheqs.proveedorId))
       .where(conds.length ? and(...conds) : undefined)
-      .orderBy(...(q.recientes ? [desc(proveedorEcheqs.fechaVenc)] : [proveedorEcheqs.fechaVenc]), desc(proveedorEcheqs.id))
+      .orderBy(...(q.proximos
+        ? [sql`${proveedorEcheqs.fechaVenc} < ${hoy}`, sql`CASE WHEN ${proveedorEcheqs.fechaVenc} >= ${hoy} THEN ${proveedorEcheqs.fechaVenc} END`, desc(proveedorEcheqs.fechaVenc)]
+        : [proveedorEcheqs.fechaVenc]), desc(proveedorEcheqs.id))
       .limit(500);
     return {
       filas: await this.conFacturas(filas),
@@ -1735,7 +1738,7 @@ export class EcheqsController {
     @Query('buscar') buscar?: string,
     @Query('orden') orden?: string,
   ) {
-    return this.svc.listarEcheqs({ filtro, proveedorId: proveedorId ? Number(proveedorId) : undefined, buscar, recientes: orden === 'recientes' });
+    return this.svc.listarEcheqs({ filtro, proveedorId: proveedorId ? Number(proveedorId) : undefined, buscar, proximos: orden === 'proximos' });
   }
   @Get('stats') stats() { return this.svc.statsEcheqs(); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.getEcheq(id); }
