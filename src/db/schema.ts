@@ -4534,3 +4534,30 @@ export const ajustesMarkup = pgTable('ajustes_markup', {
 }, (t) => ({
   ixCreado: index('ix_ajustes_markup_creado').on(t.creadoEn),
 }));
+
+/**
+ * ANOTACIONES DEL DASHBOARD (0219, 5/11/2026). Un asiento con fecha, hora y
+ * usuario que escriben el admin y el superadmin, con recordatorio optativo.
+ * No se edita; borrar la marca.
+ */
+export const anotaciones = pgTable('anotaciones', {
+  id: serial('id').primaryKey(),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** El nombre como era al escribirla: el asiento no cambia si después lo renombran. */
+  usuarioNombre: text('usuario_nombre').notNull(),
+  texto: text('texto').notNull(),
+  /** Recordatorio (optativo): desde cuándo les sale el aviso a los de `anotacion_avisos`. */
+  recordarEn: timestamp('recordar_en', { withTimezone: true }),
+  borradaEn: timestamp('borrada_en', { withTimezone: true }),
+  borradaPor: integer('borrada_por').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+
+/** A quién avisarle el recordatorio de una anotación; `vistoEn` cuando tocó «Listo». */
+export const anotacionAvisos = pgTable('anotacion_avisos', {
+  anotacionId: integer('anotacion_id').notNull().references(() => anotaciones.id, { onDelete: 'cascade' }),
+  usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
+  vistoEn: timestamp('visto_en', { withTimezone: true }),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.anotacionId, t.usuarioId] }),
+}));

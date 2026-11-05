@@ -39,6 +39,7 @@ import { RespaldoDriveModule } from './respaldos/drive.service';
 import { MetricasModule } from './metricas/metricas.module';
 import { RetirosModule } from './retiros/retiros.module';
 import { FeriadosModule } from './feriados/feriados.module';
+import { AnotacionesModule } from './anotaciones/anotaciones.module';
 import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IndicadoresModule } from './indicadores/indicadores.module';
@@ -64,6 +65,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     AsesorModule,
     RetirosModule,
     FeriadosModule,
+    AnotacionesModule,
     IngredientesModule,
     InventarioModule,
     ComprobantesModule,

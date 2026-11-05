@@ -1534,6 +1534,13 @@
       "when": 1793998800000,
       "tag": "0218_ajustes_markup",
       "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1794085200000,
+      "tag": "0219_anotaciones",
+      "breakpoints": true
     }
   ]
 }
