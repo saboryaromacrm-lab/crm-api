@@ -1808,5 +1808,7 @@ export class EdocController {
   imports: [PagosModule, AuditoriaModule],
   controllers: [CompromisosController, EcheqsController, EdocController],
   providers: [FinanzasProveedorService],
+  /* Gerencia › Vista profesional (5/11/2026) lee la deuda con proveedores de acá. */
+  exports: [FinanzasProveedorService],
 })
 export class FinanzasProveedorModule {}

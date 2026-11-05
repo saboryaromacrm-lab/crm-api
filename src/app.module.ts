@@ -40,6 +40,8 @@ import { MetricasModule } from './metricas/metricas.module';
 import { RetirosModule } from './retiros/retiros.module';
 import { FeriadosModule } from './feriados/feriados.module';
 import { AnotacionesModule } from './anotaciones/anotaciones.module';
+import { AManoModule } from './ventas/a-mano.module';
+import { VistaProfesionalModule } from './gerencia/vista-profesional.module';
 import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IndicadoresModule } from './indicadores/indicadores.module';
@@ -66,6 +68,8 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     RetirosModule,
     FeriadosModule,
     AnotacionesModule,
+    AManoModule,
+    VistaProfesionalModule,
     IngredientesModule,
     InventarioModule,
     ComprobantesModule,
