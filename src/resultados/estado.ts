@@ -293,11 +293,11 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
       return vn > 0 ? Math.min(1, Math.max(0, m.total.hechos.facturado / vn)) : 1;
     });
     const esc = escalaDelAnio(cat.escalas, anio);
-    if (!esc) { avisosGanancias.push(`No hay escala de Ganancias cargada: el impuesto no se estima (cargala en Configuración).`); continue; }
+    if (!esc) { avisosGanancias.push(`No hay escala de Ganancias cargada: el impuesto no se estima (cargala en Ventas › Configuración › Impuestos, rubros y Ganancias).`); continue; }
     /* Solo se avisa si la escala prestada se USA: un mes mirado con base positiva. */
     const usada = delAnio.some((m, i) => mesesPedidos.has(m.mes) && m.mes >= foco && m.total.cascada.antesGanancias * factores[i] > 0);
     if (!esc.propia && usada) {
-      avisosGanancias.push(`No está cargada la escala de Ganancias de ${anio}: se usa la de ${esc.escala.anio}. Cargá la nueva en Configuración apenas la publique ARCA.`);
+      avisosGanancias.push(`No está cargada la escala de Ganancias de ${anio}: se usa la de ${esc.escala.anio}. Cargá la nueva en Ventas › Configuración › Impuestos, rubros y Ganancias apenas la publique ARCA.`);
     }
     const calc = gananciasDelAnio(esc.escala, delAnio.map((m, i) => m.total.cascada.antesGanancias * factores[i]));
     delAnio.forEach((m, i) => ganancias.set(m.mes, { ...calc[i], factor: r2(factores[i] * 100) / 100, escalaAnio: esc.escala.anio }));

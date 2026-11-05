@@ -42,6 +42,7 @@ import {
 import { DENOMINACIONES } from '../caja/caja.module';
 import { TURNO_TARDE_DESDE } from '../inventario/inventario.service';
 import { type EstadoTurno, estadoTurno } from './planilla';
+import { armarConciliacion, consultarConciliacion } from './conciliacion';
 import { cerrarHastaSql } from '../caja/plazo';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
@@ -549,6 +550,31 @@ export class CashflowService {
       serie: serie.rows.map((x: any) => ({ periodo: x.periodo, ingresos: money(x.ingresos), egresos: money(x.egresos) })),
       sobresPorSucursal: sobresSuc.rows.map((x: any) => ({ ...x, enviado: money(x.enviado), contado: money(x.contado), diferencia: money(x.diferencia), descartadoImporte: money(x.descartadoImporte) })),
       porCajero: cajeros.rows.map((x: any) => ({ ...x, diferencia: money(x.diferencia), faltantes: money(x.faltantes), sobrantes: money(x.sobrantes) })),
+    };
+  }
+
+  /**
+   * CONCILIACIÓN DE EFECTIVO de un mes (4/11/2026): de lo cobrado en efectivo
+   * a lo contado en el Cash Flow, turno por turno. Ver `conciliacion.ts`.
+   * El mes en curso llega hasta hoy.
+   */
+  async conciliacion(q: { mes?: string; sucursalId?: string | number }) {
+    const hoy = hoyAr();
+    const mes = /^\d{4}-(0[1-9]|1[0-2])$/.test(String(q.mes)) ? String(q.mes) : hoy.slice(0, 7);
+    if (mes > hoy.slice(0, 7)) throw new BadRequestException('Ese mes todavía no empezó.');
+    const desde = `${mes}-01`;
+    const [a, m] = mes.split('-').map(Number);
+    const finMes = new Date(Date.UTC(a, m, 0)).toISOString().slice(0, 10);
+    const enCurso = finMes >= hoy;
+    const hasta = enCurso ? hoy : finMes;
+    const sucursalId = Number.isInteger(Number(q.sucursalId)) && Number(q.sucursalId) > 0 ? Number(q.sucursalId) : 0;
+    const [caja, datos] = await Promise.all([this.caja(), consultarConciliacion(this.db, desde, hasta, sucursalId, CAJERO_DEL_TURNO)]);
+    const fechaInicio = caja?.fechaInicio ?? null;
+    return {
+      mes, desde, hasta, enCurso, sucursalId: sucursalId || null, cashflowDesde: fechaInicio,
+      ...armarConciliacion(datos.turnos, fechaInicio, datos.ventasMes),
+      detalle: datos.detalleMov,
+      sinCaja: datos.sinCaja,
     };
   }
 
@@ -1149,6 +1175,7 @@ export class CashflowController {
 
   @Get('sobres') sobres(@Query() q: any) { return this.svc.sobres(q ?? {}); }
   @Get('planilla') planilla(@Query('dia') dia?: string) { return this.svc.planilla(dia); }
+  @Get('conciliacion') conciliacion(@Query() q: any) { return this.svc.conciliacion(q ?? {}); }
   @Post('sobres/:cajaSesionId/controlar')
   controlar(@Param('cajaSesionId', ParseIntPipe) id: number, @Body() dto: ControlarSobreDto, @Auth() s: Sesion) {
     return this.svc.controlar(id, dto, s?.usuarioId ?? null);

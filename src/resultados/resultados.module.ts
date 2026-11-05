@@ -250,8 +250,8 @@ export class ResultadosService {
     }
     if (!cat.empleados.length) {
       out.push({ tono: 'warn', texto: meses.some((m) => m.origen.sueldos === 'gastos')
-        ? 'No hay empleados cargados: los sueldos salen de lo cargado en el rubro Sueldos de Gastos (sin aguinaldo proporcional). Cargalos en Gerencia › Resultados › Configuración › Sueldos.'
-        : 'No hay sueldos: ni empleados cargados ni gastos en el rubro Sueldos. El resultado sale mejor de lo que es. Cargalos en Gerencia › Resultados › Configuración › Sueldos.' });
+        ? 'No hay empleados cargados: los sueldos salen de lo cargado en el rubro Sueldos de Gastos (sin aguinaldo proporcional). Cargalos en Gerencia › Gastos fijos y sueldos › Sueldos.'
+        : 'No hay sueldos: ni empleados cargados ni gastos en el rubro Sueldos. El resultado sale mejor de lo que es. Cargalos en Gerencia › Gastos fijos y sueldos › Sueldos.' });
     }
     /* Los gastos fijos que todavía no se cargaron (0216): cuentan con su estimado. */
     const estimados = new Map<number, { nombre: string; importe: number }>();
@@ -270,7 +270,7 @@ export class ResultadosService {
     const sinSueldo = [...new Set(meses.flatMap((m) => m.info.empleadosSinSueldo))];
     if (sinSueldo.length) out.push({ tono: 'warn', texto: `Sin sueldo cargado para el período: ${sinSueldo.join(', ')}. Cuentan $0.` });
     const sinTasa = [...new Set(meses.flatMap((m) => m.info.sinTasaMunicipal))];
-    if (sinTasa.length) out.push({ tono: 'warn', texto: `Sin tasa municipal cargada: ${sinTasa.map(nombreSuc).join(', ')}. Cargala en Configuración.` });
+    if (sinTasa.length) out.push({ tono: 'warn', texto: `Sin tasa municipal cargada: ${sinTasa.map(nombreSuc).join(', ')}. Cargala en Ventas › Configuración › Impuestos, rubros y Ganancias.` });
     const mpSinDato = suma((m) => m.info.mpSinDato);
     if (mpSinDato > 0) out.push({ tono: 'info', texto: `${mpSinDato} cobro(s) con QR de Mercado Pago sin el dato de su comisión: cuentan $0 de comisión.` });
     const excl: Record<string, number> = {};
