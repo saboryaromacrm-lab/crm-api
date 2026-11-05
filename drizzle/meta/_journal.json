@@ -1541,6 +1541,13 @@
       "when": 1794085200000,
       "tag": "0219_anotaciones",
       "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1794171600000,
+      "tag": "0220_asentado_en",
+      "breakpoints": true
     }
   ]
 }

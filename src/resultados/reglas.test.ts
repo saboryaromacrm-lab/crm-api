@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ADMINISTRACION, amortizacionMes, cascada, costoEmpleadoMes, escalaDelAnio, gananciasDelAnio, hechosVacios,
+  ADMINISTRACION, amortizacionMes, baseGanancias, cascada, costoEmpleadoMes, escalaDelAnio, gananciasDelAnio, hechosVacios,
   impuestoEscala, mesesEntre, parteDelMes, repartir, sumarHechos, sumarMeses, tasaVigente, type Escala, type Tasa,
 } from './reglas';
 
@@ -135,4 +135,25 @@ test('la cascada y su suma', () => {
   const doble = sumarHechos(h, h);
   assert.equal(cascada(doble).antesGanancias, 180);
   assert.deepEqual(doble.variables, { 9: 24 });
+});
+
+test('el IVA de lo vendido sin factura suma en las ventas netas y llega al resultado', () => {
+  const h = { ...hechosVacios(), ventasLista: 1000, cmv: 600, ivaSinFactura: 84 };
+  const c = cascada(h);
+  assert.equal(c.ventasNetas, 1084);
+  assert.equal(c.margenBruto, 484);
+  assert.equal(c.antesGanancias, 484);
+});
+
+test('base de Ganancias: con «solo lo facturado» el IVA de gestión no tributa', () => {
+  /* Ventas sin IVA 1000 (400 facturado, 600 sin factura) + 126 de IVA de gestión; resultado 326. */
+  const c = { antesGanancias: 326, ventasNetas: 1126 };
+  const h = { facturado: 400, ivaSinFactura: 126 };
+  const f = baseGanancias(c, h, 'facturado');
+  assert.equal(f.factor, 0.4);
+  assert.equal(Math.round(f.base * 100) / 100, 80);
+  assert.deepEqual(baseGanancias(c, h, 'todo'), { base: 326, factor: 1 });
+  assert.equal(baseGanancias({ antesGanancias: -50, ventasNetas: 0 }, { facturado: 0, ivaSinFactura: 0 }, 'facturado').factor, 1);
+  /* Sin IVA de gestión da lo mismo que antes: resultado × facturado ÷ ventas. */
+  assert.equal(baseGanancias({ antesGanancias: 200, ventasNetas: 1000 }, { facturado: 250, ivaSinFactura: 0 }, 'facturado').base, 50);
 });

@@ -35,6 +35,7 @@ RENGLONES (uno por artículo, en el orden del papel)
 - codigo: el código del artículo del proveedor si está impreso; "" si no.
 - descripcion: como está impresa, completa.
 - cantidad, unidad (UN, KG, CJ, BU, PQ… como figura) y precioUnitario impresos.
+- bultos: si el papel tiene DOS columnas de cantidad —una de BULTOS (o CAJAS, CJ, BTOS) y otra de UNIDADES (UNID, CANT)—, el número de la columna de bultos va en bultos y el de unidades en cantidad. En un renglón que trae solo bultos (la de unidades vacía), cantidad va 0. Si el papel tiene una sola columna de cantidad, bultos va 0. No conviertas una en la otra ni multipliques: copiá cada columna.
 - descuentos: los % de bonificación del renglón, en orden (por ejemplo "10+5" es [10, 5]); [] si no tiene.
 - importe: el importe del renglón tal como está impreso.
 - alicuotaIva: la alícuota del renglón si está impresa (21, 10.5, 27…); 0 si no.
@@ -68,7 +69,7 @@ export const ESQUEMA = objeto({
   renglones: {
     type: 'array',
     items: objeto({
-      codigo: str, descripcion: str, cantidad: num, unidad: str, precioUnitario: num,
+      codigo: str, descripcion: str, cantidad: num, bultos: num, unidad: str, precioUnitario: num,
       descuentos: { type: 'array', items: num }, importe: num, alicuotaIva: num,
     }),
   },
@@ -109,7 +110,24 @@ const fechaReal = (v: unknown) => {
 export type RenglonIa = {
   codigo: string; descripcion: string; cantidad: number; unidad: string; precioUnitario: number;
   descuentos: number[]; importe: number; alicuotaIva: number;
+  /** La columna de BULTOS, si el papel la trae aparte de la de unidades (5/11/2026); 0 si no. */
+  bultos?: number;
 };
+
+/**
+ * LAS DOS COLUMNAS DE CANTIDAD (5/11/2026, Bracema: «BULTOS | UNID.»). Un
+ * renglón con «1» en bultos y la de unidades vacía es una caja cerrada, y el
+ * P. UNIT es por UNIDAD: las unidades salen de la plata impresa (importe ÷
+ * precio con sus descuentos), que es lo exacto. Sin precio o sin importe no hay
+ * de dónde sacarlas: quedan los bultos como cantidad, como antes.
+ */
+export function unidadesDelRenglon(r: { cantidad: number; bultos?: number; precioUnitario: number; importe: number; descuentos: number[] }) {
+  const bultos = r.bultos ?? 0;
+  if (r.cantidad > 0 || !(bultos > 0)) return r.cantidad;
+  const factor = r.descuentos.reduce((f, d) => f * (1 - d / 100), 1);
+  if (!(r.precioUnitario > 0) || !(r.importe > 0) || !(factor > 0)) return bultos;
+  return Math.round((r.importe / (r.precioUnitario * factor)) * 1000) / 1000;
+}
 export type LecturaIa = ReturnType<typeof limpiar>;
 
 /**
@@ -143,16 +161,20 @@ export function limpiar(j: any, propio = '') {
   const fecha = fechaReal(e.fecha);
   const moneda = S(e.moneda, 6).toUpperCase();
 
-  const renglones: RenglonIa[] = (Array.isArray(j?.renglones) ? j.renglones : []).slice(0, 500).map((r: any) => ({
-    codigo: S(r?.codigo, 40),
-    descripcion: S(r?.descripcion, 300),
-    cantidad: Math.max(0, N(r?.cantidad)),
-    unidad: S(r?.unidad, 12),
-    precioUnitario: Math.max(0, N(r?.precioUnitario)),
-    descuentos: (Array.isArray(r?.descuentos) ? r.descuentos : []).slice(0, 5).map(pct).filter((d: number) => d > 0),
-    importe: N(r?.importe),
-    alicuotaIva: Math.max(0, N(r?.alicuotaIva)),
-  })).filter((r: RenglonIa) => r.descripcion || r.codigo || r.importe);
+  const renglones: RenglonIa[] = (Array.isArray(j?.renglones) ? j.renglones : []).slice(0, 500).map((r: any) => {
+    const x = {
+      codigo: S(r?.codigo, 40),
+      descripcion: S(r?.descripcion, 300),
+      cantidad: Math.max(0, N(r?.cantidad)),
+      unidad: S(r?.unidad, 12),
+      precioUnitario: Math.max(0, N(r?.precioUnitario)),
+      descuentos: (Array.isArray(r?.descuentos) ? r.descuentos : []).slice(0, 5).map(pct).filter((d: number) => d > 0),
+      importe: N(r?.importe),
+      alicuotaIva: Math.max(0, N(r?.alicuotaIva)),
+      bultos: Math.max(0, N(r?.bultos)),
+    };
+    return { ...x, cantidad: unidadesDelRenglon(x) };
+  }).filter((r: RenglonIa) => r.descripcion || r.codigo || r.importe);
 
   const p = j?.pie ?? {};
   const lista = (v: unknown) => (Array.isArray(v) ? v : []).slice(0, 20);

@@ -374,6 +374,8 @@ export class FacturasIaService implements OnModuleInit {
       renglones.push({
         i, codigo: r.codigo, codigoProveedor: codigo, descripcion: r.descripcion, unidad: r.unidad,
         cantidad: r.cantidad, precioUnitario: r.precioUnitario, dto: descuentoEquivalente(r.descuentos ?? []),
+        /* La columna de bultos del papel (5/11/2026): con ella el alta sabe que el precio es por unidad. */
+        bultosPapel: r.bultos ?? 0,
         importe: r.importe, iva: r.alicuotaIva || ivaUnico, costoBulto,
         productoId: prod?.id ?? null, productoNombre: prod?.nombre ?? null, porBulto: prod?.porBulto ?? null,
         confianza: prod?.confianza ?? null, fuente: prod?.fuente ?? null,

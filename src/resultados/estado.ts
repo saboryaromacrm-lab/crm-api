@@ -34,10 +34,14 @@
  *
  *   GANANCIAS (persona humana). Solo la empresa entera, por lo acumulado del
  *   año calendario con la escala de ARCA. La base es el resultado antes de
- *   Ganancias; con «solo lo facturado», la parte proporcional a lo facturado.
+ *   Ganancias; con «solo lo facturado», la parte proporcional a lo facturado
+ *   (sin el IVA de lo vendido sin factura: `baseGanancias`).
+ *
+ *   IVA DE GESTIÓN (5/11/2026). El IVA de lo vendido sin factura suma en las
+ *   ventas netas del local que vendió (ver `cascada`): no se paga, es ganancia.
  */
 import {
-  ADMINISTRACION, SIN_LOCAL, amortizacionMes, cascada, costoEmpleadoMes, diasDelMes, escalaDelAnio, estimadoFijoMes, gananciasDelAnio,
+  ADMINISTRACION, SIN_LOCAL, amortizacionMes, baseGanancias, cascada, costoEmpleadoMes, diasDelMes, escalaDelAnio, estimadoFijoMes, gananciasDelAnio,
   hechosVacios, pesosDeReparto, r2, repartir, sumarHechos, tasaVigente,
   type Bien, type Empleado, type Escala, type GastoFijo, type Hechos, type RepartoLocal, type Tasa,
 } from './reglas';
@@ -140,7 +144,8 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
     const pesoFacturado = new Map<number, number>();
     for (const [b, x] of baldes) {
       if (b === ADMINISTRACION) continue;
-      pesoVentas.set(b, x.ventasLista - x.descuentos - x.notasCredito + x.cargos);
+      /* Las mismas ventas netas que muestra el estado: con el IVA de lo vendido sin factura (5/11/2026). */
+      pesoVentas.set(b, x.ventasLista - x.descuentos - x.notasCredito + x.cargos + x.ivaSinFactura);
       pesoFacturado.set(b, x.facturado);
     }
     const aBalde = (
@@ -287,20 +292,16 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
   const anios = [...new Set(meses.map((m) => Number(m.mes.slice(0, 4))))];
   for (const anio of anios) {
     const delAnio = meses.filter((m) => m.mes.startsWith(`${anio}-`));
-    const factores = delAnio.map((m) => {
-      if (cat.config.gananciasBase === 'todo') return 1;
-      const vn = m.total.cascada.ventasNetas;
-      return vn > 0 ? Math.min(1, Math.max(0, m.total.hechos.facturado / vn)) : 1;
-    });
+    const bases = delAnio.map((m) => baseGanancias(m.total.cascada, m.total.hechos, cat.config.gananciasBase === 'todo' ? 'todo' : 'facturado'));
     const esc = escalaDelAnio(cat.escalas, anio);
     if (!esc) { avisosGanancias.push(`No hay escala de Ganancias cargada: el impuesto no se estima (cargala en Ventas › Configuración › Impuestos, rubros y Ganancias).`); continue; }
     /* Solo se avisa si la escala prestada se USA: un mes mirado con base positiva. */
-    const usada = delAnio.some((m, i) => mesesPedidos.has(m.mes) && m.mes >= foco && m.total.cascada.antesGanancias * factores[i] > 0);
+    const usada = delAnio.some((m, i) => mesesPedidos.has(m.mes) && m.mes >= foco && bases[i].base > 0);
     if (!esc.propia && usada) {
       avisosGanancias.push(`No está cargada la escala de Ganancias de ${anio}: se usa la de ${esc.escala.anio}. Cargá la nueva en Ventas › Configuración › Impuestos, rubros y Ganancias apenas la publique ARCA.`);
     }
-    const calc = gananciasDelAnio(esc.escala, delAnio.map((m, i) => m.total.cascada.antesGanancias * factores[i]));
-    delAnio.forEach((m, i) => ganancias.set(m.mes, { ...calc[i], factor: r2(factores[i] * 100) / 100, escalaAnio: esc.escala.anio }));
+    const calc = gananciasDelAnio(esc.escala, bases.map((b) => b.base));
+    delAnio.forEach((m, i) => ganancias.set(m.mes, { ...calc[i], factor: r2(bases[i].factor * 100) / 100, escalaAnio: esc.escala.anio }));
   }
 
   return {

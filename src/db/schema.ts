@@ -1905,6 +1905,8 @@ export const facturacionesMesFacturas = pgTable('facturaciones_mes_facturas', {
   puntoVenta: text('punto_venta').notNull(),
   numero: integer('numero').notNull(),
   fecha: timestamp('fecha', { withTimezone: true }).notNull(),
+  /** Cuándo se asentó en el sistema (0220). NULL en las anteriores: no se sabe. */
+  creadoEn: timestamp('creado_en', { withTimezone: true }).defaultNow(),
   cae: text('cae').notNull().default(''),
   /** En la A, el neto gravado; en la B y la C (sin IVA discriminado), el importe sin percepciones. */
   neto: doublePrecision('neto').notNull(),
@@ -3504,6 +3506,8 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
   id: serial('id').primaryKey(),
   /** La hora exacta en que la plata salió del cajón. Es dato de control. */
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  /** Cuándo se asentó en el sistema (0220). NULL en los anteriores: no se sabe. */
+  creadoEn: timestamp('creado_en', { withTimezone: true }).defaultNow(),
   /**
    * Opcional SOLO para el pago que nace pegado a su documento (el ticket de
    * nafta que no tiene proveedor cargado). Un pago a cuenta —el que va a

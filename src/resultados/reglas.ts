@@ -284,9 +284,13 @@ export type Hechos = {
   recargos: number; financieros: Record<string, number>; // recargos: + ingreso; financieros: gasto
   retiros: number;
   sinCosto: number; ventaSinCosto: number; // renglones sin costo y lo vendido en ellos
+  /**
+   * El IVA de lo vendido SIN factura («de gestión», 5/11/2026): se cobró dentro
+   * del precio y no se le paga a nadie, así que es venta. Suma en las ventas netas.
+   */
+  ivaSinFactura: number;
   /* Informativos (no entran en la cascada): */
   facturado: number; // neto facturado: la base de IIBB y de la tasa municipal
-  ivaSinFactura: number; // el IVA de lo vendido sin factura (el resultado de IVA «de gestión»)
   comisionesMp: number; // la parte de Mercado Pago dentro de `comisiones`
   ajustesFuera: number; // las diferencias de inventario que NO se cuentan (casilla apagada, 4/11/2026)
   cobradoTarjeta: number; // lo cobrado con débito y crédito: la base del posnet (4/11/2026)
@@ -303,9 +307,15 @@ export const hechosVacios = (): Hechos => ({
 
 const sumaDe = (o: Record<string, number>) => Object.values(o).reduce((a, v) => a + N(v), 0);
 
-/** Los subtotales de la cascada. Son sumas: los de varios baldes o meses se pueden sumar entre sí. */
+/**
+ * Los subtotales de la cascada. Son sumas: los de varios baldes o meses se pueden sumar entre sí.
+ *
+ * Las ventas van sin IVA, MENOS el de lo vendido sin factura (5/11/2026, pedido
+ * del dueño: «al fin de cuenta es ganancia»): ese IVA no se declara ni se paga,
+ * así que es parte del precio que queda en la casa, y suma en el local que vendió.
+ */
 export function cascada(h: Hechos) {
-  const ventasNetas = r2(h.ventasLista - h.descuentos - h.notasCredito + h.cargos);
+  const ventasNetas = r2(h.ventasLista - h.descuentos - h.notasCredito + h.cargos + N(h.ivaSinFactura));
   const margenBruto = r2(ventasNetas - h.cmv - h.mermas + h.ajustesStock);
   const otrosVariables = r2(sumaDe(h.variables));
   const totalVariables = r2(h.iibb + h.municipalidad + h.comisiones + otrosVariables);
@@ -332,4 +342,21 @@ export function sumarHechos(a: Hechos, b: Hechos): Hechos {
     for (const [id, v] of Object.entries(b[grupo] ?? {})) out[grupo][id] = r2(N(out[grupo][id]) + N(v));
   }
   return out;
+}
+
+/**
+ * LA BASE DE GANANCIAS DE UN MES (5/11/2026). Con «todo», el resultado antes de
+ * Ganancias entero. Con «solo lo facturado», la parte del resultado que
+ * corresponde a lo facturado: el IVA de lo vendido sin factura sale primero
+ * (es todo de lo no facturado) y lo que queda va en proporción a lo facturado
+ * sobre las ventas sin ese IVA. `factor` es esa proporción (1 con «todo»).
+ */
+export function baseGanancias(
+  c: { antesGanancias: number; ventasNetas: number }, h: { facturado: number; ivaSinFactura: number }, modo: 'facturado' | 'todo',
+) {
+  if (modo === 'todo') return { base: c.antesGanancias, factor: 1 };
+  const g = N(h.ivaSinFactura);
+  const vn = c.ventasNetas - g;
+  const factor = vn > 0 ? Math.min(1, Math.max(0, N(h.facturado) / vn)) : 1;
+  return { base: (c.antesGanancias - g) * factor, factor };
 }

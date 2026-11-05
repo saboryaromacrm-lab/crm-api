@@ -129,3 +129,20 @@ test('el costo: Haiku y Sonnet a precio oficial; un modelo desconocido, al más 
   /* El más caro de la tabla: Opus 4.8 (respaldo del Asesor, 0193), a $5 / $25. */
   assert.equal(costoUsd('modelo-nuevo', uso), 0.07);
 });
+
+test('limpiar: columna de BULTOS aparte (Bracema) — 1 bulto con la de unidades vacía da las unidades por la plata', () => {
+  const x = limpiar({
+    encabezado: { tipo: 'factura', letra: 'A' },
+    renglones: [
+      { codigo: '007925', descripcion: 'CEREALITAS CLASICAS 45X212G', cantidad: 0, bultos: 1, unidad: '', precioUnitario: 1426.14, descuentos: [10], importe: 57758.67, alicuotaIva: 0 },
+      { codigo: '005879', descripcion: 'MANTECOL IMPULSO BS 40X111G', cantidad: 6, bultos: 0, unidad: '', precioUnitario: 2068.68, descuentos: [], importe: 12412.08, alicuotaIva: 0 },
+      { codigo: '1', descripcion: 'SIN PRECIO', cantidad: 0, bultos: 2, unidad: '', precioUnitario: 0, descuentos: [], importe: 0, alicuotaIva: 0 },
+    ],
+    pie: {},
+  });
+  assert.equal(x.renglones[0].cantidad, 45);
+  assert.equal(x.renglones[0].bultos, 1);
+  assert.equal(x.renglones[1].cantidad, 6);
+  assert.equal(x.renglones[2].cantidad, 2, 'sin plata para calcular, quedan los bultos como antes');
+  assert.ok(renglonCierra(x.renglones[0]));
+});

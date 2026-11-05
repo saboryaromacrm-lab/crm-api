@@ -1332,6 +1332,7 @@ export class FinanzasProveedorService {
       this.db.select({
         id: proveedorPagos.id,
         fecha: proveedorPagos.fecha,
+        creadoEn: proveedorPagos.creadoEn,
         medio: proveedorPagos.medio,
         importe: proveedorPagos.importe,
         aplicado: proveedorPagos.aplicado,
@@ -1406,6 +1407,7 @@ export class FinanzasProveedorService {
         kind: esNc ? 'nc' : 'comprobante',
         id: c.id,
         fecha: c.fecha,
+        asentado: c.fechaCarga,
         etiqueta: etiquetaDoc(c),
         detalle: c.observaciones || '',
         debe: esNc ? 0 : money(c.total),
@@ -1424,6 +1426,7 @@ export class FinanzasProveedorService {
         kind: esNc ? 'nc_gasto' : 'gasto',
         id: g.id,
         fecha: g.fecha,
+        asentado: g.fechaCarga,
         etiqueta: `${esNc ? 'NC de gasto' : 'Gasto'} #${g.id}${g.numero ? ` · ${g.numero}` : ''}`,
         detalle: g.descripcion || '',
         debe: esNc ? 0 : money(g.total),
@@ -1453,8 +1456,10 @@ export class FinanzasProveedorService {
       if (!cd) continue;
       const g = porCuenta.get(cd.cuentaId) ?? {
         kind: 'pago', id: p.id, agrupado: true, medio: 'transferencia', formas: [], debe: 0, haber: 0, aplicado: 0,
-        esFlete: false, cuenta: cd, transferencias: 0, desde: p.fecha, fecha: p.fecha,
+        esFlete: false, cuenta: cd, transferencias: 0, desde: p.fecha, fecha: p.fecha, asentado: null,
       };
+      /* El grupo se asentó con su última transferencia. */
+      if (p.creadoEn && (!g.asentado || p.creadoEn > g.asentado)) g.asentado = p.creadoEn;
       g.id = Math.min(g.id, p.id);
       g.haber = money(g.haber + p.importe);
       g.aplicado = money(g.aplicado + p.aplicado);
@@ -1486,6 +1491,7 @@ export class FinanzasProveedorService {
         kind: 'pago',
         id: p.id,
         fecha: p.fecha,
+        asentado: p.creadoEn,
         /* El flete se nombra por lo que es. En el mayor no es un detalle
          * cosmético: leído de arriba abajo tiene que poder explicar por qué a
          * una factura de $100.000 se le terminaron pagando $80.000. */
@@ -1528,6 +1534,7 @@ export class FinanzasProveedorService {
         kind: 'factura_mes',
         id: f.id,
         fecha: f.fecha,
+        asentado: f.creadoEn,
         etiqueta: `Factura ${f.letra} ${f.puntoVenta}-${String(f.numero).padStart(8, '0')}`,
         detalle: `Factura de las entregas de ${nombreMes(mes)} por ${$(f.total)}${f.iva > 0 ? ` (IVA ${$(f.iva)}: crédito fiscal)` : ''}. `
           + `No suma deuda: se pagan las entregas sin IVA${f.comision > 0 ? ` y la comisión (${$(f.comision)})` : ''}.`,
@@ -1541,6 +1548,7 @@ export class FinanzasProveedorService {
         kind: esDebe ? 'ajuste_debe' : 'ajuste_haber',
         id: a.id,
         fecha: a.fecha,
+        asentado: a.creadoEn,
         etiqueta: `Ajuste ${esDebe ? 'DEBE' : 'HABER'}`,
         detalle: a.motivo,
         debe: esDebe ? money(a.importe) : 0,
