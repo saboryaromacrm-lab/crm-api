@@ -48,6 +48,7 @@ import { reporteProductos } from './productos';
 import { reporteStock, valorizarStock } from './stock';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
+import { reporteLocales } from './locales';
 import { reporteOfertas } from './ofertas';
 import { reporteQuiebres } from './quiebres';
 import { GuardarAnteriorDto, guardarAnterior, localesConAnterior, quitarAnterior, reporteAnterior } from './anterior';
@@ -135,6 +136,9 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
   private paso(v?: string): Paso { return (v && v in PASOS ? v : 'dia') as Paso; }
 
   ventas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteVentas(c, f, this.paso(q.paso))); }
+
+  /** Sucursales (6/11/2026): venta, tickets y promedio por local, por turno y por hora. */
+  locales(q: any) { const f = this.filtro(q); return this.leer((c) => reporteLocales(c, f)); }
 
   /** Ofertas y descuentos (0189): del precio de lista a la venta neta, y si cada oferta es rentable. */
   ofertas(q: any) { const f = this.filtro(q); return this.leer((c) => reporteOfertas(c, f)); }
@@ -378,6 +382,7 @@ export class MetricasController {
   @Get('estado') estado() { return this.svc.estado(); }
   @Get('sucursales') sucursales() { return this.svc.sucursales(); }
   @Get('ventas') ventas(@Query() q: any) { return this.svc.ventas(q); }
+  @Get('locales') locales(@Query() q: any) { return this.svc.locales(q); }
   @Get('margenes') margenes(@Query() q: any) { return this.svc.margenes(q); }
   @Get('granel') granel(@Query() q: any) { return this.svc.granel(q); }
   @Get('productos') productos(@Query() q: any) { return this.svc.productos(q); }
