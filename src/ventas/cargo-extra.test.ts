@@ -2,16 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cargosNoPermitidos, esCargoFijo, mensajeCargoNoPermitido } from './cargo-extra';
 
-test('sin permiso pasan Envío y Bolsa al 21 %, el envío del pedido y el recargo por cuotas', () => {
-  assert.ok(esCargoFijo({ concepto: 'Envío', iva: 21 }));
-  assert.ok(esCargoFijo({ concepto: ' Bolsa ', iva: 21 }));
+test('sin permiso pasan solo los que pone el sistema: el envío del pedido y el recargo por cuotas', () => {
   assert.ok(esCargoFijo({ concepto: 'Envío a domicilio', iva: 21 }));
   assert.ok(esCargoFijo({ concepto: 'Envío a domicilio (B° Centro)', iva: 21 }));
   assert.ok(esCargoFijo({ concepto: 'Recargo 3 cuotas (20%)', iva: 21 }));
   assert.ok(esCargoFijo({ concepto: 'Recargo 1 cuota (5%)', iva: 21 }));
 });
 
-test('sin permiso NO pasan: otro concepto, ni Envío/Bolsa con otro IVA', () => {
+test('sin permiso NO pasa nada tipeado: ni Envío ni Bolsa', () => {
+  assert.ok(!esCargoFijo({ concepto: 'Envío', iva: 21 }));
+  assert.ok(!esCargoFijo({ concepto: 'Bolsa', iva: 21 }));
   assert.ok(!esCargoFijo({ concepto: 'Yerba Playadito 1kg', iva: 0 }));
   assert.ok(!esCargoFijo({ concepto: 'Yerba Playadito 1kg', iva: 21 }));
   assert.ok(!esCargoFijo({ concepto: 'Bolsa', iva: 0 }), 'la bolsa exenta era justamente el problema');
@@ -36,5 +36,5 @@ test('sin permiso: lo que el ticket ya tenía guardado sigue, uno por uno', () =
 test('el mensaje nombra lo que no pasó y dice qué se puede', () => {
   const m = mensajeCargoNoPermitido([{ concepto: 'Yerba 1kg' }]);
   assert.match(m, /«Yerba 1kg»/);
-  assert.match(m, /Envío o Bolsa/);
+  assert.match(m, /Cargo extra a mano/);
 });

@@ -19,6 +19,14 @@ export const esConceptoDeposito = (nombre: unknown) => normal(nombre).includes('
 /** Un concepto que es en sí un cambio (0191): «Cambio a mi cuenta (efectivo por transferencia)». */
 export const esConceptoCambio = (nombre: unknown) => normal(nombre).includes('efectivo por transferencia');
 
+/**
+ * Un concepto de adelanto de sueldo (6/11/2026): todo EGRESO que diga «adelanto»
+ * («Adelantos sueldos», «Adelanto aguinaldo»…). Pide elegir el empleado (0221)
+ * y es lo que se manda a la app de sueldos.
+ */
+export const esConceptoAdelanto = (c: { nombre?: string | null; tipo?: string | null }) =>
+  c?.tipo === 'egreso' && normal(c?.nombre).includes('adelanto');
+
 /** Lo mínimo que estas reglas necesitan de un concepto. */
 export type ConceptoRegla = { nombre: string; tipo: string; clase: string; activo: boolean; gastoCategoriaId: number | null; pideDetalle: boolean };
 

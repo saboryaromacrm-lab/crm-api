@@ -12,6 +12,8 @@ import { ProveedoresModule } from './proveedores/proveedores.module';
 import { CuentasDisponiblesModule } from './proveedores/cuentas-disponibles.module';
 import { FacturasMesModule } from './proveedores/facturas-mes.module';
 import { CatalogoExternoModule } from './catalogo-externo/catalogo-externo.module';
+import { AdelantosExternoModule } from './adelantos-externo/adelantos.module';
+import { PersonalModule } from './personal/personal.module';
 import { PedidosProveedorModule } from './proveedores/pedidos.module';
 import { FinanzasProveedorModule } from './proveedores/finanzas.module';
 import { ReposicionesModule } from './proveedores/reposiciones.module';
@@ -83,6 +85,8 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     CuentasDisponiblesModule,
     FacturasMesModule,
     CatalogoExternoModule,
+    AdelantosExternoModule,
+    PersonalModule,
     PreciosModule,
     ListasModule,
     SucursalesModule,

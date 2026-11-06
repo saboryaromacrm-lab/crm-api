@@ -47,7 +47,8 @@ import { cerrarHastaSql } from '../caja/plazo';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
-import { esConceptoCambio, esConceptoDeposito, exigirConcepto } from './conceptos';
+import { esConceptoAdelanto, esConceptoCambio, esConceptoDeposito, exigirConcepto } from './conceptos';
+import { empleadoDelMovimiento } from '../personal/personal';
 import {
   MarcaDto, PERMISO_CASHFLOW, cambiarUmbral, cuantasPendientes, listarCajas, marcarCaja, marcarDesdePantalla, resolverCaja, umbralControlar,
 } from './a-controlar';
@@ -229,6 +230,8 @@ class MovimientoDto {
   /** Efectivo por transferencia (0191): quién transfirió y a qué cuenta. Van juntos y solo en un egreso. */
   @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
   @IsOptional() @IsString() @MaxLength(120) cambioCuenta?: string;
+  /** 0221: el empleado, obligatorio con un concepto de adelanto. */
+  @IsOptional() @IsInt() personalId?: number;
   @IsBoolean() confirmado!: boolean;
 }
 
@@ -816,8 +819,8 @@ export class CashflowService {
 
   /* ------------------------------ Conceptos ------------------------------ */
 
-  conceptos() {
-    return this.db.select({
+  async conceptos() {
+    const filas = await this.db.select({
       id: cashflowConceptos.id, nombre: cashflowConceptos.nombre, tipo: cashflowConceptos.tipo, clase: cashflowConceptos.clase,
       gastoCategoriaId: cashflowConceptos.gastoCategoriaId, activo: cashflowConceptos.activo, orden: cashflowConceptos.orden,
       gastoCategoria: gastoCategorias.nombre,
@@ -827,6 +830,8 @@ export class CashflowService {
     }).from(cashflowConceptos)
       .leftJoin(gastoCategorias, eq(gastoCategorias.id, cashflowConceptos.gastoCategoriaId))
       .orderBy(asc(cashflowConceptos.tipo), asc(cashflowConceptos.orden), asc(cashflowConceptos.nombre));
+    /* El de adelanto de sueldo pide el empleado (0221): la pantalla lo sabe por acá. */
+    return filas.map((c) => ({ ...c, esAdelanto: esConceptoAdelanto(c) }));
   }
 
   private async validarConcepto(dto: ConceptoDto, actual?: any) {
@@ -964,7 +969,7 @@ export class CashflowService {
       const [c] = await tx.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, dto.conceptoId)).limit(1);
       if (!c) throw new NotFoundException('Ese concepto no existe.');
       if (!c.enCashflow) throw new BadRequestException(`«${c.nombre}» es solo para la caja de los locales: elegí otro concepto.`);
-      const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
+      const { personalId, detalle } = await empleadoDelMovimiento(tx, c, dto.personalId, exigirConcepto(c, dto.tipo, dto.detalle));
       const esGasto = c.clase === 'gasto';
       /* Un depósito es el efectivo que llevás vos al banco: no es la transferencia de otro. */
       if (esCambio && esConceptoDeposito(c.nombre)) throw new BadRequestException(`«${c.nombre}» es un depósito: sale en efectivo. Para un cambio por transferencia elegí otro concepto.`);
@@ -973,7 +978,7 @@ export class CashflowService {
       if (dto.tipo === 'egreso') await this.exigirEfectivo(tx, fecha, instante, importe, 'el egreso');
       const [m] = await tx.insert(cashflowMovimientos).values({
         fecha: instante,
-        tipo: dto.tipo, origen: esGasto ? 'gasto' : 'concepto', importe, conceptoId: c.id, detalle, usuarioId,
+        tipo: dto.tipo, origen: esGasto ? 'gasto' : 'concepto', importe, conceptoId: c.id, detalle, personalId, usuarioId,
         cambioPor: esCambio ? cambioPor : null, cambioCuenta: esCambio ? cambioCuenta : null,
       }).returning();
       /*

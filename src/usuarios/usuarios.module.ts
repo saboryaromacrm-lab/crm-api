@@ -20,7 +20,8 @@ import {
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { roles, sucursales, usuarios } from '../db/schema';
+import { personal, roles, sucursales, usuarios } from '../db/schema';
+import { marcarEmpleado } from '../personal/personal';
 import { HORAS_VIDA_RECORDADA, SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
@@ -609,12 +610,15 @@ export class UsuariosService {
   /* ---------------- Usuarios ---------------- */
 
   async listUsuarios() {
-    const [us, rs] = await Promise.all([
+    const [us, rs, emp] = await Promise.all([
       this.db.select().from(usuarios).orderBy(usuarios.id),
       this.db.select().from(roles),
+      this.db.select({ usuarioId: personal.usuarioId }).from(personal).where(eq(personal.activo, true)),
     ]);
     const rolDe = new Map(rs.map((r) => [r.id, r]));
-    return us.map((u) => publico(u, rolDe.get(u.rolId)));
+    /* Es empleado (0221): aparece para elegir en los adelantos de sueldo. */
+    const empleados = new Set(emp.map((e) => e.usuarioId));
+    return us.map((u) => ({ ...publico(u, rolDe.get(u.rolId)), esEmpleado: empleados.has(u.id) }));
   }
 
   async crearUsuario(o: any, sesion?: Sesion) {
@@ -652,9 +656,10 @@ export class UsuariosService {
         nombre, rolId: r.id, passwordHash: hashPassword(password), activo: o?.activo !== false,
         relevoCaja, pinHash: pin ? hashPassword(pin) : '', sucursales: suc, descuentoManualMax,
       }).returning();
+      if (o?.esEmpleado) await marcarEmpleado(tx, nuevo.id, true);
       await this.audit.registrar([{
         entidad: 'usuario', entidadId: nuevo.id, ambito: 'Usuarios', detalle: nombre, campo: 'Usuario creado',
-        despues: `Rol ${r.nombre} · ${locales}${relevoCaja ? ' · relevo de caja' : ''}${descuentoManualMax ? ` · descuento a mano ${textoDescuento(descuentoManualMax).toLowerCase()}` : ''}${nuevo.activo ? '' : ' · inactivo'}`,
+        despues: `Rol ${r.nombre} · ${locales}${relevoCaja ? ' · relevo de caja' : ''}${descuentoManualMax ? ` · descuento a mano ${textoDescuento(descuentoManualMax).toLowerCase()}` : ''}${o?.esEmpleado ? ' · empleado' : ''}${nuevo.activo ? '' : ' · inactivo'}`,
         usuarioId: sesion?.usuarioId ?? null,
       }], tx);
       return nuevo;
@@ -1060,7 +1065,11 @@ export class UsuariosService {
       const antes = (Array.isArray(u.sucursales) ? u.sucursales : []).slice().sort((a: number, b: number) => a - b);
       if (JSON.stringify(nuevas) !== JSON.stringify(antes)) { patch.sucursales = nuevas; sucursalesCambiaron = true; }
     }
-    if (Object.keys(patch).length) {
+    /* Es empleado (0221): su fila del personal, para los adelantos de sueldo. */
+    const [emp] = await this.db.select({ activo: personal.activo }).from(personal).where(eq(personal.usuarioId, id)).limit(1);
+    const eraEmpleado = !!emp?.activo;
+    const esEmpleado = o?.esEmpleado != null && !!o.esEmpleado !== eraEmpleado ? !!o.esEmpleado : null;
+    if (Object.keys(patch).length || esEmpleado != null) {
       /* Lo que cambió, firmado. Las claves y el PIN nunca: solo que se cambiaron. */
       const base = { entidad: 'usuario', entidadId: id, ambito: 'Usuarios', detalle: patch.nombre ?? u.nombre, usuarioId: sesion?.usuarioId ?? null };
       const siNo = (v: boolean) => (v ? 'Sí' : 'No');
@@ -1072,13 +1081,15 @@ export class UsuariosService {
         ...(patch.pinHash ? [{ ...base, campo: 'PIN de relevo', despues: u.pinHash ? 'Cambiado' : 'Definido' }] : []),
         ...(patch.relevoCaja != null ? [{ ...base, campo: 'Relevo de caja', antes: siNo(u.relevoCaja), despues: siNo(patch.relevoCaja) }] : []),
         ...(patch.descuentoManualMax != null ? [{ ...base, campo: 'Descuento a mano', antes: textoDescuento(Number(u.descuentoManualMax) || 0), despues: textoDescuento(patch.descuentoManualMax) }] : []),
+        ...(esEmpleado != null ? [{ ...base, campo: 'Es empleado', antes: siNo(eraEmpleado), despues: siNo(esEmpleado) }] : []),
         ...(sucursalesCambiaron ? [{
           ...base, campo: 'Sucursales',
           antes: await this.nombresDeSucursales(Array.isArray(u.sucursales) ? u.sucursales : []), despues: await this.nombresDeSucursales(patch.sucursales),
         }] : []),
       ];
       await this.db.transaction(async (tx) => {
-        await tx.update(usuarios).set(patch).where(eq(usuarios.id, id));
+        if (Object.keys(patch).length) await tx.update(usuarios).set(patch).where(eq(usuarios.id, id));
+        if (esEmpleado != null) await marcarEmpleado(tx, id, esEmpleado);
         await this.audit.registrar(cambios, tx);
       });
     }

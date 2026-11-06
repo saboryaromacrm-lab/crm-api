@@ -2161,6 +2161,8 @@ export const cajaMovimientos = pgTable('caja_movimientos', {
   anuladoMotivo: text('anulado_motivo').notNull().default(''),
   /** 0192: el concepto (la lista del Cash Flow). NULL = motivo a mano de antes, o pago a proveedor / devolución. */
   conceptoId: integer('concepto_id').references((): AnyPgColumn => cashflowConceptos.id, { onDelete: 'restrict' }),
+  /** 0221: el empleado del adelanto de sueldo (obligatorio con un concepto de adelanto). */
+  personalId: integer('personal_id').references((): AnyPgColumn => personal.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixSesion: index('ix_caja_mov_sesion').on(t.cajaSesionId),
 }));
@@ -2853,6 +2855,8 @@ export const cashflowMovimientos = pgTable('cashflow_movimientos', {
   anuladoEn: timestamp('anulado_en', { withTimezone: true }),
   anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
   anuladoMotivo: text('anulado_motivo').notNull().default(''),
+  /** 0221: el empleado del adelanto de sueldo (obligatorio con un concepto de adelanto). */
+  personalId: integer('personal_id').references((): AnyPgColumn => personal.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixFecha: index('ix_cashflow_mov_fecha').on(t.fecha),
 }));
@@ -4265,6 +4269,19 @@ export const coffitcostEnvios = pgTable('coffitcost_envios', {
   respuesta: text('respuesta').notNull().default(''),
   firma: text('firma').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+});
+
+/**
+ * EL PERSONAL, PARA LOS ADELANTOS DE SUELDO (0221). Con `usuarioId`: un usuario
+ * del ERP marcado «es empleado» (el nombre es el del usuario). Sin él: alguien
+ * que no usa el sistema, solo el nombre. Se desactiva, no se borra.
+ */
+export const personal = pgTable('personal', {
+  id: serial('id').primaryKey(),
+  nombre: text('nombre').notNull().default(''),
+  usuarioId: integer('usuario_id').unique().references(() => usuarios.id, { onDelete: 'cascade' }),
+  activo: boolean('activo').notNull().default(true),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
 });
 
 /* ===================== RESULTADOS (0152, 9/10/2026) ===================== */

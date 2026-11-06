@@ -1548,6 +1548,13 @@
       "when": 1794171600000,
       "tag": "0220_asentado_en",
       "breakpoints": true
+    },
+    {
+      "idx": 221,
+      "version": "7",
+      "when": 1794258000000,
+      "tag": "0221_personal",
+      "breakpoints": true
     }
   ]
 }

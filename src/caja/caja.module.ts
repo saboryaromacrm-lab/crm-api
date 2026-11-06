@@ -26,7 +26,8 @@ import { MarcaDto, PERMISO_CASHFLOW, marcarCaja } from '../cashflow/a-controlar'
 import { resolverOperador } from '../usuarios/usuarios.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
-import { type ConceptoRegla, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
+import { type ConceptoRegla, esConceptoAdelanto, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
+import { empleadoDelMovimiento } from '../personal/personal';
 import { cerrarHastaDe, diaEnPalabras, plazoDelTurno } from './plazo';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cashflowConceptos, cobranzaPagos, cobranzas, gastoCategorias, mpCobros,
@@ -197,6 +198,8 @@ class MovimientoCajaDto {
   /** 0192: SIEMPRE un concepto (la lista del Cash Flow) y, si hace falta, la descripción. */
   @IsOptional() @IsInt() conceptoId?: number;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  /** 0221: el empleado, obligatorio con un concepto de adelanto. */
+  @IsOptional() @IsInt() personalId?: number;
   /** El motivo a mano de antes del 0192: ya no alcanza solo (una pantalla vieja recibe el aviso). */
   @IsOptional() @IsString() motivo?: string;
   @IsOptional() @IsInt() usuarioId?: number;
@@ -211,6 +214,8 @@ class MovimientoPosteriorDto {
   /** 0192: el concepto y la descripción (qué fue y quién avisó: obligatoria acá). */
   @IsOptional() @IsInt() conceptoId?: number;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
+  /** 0221: el empleado, obligatorio con un concepto de adelanto. */
+  @IsOptional() @IsInt() personalId?: number;
   @IsBoolean() confirmado!: boolean;
 }
 class AnularPosteriorDto {
@@ -286,7 +291,8 @@ export class CajaService {
       .leftJoin(gastoCategorias, eq(gastoCategorias.id, cashflowConceptos.gastoCategoriaId))
       .where(todos ? eq(cashflowConceptos.enCaja, true) : and(eq(cashflowConceptos.enCaja, true), eq(cashflowConceptos.activo, true)))
       .orderBy(cashflowConceptos.tipo, cashflowConceptos.orden, cashflowConceptos.nombre);
-    return filas.filter((c) => !esConceptoCambio(c.nombre) && (todos || c.clase !== 'gasto' || c.gastoCategoriaId));
+    return filas.filter((c) => !esConceptoCambio(c.nombre) && (todos || c.clase !== 'gasto' || c.gastoCategoriaId))
+      .map((c) => ({ ...c, esAdelanto: esConceptoAdelanto(c) }));
   }
 
   /** El concepto pedido, si se puede usar en la caja de un local. */
@@ -917,10 +923,10 @@ export class CajaService {
     if (importe <= 0) throw new BadRequestException('El importe debe ser mayor a 0.');
     /* SIEMPRE UN CONCEPTO (0192): el de la lista y, si la pide, la descripción. */
     const c = await this.conceptoDeCaja(dto.conceptoId);
-    const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
+    const { personalId, detalle } = await empleadoDelMovimiento(this.db, c, dto.personalId, exigirConcepto(c, dto.tipo, dto.detalle));
     // El relevo (0088): el ingreso/egreso manual lo firma quien está en la caja.
     const autor = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
-    if (c.clase === 'gasto') return this.egresoComoGasto(id, c, detalle, importe, autor, sesion, sucursalSesion);
+    if (c.clase === 'gasto') return this.egresoComoGasto(id, c, detalle, personalId, importe, autor, sesion, sucursalSesion);
 
     return this.db.transaction(async (tx) => {
       /* Con candado y en la misma transacción que el insert: si el cierre está
@@ -936,7 +942,7 @@ export class CajaService {
       if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
 
       const [m] = await tx.insert(cajaMovimientos).values({
-        cajaSesionId: id, tipo: dto.tipo, importe, motivo: textoConcepto(c.nombre, detalle), conceptoId: c.id, usuarioId: autor,
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo: textoConcepto(c.nombre, detalle), conceptoId: c.id, personalId, usuarioId: autor,
       }).returning();
       return m;
     });
@@ -952,7 +958,7 @@ export class CajaService {
    * anulando el gasto en Gastos mientras el turno siga abierto.
    */
   private async egresoComoGasto(
-    id: number, c: ConceptoRegla & { id: number }, detalle: string, importe: number, autor: number | null, sesion: Sesion, sucursalSesion: number | null,
+    id: number, c: ConceptoRegla & { id: number }, detalle: string, personalId: number | null, importe: number, autor: number | null, sesion: Sesion, sucursalSesion: number | null,
   ) {
     /* Los avisos claros antes de cargar nada (el pago los vuelve a mirar con candado). */
     const [turno] = await this.db.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1);
@@ -974,7 +980,7 @@ export class CajaService {
       .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
       .where(and(eq(proveedorImputaciones.gastoId, g.id), eq(proveedorPagos.estado, 'activo'))).limit(1);
     if (!p?.movId) throw new ConflictException('El gasto se cargó pero su egreso de caja no aparece: revisá el turno en Gastos.');
-    const [m] = await this.db.update(cajaMovimientos).set({ conceptoId: c.id, motivo: textoConcepto(c.nombre, detalle) })
+    const [m] = await this.db.update(cajaMovimientos).set({ conceptoId: c.id, personalId, motivo: textoConcepto(c.nombre, detalle) })
       .where(eq(cajaMovimientos.id, p.movId)).returning();
     return { ...m, gastoId: g.id };
   }
@@ -1001,8 +1007,9 @@ export class CajaService {
     if (c.clase === 'gasto') {
       throw new BadRequestException(`«${c.nombre}» es un gasto: después del cierre no se carga desde acá. Cargá el gasto en Gastos (pagado) y asentá acá el egreso con un concepto que no sea gasto, como «Otro egreso».`);
     }
-    const detalle = exigirConcepto(c, dto.tipo, dto.detalle);
-    if (detalle.length < 5) throw new BadRequestException('Escribí la descripción: qué fue y quién avisó (queda en el turno).');
+    const escrito = exigirConcepto(c, dto.tipo, dto.detalle);
+    if (escrito.length < 5) throw new BadRequestException('Escribí la descripción: qué fue y quién avisó (queda en el turno).');
+    const { personalId, detalle } = await empleadoDelMovimiento(this.db, c, dto.personalId, escrito);
     const motivo = textoConcepto(c.nombre, detalle);
     return this.db.transaction(async (tx) => {
       const sesion = await this.turnoCerrado(tx, id);
@@ -1015,7 +1022,7 @@ export class CajaService {
       )).limit(1);
       if (gemelo) throw new ConflictException('Ese movimiento ya se asentó recién: revisá los movimientos del turno.');
       const [m] = await tx.insert(cajaMovimientos).values({
-        cajaSesionId: id, tipo: dto.tipo, importe, motivo, conceptoId: c.id, usuarioId, posterior: true,
+        cajaSesionId: id, tipo: dto.tipo, importe, motivo, conceptoId: c.id, personalId, usuarioId, posterior: true,
       }).returning();
       const turno = await this.recalcularCierre(tx, sesion, dto.tipo, importe, false, usuarioId,
         `${dto.tipo === 'egreso' ? 'Egreso' : 'Ingreso'} asentado después del cierre: $${importe.toLocaleString('es-AR')} · ${motivo}`);

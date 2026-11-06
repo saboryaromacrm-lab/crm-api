@@ -8,8 +8,9 @@
  *
  * Desde ahora escribir un cargo libre pide el permiso `cargo_extra`, que no
  * trae ningún rol (lo tilda el superadmin en Gerencia › Usuarios y roles).
- * Sin el permiso queda lo que no es mercadería y no se puede usar para
- * esconderla: ENVÍO y BOLSA, con concepto fijo y siempre al 21 %.
+ * Sin el permiso NO se puede cargar ningún cargo a mano: ni siquiera Envío o
+ * Bolsa (6/11/2026, el dueño: «que elimines todo hasta envío y bolsa»). El
+ * botón ni aparece en la caja.
  *
  * Pasan además, sin permiso, los cargos que NO tipea nadie:
  *   · el envío a domicilio de un pedido de la tienda / presupuesto
@@ -19,21 +20,16 @@
  *     un ticket que cargó alguien con permiso; el permiso es para AGREGAR).
  */
 
-/** Los conceptos que cualquier cajero puede cargar. Siempre al 21 %. */
-export const CARGOS_FIJOS = ['Envío', 'Bolsa'] as const;
-export const IVA_CARGO_FIJO = 21;
-
 const RE_ENVIO_PEDIDO = /^Envío a domicilio( \(B° [^)]*\))?$/;
 const RE_RECARGO = /^Recargo \d+ cuotas? \(/;
 
 type Extra = { concepto?: string | null; importe?: number | string | null; iva?: number | string | null };
 
-/** ¿Este cargo lo puede llevar un ticket armado por alguien SIN el permiso? */
+/** ¿Este cargo lo pone el sistema (y lo puede llevar un ticket de alguien SIN el permiso)? */
 export function esCargoFijo(e: Extra): boolean {
   const c = String(e?.concepto ?? '').trim();
   if (RE_RECARGO.test(c)) return true;
-  if (Number(e?.iva) !== IVA_CARGO_FIJO) return false;
-  return (CARGOS_FIJOS as readonly string[]).includes(c) || RE_ENVIO_PEDIDO.test(c);
+  return Number(e?.iva) === 21 && RE_ENVIO_PEDIDO.test(c);
 }
 
 const clave = (e: Extra) => `${String(e?.concepto ?? '').trim()}|${Number(e?.importe) || 0}|${Number(e?.iva) || 0}`;
@@ -61,6 +57,5 @@ export function cargosNoPermitidos(extras: Extra[] = [], puedeLibre: boolean, pr
 export function mensajeCargoNoPermitido(malos: Extra[]): string {
   const nombres = malos.map((e) => `«${String(e.concepto ?? '').trim() || 'sin concepto'}»`).join(', ');
   return `Para cargar ${nombres} a mano hace falta el permiso «Cargo extra a mano». `
-    + 'Sin ese permiso solo se puede cargar Envío o Bolsa (al 21 %). '
     + 'Si es mercadería, cargala como producto.';
 }
