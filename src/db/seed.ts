@@ -356,7 +356,7 @@ async function main() {
    * dos son lo que el controller resolvería de una sesión de admin. El `iva` no
    * viaja: lo pone el servidor con la alícuota del producto.
    */
-  const comoAdmin = { puedePisarPrecio: true, sucursalSesion: dist.id, esJefe: true };
+  const comoAdmin = { puedePisarPrecio: true, puedeCargoExtra: true, sucursalSesion: dist.id, esJefe: true };
   const v1 = await vtas.create({
     clienteId: kiosco.id, usuarioId: carla.id, condicionPago: 'cuenta_corriente',
     observaciones: 'Pedido semanal',

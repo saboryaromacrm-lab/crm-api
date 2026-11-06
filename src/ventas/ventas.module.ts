@@ -58,6 +58,7 @@ import { conPermisosBase } from '../auth/permisos-base';
 import { esNotaCredito, etiquetaVenta, letraDe } from './etiqueta';
 import { descuentoCuponNeto } from '../cupones/reglas';
 import { mediosDeDescuento, mediosLegibles, normalizarMedios, pagoFueraDeLista } from './medios-descuento';
+import { cargosNoPermitidos, mensajeCargoNoPermitido } from './cargo-extra';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -501,6 +502,8 @@ export interface OpcionesVenta {
   soloSuSucursal?: number;
   /** Permiso `precio_manual`: pisar el precio, la lista y el tope de descuento. */
   puedePisarPrecio?: boolean;
+  /** Permiso `cargo_extra`: escribir un cargo a mano con concepto, precio e IVA libres (ver `cargo-extra.ts`). */
+  puedeCargoExtra?: boolean;
   /** Rol admin/superadmin: puede fechar la venta y anular contra un turno cerrado. */
   esJefe?: boolean;
   /** El cierre automático de un cobro por QR de Mercado Pago (0126): el único que pasa el candado del cobro vivo. */
@@ -3748,6 +3751,8 @@ export class VentasService {
       dto.items ?? [], cliente, config, !!opciones.puedePisarPrecio, congelados, descuentosPorLista, sucursalId,
       { tope: await this.topeDescuentoManual(autor) },
     );
+    const malos = cargosNoPermitidos(dto.extras ?? [], !!opciones.puedeCargoExtra);
+    if (malos.length) throw new BadRequestException(mensajeCargoNoPermitido(malos));
     const tot = this.calcularTotales(items, dto.extras ?? []);
     const condicionPago = dto.condicionPago ?? 'contado';
     /*
@@ -3964,7 +3969,10 @@ export class VentasService {
       descuentoId: ventaItems.descuentoId, productoId: ventaItems.productoId, presentacionId: ventaItems.presentacionId,
       descuento: ventaItems.descuento, descuentoBase: ventaItems.descuentoBase,
     }).from(ventaItems).where(eq(ventaItems.ventaId, id));
-    return { ...v, items };
+    /* Los cargos que ya tiene: el permiso `cargo_extra` se pide para AGREGAR uno libre, no para seguir con el ticket. */
+    const extras = await this.db.select({ concepto: ventaExtras.concepto, importe: ventaExtras.importe, iva: ventaExtras.iva })
+      .from(ventaExtras).where(eq(ventaExtras.ventaId, id));
+    return { ...v, items, extras };
   }
 
   /**
@@ -4032,6 +4040,9 @@ export class VentasService {
         yaAutorizados: new Map((actual.items ?? []).map((it: any) => [`${it.productoId}|${it.presentacionId ?? ''}`, Number(it.descuentoBase ?? it.descuento) || 0])),
       },
     );
+    /* El permiso es para AGREGAR un cargo libre: los que el ticket ya tenía guardados siguen. */
+    const malos = cargosNoPermitidos(dto.extras ?? [], !!opciones.puedeCargoExtra, actual.extras ?? []);
+    if (malos.length) throw new BadRequestException(mensajeCargoNoPermitido(malos));
     const tot = this.calcularTotales(items, dto.extras ?? []);
 
     await this.db.transaction(async (tx) => {
@@ -5435,6 +5446,8 @@ export class VentasController {
       // La llave que pasa el tope de descuento a mano del usuario (0147)
       // y `overrideListaRequiereAdmin`, validados acá del lado del servidor.
       puedePisarPrecio: tienePermiso(sesion.permisos, ['precio_manual']),
+      // El cargo a mano libre (6/11/2026): sin esto, solo Envío y Bolsa al 21 %.
+      puedeCargoExtra: tienePermiso(sesion.permisos, ['cargo_extra']),
       esJefe: jefe,
     };
   }

@@ -140,6 +140,13 @@ export const CATALOGO_PERMISOS = [
        * mano de cada usuario (0147, `usuarios.descuentoManualMax`).
        */
       { clave: 'precio_manual', nombre: 'Pisar el precio y pasar el tope de descuento' },
+      /*
+       * EL CARGO A MANO (6/11/2026, decisión del dueño). «Cargo extra» en la caja
+       * con concepto, precio e IVA libres. Sin migración a propósito: ningún rol
+       * la trae, solo el `*` del superadmin. Sin ella, la caja carga Envío y
+       * Bolsa al 21 % y nada más (ver `ventas/cargo-extra.ts`).
+       */
+      { clave: 'cargo_extra', nombre: 'Cargo extra a mano en la caja (concepto, precio e IVA libres)' },
     ],
   },
   {
