@@ -59,6 +59,7 @@ import { esNotaCredito, etiquetaVenta, letraDe } from './etiqueta';
 import { descuentoCuponNeto } from '../cupones/reglas';
 import { mediosDeDescuento, mediosLegibles, normalizarMedios, pagoFueraDeLista } from './medios-descuento';
 import { cargosNoPermitidos, mensajeCargoNoPermitido } from './cargo-extra';
+import { garantizaPrecio } from '../presupuestos/precio-garantizado';
 
 const TIPOS = [
   'ticket', 'factura_a', 'factura_b', 'factura_c',
@@ -457,7 +458,8 @@ type RenglonResuelto = VentaItemDto & {
  * lista y el descuento de la tienda (barrio y cupón). `cuponPct` es la parte
  * de ese descuento que fue el cupón (0190), como fracción.
  */
-type Congelado = { precioLista: number; listaId: number | null; descuento: number; cuponId: number | null; cuponPct: number };
+/** `cantidad`: lo que cubre el precio garantizado (lo cotizado, o lo armado si la casa armó más) — 6/11/2026. */
+type Congelado = { precioLista: number; listaId: number | null; descuento: number; cuponId: number | null; cuponPct: number; cantidad: number };
 
 /** Un descuento con nombre ya validado y listo para aplicar. */
 type DescuentoResuelto = {
@@ -1387,7 +1389,24 @@ export class VentasService {
        * tiene que volver a sumar en su vista previa. */
       extrasAcreditados: nc.extras,
       origen: origen ?? null,
+      cotizados: await this.cotizadosDelBorrador(v),
     };
+  }
+
+  /**
+   * LO QUE CUBRE EL PRECIO GARANTIZADO, para la caja (6/11/2026). Solo en un
+   * borrador que cierra un presupuesto confirmado: por artículo, cuánto entra al
+   * precio cotizado. La caja parte el renglón cuando el cliente lleva más, y el
+   * servidor lo vuelve a medir igual (`resolverRenglones`).
+   */
+  private async cotizadosDelBorrador(v: { estado: string; presupuestoId: number | null; clienteId: number }) {
+    if (v.estado !== 'borrador' || !v.presupuestoId) return [];
+    try {
+      const mapa = await this.congeladosDePresupuesto(v.presupuestoId, v.clienteId, null);
+      return [...mapa].map(([clave, c]) => ({ clave, cantidad: c.cantidad, precioLista: c.precioLista }));
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -2045,18 +2064,20 @@ export class VentasService {
    * `congelados` es la SEXTA puerta y la agregó el mordisco que se llevó este
    * mismo portero: un presupuesto se cotiza hoy y se cobra la semana que viene,
    * así que su precio ya no coincide con el de la lista. Con esto, un renglón
-   * que viene de un presupuesto confirmado y vigente se cobra al precio con el
+   * que viene de un presupuesto confirmado se cobra al precio con el
    * que se prometió, sin pedir `precio_manual` — que era lo que dejaba al
    * vendedor sin poder cerrar el pedido que la casa ya había firmado.
    */
   /**
    * Los precios que la casa ya prometió por escrito, para que el portero los
    * reconozca. Devuelve un mapa vacío —o sea, ninguna excepción— salvo que la
-   * venta declare un presupuesto que exista, sea **de este cliente**, esté
-   * **confirmado** y **no esté vencido**. Las tres condiciones importan: sin la
-   * del cliente, cualquiera invocaría el presupuesto ajeno para llevarse su
-   * precio; sin la del estado, valdría un borrador que se escribe solo; y sin la
-   * del vencimiento, un precio de hace un año seguiría vigente para siempre.
+   * venta declare un presupuesto que exista, sea **de este cliente** y esté
+   * **confirmado**. Sin la del cliente, cualquiera invocaría el presupuesto
+   * ajeno para llevarse su precio; sin la del estado, valdría un borrador que se
+   * escribe solo. El vencimiento NO corta en un confirmado (6/11/2026, decisión
+   * del dueño): el cliente dijo que sí dentro del plazo y la mercadería está
+   * apartada; lo que evita el precio eterno es que el confirmado se cobra o se
+   * cancela (ver `presupuestos/precio-garantizado.ts`).
    *
    * `descuento`: el del BARRIO de un pedido de la tienda (0185) — lo calculó el
    * servidor con las promos del dueño, así que no pasa por el tope a mano de la
@@ -2091,22 +2112,27 @@ export class VentasService {
         'Ese presupuesto se cotizó en otra sucursal: tiene la mercadería reservada allá.',
       );
     }
-    // Estado y vencimiento NO cortan: un pedido todavía no confirmado, o vencido,
-    // se puede cerrar igual — lo que no se hereda es su precio congelado.
-    if (pre.estado !== 'confirmado') return vacio;
-    if (pre.vencimiento && pre.vencimiento.getTime() < Date.now()) return vacio;
+    // El estado NO corta: un pedido todavía no confirmado se puede cerrar igual
+    // — lo que no se hereda es su precio congelado. El VENCIMIENTO tampoco le
+    // quita el precio a un confirmado (6/11/2026): ver `garantizaPrecio`.
+    if (!garantizaPrecio(pre)) return vacio;
 
     const renglones = await this.db.select().from(presupuestoItems)
       .where(eq(presupuestoItems.presupuestoId, pre.id));
     const web = pre.origen === 'web';
     for (const r of renglones) {
       const parteCupon = web ? Number(r.cuponPct) || 0 : 0;
-      vacio.set(`${r.productoId}:${r.presentacionId ?? ''}`, {
+      const k = `${r.productoId}:${r.presentacionId ?? ''}`;
+      /* Lo que cubre el precio: lo cotizado, o lo ARMADO si la casa armó más (el granel pesado
+       * de más lo decidió la casa). Dos renglones del mismo artículo se suman. */
+      const cubre = Math.max(Number(r.cantidad) || 0, Number(r.cantidadArmada) || 0) + (vacio.get(k)?.cantidad ?? 0);
+      vacio.set(k, {
         precioLista: money(r.precioLista),
         listaId: r.listaId ?? null,
         descuento: !web ? 0 : r.ofertaId ? Math.round(1e6 * parteCupon) / 1e4 : Number(r.descuento) || 0,
         cuponId: parteCupon > 0 ? pre.cuponId ?? null : null,
         cuponPct: parteCupon,
+        cantidad: cubre,
       });
     }
     return vacio;
@@ -2335,6 +2361,8 @@ export class VentasService {
       declaranOferta ? ((await this.ofertas.activas()) as any[]).map((o) => [o.id, o]) : [],
     );
 
+    /* Lo que ya se usó del precio garantizado de cada artículo, renglón por renglón (6/11/2026). */
+    const usadoCotizado = new Map<string, number>();
     const resueltos = items.map((it) => {
       const prod = prodDe.get(Number(it.productoId));
       if (!prod) throw new BadRequestException('Uno de los artículos del ticket no existe.');
@@ -2477,11 +2505,32 @@ export class VentasService {
        * ya había prometido por escrito.
        *
        * No es un agujero: el precio tiene que coincidir con el renglón de un
-       * presupuesto CONFIRMADO y VIGENTE de ESTE cliente, cargado de la base
+       * presupuesto CONFIRMADO de ESTE cliente, cargado de la base
        * (ver `congeladosDePresupuesto`). No es un número que el cliente HTTP
        * elige — es uno que ya está escrito en un documento.
        */
-      const honraCotizado = !!congelado && Math.abs(pedido - congelado.precioLista) <= 0.01;
+      /*
+       * EL PRECIO GARANTIZADO CUBRE LO COTIZADO, NO MÁS (6/11/2026, decisión del
+       * dueño). Si el cliente lleva más de lo que se le cotizó, lo de más va al
+       * precio de hoy, en otro renglón (la caja lo parte sola y avisa). Si el
+       * precio no cambió, lo de más pasa igual, pero queda con su lista (no como
+       * precio de presupuesto); si cambió, sin el permiso de pisar precios se
+       * rechaza.
+       */
+      const claveCot = `${prod.id}:${presId ?? ''}`;
+      const cotizaEste = !!congelado && Math.abs(pedido - congelado.precioLista) <= 0.01;
+      const usado = cotizaEste ? (usadoCotizado.get(claveCot) ?? 0) + cantidad : 0;
+      const excede = cotizaEste && usado > congelado!.cantidad + 1e-6;
+      if (excede && difiere && !puedePisarPrecio) {
+        const fmt = (n: number) => String(Math.round(n * 1000) / 1000).replace('.', ',');
+        throw new BadRequestException(
+          `${etiqueta}: el presupuesto cotizó ${fmt(congelado!.cantidad)} a $${congelado!.precioLista.toFixed(2)}; `
+          + `lo que pasa de eso va al precio de hoy ($${netoLista.toFixed(2)}) en otro renglón. `
+          + 'Actualizá los precios y volvé a cargar la cantidad de más.',
+        );
+      }
+      if (cotizaEste && !excede) usadoCotizado.set(claveCot, usado);
+      const honraCotizado = cotizaEste && !excede;
       const pisado = difiere && !honraCotizado;
       /*
        * EL MENSAJE NOMBRA LA CAUSA DE VERDAD (23/9/2026).
