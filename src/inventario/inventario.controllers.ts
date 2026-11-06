@@ -204,11 +204,19 @@ class AgregarItemDto {
   @IsOptional() @IsString() @MaxLength(300) motivo?: string;
 }
 
+class OperadorRenglonDto {
+  @IsInt() itemId!: number;
+  @IsInt() operadorId!: number;
+}
+
 class ConfirmarListaDto {
   @IsIn(['enteros', 'granel']) tipo!: 'enteros' | 'granel';
   @IsBoolean() listo!: boolean;
-  /** Solo lo mira la lista de granel, y solo si confirmar tiene que fraccionar. */
+  /** Solo lo mira la lista de granel, y solo si confirmar tiene que fraccionar: quién armó TODA la lista. */
   @IsOptional() @IsInt() operadorId?: number;
+  /** Los productos que armó otra persona (6/11/2026): pisan a `operadorId` en ese renglón. */
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_ITEMS) @ValidateNested({ each: true }) @Type(() => OperadorRenglonDto)
+  operadores?: OperadorRenglonDto[];
 }
 
 class ItemRecibidoDto {

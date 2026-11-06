@@ -2209,7 +2209,10 @@ export class InventarioService {
    * El reclamo del flag es atómico (`WHERE flag = <contrario>`): dos clics
    * simultáneos en Confirmar reservarían dos veces — solo uno gana el UPDATE.
    */
-  async confirmarListaTransferencia(id: number, o: { tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number; operadorId?: number }, soloSuc?: number | null) {
+  async confirmarListaTransferencia(id: number, o: {
+    tipo: 'enteros' | 'granel'; listo: boolean; usuarioId?: number;
+    operadorId?: number; operadores?: { itemId: number; operadorId: number }[];
+  }, soloSuc?: number | null) {
     if (o.tipo !== 'enteros' && o.tipo !== 'granel') throw new BadRequestException('Lista inválida.');
     return this.db.transaction(async (tx) => {
       const t = await this.transferEnPreparacion(tx, id, soloSuc);
@@ -2251,7 +2254,10 @@ export class InventarioService {
        */
       let armados: string[] = [];
       let recortes: string[] = [];
-      if (o.listo) ({ armados, recortes } = await this.completarPreparado(tx, t, mios, o.usuarioId, o.operadorId));
+      if (o.listo) {
+        const porRenglon = new Map((o.operadores ?? []).map((x) => [x.itemId, x.operadorId]));
+        ({ armados, recortes } = await this.completarPreparado(tx, t, mios, o.usuarioId, (itemId) => porRenglon.get(itemId) ?? o.operadorId));
+      }
 
       const etiqueta = o.tipo === 'enteros' ? 'Enteros' : 'Fraccionados';
       for (const { it, prod } of mios) {
@@ -2300,17 +2306,18 @@ export class InventarioService {
     tx: any,
     t: any,
     mios: { it: any; prod: any }[],
-    usuarioId?: number,
-    operadorPedido?: number,
+    usuarioId: number | undefined,
+    operadorDe: (itemId: number) => number | undefined,
   ): Promise<{ armados: string[]; recortes: string[] }> {
     const armados: string[] = [];
     const recortes: string[] = [];
-    /* El operador se resuelve la PRIMERA vez que hace falta armar: una lista
-     * que ya tenía los paquetes hechos no fracciona nada y no tiene por qué
-     * pedirlo. `undefined` = todavía no se preguntó. */
-    let operadorId: number | null | undefined;
-    /* Todo lo que esta confirmación arme va a UN registro del historial. */
-    const renglonesArmados: { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number }[] = [];
+    /* QUIÉN ARMÓ CADA PRODUCTO (6/11/2026, pedido del dueño): una lista la
+     * fraccionan varias personas. El operador se valida la primera vez que un
+     * renglón tiene que armar (una lista con los paquetes hechos no lo pide) y
+     * lo armado va a UN registro del historial POR PERSONA: así sus paquetes,
+     * kilos y turnos cuentan exactos en los promedios por colaborador. */
+    const validado = new Map<number | undefined, number | null>();
+    const armadoPor = new Map<number | null, { productoId: number; presentacionId: number; tamKg: number; paquetes: number; movimientoId: number }[]>();
 
     const presIds = Array.from(
       new Set(mios.map(({ it }) => it.presentacionId).filter((x: any) => x != null)),
@@ -2333,9 +2340,9 @@ export class InventarioService {
         const faltan = Math.ceil(it.cantidadPreparada - disp - 1e-9);
         const armar = Math.min(faltan, Math.floor(granel / pres.tamKg + 1e-9));
         if (armar > 0) {
-          if (operadorId === undefined) {
-            operadorId = await this.operadorDeFraccion(tx, operadorPedido, t.origenId, true);
-          }
+          const pedido = operadorDe(it.id);
+          if (!validado.has(pedido)) validado.set(pedido, await this.operadorDeFraccion(tx, pedido, t.origenId, true));
+          const operadorId = validado.get(pedido)!;
           const kg = Math.round(armar * pres.tamKg * 1000) / 1000;
           const base = { productoId: it.productoId, sucursalId: t.origenId, estado: 'disponible' as const };
           await this.addDelta(tx, { ...base, presentacionId: null }, -kg);
@@ -2347,7 +2354,8 @@ export class InventarioService {
             refTransferenciaId: t.id, usuarioId: usuarioId ?? null,
             descripcion: `${t.codigo}: fraccionó ${kg} kg en ${armar}×${this.fmtTam(pres.tamKg)} para completar el pedido`,
           });
-          renglonesArmados.push({
+          if (!armadoPor.has(operadorId)) armadoPor.set(operadorId, []);
+          armadoPor.get(operadorId)!.push({
             productoId: it.productoId, presentacionId: it.presentacionId, tamKg: pres.tamKg, paquetes: armar, movimientoId: m.id,
           });
           armados.push(`${prod.nombre}: ${armar}×${this.fmtTam(pres.tamKg)} (${kg} kg de granel)`);
@@ -2376,10 +2384,9 @@ export class InventarioService {
         `${prod.nombre}: quedó en ${this.fmtCant(prod.tipo, it.presentacionId, hay)} (faltó para ${this.fmtCant(prod.tipo, it.presentacionId, antes)})`,
       );
     }
-    if (renglonesArmados.length) {
+    for (const [operadorId, items] of armadoPor) {
       await this.registrarFraccionamiento(tx, {
-        origen: 'pedido', sucursalId: t.origenId, operadorId: operadorId ?? null, usuarioId,
-        transferenciaId: t.id, items: renglonesArmados,
+        origen: 'pedido', sucursalId: t.origenId, operadorId, usuarioId, transferenciaId: t.id, items,
       });
     }
     return { armados, recortes };
