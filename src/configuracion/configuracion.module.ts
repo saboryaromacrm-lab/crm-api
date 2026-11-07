@@ -129,7 +129,7 @@ export const VENTAS_DEFAULTS = {
   tiendaCadeteWhatsapp: '' as string,
   /**
    * DE QUÉ LOCAL ES EL HORARIO DE LOS ENVÍOS (23/10/2026): el nombre de uno de
-   * los locales de la tienda (General › Locales). Con su horario, el checkout
+   * los locales de la tienda (Sistema › Horarios). Con su horario, el checkout
    * minorista ofrece «lo antes posible» solo abierto y las franjas para elegir.
    * Vacío = el primer local con horario cargado.
    */
@@ -944,16 +944,22 @@ const DUENO_DE_AREA: Record<string, string[]> = {
  *   · Stock → Almacén › Configuración (3/10/2026).
  *   · Tienda online → Tienda online › Configuración (16/10/2026, pedido del dueño:
  *     «que esté concentrado todo ahí»).
+ *   · Los locales y sus horarios (de la config web) → Sistema › Horarios
+ *     (7/11/2026, pedido del dueño), con la llave de Feriados: los dos dicen
+ *     cuándo abre cada local.
  */
-const LLAVES_DE_OTRO_MODULO: [Set<string>, string][] = [
-  [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
-  [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaSoloConStock', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp', 'tiendaMinoristaLocalEnvios']), 'web.configuracion'],
-];
+const LLAVES_DE_OTRO_MODULO: Record<string, [Set<string>, string][]> = {
+  ventas: [
+    [new Set(['controlStockGranel', 'controlStockEnteros', 'permitirStockNegativo', 'bajosDiasCobertura', 'bajosUmbralRojo']), 'almacen.configuracion'],
+    [new Set(['envioCamionetaActivo', 'montoMinimoCamioneta', 'tiendaVistaLista', 'tiendaSoloConStock', 'tiendaMinoristaActiva', 'tiendaMinoristaEnvioGratisDesde', 'tiendaMinoristaMapsKey', 'tiendaMayoristaPublica', 'tiendaMinoristaPublica', 'tiendaCadeteWhatsapp', 'tiendaMinoristaLocalEnvios']), 'web.configuracion'],
+  ],
+  web: [[new Set(['locales']), 'sistema.feriados']],
+};
 export function permisosParaGuardar(clave: string, body: any): string[] | undefined {
   const base = DUENO_DE_AREA[clave];
-  if (!base || clave !== 'ventas') return base;
+  if (!base) return base;
   const keys = body && typeof body === 'object' ? Object.keys(body) : [];
-  const grupo = keys.length ? LLAVES_DE_OTRO_MODULO.find(([llaves]) => keys.every((k) => llaves.has(k))) : undefined;
+  const grupo = keys.length ? (LLAVES_DE_OTRO_MODULO[clave] ?? []).find(([llaves]) => keys.every((k) => llaves.has(k))) : undefined;
   return grupo ? [...base, grupo[1]] : base;
 }
 

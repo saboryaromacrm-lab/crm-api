@@ -21,7 +21,9 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { feriadoSucursales, feriados, sucursales } from '../db/schema';
 import { hoyAr, sumarDias } from '../cafeteria/cuenta';
-import { ALCANCES_FERIADO, DIAS_AVISO, TIPOS_FERIADO, type FeriadoArgentinaDatos, feriadosDelAnio } from './reglas';
+import { ConfiguracionModule, ConfiguracionService } from '../configuracion/configuracion.module';
+import { DIAS_SEMANA, horarioDelDia } from '../common/horario';
+import { ALCANCES_FERIADO, DIAS_AVISO, TIPOS_FERIADO, type FeriadoArgentinaDatos, feriadosDelAnio, localDeSucursal } from './reglas';
 
 const PERMISO = 'sistema.feriados';
 const FUENTE = (anio: number) => `https://api.argentinadatos.com/v1/feriados/${anio}`;
@@ -52,7 +54,7 @@ class ImportarDto {
 
 @Injectable()
 export class FeriadosService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(@Inject(DRIZZLE) private readonly db: Database, private readonly cfg: ConfiguracionService) {}
 
   /** Los feriados (con lo de cada sucursal) entre dos días, ordenados. Una consulta. */
   private async entre(desde: string, hasta: string) {
@@ -76,12 +78,19 @@ export class FeriadosService {
   async delAnio(anioIn?: string) {
     const hoy = hoyAr();
     const anio = Number(anioIn) || Number(hoy.slice(0, 4));
-    const [lista, anios, sucs] = await Promise.all([
+    const [lista, anios, sucs, web] = await Promise.all([
       this.entre(`${anio}-01-01`, `${anio}-12-31`),
       this.db.execute(sql`select distinct extract(year from fecha)::int as anio from feriados order by 1`),
       this.activas(),
+      this.cfg.get('web'),
     ]);
-    return { anio, hoy, anios: ((anios as any).rows ?? anios).map((r: any) => r.anio), sucursales: sucs, feriados: lista };
+    /* El horario de siempre de cada una, día por día (null = su local no está en la tienda): para «abre a la mañana / a la tarde». */
+    const locales = (web.locales ?? []) as Array<Record<string, any>>;
+    const conHorario = sucs.map((su) => {
+      const local = localDeSucursal(su.nombre, locales);
+      return { ...su, semana: local ? Object.fromEntries(DIAS_SEMANA.map((d) => [d, horarioDelDia(local[d] ?? '')])) : null };
+    });
+    return { anio, hoy, anios: ((anios as any).rows ?? anios).map((r: any) => r.anio), sucursales: conHorario, feriados: lista };
   }
 
   /** El aviso de toda la app: los que caen de hoy a `DIAS_AVISO` días. Liviano: lo sondea el banner. */
@@ -165,5 +174,5 @@ export class FeriadosController {
   @Delete(':id') borrar(@Param('id', ParseIntPipe) id: number) { return this.svc.borrar(id); }
 }
 
-@Module({ controllers: [FeriadosController], providers: [FeriadosService] })
+@Module({ imports: [ConfiguracionModule], controllers: [FeriadosController], providers: [FeriadosService] })
 export class FeriadosModule {}

@@ -46,3 +46,21 @@ export function feriadosDelAnio(anio: number, nacionales: FeriadoArgentinaDatos[
   }
   return lista.sort((a, b) => a.fecha.localeCompare(b.fecha));
 }
+
+/**
+ * EL LOCAL DE LA TIENDA QUE ES ESTA SUCURSAL (7/11/2026): para ofrecer «abre a
+ * la mañana / a la tarde» con su horario de siempre (Sistema › Horarios). No
+ * hay un vínculo guardado: se busca por nombre, sin mayúsculas,
+ * tildes ni «Local» adelante («Local Fontana» es Fontana). Si no hay uno igual,
+ * vale el único que lo contiene; si no hay o hay dos, ninguno (se carga a mano).
+ */
+const llaveNombre = (t: unknown) => String(t ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '')
+  .toLowerCase().replace(/^local\s+/, '').replace(/\s+/g, ' ').trim();
+export function localDeSucursal<T extends { nombre?: unknown }>(sucursal: string, locales: T[]): T | null {
+  const k = llaveNombre(sucursal);
+  if (!k) return null;
+  const igual = locales.find((l) => llaveNombre(l.nombre) === k);
+  if (igual) return igual;
+  const contiene = locales.filter((l) => llaveNombre(l.nombre).includes(k));
+  return contiene.length === 1 ? contiene[0] : null;
+}

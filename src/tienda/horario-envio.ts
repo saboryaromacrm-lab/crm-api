@@ -9,7 +9,7 @@
  *   · Lo coordina por WhatsApp.
  *
  * El horario es el del local elegido en Tienda online › Configuración ›
- * Tienda minorista (cargado en General › Locales), y un feriado de la sucursal
+ * Tienda minorista (cargado en Sistema › Horarios), y un feriado de la sucursal
  * que despacha manda sobre él (Sistema › Feriados: cerrado, u otro horario).
  * Sin horario cargado no se puede saber si está abierto: se ofrece «lo antes
  * posible» y WhatsApp, sin franjas. Todo en hora argentina, sin importar el huso

@@ -29,3 +29,8 @@ test('las otras áreas no cambian', () => {
   assert.deepEqual(permisosParaGuardar('web', { controlStockGranel: false }), ['web.configuracion']);
   assert.equal(permisosParaGuardar('inventada', {}), undefined);
 });
+
+test('los locales y horarios de la tienda: también la llave de Feriados (Sistema › Horarios), y solo ellos', () => {
+  assert.deepEqual(permisosParaGuardar('web', { locales: [] }), ['web.configuracion', 'sistema.feriados']);
+  assert.deepEqual(permisosParaGuardar('web', { locales: [], whatsapp: '1' }), ['web.configuracion'], 'mezclado con otra llave: solo web');
+});

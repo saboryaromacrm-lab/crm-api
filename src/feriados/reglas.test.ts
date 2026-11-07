@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FIJOS_FORMOSA, JUEVES_SANTO, feriadosDelAnio } from './reglas';
+import { FIJOS_FORMOSA, JUEVES_SANTO, feriadosDelAnio, localDeSucursal } from './reglas';
 
 const NACIONALES = [
   { fecha: '2027-01-01', tipo: 'inamovible', nombre: 'Año nuevo' },
@@ -37,4 +37,15 @@ test('feriadosDelAnio: los de Formosa de fecha fija, provinciales, ordenados por
     assert.equal(x?.alcance, 'provincial');
   }
   assert.deepEqual(l.map((f) => f.fecha), [...l.map((f) => f.fecha)].sort());
+});
+
+test('localDeSucursal: por nombre, sin «Local», tildes ni mayúsculas; ante la duda, ninguno', () => {
+  const locales = [{ nombre: 'Local Fontana' }, { nombre: 'Express 1' }, { nombre: 'Express 3' }, { nombre: 'Distribuidora' }];
+  assert.equal(localDeSucursal('Fontana', locales)?.nombre, 'Local Fontana');
+  assert.equal(localDeSucursal('express 3', locales)?.nombre, 'Express 3');
+  assert.equal(localDeSucursal('DISTRIBUIDORA', locales)?.nombre, 'Distribuidora');
+  assert.equal(localDeSucursal('Express', locales), null, 'dos lo contienen: no se adivina');
+  assert.equal(localDeSucursal('Centro', locales), null);
+  assert.equal(localDeSucursal('', locales), null);
+  assert.equal(localDeSucursal('Fontaná', [{ nombre: 'Fontana Sur' }])?.nombre, 'Fontana Sur');
 });
