@@ -3939,6 +3939,8 @@ export const pedidosProveedor = pgTable('pedidos_proveedor', {
 }, (t) => ({
   ixEstado: index('ix_pedidos_proveedor_estado').on(t.estado, t.proveedorId),
   ixRecepcion: index('ix_pedidos_proveedor_recepcion').on(t.fechaRecepcion),
+  /** Una sola tarjeta abierta por proveedor (0223): la orden de pedido usa la que ya está. */
+  uqAbierta: uniqueIndex('uq_pedidos_proveedor_abierta').on(t.proveedorId).where(sql`${t.estado} <> 'recibido'`),
 }));
 
 /**

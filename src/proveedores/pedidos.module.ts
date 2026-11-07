@@ -21,6 +21,11 @@
  *
  * CUALQUIER cambio de estado resetea los dos flags: solo significan algo
  * mientras la tarjeta está en Solicitado, y si vuelve, vuelve limpia.
+ *
+ * UNA SOLA TARJETA ABIERTA POR PROVEEDOR (0223, 7/11/2026: «quedan muchos
+ * repetidos, el que creás con la orden de pedido y el de Solicitado»). La
+ * orden de pedido y «Ya lo pedí» usan la que ya está (la pasan a Pedido y le
+ * suman la nota); Solicitar saltea a los que ya están en el tablero.
  */
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
@@ -237,6 +242,20 @@ export class PedidosProveedorService {
     return p;
   }
 
+  /** La tarjeta abierta (no recibida) del proveedor: hay una sola (0223). */
+  private async abiertaDe(proveedorId: number) {
+    const [p] = await this.db.select().from(pedidosProveedor)
+      .where(and(eq(pedidosProveedor.proveedorId, proveedorId), ne(pedidosProveedor.estado, 'recibido'))).limit(1);
+    return p ?? null;
+  }
+
+  /** Volver una tarjeta al tablero (o pasarla a otro proveedor) no puede dejar dos del mismo. */
+  private async sinOtraAbierta(proveedorId: number) {
+    if (await this.abiertaDe(proveedorId)) {
+      throw new BadRequestException('Ese proveedor ya tiene su tarjeta en el tablero: sumá la nota ahí.');
+    }
+  }
+
   private async validarProveedor(id: number) {
     const [p] = await this.db.select({ id: proveedores.id }).from(proveedores)
       .where(eq(proveedores.id, id)).limit(1);
@@ -249,30 +268,52 @@ export class PedidosProveedorService {
     const validos = await this.db.select({ id: proveedores.id }).from(proveedores)
       .where(inArray(proveedores.id, ids));
     if (!validos.length) throw new BadRequestException('Ningún proveedor válido.');
+    /* Los que ya tienen su tarjeta en el tablero no suman otra (el índice cubre los clics simultáneos). */
     const filas = await this.db.insert(pedidosProveedor).values(validos.map((p) => ({
       proveedorId: p.id,
       notas: (dto.notas ?? '').trim(),
       usuarioId,
-    }))).returning({ id: pedidosProveedor.id });
-    return { creados: filas.length, ids: filas.map((f) => f.id) };
+    }))).onConflictDoNothing().returning({ id: pedidosProveedor.id });
+    return { creados: filas.length, yaEstaban: validos.length - filas.length, ids: filas.map((f) => f.id) };
   }
 
-  /** "Ya lo pedí por teléfono, registralo": nace directo en Pedido, con fecha. */
-  async directo(dto: PedidoDirectoDto, usuarioId: number | null) {
+  /**
+   * "Ya lo pedí, registralo" (y la orden de pedido de Almacén): nace en Pedido
+   * con fecha. Si el proveedor ya tiene su tarjeta abierta, es esa: pasa a
+   * Pedido (sin pisar el día en que se pidió) y la nota nueva va debajo de la
+   * que tenía. `yaEstaba` dice en qué columna estaba.
+   */
+  async directo(dto: PedidoDirectoDto, usuarioId: number | null): Promise<any> {
     await this.validarProveedor(dto.proveedorId);
+    const notas = (dto.notas ?? '').trim();
+    const abierta = await this.abiertaDe(dto.proveedorId);
+    if (abierta) {
+      await this.db.update(pedidosProveedor).set({
+        estado: 'pedido',
+        fechaPedido: abierta.fechaPedido ?? new Date(),
+        pedidoEnviado: false,
+        revisadoAt: null,
+        notas: abierta.notas === notas ? notas : [abierta.notas.trim(), notas].filter(Boolean).join('\n\n'),
+      }).where(eq(pedidosProveedor.id, abierta.id));
+      return { ...(await this.get(abierta.id)), yaEstaba: abierta.estado };
+    }
     const [p] = await this.db.insert(pedidosProveedor).values({
       proveedorId: dto.proveedorId,
       estado: 'pedido',
       fechaPedido: new Date(),
-      notas: (dto.notas ?? '').trim(),
+      notas,
       usuarioId,
-    }).returning();
-    return this.get(p.id);
+    }).onConflictDoNothing().returning();
+    /* Otro la creó en el mismo instante: ahora está, y se usa esa. */
+    return p ? this.get(p.id) : this.directo(dto, usuarioId);
   }
 
   async editar(id: number, dto: EditarPedidoDto) {
-    await this.get(id);
-    if (dto.proveedorId != null) await this.validarProveedor(dto.proveedorId);
+    const actual = await this.get(id);
+    if (dto.proveedorId != null && dto.proveedorId !== actual.proveedorId) {
+      await this.validarProveedor(dto.proveedorId);
+      if (actual.estado !== 'recibido') await this.sinOtraAbierta(dto.proveedorId);
+    }
     await this.db.update(pedidosProveedor).set({
       ...(dto.proveedorId != null ? { proveedorId: dto.proveedorId } : {}),
       ...(dto.notas !== undefined ? { notas: dto.notas.trim() } : {}),
@@ -282,6 +323,7 @@ export class PedidosProveedorService {
 
   async cambiarEstado(id: number, nuevo: (typeof ESTADOS)[number]) {
     const actual = await this.get(id);
+    if (actual.estado === 'recibido' && nuevo !== 'recibido') await this.sinOtraAbierta(actual.proveedorId);
     const set: any = {
       estado: nuevo,
       // Los flags son de Solicitado: cualquier movimiento los limpia (regla
