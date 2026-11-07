@@ -1555,6 +1555,13 @@
       "when": 1794258000000,
       "tag": "0221_personal",
       "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1794344400000,
+      "tag": "0222_pedido_factura_resuelta",
+      "breakpoints": true
     }
   ]
 }

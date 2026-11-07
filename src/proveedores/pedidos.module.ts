@@ -15,23 +15,26 @@
  *       para poder decir "lo viste hace 4 días".
  *   pedido     → confirmado con el proveedor (queda fechaPedido).
  *   recibido   → llegó (queda fechaRecepcion) — alimenta la pestaña Ingresos,
- *                que mide además cuántos días tardó cada proveedor.
+ *                que mide además cuántos días tardó cada proveedor, y el
+ *                banner de facturas sin cargar (7/11/2026, `sin-factura.ts`).
  *   retomar    → aparcado sin fecha: ni urge ni murió.
  *
  * CUALQUIER cambio de estado resetea los dos flags: solo significan algo
  * mientras la tarjeta está en Solicitado, y si vuelve, vuelve limpia.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsOptional, IsString, MaxLength,
 } from 'class-validator';
 import { and, desc, eq, gte, inArray, ne, sql } from 'drizzle-orm';
-import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { Auth, CualquierUsuario, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { esJefe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { pedidosProveedor, productoProveedores, proveedores } from '../db/schema';
+import { desdeDe, sinFactura } from './sin-factura';
 
 const ESTADOS = ['solicitado', 'pedido', 'recibido', 'retomar'] as const;
 
@@ -175,6 +178,43 @@ export class PedidosProveedorService {
       order by c.fecha desc, c.id desc
       limit 15`);
     return r.rows;
+  }
+
+  /**
+   * LO QUE LLEGÓ Y SU FACTURA NO SE CARGÓ (7/11/2026): el banner de
+   * administración. Las tarjetas en «Recibido» que nadie dio por resueltas,
+   * contra los comprobantes que entraron stock de esos proveedores; la regla
+   * que los empareja, en `sin-factura.ts`.
+   */
+  async sinFactura() {
+    const r = await this.db.execute(sql`
+      select pp.id, pp.proveedor_id as "proveedorId", pr.nombre as proveedor, pp.notas,
+        pp.fecha_pedido as "fechaPedido", pp.fecha_recepcion as "fechaRecepcion"
+      from pedidos_proveedor pp join proveedores pr on pr.id = pp.proveedor_id
+      where pp.estado = 'recibido' and pp.fecha_recepcion is not null and pp.factura_resuelta_en is null`);
+    const recibidas = (r.rows as any[]).map((x) => ({
+      ...x, fechaPedido: x.fechaPedido ? new Date(x.fechaPedido) : null, fechaRecepcion: new Date(x.fechaRecepcion),
+    }));
+    if (!recibidas.length) return { pedidos: [] };
+    const provs = [...new Set(recibidas.map((x) => x.proveedorId as number))];
+    const c = await this.db.execute(sql`
+      select proveedor_id as "proveedorId", greatest(fecha, fecha_carga) as en
+      from comprobantes
+      where estado = 'confirmado' and recepcion and tipo in ('factura', 'remito', 'liquidacion')
+        and proveedor_id in (${sql.join(provs.map((i) => sql`${i}`), sql`, `)})
+        and greatest(fecha, fecha_carga) >= ${new Date(Math.min(...recibidas.map(desdeDe)))}`);
+    const cargas = (c.rows as any[]).map((x) => ({ proveedorId: x.proveedorId as number, en: new Date(x.en) }));
+    return { pedidos: sinFactura(recibidas, cargas) };
+  }
+
+  /** «Ya está» en el banner: deja de avisar por esta tarjeta, con quién y cuándo (0222). */
+  async resolverFactura(id: number, usuarioId: number | null) {
+    const [p] = await this.db.update(pedidosProveedor)
+      .set({ facturaResueltaEn: new Date(), facturaResueltaPor: usuarioId })
+      .where(and(eq(pedidosProveedor.id, id), eq(pedidosProveedor.estado, 'recibido')))
+      .returning({ id: pedidosProveedor.id });
+    if (!p) throw new NotFoundException('Ese pedido no está como recibido (¿lo borraron?). Actualizá la pantalla.');
+    return { ok: true };
   }
 
   /** El kanban: todo lo que NO está recibido (los recibidos son historial). */
@@ -380,6 +420,18 @@ export class PedidosProveedorController {
       page: page ? Number(page) : undefined,
       limit: limit ? Number(limit) : undefined,
     });
+  }
+
+  /* El banner de facturas sin cargar (7/11/2026): administración, esté en la pantalla que esté. */
+  @Get('sin-factura') @CualquierUsuario()
+  sinFactura(@Auth() auth: Sesion) {
+    if (!esJefe(auth)) throw new ForbiddenException('Las facturas sin cargar las ve administración.');
+    return this.svc.sinFactura();
+  }
+  @Post(':id/factura-resuelta') @CualquierUsuario()
+  facturaResuelta(@Param('id', ParseIntPipe) id: number, @Auth() auth: Sesion) {
+    if (!esJefe(auth)) throw new ForbiddenException('Lo da por resuelto administración.');
+    return this.svc.resolverFactura(id, auth.usuarioId ?? null);
   }
 
   @Post() alta(@Body() dto: AltaPedidosDto, @Auth() auth: Sesion) {

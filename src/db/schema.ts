@@ -3933,6 +3933,9 @@ export const pedidosProveedor = pgTable('pedidos_proveedor', {
   /** Fecha y no booleano: la tarjeta dice "lo viste hace N días". */
   revisadoAt: timestamp('revisado_at', { withTimezone: true }),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** «Ya está» del aviso de factura sin cargar (0222): deja de avisar por esta tarjeta. */
+  facturaResueltaEn: timestamp('factura_resuelta_en', { withTimezone: true }),
+  facturaResueltaPor: integer('factura_resuelta_por').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixEstado: index('ix_pedidos_proveedor_estado').on(t.estado, t.proveedorId),
   ixRecepcion: index('ix_pedidos_proveedor_recepcion').on(t.fechaRecepcion),
