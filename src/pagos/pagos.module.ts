@@ -369,8 +369,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
    *    una CUOTA pagada de verdad aunque el resto de la factura deba. Y el
    *    echeq pendiente de hacer queda por lo que su parte todavía debe
    *    (7/11/2026, `ajustarPendientesTx`): pagada en parte por otro medio, baja.
+   *
+   * `tomadas`: las cuotas que ESTE pago está pagando, ya marcadas por quien
+   * llama (el «Pagar» de la cuota, el cobro del echeq) y todavía sin su pagoId.
+   * No se reabren: si se reabrieran un instante, el ajuste le cargaría este pago
+   * al echeq pendiente de otra cuota de la misma factura (la que vence antes).
    */
-  async sincronizarCompromisos(tx: any, comprobanteId: number, pagoCerradorId: number | null) {
+  async sincronizarCompromisos(tx: any, comprobanteId: number, pagoCerradorId: number | null, tomadas: number[] = []) {
     const comps = await tx.select().from(proveedorCompromisos)
       .where(eq(proveedorCompromisos.comprobanteId, comprobanteId));
     if (!comps.length) return;
@@ -412,7 +417,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       return;
     }
 
-    const cerrados = comps.filter((x: any) => x.pagado);
+    const cerrados = comps.filter((x: any) => x.pagado && !tomadas.includes(x.id));
     if (cerrados.length) await this.reabrirCompromisos(tx, comprobanteId, cerrados);
     await ajustarPendientesTx(tx, comprobanteId);
   }
@@ -706,14 +711,17 @@ export class PagosProveedorService implements OnApplicationBootstrap {
     /*
      * Los echeqs vivos que cubren cada factura (7/11/2026): quien la paga ve si
      * ya tiene uno hecho (pagarla también es pagar dos veces) o uno pendiente de
-     * hacer (que se da de baja solo al pagarla por otro medio).
+     * hacer (que se da de baja solo al pagarla por otro medio). `cubre`: del
+     * hecho, su parte entera —es lo que el banco va a debitar, y lo que
+     * `hacerLugar` reserva—; del pendiente, lo que esa parte todavía debe.
      */
     const echeqsDe = new Map<number, Array<{ id: number; estado: string; numero: string; banco: string; fechaVenc: Date; cubre: number }>>();
     if (cs.length) {
       const ks = await ex.select({
         comprobanteId: proveedorCompromisos.comprobanteId,
         id: proveedorEcheqs.id, estado: proveedorEcheqs.estado, numero: proveedorEcheqs.numero,
-        banco: proveedorEcheqs.banco, fechaVenc: proveedorEcheqs.fechaVenc, cubre: faltaCompromiso,
+        banco: proveedorEcheqs.banco, fechaVenc: proveedorEcheqs.fechaVenc,
+        parte: proveedorCompromisos.importe, falta: faltaCompromiso,
       }).from(proveedorCompromisos)
         .innerJoin(proveedorEcheqs, eq(proveedorEcheqs.id, proveedorCompromisos.echeqId))
         .where(and(
@@ -722,9 +730,10 @@ export class PagosProveedorService implements OnApplicationBootstrap {
           inArray(proveedorEcheqs.estado, ECHEQ_VIVOS),
         )).orderBy(proveedorEcheqs.fechaVenc, proveedorEcheqs.id);
       for (const k of ks) {
-        if (Number(k.cubre) <= EPS) continue;
+        const cubre = money(Number(k.estado === 'pendiente' ? k.falta : k.parte));
+        if (cubre <= EPS) continue;
         const l = echeqsDe.get(k.comprobanteId!) ?? [];
-        l.push({ id: k.id, estado: k.estado, numero: k.numero, banco: k.banco, fechaVenc: k.fechaVenc, cubre: money(Number(k.cubre)) });
+        l.push({ id: k.id, estado: k.estado, numero: k.numero, banco: k.banco, fechaVenc: k.fechaVenc, cubre });
         echeqsDe.set(k.comprobanteId!, l);
       }
       const notas = await ex.select({
@@ -860,7 +869,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
    */
   async crear(
     dto: CrearPagoDto, sucursalSesion: number, cruzaSucursales = false, enAltaComprobante = false,
-    opciones: { cuotaTomadaId?: number; controlarDuplicado?: boolean } = {},
+    opciones: { cuotasTomadas?: number[]; controlarDuplicado?: boolean } = {},
   ) {
     const importe = money(dto.importe);
     if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
@@ -1145,7 +1154,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
 
       if (dto.imputaciones?.length) {
         await this.aplicar(
-          tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante, opciones.cuotaTomadaId,
+          tx, pago.id, dto.imputaciones, dto.usuarioId, cruzaSucursales, enAltaComprobante, opciones.cuotasTomadas,
         );
       }
       await this.aplicarCuentaLibre(proveedorId, tx);
@@ -1293,7 +1302,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
    */
   private async aplicar(
     tx: any, pagoId: number, items: ImputacionDto[], usuarioId?: number, cruzaSucursales = false,
-    enAltaComprobante = false, cuotaTomadaId?: number, desdePagoExistente = false,
+    enAltaComprobante = false, cuotasTomadas: number[] = [], desdePagoExistente = false,
   ) {
     for (const item of items) {
       const importe = money(item.importe);
@@ -1447,15 +1456,15 @@ export class PagosProveedorService implements OnApplicationBootstrap {
              * del compromiso la TOMA antes de pagar (`pagado = true`, para que
              * dos clics no la paguen dos veces), así que buscando solo las
              * `pagado = false` la propia cuota no aparecía: en una factura de
-             * $1.000 en 3 cuotas la 2 y la 3 rebotaban. `cuotaTomadaId` la
-             * nombra el servidor (Compromisos), nunca el cliente.
+             * $1.000 en 3 cuotas la 2 y la 3 rebotaban. `cuotasTomadas` las
+             * nombra el servidor (Compromisos, el cobro del echeq), nunca el cliente.
              */
             const cuotas = await tx.select({ importe: proveedorCompromisos.importe })
               .from(proveedorCompromisos)
               .where(and(
                 eq(proveedorCompromisos.comprobanteId, c.id),
-                cuotaTomadaId
-                  ? or(eq(proveedorCompromisos.pagado, false), eq(proveedorCompromisos.id, cuotaTomadaId))
+                cuotasTomadas.length
+                  ? or(eq(proveedorCompromisos.pagado, false), inArray(proveedorCompromisos.id, cuotasTomadas))
                   : eq(proveedorCompromisos.pagado, false),
               ));
             const esCuota = cuotas.some((q: any) => Math.abs(money(q.importe) - importe) <= EPS);
@@ -1520,7 +1529,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
         await this.recalcularComprobante(tx, item.comprobanteId!);
         // El puente (0068): si esta aplicación saldó la factura, sus
         // compromisos se cierran acá mismo, firmados por este pago.
-        await this.sincronizarCompromisos(tx, item.comprobanteId!, pagoId);
+        await this.sincronizarCompromisos(tx, item.comprobanteId!, pagoId, cuotasTomadas);
       }
     }
   }

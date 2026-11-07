@@ -407,12 +407,15 @@ export class FinanzasProveedorService {
    * saldo proyectado pasaban a mentir. Lo pendiente de todas sus cuotas no
    * puede pasar del saldo vivo de la factura (con sus notas descontadas).
    * Devuelve lo que la factura deja libre para esta cuota (saldo − las otras).
+   * Las otras cuentan por lo que todavía deben (7/11/2026): pagada la factura en
+   * parte, la cuota anterior ya no pide su importe entero, y confirmar el echeq
+   * pendiente de la siguiente por lo que muestra no tiene que rebotar.
    */
   private async exigirTopeCuotas(comprobanteId: number, proveedorId: number, compromisoId: number, nuevo: number) {
     const docs = await this.pagos.documentosPendientes(proveedorId, 'mercaderia');
     const doc = docs.find((d: any) => d.tipo === 'comprobante' && d.docId === comprobanteId);
     const saldo = money(doc?.saldo ?? 0);
-    const [r] = await this.db.select({ t: sql<number>`coalesce(sum(${proveedorCompromisos.importe}), 0)` })
+    const [r] = await this.db.select({ t: sql<number>`coalesce(sum(${faltaCompromiso}), 0)` })
       .from(proveedorCompromisos).where(and(
         eq(proveedorCompromisos.comprobanteId, comprobanteId),
         eq(proveedorCompromisos.pagado, false),
@@ -573,7 +576,7 @@ export class FinanzasProveedorService {
       cajaSesionId: dto.cajaSesionId,
       usuarioId: auth.usuarioId,
       imputaciones,
-    } as any, auth.sucursalId, esJefe(auth), false, { cuotaTomadaId: id });
+    } as any, auth.sucursalId, esJefe(auth), false, { cuotasTomadas: [id] });
 
     /* La CUOTA: si la factura sigue con saldo, el puente no lo cerró — lo
      * cierra este método, que es el único que sabe qué compromiso se pagó. */
@@ -893,13 +896,18 @@ export class FinanzasProveedorService {
    * factura que cubre. Lo que sobra (era por más, o una factura se pagó por
    * otro lado) queda a cuenta del proveedor; en cuenta libre va solo a lo más
    * viejo. El echeq se toma antes de pagar, como la cuota: dos «Cobrar» a la
-   * vez no pagan dos veces, y si el pago falla vuelve a la cartera.
+   * vez no pagan dos veces, y si el pago falla vuelve a la cartera. Sus partes
+   * también se toman antes (7/11/2026): el puente las ve pagas y no le carga
+   * este pago al echeq pendiente de otra cuota de la misma factura.
    */
   private async cobrarEcheq(e: any, auth: Sesion) {
     const [tomado] = await this.db.update(proveedorEcheqs).set({ estado: 'cobrado' })
       .where(and(eq(proveedorEcheqs.id, e.id), inArray(proveedorEcheqs.estado, ECHEQ_EN_CARTERA)))
       .returning({ id: proveedorEcheqs.id });
     if (!tomado) throw new BadRequestException('Ese echeq ya se cobró (o se está cobrando en este momento). Actualizá la pantalla.');
+    const tomadas = (await this.db.update(proveedorCompromisos).set({ pagado: true })
+      .where(and(eq(proveedorCompromisos.echeqId, e.id), eq(proveedorCompromisos.pagado, false)))
+      .returning({ id: proveedorCompromisos.id })).map((k) => k.id);
     let queda = money(e.importe);
     const imputaciones: Array<{ comprobanteId: number; importe: number }> = [];
     for (const f of e.facturas) {
@@ -919,16 +927,20 @@ export class FinanzasProveedorService {
         concepto: `Cobro de echeq ${e.numero || `#${e.id}`}${e.banco ? ` (${e.banco})` : ''}`,
         usuarioId: auth.usuarioId,
         imputaciones,
-      } as any, auth.sucursalId, esJefe(auth));
+      } as any, auth.sucursalId, esJefe(auth), false, { cuotasTomadas: tomadas });
     } catch (err) {
       await this.db.update(proveedorEcheqs).set({ estado: e.estado }).where(eq(proveedorEcheqs.id, e.id));
+      if (tomadas.length) {
+        await this.db.update(proveedorCompromisos).set({ pagado: false }).where(inArray(proveedorCompromisos.id, tomadas));
+      }
       throw err;
     }
     /* Lo que cubría queda pago con este pago (la factura que quedó saldada ya la cerró el puente). */
     await this.db.transaction(async (tx) => {
       await tx.update(proveedorEcheqs).set({ pagoId: pago.id }).where(eq(proveedorEcheqs.id, e.id));
-      await tx.update(proveedorCompromisos).set({ pagado: true, pagoId: pago.id })
-        .where(and(eq(proveedorCompromisos.echeqId, e.id), eq(proveedorCompromisos.pagado, false)));
+      if (tomadas.length) {
+        await tx.update(proveedorCompromisos).set({ pagado: true, pagoId: pago.id }).where(inArray(proveedorCompromisos.id, tomadas));
+      }
     });
     return this.getEcheq(e.id);
   }
