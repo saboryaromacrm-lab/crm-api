@@ -8,6 +8,11 @@
  * DE DÓNDE SALE CADA NÚMERO (todo NETO, sin IVA):
  *   ventas     renglones de ventas confirmadas (y pendientes de CAE): precio de
  *              lista, neto cobrado y costo congelado; las NC restan aparte.
+ *   descuentos lo que va de la lista a lo cobrado, por renglón y por qué
+ *              (7/11/2026): precio cambiado a mano, cupón, descuento con nombre,
+ *              el del cliente o a mano, cada oferta y los redondeos. Todo
+ *              descuento vive en los renglones (también el de ticket y el
+ *              combo, repartidos): la suma es «Descuentos y ofertas».
  *              Cargos extra: envíos y otros (venta) y el recargo por cuotas
  *              (resultado financiero).
  *   facturado  el neto de lo facturado (y lo pendiente de CAE): la base de
@@ -39,7 +44,7 @@ const N = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
 export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: string) {
   const p = [inicio, finExclusivo];
-  const [items, extras, fiscal, tarjetas, mp, stock, gastos, percIibb, retiros] = await Promise.all([
+  const [items, descuentos, extras, fiscal, tarjetas, mp, stock, gastos, percIibb, retiros] = await Promise.all([
     c.query(`
       select ${MES('v.fecha')} as mes, ${SUC} as suc, ${NOTA} as nota,
         coalesce(sum(vi.cantidad * coalesce(nullif(vi.precio_lista, 0), vi.precio_unitario)), 0) as lista,
@@ -50,6 +55,23 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
       from venta_items vi join ventas v on v.id = vi.venta_id
       where ${VALIDA} and ${RANGO('v.fecha')}
       group by 1, 2, 3`, p),
+    c.query(`
+      select ${MES('v.fecha')} as mes, ${SUC} as suc, x.clave, sum(x.importe) as importe
+      from venta_items vi join ventas v on v.id = vi.venta_id
+        left join cupones cu on cu.id = vi.cupon_id
+        cross join lateral (select vi.cantidad * coalesce(nullif(vi.precio_lista, 0), vi.precio_unitario) as lista,
+          vi.cantidad * vi.precio_unitario as bruto) b
+        cross join lateral (values
+          ('pisado', b.lista - b.bruto),
+          ('cupon:' || coalesce(cu.codigo, 'Cupón'), vi.cupon_descuento),
+          (case when vi.descuento_nombre <> '' then 'nombre:' || vi.descuento_nombre else 'mano' end,
+            b.bruto * vi.descuento / 100 - vi.cupon_descuento),
+          ('oferta:' || coalesce(nullif(vi.oferta, ''), 'Oferta'), vi.oferta_descuento),
+          ('redondeo', b.bruto * (1 - vi.descuento / 100) - vi.oferta_descuento - vi.subtotal)
+        ) x(clave, importe)
+      where ${VALIDA} and not ${NOTA} and ${RANGO('v.fecha')}
+      group by 1, 2, 3
+      having abs(sum(x.importe)) >= 0.005`, p),
     c.query(`
       select ${MES('v.fecha')} as mes, ${SUC} as suc,
         coalesce(sum(ve.importe * ${SIGNO}) filter (where ve.concepto !~ '^Recargo [0-9]+ cuotas? \\('), 0) as cargos,
@@ -118,11 +140,11 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
   ]);
   const num = (rows: any[]) => rows.map((x) => {
     const o: any = { ...x };
-    for (const k of Object.keys(o)) if (k !== 'mes' && k !== 'medio' && k !== 'nota' && k !== 'reparto' && o[k] != null) o[k] = N(o[k]);
+    for (const k of Object.keys(o)) if (k !== 'mes' && k !== 'medio' && k !== 'nota' && k !== 'reparto' && k !== 'clave' && o[k] != null) o[k] = N(o[k]);
     return o;
   });
   return {
-    items: num(items.rows), extras: num(extras.rows), fiscal: num(fiscal.rows), tarjetas: num(tarjetas.rows),
+    items: num(items.rows), descuentos: num(descuentos.rows), extras: num(extras.rows), fiscal: num(fiscal.rows), tarjetas: num(tarjetas.rows),
     mp: num(mp.rows), stock: num(stock.rows), gastos: num(gastos.rows), percIibb: num(percIibb.rows), retiros: num(retiros.rows),
   };
 }

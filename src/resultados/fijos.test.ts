@@ -42,7 +42,7 @@ test('reparto: dos locales o más, sin repetir, más de 0 % y suma 100', () => {
   assert.ok(!('error' in normalizarReparto([{ sucursalId: 2, pct: 33.34 }, { sucursalId: 4, pct: 33.33 }, { sucursalId: 5, pct: 33.33 }])));
 });
 
-const vacios = (): HechosLeidos => ({ items: [], extras: [], fiscal: [], tarjetas: [], mp: [], stock: [], gastos: [], percIibb: [], retiros: [] });
+const vacios = (): HechosLeidos => ({ items: [], descuentos: [], extras: [], fiscal: [], tarjetas: [], mp: [], stock: [], gastos: [], percIibb: [], retiros: [] });
 const catalogos = (o: Partial<Catalogos> = {}): Catalogos => ({
   rubros: [
     { id: 10, nombre: 'Alquileres', tipo: 'fijo', resultado: 'normal', reparte: true, activa: true },
@@ -130,4 +130,21 @@ test('armado: en el mes en curso la planilla y los fijos estimados cuentan los d
   const cerrado = armarEstado(vacios(), cat, ['2026-10'], new Set(['2026-10']), '', '2026-11-04');
   assert.equal(cerrado.meses[0].total.hechos.sueldos, 3_000_000, 'un mes cerrado va entero');
   assert.equal(cerrado.meses[0].enCurso, null);
+});
+
+test('armado: los descuentos se abren por qué, por local, y el total los suma', () => {
+  const h = {
+    ...vacios(),
+    items: [{ mes: '2026-10', suc: 2, nota: false, lista: 1_000, neto: 850, costo: 0, sin_costo: 0, venta_sin_costo: 0 }],
+    descuentos: [
+      { mes: '2026-10', suc: 2, clave: 'oferta:3x2 galletitas', importe: 100 },
+      { mes: '2026-10', suc: 2, clave: 'nombre:Empleados', importe: 50 },
+      { mes: '2026-10', suc: 4, clave: 'nombre:Empleados', importe: 20 },
+    ],
+  };
+  const r = armarEstado(h, catalogos(), ['2026-10'], new Set(['2026-10']));
+  const b2 = r.meses[0].baldes.find((b) => b.balde === 2)!.hechos;
+  assert.deepEqual(b2.descuentosPor, { 'oferta:3x2 galletitas': 100, 'nombre:Empleados': 50 });
+  assert.equal(b2.descuentos, 150, 'el detalle suma el renglón');
+  assert.deepEqual(r.meses[0].total.hechos.descuentosPor, { 'oferta:3x2 galletitas': 100, 'nombre:Empleados': 70 });
 });

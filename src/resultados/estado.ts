@@ -49,7 +49,7 @@ import {
 type Fila = Record<string, any>;
 export type Rubro = { id: number; nombre: string; tipo: string; resultado: string; reparte: boolean; activa: boolean };
 export type HechosLeidos = {
-  items: Fila[]; extras: Fila[]; fiscal: Fila[]; tarjetas: Fila[]; mp: Fila[];
+  items: Fila[]; descuentos: Fila[]; extras: Fila[]; fiscal: Fila[]; tarjetas: Fila[]; mp: Fila[];
   stock: Fila[]; gastos: Fila[]; percIibb: Fila[]; retiros: Fila[];
 };
 export type Catalogos = {
@@ -103,7 +103,7 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
   const rubroDe = new Map(cat.rubros.map((r) => [r.id, r]));
   const rubroSueldos = cat.rubros.find((r) => r.resultado === 'sueldos');
   const idx = {
-    items: porMes(h.items), extras: porMes(h.extras), fiscal: porMes(h.fiscal), tarjetas: porMes(h.tarjetas),
+    items: porMes(h.items), descuentos: porMes(h.descuentos), extras: porMes(h.extras), fiscal: porMes(h.fiscal), tarjetas: porMes(h.tarjetas),
     mp: porMes(h.mp), stock: porMes(h.stock), gastos: porMes(h.gastos), percIibb: porMes(h.percIibb), retiros: porMes(h.retiros),
   };
 
@@ -124,6 +124,7 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
       else { x.ventasLista += f.lista; x.descuentos += f.lista - f.neto; x.cmv += f.costo; x.ventaSinCosto += f.venta_sin_costo; }
       x.sinCosto += f.sin_costo;
     }
+    for (const f of idx.descuentos.get(mes) ?? []) { const x = de(f.suc); x.descuentosPor[f.clave] = r2((x.descuentosPor[f.clave] ?? 0) + f.importe); }
     for (const f of idx.extras.get(mes) ?? []) { const x = de(f.suc); x.cargos += f.cargos; x.recargos += f.recargos; }
     for (const f of idx.fiscal.get(mes) ?? []) { const x = de(f.suc); x.facturado += f.facturado; x.ivaSinFactura += f.iva_sin_factura; }
     /*

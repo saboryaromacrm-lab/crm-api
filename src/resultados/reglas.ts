@@ -296,13 +296,20 @@ export type Hechos = {
   cobradoTarjeta: number; // lo cobrado con débito y crédito: la base del posnet (4/11/2026)
   /** Los sueldos por empleado (`e<id>`) o, sin planilla, por rubro de Gastos (`r<id>`): para abrir el renglón. */
   sueldosPor: Record<string, number>;
+  /**
+   * «Descuentos y ofertas» por qué (7/11/2026, pedido del dueño), para abrir el
+   * renglón: `pisado` (precio cambiado a mano), `mano` (el del cliente o puesto
+   * a mano), `nombre:<descuento>`, `oferta:<oferta>`, `cupon:<código>` y
+   * `redondeo`. Suman `descuentos`.
+   */
+  descuentosPor: Record<string, number>;
 };
 
 export const hechosVacios = (): Hechos => ({
   ventasLista: 0, descuentos: 0, notasCredito: 0, cargos: 0, cmv: 0, mermas: 0, ajustesStock: 0,
   iibb: 0, municipalidad: 0, comisiones: 0, variables: {}, sueldos: 0, fijos: {}, amortizaciones: 0,
   recargos: 0, financieros: {}, retiros: 0, sinCosto: 0, ventaSinCosto: 0,
-  facturado: 0, ivaSinFactura: 0, comisionesMp: 0, ajustesFuera: 0, cobradoTarjeta: 0, sueldosPor: {},
+  facturado: 0, ivaSinFactura: 0, comisionesMp: 0, ajustesFuera: 0, cobradoTarjeta: 0, sueldosPor: {}, descuentosPor: {},
 });
 
 const sumaDe = (o: Record<string, number>) => Object.values(o).reduce((a, v) => a + N(v), 0);
@@ -333,12 +340,12 @@ export function cascada(h: Hechos) {
 
 /** Suma `b` en `a` (los dos son Hechos; los rubros, por id). */
 export function sumarHechos(a: Hechos, b: Hechos): Hechos {
-  const out = { ...a, variables: { ...a.variables }, fijos: { ...a.fijos }, financieros: { ...a.financieros }, sueldosPor: { ...(a.sueldosPor ?? {}) } };
+  const out = { ...a, variables: { ...a.variables }, fijos: { ...a.fijos }, financieros: { ...a.financieros }, sueldosPor: { ...(a.sueldosPor ?? {}) }, descuentosPor: { ...(a.descuentosPor ?? {}) } };
   for (const k of Object.keys(b) as (keyof Hechos)[]) {
     const v = b[k];
     if (typeof v === 'number') (out as any)[k] = r2(N((out as any)[k]) + v);
   }
-  for (const grupo of ['variables', 'fijos', 'financieros', 'sueldosPor'] as const) {
+  for (const grupo of ['variables', 'fijos', 'financieros', 'sueldosPor', 'descuentosPor'] as const) {
     for (const [id, v] of Object.entries(b[grupo] ?? {})) out[grupo][id] = r2(N(out[grupo][id]) + N(v));
   }
   return out;
