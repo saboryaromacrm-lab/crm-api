@@ -110,3 +110,46 @@ export async function imputarEcheqTx(
     echeqId: e.id,
   });
 }
+
+/**
+ * EL PENDIENTE DICE LO QUE FALTA (7/11/2026, pedido del dueño: «hay proveedor
+ * que le pago por echeq a dos días, no llego a generarlo y le transfiero»). El
+ * echeq automático sin hacer es la promesa de pagar lo que su factura todavía
+ * debe: si se pagó en parte por otro medio, baja a lo que falta; si ya no falta
+ * nada, se da de baja y su parte queda como deuda común (si ese pago se anula,
+ * vuelve a Cuentas corrientes, no a un echeq que nadie hizo). Si se anula el
+ * pago parcial, vuelve a subir hasta lo que la factura debe de nuevo. Lo corre
+ * el puente de pagos con la factura todavía con saldo; saldada, el puente ya lo
+ * da de baja.
+ */
+export async function ajustarPendientesTx(tx: any, comprobanteId: number) {
+  const ks = await tx.select({
+    id: proveedorCompromisos.id,
+    echeqId: proveedorCompromisos.echeqId,
+    importe: proveedorEcheqs.importe,
+    falta: faltaCompromiso,
+  }).from(proveedorCompromisos)
+    .innerJoin(proveedorEcheqs, eq(proveedorEcheqs.id, proveedorCompromisos.echeqId))
+    .where(and(
+      eq(proveedorCompromisos.comprobanteId, comprobanteId),
+      eq(proveedorCompromisos.pagado, false),
+      eq(proveedorEcheqs.estado, 'pendiente'),
+    ));
+  const porEcheq = new Map<number, { importe: number; falta: number; ks: number[] }>();
+  for (const k of ks) {
+    const e = porEcheq.get(k.echeqId) ?? { importe: Number(k.importe), falta: 0, ks: [] };
+    e.falta = money(e.falta + Number(k.falta));
+    e.ks.push(k.id);
+    porEcheq.set(k.echeqId, e);
+  }
+  for (const [echeqId, e] of porEcheq) {
+    if (e.falta <= EPS) {
+      await tx.update(proveedorEcheqs).set({ estado: 'anulado', obs: 'No se hizo: la factura se pagó por otro medio.' })
+        .where(and(eq(proveedorEcheqs.id, echeqId), eq(proveedorEcheqs.estado, 'pendiente')));
+      await deudaACuentaCorriente(tx, echeqId);
+    } else if (Math.abs(e.falta - e.importe) > EPS) {
+      await tx.update(proveedorEcheqs).set({ importe: e.falta })
+        .where(and(eq(proveedorEcheqs.id, echeqId), eq(proveedorEcheqs.estado, 'pendiente')));
+    }
+  }
+}

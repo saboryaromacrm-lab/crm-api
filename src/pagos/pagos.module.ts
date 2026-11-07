@@ -41,7 +41,7 @@ import { resolverOperador } from '../usuarios/usuarios.module';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { ABREV_TIPO, etiquetaDoc, numeroDoc } from '../common/documentos';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
-import { ECHEQ_EN_CARTERA } from '../proveedores/echeqs';
+import { ECHEQ_EN_CARTERA, ECHEQ_VIVOS, ajustarPendientesTx, faltaCompromiso } from '../proveedores/echeqs';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia, nombreCuentaSql } from './cuentas-propias';
 import {
@@ -366,7 +366,9 @@ export class PagosProveedorService implements OnApplicationBootstrap {
    *  · Factura CON SALDO → se reabren los compromisos cuyo cerrador ya no
    *    está: pago anulado/desaplicado, o una NC (pagoId null) ahora anulada.
    *    El compromiso cerrado por un pago QUE SIGUE APLICADO no se toca — es
-   *    una CUOTA pagada de verdad aunque el resto de la factura deba.
+   *    una CUOTA pagada de verdad aunque el resto de la factura deba. Y el
+   *    echeq pendiente de hacer queda por lo que su parte todavía debe
+   *    (7/11/2026, `ajustarPendientesTx`): pagada en parte por otro medio, baja.
    */
   async sincronizarCompromisos(tx: any, comprobanteId: number, pagoCerradorId: number | null) {
     const comps = await tx.select().from(proveedorCompromisos)
@@ -411,7 +413,12 @@ export class PagosProveedorService implements OnApplicationBootstrap {
     }
 
     const cerrados = comps.filter((x: any) => x.pagado);
-    if (!cerrados.length) return;
+    if (cerrados.length) await this.reabrirCompromisos(tx, comprobanteId, cerrados);
+    await ajustarPendientesTx(tx, comprobanteId);
+  }
+
+  /** Los compromisos cerrados por un pago que ya no está aplicado vuelven a deber (rama «con saldo» del puente). */
+  private async reabrirCompromisos(tx: any, comprobanteId: number, cerrados: any[]) {
     const vivos = await tx.select({ pagoId: proveedorImputaciones.pagoId })
       .from(proveedorImputaciones)
       .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
@@ -696,7 +703,30 @@ export class PagosProveedorService implements OnApplicationBootstrap {
 
     /* Lo que las notas le sumaron o restaron a cada uno de esos documentos. */
     const ajustes = new Map<number, number>();
+    /*
+     * Los echeqs vivos que cubren cada factura (7/11/2026): quien la paga ve si
+     * ya tiene uno hecho (pagarla también es pagar dos veces) o uno pendiente de
+     * hacer (que se da de baja solo al pagarla por otro medio).
+     */
+    const echeqsDe = new Map<number, Array<{ id: number; estado: string; numero: string; banco: string; fechaVenc: Date; cubre: number }>>();
     if (cs.length) {
+      const ks = await ex.select({
+        comprobanteId: proveedorCompromisos.comprobanteId,
+        id: proveedorEcheqs.id, estado: proveedorEcheqs.estado, numero: proveedorEcheqs.numero,
+        banco: proveedorEcheqs.banco, fechaVenc: proveedorEcheqs.fechaVenc, cubre: faltaCompromiso,
+      }).from(proveedorCompromisos)
+        .innerJoin(proveedorEcheqs, eq(proveedorEcheqs.id, proveedorCompromisos.echeqId))
+        .where(and(
+          inArray(proveedorCompromisos.comprobanteId, cs.map((c: any) => c.id)),
+          eq(proveedorCompromisos.pagado, false),
+          inArray(proveedorEcheqs.estado, ECHEQ_VIVOS),
+        )).orderBy(proveedorEcheqs.fechaVenc, proveedorEcheqs.id);
+      for (const k of ks) {
+        if (Number(k.cubre) <= EPS) continue;
+        const l = echeqsDe.get(k.comprobanteId!) ?? [];
+        l.push({ id: k.id, estado: k.estado, numero: k.numero, banco: k.banco, fechaVenc: k.fechaVenc, cubre: money(Number(k.cubre)) });
+        echeqsDe.set(k.comprobanteId!, l);
+      }
       const notas = await ex.select({
         ref: comprobantes.refComprobanteId,
         tipo: comprobantes.tipo,
@@ -739,6 +769,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
           // pueda decir POR QUÉ el saldo no es total − pagado.
           ajuste: money(ajuste),
           saldo: money(c.total + ajuste - c.pagado),
+          echeqs: echeqsDe.get(c.id) ?? [],
         };
       // Saldado (o dado vuelta por una NC grande) no se ofrece para pagar.
       }).filter((d) => d.saldo > EPS),
