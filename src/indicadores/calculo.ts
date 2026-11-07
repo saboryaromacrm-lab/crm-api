@@ -108,7 +108,7 @@ export async function calcularIndicadores(c: PoolClient, f: Filtro) {
 
   return {
     desde: f.desde, hasta: f.hasta, sucursalId: f.sucursalId,
-    anterior: { desde: ant.desde, hasta: ant.hasta },
+    anterior: { desde: ant.desde, hasta: ant.hasta }, comparar: f.comparar === 'mes' ? 'mes' : 'anterior',
     anioPasado: { desde: anio.desde, hasta: anio.hasta },
     valores: {
       crecimiento: variacion(ahora.venta, antes.venta),

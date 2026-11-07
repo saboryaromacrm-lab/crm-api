@@ -21,7 +21,12 @@ export type Lente = (typeof LENTES)[number];
 export const TIPOS = ['granel', 'entero'] as const;
 export type TipoVenta = (typeof TIPOS)[number];
 
-export interface Filtro { desde: string; hasta: string; sucursalId: number | null; tipo?: TipoVenta | null }
+/**
+ * `comparar: 'mes'` (Indicadores, 7/11/2026): «el período anterior» pasa a ser
+ * el mismo período del mes anterior (del 2 al 7 de noviembre → del 2 al 7 de
+ * octubre) en vez de los días justo antes, del mismo largo.
+ */
+export interface Filtro { desde: string; hasta: string; sucursalId: number | null; tipo?: TipoVenta | null; comparar?: 'mes' | null }
 
 export const N = (x: unknown) => Number(x ?? 0) || 0;
 export const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -31,8 +36,25 @@ export const variacion = (ahora: number, antes: number) => (antes > 0 ? r2(((aho
 const MS_DIA = 86_400_000;
 const diasEntre = (a: string, b: string) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / MS_DIA);
 
-/** El período inmediatamente anterior, del mismo largo: contra qué se compara. */
+/**
+ * El mismo día, un mes antes. Si ese mes es más corto, su último día (31/3 →
+ * 28/2); con `finDeMes`, el último día de un mes cae en el último del anterior
+ * (30/11 → 31/10), así un mes entero se compara con el mes entero.
+ */
+export function unMesAntes(dia: string, finDeMes = false): string {
+  const [a, m, d] = dia.split('-').map(Number);
+  const ultimoDe = (anio: number, mes: number) => new Date(Date.UTC(anio, mes, 0)).getUTCDate(); // mes 1-12
+  const [aa, ma] = m === 1 ? [a - 1, 12] : [a, m - 1];
+  const tope = ultimoDe(aa, ma);
+  const dd = finDeMes && d === ultimoDe(a, m) ? tope : Math.min(d, tope);
+  return `${aa}-${String(ma).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+}
+
+/** El período contra el que se compara: los días justo antes, del mismo largo, o el mismo período del mes anterior. */
 export function periodoAnterior(f: Filtro): Filtro {
+  if (f.comparar === 'mes') {
+    return { desde: unMesAntes(f.desde), hasta: unMesAntes(f.hasta, true), sucursalId: f.sucursalId, tipo: f.tipo ?? null };
+  }
   const n = diasEntre(f.desde, f.hasta) + 1;
   return { desde: sumarDias(f.desde, -n), hasta: sumarDias(f.desde, -1), sucursalId: f.sucursalId, tipo: f.tipo ?? null };
 }

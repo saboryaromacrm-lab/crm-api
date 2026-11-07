@@ -46,7 +46,7 @@ class ObjetivosDto {
 export class IndicadoresService {
   constructor(private readonly metricas: MetricasService, @Inject(DRIZZLE) private readonly db: Database) {}
 
-  private filtro(q: { desde?: string; hasta?: string; sucursalId?: string }) {
+  private filtro(q: { desde?: string; hasta?: string; sucursalId?: string; comparar?: string }) {
     const hoy = hoyAr();
     const desde = diaValido(q.desde) ? q.desde! : `${hoy.slice(0, 8)}01`;
     const hasta = diaValido(q.hasta) ? q.hasta! : hoy;
@@ -54,7 +54,8 @@ export class IndicadoresService {
     const dias = Math.round((Date.parse(`${hasta}T00:00:00Z`) - Date.parse(`${desde}T00:00:00Z`)) / 86_400_000) + 1;
     if (dias > MAX_DIAS) throw new BadRequestException('El período puede ser de hasta un año.');
     const suc = Number(q.sucursalId);
-    return { desde, hasta, sucursalId: Number.isInteger(suc) && suc > 0 ? suc : null };
+    /* «Contra el período anterior» o contra el mismo período del mes anterior (7/11/2026). */
+    return { desde, hasta, sucursalId: Number.isInteger(suc) && suc > 0 ? suc : null, comparar: q.comparar === 'mes' ? 'mes' as const : null };
   }
 
   async indicadores(q: any) {
