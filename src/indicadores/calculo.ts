@@ -11,6 +11,7 @@
  */
 import type { PoolClient } from 'pg';
 import { N, donde, pct, periodoAnterior, r2, reporteGranel, reporteMargenes, variacion, type Filtro } from '../metricas/consultas';
+import { leerActividad, porDiaAbierto } from '../metricas/actividad';
 import { desglose } from '../metricas/ofertas';
 
 const MS_DIA = 86_400_000;
@@ -79,7 +80,7 @@ export async function calcularIndicadores(c: PoolClient, f: Filtro) {
   const wh = donde(f, 'h');
   const wd = donde(f, 'd');
   const wp = donde(f, 'p');
-  const [ahora, antes, anioPasado, sucs, sucsAnt, horas, semana, medios, mCat, mSuc, granel, desc, caja, bajo] = await Promise.all([
+  const [ahora, antes, anioPasado, sucs, sucsAnt, horas, semana, medios, mCat, mSuc, granel, desc, caja, bajo, abrioAhora, abrioAntes] = await Promise.all([
     ventasYTickets(c, f),
     ventasYTickets(c, ant),
     ventasYTickets(c, anio),
@@ -96,6 +97,8 @@ export async function calcularIndicadores(c: PoolClient, f: Filtro) {
     desglose(c, f),
     cierres(c, f),
     bajoCosto(c, f),
+    leerActividad(c, f),
+    leerActividad(c, ant),
   ]);
 
   const tp = (x: { venta: number; tickets: number }) => (x.tickets > 0 ? x.venta / x.tickets : 0);
@@ -112,6 +115,8 @@ export async function calcularIndicadores(c: PoolClient, f: Filtro) {
     anioPasado: { desde: anio.desde, hasta: anio.hasta },
     valores: {
       crecimiento: variacion(ahora.venta, antes.venta),
+      /* Por día abierto (9/11/2026): un período con feriados no parece una caída. */
+      crecimientoPorDia: variacion(porDiaAbierto(ahora.venta, abrioAhora) ?? 0, porDiaAbierto(antes.venta, abrioAntes) ?? 0),
       crecimientoAnual: variacion(ahora.venta, anioPasado.venta),
       tickets: variacion(ahora.tickets, antes.tickets),
       ticketPromedio: variacion(tp(ahora), tp(antes)),
@@ -134,6 +139,9 @@ export async function calcularIndicadores(c: PoolClient, f: Filtro) {
       granelMargen: granel.granel.margenPct,
       enterosMargen: granel.entero.margenPct,
       anioPasadoSinDatos: anioPasado.venta === 0,
+      /* Cantidades de días y turnos: ni un peso. */
+      actividad: { dias: abrioAhora.dias, abiertos: abrioAhora.abiertos, turnos: abrioAhora.turnos, sinAbrir: abrioAhora.sinAbrir },
+      actividadAnterior: { dias: abrioAntes.dias, abiertos: abrioAntes.abiertos, turnos: abrioAntes.turnos },
     },
     sucursales: [...sucs.entries()]
       .map(([id, x]) => ({ id, nombre: x.nombre, pct: x.pct, puntos: puntos(x.pct, sucsAnt.get(id)?.pct ?? null) }))

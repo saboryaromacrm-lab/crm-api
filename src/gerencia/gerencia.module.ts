@@ -24,6 +24,8 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { veMetricasDelCafe } from '../auth/auth.guard';
 import { totalesCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { leerActividad, porDiaAbierto } from '../metricas/actividad';
+import { MetricasModule, MetricasService } from '../metricas/metricas.module';
 import {
   categorias, comprobantes, envioCafeteriaItems, enviosCafeteria, facturacionesMesFacturas, gastos, marcas, productoProveedores,
   productos, proveedores, stock, sucursales, ventaItems, ventaPagos, ventas,
@@ -55,9 +57,15 @@ const dia = (v?: string) => {
   return Number.isNaN(d.getTime()) ? null : d;
 };
 
+/** Date local → 'AAAA-MM-DD' (el proceso corre con la hora argentina). */
+const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
 @Injectable()
 export class RentabilidadService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly metricas: MetricasService,
+  ) {}
 
   async rentabilidad(q: { desde?: string; hasta?: string; sucursalId?: number | null }) {
     /* El período: por defecto, del 1° del mes hasta hoy. `hastaEx` es EXCLUSIVO
@@ -69,7 +77,7 @@ export class RentabilidadService {
     const hastaEx = new Date(hastaInc.getFullYear(), hastaInc.getMonth(), hastaInc.getDate() + 1);
     const suc = q.sucursalId || null;
 
-    const [filasVenta, filasSucursal, sucs, fiscalVentas, filasCompra, filaGastos, financiacion, coffit, provRows, prods, ms, cs] = await Promise.all([
+    const [filasVenta, filasSucursal, sucs, fiscalVentas, filasCompra, filaGastos, financiacion, coffit, provRows, prods, ms, cs, actividad] = await Promise.all([
       this.ventasAgrupadas(desde, hastaEx, suc, 'producto'),
       // Con un local elegido, la comparación entre locales no hace falta.
       suc ? Promise.resolve([]) : this.ventasAgrupadas(desde, hastaEx, null, 'sucursal'),
@@ -83,6 +91,8 @@ export class RentabilidadService {
       this.db.select().from(productos).where(ne(productos.estado, 'archivado' as any)),
       this.db.select().from(marcas),
       this.db.select().from(categorias),
+      /* Días abiertos y turnos (9/11/2026): para leer la venta por día abierto. */
+      this.metricas.leer((c) => leerActividad(c, { desde: iso(desde), hasta: iso(hastaInc), sucursalId: suc })),
     ]);
 
     /* ---- El formato activo de cada producto: proveedor, % y costos de HOY ---- */
@@ -152,6 +162,9 @@ export class RentabilidadService {
       participacion: totales.ventaNeta !== 0 ? r2((f.ventaNeta / totales.ventaNeta) * 100) : 0,
       renglones: f.renglones,
       conCosto: f.conCosto,
+      diasAbiertos: actividad.porSucursal[f.clave]?.dias ?? 0,
+      turnos: actividad.porSucursal[f.clave]?.turnos ?? 0,
+      ventaPorDia: porDiaAbierto(f.ventaNeta, { abiertos: actividad.porSucursal[f.clave]?.dias ?? 0 }),
     })).sort((a: any, b: any) => b.ventaNeta - a.ventaNeta);
 
     const sf = porProductoOut.filter((x) => x.sinFactura);
@@ -251,6 +264,7 @@ export class RentabilidadService {
       /** Para el filtro: las activas (0143). Una desactivada con ventas igual figura en `porSucursal`. */
       sucursales: sucs.filter((x) => x.activa).map(({ id, nombre }) => ({ id, nombre })),
       porSucursal,
+      actividad: { ...actividad, ventaPorDia: porDiaAbierto(totales.ventaNeta, actividad) },
       sinFactura,
       /** Lo que entró por financiar, aparte de lo que entró por vender (0100). */
       recargoCuotas,
@@ -505,6 +519,7 @@ export class GerenciaController {
 }
 
 @Module({
+  imports: [MetricasModule],
   controllers: [GerenciaController],
   providers: [RentabilidadService],
 })

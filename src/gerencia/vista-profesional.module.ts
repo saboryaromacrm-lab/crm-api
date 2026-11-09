@@ -17,6 +17,8 @@
  *   proveedores    = el saldo del estado de cuenta de cada uno (lo que les
  *                    debés; los saldos a favor van aparte).
  *   clientes       = lo que falta cobrar de las ventas en cuenta corriente.
+ *   días abiertos  = los de `metricas/actividad.ts` (9/11/2026): días con venta
+ *                    de mostrador y turnos de caja, del negocio y por local.
  *
  * Los «días» (de stock, de cobro, de pago) se miden contra el ritmo de los
  * últimos 90 días: un mes flojo no los dispara.
@@ -29,6 +31,7 @@ import { asc } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { sucursales } from '../db/schema';
 import { hoyAr, sumarDias } from '../cafeteria/cuenta';
+import { diasPorLocal, resumirActividad } from '../metricas/actividad';
 import { CLASE_VENTA } from '../metricas/iva';
 import { MetricasModule, MetricasService } from '../metricas/metricas.module';
 import { ResultadosModule, ResultadosService } from '../resultados/resultados.module';
@@ -108,7 +111,7 @@ export class VistaProfesionalService {
     const SIGNO = `(case when v.tipo::text like 'nota_credito%' then -1 else 1 end)`;
     const desde90 = sumarDias(hoy, -(VENTANA_DIAS - 1));
 
-    const [ventas, costos, medios, ritmo, clientes] = await this.metricas.leer((c) => Promise.all([
+    const [ventas, costos, medios, ritmo, clientes, diasLocales] = await this.metricas.leer((c) => Promise.all([
       c.query(`
         select ${PER} as p, coalesce(v.sucursal_id, 0) as suc,
           count(*) filter (where v.tipo::text not like 'nota_credito%')::int as tickets,
@@ -152,6 +155,7 @@ export class VistaProfesionalService {
                       and n.condicion_pago = 'cuenta_corriente' and n.tipo::text like 'nota_credito%'), 0))), 0) as saldo
         from ventas v
         where v.estado = 'confirmada' and v.condicion_pago = 'cuenta_corriente' and v.tipo::text not like 'nota_credito%'`),
+      diasPorLocal(c, inicio, hoy),
     ]));
 
     /* ---- Por período y por local ---- */
@@ -215,10 +219,14 @@ export class VistaProfesionalService {
         for (const [g, v] of Object.entries(x.medios)) total.medios[g] = (total.medios[g] ?? 0) + v;
       }
       const mes = porMes.get(p.clave.slice(0, 7));
+      const act = resumirActividad(diasLocales, p.desde, p.hasta, hoy);
       return {
         ...p,
-        total: { ...redondear(total), resultado: resultadoDe(mes, null) },
-        porLocal: Object.fromEntries([...m.entries()].map(([suc, x]) => [suc, { ...redondear(x), resultado: resultadoDe(mes, suc) }])),
+        total: { ...redondear(total), resultado: resultadoDe(mes, null), diasAbiertos: act.abiertos, turnos: act.turnos, sinAbrir: act.sinAbrir },
+        porLocal: Object.fromEntries([...m.entries()].map(([suc, x]) => [suc, {
+          ...redondear(x), resultado: resultadoDe(mes, suc),
+          diasAbiertos: act.porSucursal[suc]?.dias ?? 0, turnos: act.porSucursal[suc]?.turnos ?? 0,
+        }])),
       };
     });
 

@@ -29,7 +29,7 @@ const CLAVE = 'indicadores_objetivos';
 
 /** Los indicadores que llevan objetivo (la pantalla tiene los textos y los valores de partida). */
 export const CON_OBJETIVO = [
-  'crecimiento', 'crecimientoAnual', 'tickets', 'ticketPromedio', 'credito',
+  'crecimiento', 'crecimientoPorDia', 'crecimientoAnual', 'tickets', 'ticketPromedio', 'credito',
   'margen', 'granel', 'descuentos', 'bajoCosto',
   'parado', 'sobrestock', 'porAgotarse',
   'cierresDiferencia', 'notas',

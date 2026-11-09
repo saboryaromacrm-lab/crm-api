@@ -11,6 +11,7 @@
  */
 import type { PoolClient } from 'pg';
 import { sumarDias } from '../cafeteria/cuenta';
+import { leerActividad, porDiaAbierto } from './actividad';
 
 export const PASOS = { dia: 'day', semana: 'week', mes: 'month' } as const;
 export type Paso = keyof typeof PASOS;
@@ -87,20 +88,27 @@ export const donde = (f: Filtro, a: string, conTipo = false) => ({
 
 /* ============================== VENTAS ============================== */
 
+/**
+ * El promedio por día es por DÍA ABIERTO (9/11/2026, ver `actividad.ts`): un
+ * mes con feriados no parece flojo. `diasConVenta` queda con ese mismo número
+ * porque lo lee el Asesor.
+ */
 const sumaVentas = async (c: PoolClient, f: Filtro) => {
   const w = donde(f, 'd');
-  const r = await c.query(
-    `SELECT coalesce(sum(d.tickets), 0)::float8 AS tickets, coalesce(sum(d.notas), 0)::float8 AS notas,
-       coalesce(sum(d.venta_neta), 0) AS venta_neta, coalesce(sum(d.descuento), 0) AS descuento,
-       coalesce(sum(d.iva), 0) AS iva, coalesce(sum(d.total), 0) AS total,
-       count(DISTINCT d.dia) FILTER (WHERE d.tickets > 0)::float8 AS dias
-     FROM metricas_venta_dia d WHERE ${w.sql}`, w.params);
+  const [r, actividad] = await Promise.all([
+    c.query(
+      `SELECT coalesce(sum(d.tickets), 0)::float8 AS tickets, coalesce(sum(d.notas), 0)::float8 AS notas,
+         coalesce(sum(d.venta_neta), 0) AS venta_neta, coalesce(sum(d.descuento), 0) AS descuento,
+         coalesce(sum(d.iva), 0) AS iva, coalesce(sum(d.total), 0) AS total
+       FROM metricas_venta_dia d WHERE ${w.sql}`, w.params),
+    leerActividad(c, f),
+  ]);
   const x = r.rows[0];
   const t = {
     tickets: N(x.tickets), notas: N(x.notas), ventaNeta: r2(N(x.venta_neta)), descuento: r2(N(x.descuento)),
-    iva: r2(N(x.iva)), total: r2(N(x.total)), diasConVenta: N(x.dias),
+    iva: r2(N(x.iva)), total: r2(N(x.total)), diasConVenta: actividad.abiertos,
   };
-  return { ...t, ticketPromedio: t.tickets > 0 ? r2(t.ventaNeta / t.tickets) : 0, promedioPorDia: t.diasConVenta > 0 ? r2(t.ventaNeta / t.diasConVenta) : 0 };
+  return { ...t, actividad, ticketPromedio: t.tickets > 0 ? r2(t.ventaNeta / t.tickets) : 0, promedioPorDia: porDiaAbierto(t.ventaNeta, actividad) ?? 0 };
 };
 
 export async function reporteVentas(c: PoolClient, f: Filtro, paso: Paso) {
@@ -149,7 +157,10 @@ export async function reporteVentas(c: PoolClient, f: Filtro, paso: Paso) {
   const total = totales.ventaNeta;
   return {
     desde: f.desde, hasta: f.hasta, paso,
-    totales: { ...totales, variacionVenta: variacion(totales.ventaNeta, anterior.ventaNeta), variacionTickets: variacion(totales.tickets, anterior.tickets) },
+    totales: {
+      ...totales, variacionVenta: variacion(totales.ventaNeta, anterior.ventaNeta), variacionTickets: variacion(totales.tickets, anterior.tickets),
+      variacionPorDia: variacion(totales.promedioPorDia, anterior.promedioPorDia),
+    },
     anterior: { desde: ant.desde, hasta: ant.hasta, ...anterior },
     serie: periodos(f.desde, f.hasta, paso).map((p) => {
       const x: any = porPeriodo.get(p);
@@ -159,6 +170,7 @@ export async function reporteVentas(c: PoolClient, f: Filtro, paso: Paso) {
     porSucursal: sucs.rows.map((x: any) => ({
       sucursalId: N(x.sucursal_id), nombre: x.nombre, tickets: N(x.tickets), ventaNeta: r2(N(x.venta_neta)), total: r2(N(x.total)),
       ticketPromedio: N(x.tickets) > 0 ? r2(N(x.venta_neta) / N(x.tickets)) : 0, participacion: pct(N(x.venta_neta), total),
+      diasAbiertos: totales.actividad.porSucursal[N(x.sucursal_id)]?.dias ?? 0,
     })),
     porHora: horas.rows.map((x: any) => ({ hora: N(x.hora), tickets: N(x.tickets), ventaNeta: r2(N(x.venta_neta)) })),
     porDiaSemana: semana.rows.map((x: any) => ({
@@ -478,7 +490,7 @@ const resumenComparable = async (c: PoolClient, f: Filtro) => {
   return {
     desde: f.desde, hasta: f.hasta,
     ventaNeta: v.ventaNeta, tickets: v.tickets, ticketPromedio: v.ticketPromedio, promedioPorDia: v.promedioPorDia,
-    diasConVenta: v.diasConVenta, total: v.total, descuento: v.descuento, notas: v.notas,
+    diasConVenta: v.diasConVenta, actividad: v.actividad, total: v.total, descuento: v.descuento, notas: v.notas,
     costo: m.costo, margen: m.margen, margenPct: m.margenPct, ventaSinCosto: r2(m.ventaNeta - m.ventaCosteada),
     ventaGranel: g.granel.ventaNeta, ventaEnteros: g.entero.ventaNeta, pctGranel: pct(g.granel.ventaNeta, g.total.ventaNeta),
     kilosGranel: g.granel.cantidadBase, unidadesEnteros: g.entero.unidades,

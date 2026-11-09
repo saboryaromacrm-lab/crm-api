@@ -40,6 +40,7 @@ import {
   auditoria, bienesUso, empleadoSueldos, empleados, gananciasEscalas, gastoCategorias, resultadosConfig,
   resultadosObjetivos, resultadosTasas, sucursales,
 } from '../db/schema';
+import { diasPorLocal, resumirActividad } from '../metricas/actividad';
 import { reporteIva } from '../metricas/iva';
 import { MetricasModule, MetricasService } from '../metricas/metricas.module';
 import { leerCatalogos, leerHechos, leerObjetivos } from './datos';
@@ -192,12 +193,13 @@ export class ResultadosService {
     return this.metricas.leer(async (c) => {
       const empresa = await c.query(`select valor from configuracion where clave = 'empresa'`);
       const v: any = empresa.rows[0]?.valor ?? {};
-      const [hechos, cat, objetivos, iva] = await Promise.all([
+      const [hechos, cat, objetivos, iva, dias] = await Promise.all([
         leerHechos(c, inicio, finEx),
         leerCatalogos(c, Number(desde.slice(0, 4))),
         leerObjetivos(c, `${desde}-01`, finEx),
         reporteIva(c, { desde: `${desde}-01`, hasta: ultimoDia, sucursalId: null },
           { importe: Number(v.ivaSaldoInicial) || 0, mes: String(v.ivaSaldoMes ?? '') }),
+        diasPorLocal(c, inicio, ultimoDia),
       ]);
       const { meses, avisosGanancias } = armarEstado(hechos, cat, calculo, new Set(pedidos), foco, hoy);
       const ivaDe = new Map(iva.meses.map((m: any) => [m.mes, m]));
@@ -211,6 +213,8 @@ export class ResultadosService {
             saldoAnterior: r2(i.saldoAnterior ?? 0), aPagar: r2(i.aPagar ?? 0), saldoAFavor: r2(i.saldoAFavor ?? 0),
             sinFactura: r2(m.total.hechos.ivaSinFactura),
           },
+          /* Días abiertos y turnos del mes, del negocio y por local (9/11/2026): `porSucursal` va por el id del balde. */
+          actividad: resumirActividad(dias, `${m.mes}-01`, `${m.mes}-${String(diasDelMes(m.mes)).padStart(2, '0')}`, hoy),
         };
       });
       return {
