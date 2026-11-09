@@ -77,6 +77,8 @@ export interface Sesion {
    * a ningún filtro. Quien lea `sucursalId` a mano tiene que mirar esto antes.
    */
   sinSucursal: boolean;
+  /** Entra en cualquier sucursal y cambia desde el encabezado (0224, `rolCruzaSucursales`). */
+  cruzaSucursales: boolean;
 }
 
 /**

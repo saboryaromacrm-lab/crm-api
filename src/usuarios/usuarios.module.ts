@@ -20,14 +20,14 @@ import {
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { personal, roles, sucursales, usuarios } from '../db/schema';
+import { MODOS_SUCURSAL, personal, roles, sucursales, usuarios } from '../db/schema';
 import { marcarEmpleado } from '../personal/personal';
 import { HORAS_VIDA_RECORDADA, SesionesService } from '../auth/sesiones.service';
 import { FrenoLogin } from '../auth/freno-login';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { PERMISOS_BASE, conPermisosBase } from '../auth/permisos-base';
 import { Auth, Permiso, Publico, type Sesion } from '../auth/auth.decoradores';
-import { esJefe } from '../auth/auth.guard';
+import { rolCruzaSucursales } from '../auth/modo-sucursal';
 /* Dos funciones sueltas, no un servicio: el login las necesita antes de que
  * exista sesión y así Usuarios no tiene que importar el módulo Sucursales
  * entero por una consulta. */
@@ -410,14 +410,14 @@ function publico(u: any, r: any) {
     sucursales: Array.isArray(u.sucursales) ? u.sucursales : [],
     /** Descuento a mano (0147): hasta cuánto %. 0 = no puede. */
     descuentoManualMax: Number(u.descuentoManualMax) || 0,
+    /** Entra en cualquier sucursal y cambia desde el encabezado (0224). */
+    cruzaSucursales: rolCruzaSucursales(r),
   };
 }
 
-/** Admin y superadmin cruzan sucursales: la lista de `usuarios.sucursales` no los ata. */
-function rolQueCruza(r: any) {
-  return r?.clave === 'admin' || r?.clave === 'superadmin'
-    || (Array.isArray(r?.permisos) && (r.permisos as string[]).includes('*'));
-}
+const NOMBRE_MODO_SUCURSAL: Record<string, string> = {
+  usuario: 'Las de cada usuario', libre: 'Libre (cualquiera, cambia desde el encabezado)', ninguna: 'No trabaja en una sucursal',
+};
 
 /** El PIN del relevo: corto a propósito (se tipea con un cliente esperando),
  *  y por eso con freno de intentos en `verificarRelevo`. */
@@ -538,11 +538,26 @@ export class UsuariosService {
    *
    * El superadmin queda exento, como en `validarPermisos`.
    */
+  /**
+   * CÓMO ENTRA A LAS SUCURSALES (0224), validado. «Libre» es poder pararse en
+   * cualquier sucursal: como un permiso, no lo da quien no lo tiene.
+   */
+  private validarModoSucursal(modo: unknown, sesion?: Sesion): (typeof MODOS_SUCURSAL)[number] {
+    if (!(MODOS_SUCURSAL as readonly unknown[]).includes(modo)) throw new BadRequestException('Elegí cómo entra a las sucursales.');
+    if (modo === 'libre' && !sesion?.cruzaSucursales) {
+      throw new ForbiddenException('No podés dar «Libre»: tu usuario no entra en cualquier sucursal.');
+    }
+    return modo as (typeof MODOS_SUCURSAL)[number];
+  }
+
   private exigirPuedeAsignarRol(rol: any, sesion?: Sesion) {
     if (rolDeMando(rol) && !esSuperadmin(sesion)) {
       throw new ForbiddenException('Solo el superadmin puede nombrar a otro superadmin.');
     }
     if (esSuperadmin(sesion)) return;
+    if (rol?.modoSucursal === 'libre' && !sesion?.cruzaSucursales) {
+      throw new ForbiddenException(`No podés asignar el rol "${rol.nombre}": entra en cualquier sucursal y tu usuario no.`);
+    }
     const propios = new Set(sesion?.permisos ?? []);
     const deMas = (rol?.permisos ?? []).filter((p: string) => !CLAVES_LEGADAS.has(p) && !propios.has(p));
     if (deMas.length) {
@@ -561,13 +576,15 @@ export class UsuariosService {
     const [ya] = await this.db.select().from(roles).where(eq(roles.clave, clave)).limit(1);
     if (ya) throw new BadRequestException(`Ya existe un rol con la clave "${clave}".`);
     const permisos = this.validarPermisos(o?.permisos ?? ['ver'], sesion);
+    const modoSucursal = this.validarModoSucursal(o?.modoSucursal ?? 'usuario', sesion);
     const r = await this.db.transaction(async (tx) => {
       const [nuevo] = await tx.insert(roles).values({
-        clave, nombre, descripcion: (o?.descripcion ?? '').trim(), permisos, esSistema: false,
+        clave, nombre, descripcion: (o?.descripcion ?? '').trim(), permisos, esSistema: false, modoSucursal,
       }).returning();
       const base = { entidad: 'rol', entidadId: nuevo.id, ambito: 'Roles y permisos', detalle: nombre, usuarioId: sesion?.usuarioId ?? null };
       await this.audit.registrar([
         { ...base, campo: 'Rol creado', despues: nombre },
+        { ...base, campo: 'Sucursales', despues: NOMBRE_MODO_SUCURSAL[modoSucursal] },
         ...permisos.map((p) => ({ ...base, campo: 'Permiso dado', despues: nombrePermiso(p) })),
       ], tx);
       return nuevo;
@@ -588,11 +605,14 @@ export class UsuariosService {
     }
     if (o?.descripcion != null) patch.descripcion = String(o.descripcion).trim();
     if (o?.permisos != null) patch.permisos = this.validarPermisos(o.permisos, sesion);
+    if (o?.modoSucursal != null && o.modoSucursal !== r.modoSucursal) patch.modoSucursal = this.validarModoSucursal(o.modoSucursal, sesion);
     if (!Object.keys(patch).length) return { ok: true };
     /* Repartir permisos es la llave de todas las demás: cada uno que entra o sale queda firmado. */
     const base = { entidad: 'rol', entidadId: id, ambito: 'Roles y permisos', detalle: patch.nombre ?? r.nombre, usuarioId: sesion?.usuarioId ?? null };
-    const cambios = this.audit.diferencias(base, { nombre: r.nombre, descripcion: r.descripcion ?? '' },
-      { nombre: patch.nombre ?? r.nombre, descripcion: patch.descripcion ?? r.descripcion ?? '' }, { nombre: 'Nombre', descripcion: 'Descripción' });
+    const cambios = this.audit.diferencias(base,
+      { nombre: r.nombre, descripcion: r.descripcion ?? '', sucursales: NOMBRE_MODO_SUCURSAL[r.modoSucursal] },
+      { nombre: patch.nombre ?? r.nombre, descripcion: patch.descripcion ?? r.descripcion ?? '', sucursales: NOMBRE_MODO_SUCURSAL[patch.modoSucursal ?? r.modoSucursal] },
+      { nombre: 'Nombre', descripcion: 'Descripción', sucursales: 'Sucursales' });
     if (patch.permisos) {
       const antes = new Set<string>(r.permisos ?? []);
       const despues = new Set<string>(patch.permisos);
@@ -788,7 +808,7 @@ export class UsuariosService {
      * `soloSuSucursal` corten antes de mirarlo, y abajo se devuelve
      * `sucursal: null` para que el encabezado tampoco lo muestre.
      */
-    const sinSucursal = !!r?.sinSucursal;
+    const sinSucursal = r?.modoSucursal === 'ninguna';
     if (sinSucursal) {
       const [primera] = await this.db.select().from(sucursales).where(eq(sucursales.activa, true)).orderBy(sucursales.id).limit(1);
       if (!primera) throw new UnauthorizedException('No hay sucursales cargadas.');
@@ -815,7 +835,7 @@ export class UsuariosService {
      * administración cruza igual. El puesto sin sucursal no elige ninguna.
      */
     const permitidas: number[] = Array.isArray(u.sucursales) ? u.sucursales : [];
-    if (!sinSucursal && permitidas.length && !rolQueCruza(r) && !permitidas.includes(suc.id)) {
+    if (!sinSucursal && permitidas.length && !rolCruzaSucursales(r) && !permitidas.includes(suc.id)) {
       const nombres = await this.db.select({ nombre: sucursales.nombre }).from(sucursales)
         .where(and(inArray(sucursales.id, permitidas), eq(sucursales.activa, true))).orderBy(sucursales.id);
       if (!nombres.length) {
@@ -898,11 +918,11 @@ export class UsuariosService {
       this.db.select({
         id: usuarios.id,
         nombre: usuarios.nombre,
-        pideSucursal: sql<boolean>`not ${roles.sinSucursal}`,
+        pideSucursal: sql<boolean>`${roles.modoSucursal} <> 'ninguna'`,
         /* Las sucursales en las que puede entrar (0105), para que el
          * desplegable no ofrezca las ajenas. Vacía = todas. Es la misma
          * información que el desplegable ya muestra, filtrada: no dice rol. */
-        sucursales: sql<number[]>`case when ${roles.clave} in ('admin', 'superadmin') or ${roles.permisos} ? '*' then '[]'::jsonb else ${usuarios.sucursales} end`,
+        sucursales: sql<number[]>`case when ${roles.modoSucursal} = 'libre' or ${roles.permisos} ? '*' then '[]'::jsonb else ${usuarios.sucursales} end`,
       })
         .from(usuarios)
         .innerJoin(roles, eq(roles.id, usuarios.rolId))
@@ -1230,7 +1250,7 @@ export class AuthController {
       usuario: {
         id: sesion.usuarioId, nombre: sesion.nombre, rolId: sesion.rolId,
         rolClave: sesion.rolClave, rolNombre: sesion.rolNombre,
-        permisos: sesion.permisos, activo: true,
+        permisos: sesion.permisos, activo: true, cruzaSucursales: sesion.cruzaSucursales,
       },
       /* Igual que el login: `null` para el puesto que trabaja fuera de las
        * sucursales. Si acá viajara la sucursal de relleno, el primer F5 se la
@@ -1248,14 +1268,13 @@ export class AuthController {
    * mientras el contexto de los módulos, que no se pisa, seguía en la nueva. El
    * encabezado quedaba en una sucursal y Compras/Almacén/Ventas en otra.
    *
-   * Solo el jefe: es el mismo criterio de `esJefe` que usa todo el sistema para
-   * decidir quién atraviesa sucursales, y el mismo con el que el encabezado
-   * decide mostrar el selector. Al cajero la sucursal se la sigue dando el
-   * login.
+   * Solo los roles que entran en cualquier sucursal (0224: «Libre» en el rol;
+   * el superadmin siempre): el mismo criterio con el que el encabezado decide
+   * mostrar el selector. A los demás la sucursal se la da el login.
    */
   @Post('sucursal')
   async cambiarSucursal(@Body() body: any, @Auth() sesion: Sesion) {
-    if (!esJefe(sesion)) {
+    if (!sesion.cruzaSucursales) {
       throw new ForbiddenException('Tu usuario opera en la sucursal con la que entró.');
     }
     const id = Number(body?.sucursalId);

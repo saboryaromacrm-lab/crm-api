@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { roles, sesiones, sucursales, usuarios } from '../db/schema';
 import type { Sesion } from './auth.decoradores';
+import { rolCruzaSucursales } from './modo-sucursal';
 import { conPermisosBase } from './permisos-base';
 
 /**
@@ -81,7 +82,7 @@ export class SesionesService {
         // respuesta, así que el nombre del rol se perdía en el primer F5.
         rolNombre: roles.nombre,
         permisos: roles.permisos,
-        sinSucursal: roles.sinSucursal,
+        modoSucursal: roles.modoSucursal,
         sucursalId: sucursales.id,
         sucursalNombre: sucursales.nombre,
       })
@@ -127,14 +128,15 @@ export class SesionesService {
       rolNombre: f.rolNombre ?? '',
       // Los del rol MÁS los de fábrica (ver `permisos-base.ts`).
       permisos: conPermisosBase(f.permisos as string[], f.rolClave ?? ''),
-      sinSucursal: !!f.sinSucursal,
+      sinSucursal: f.modoSucursal === 'ninguna',
+      cruzaSucursales: rolCruzaSucursales(f),
       /* Para un puesto SIN SUCURSAL estos dos no significan nada: la fila de la
        * sesión necesita una clave foránea y ahí quedó, pero nadie la eligió.
        * El nombre se vacía para que no pueda terminar en un encabezado ni en
        * un comprobante diciendo algo que no pasó; el id se deja porque hay
        * código que lo compara, y `sinSucursal` es el que manda. */
       sucursalId: f.sucursalId,
-      sucursalNombre: f.sinSucursal ? '' : f.sucursalNombre,
+      sucursalNombre: f.modoSucursal === 'ninguna' ? '' : f.sucursalNombre,
     };
   }
 

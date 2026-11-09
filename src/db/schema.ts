@@ -182,6 +182,9 @@ export const medioHabitualProvEnum = pgEnum('medio_habitual_prov', [
  *  'libre' = pagos a cuenta contra la deuda global (proveedores que entregan
  *  y se les va pagando; la antigüedad se calcula por FIFO en el EDOC). */
 export const modoCuentaProvEnum = pgEnum('modo_cuenta_prov', ['facturas', 'libre']);
+/** Cómo entra un rol a las sucursales (0224): las de su usuario, cualquiera (cambia desde el encabezado) o ninguna. */
+export const MODOS_SUCURSAL = ['usuario', 'libre', 'ninguna'] as const;
+export const modoSucursalEnum = pgEnum('modo_sucursal', MODOS_SUCURSAL);
 
 /**
  * Proveedor. UNA sola tabla para el que trae mercadería y para el que factura
@@ -282,15 +285,17 @@ export const roles = pgTable('roles', {
   permisos: jsonb('permisos').$type<string[]>().notNull().default([]),
   esSistema: boolean('es_sistema').notNull().default(false),
   /**
-   * EL PUESTO TRABAJA FUERA DE LAS SUCURSALES (0098). La cafetería no está
-   * adentro de ninguna: habla CON ellas. Pedirle que elija una al entrar es
-   * pedirle que invente un dato, y ese dato después se cuela en lo que graba.
-   *
-   * Va en el ROL y no en el usuario porque es una propiedad del puesto, no de
-   * la persona. La pantalla de login deja de pedir sucursal y el servidor la
-   * ignora aunque la manden: la decisión es del servidor, no del navegador.
+   * CÓMO ENTRA A LAS SUCURSALES (0224; antes `sin_sucursal`, 0098). Va en el
+   * ROL y no en el usuario porque es una propiedad del puesto, no de la persona.
+   *   · usuario: las tildadas en su usuario (ninguna = elige cualquiera) y se queda.
+   *   · libre:   cualquiera, y cambia desde el encabezado (como el admin). Solo
+   *              dice dónde puede pararse: los permisos son los del rol.
+   *   · ninguna: trabaja FUERA de las sucursales (la cafetería): pedirle que
+   *              elija una sería pedirle que invente un dato. El login no la
+   *              pide y el servidor la ignora aunque la manden.
+   * El superadmin cruza siempre (el comodín), diga lo que diga el campo.
    */
-  sinSucursal: boolean('sin_sucursal').notNull().default(false),
+  modoSucursal: modoSucursalEnum('modo_sucursal').notNull().default('usuario'),
 });
 
 export const usuarios = pgTable('usuarios', {
