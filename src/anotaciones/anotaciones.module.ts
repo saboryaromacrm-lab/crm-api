@@ -6,21 +6,27 @@
  * superadmin (`esJefe`, el mismo criterio de todo el sistema). Fecha, hora y
  * usuario los pone el servidor: el cliente solo manda el texto.
  *
- * No se editan. La borra quien la escribió o el superadmin, y queda marcada
- * (quién y cuándo) en vez de desaparecer de la base.
+ * El texto no se edita. La borra quien la escribió o el superadmin, y queda
+ * marcada (quién y cuándo) en vez de desaparecer de la base.
  *
  * RECORDATORIO (optativo): «que avise con banner y poder elegir a qué usuario
  * avisarle». Una fecha y hora y los usuarios elegidos (cualquier usuario
  * activo, no solo admins). Desde esa hora a cada uno le sale el aviso arriba de
  * toda la app (`GET mis-avisos`) hasta que toca «Listo» (`POST :id/visto`).
  * Esas dos rutas son de cualquier usuario: solo tocan SUS avisos.
+ *
+ * EDITAR EL RECORDATORIO (9/11/2026, pedido del dueño): solo quien escribió la
+ * anotación (ni el superadmin) cambia el día y la hora, a quién avisarle, o lo
+ * saca. Si cambia el día y la hora, el aviso vuelve a salirles a todos (lo
+ * visto era del aviso anterior); si solo cambia a quién, los que ya lo vieron
+ * siguen como vistos.
  */
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
-  NotFoundException, Param, ParseIntPipe, Post, Query,
+  NotFoundException, Param, ParseIntPipe, Post, Put, Query,
 } from '@nestjs/common';
 import { ArrayMaxSize, IsArray, IsInt, IsOptional, IsString, MaxLength } from 'class-validator';
-import { and, asc, desc, eq, inArray, isNull, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, lte, notInArray, sql } from 'drizzle-orm';
 import { Auth, CualquierUsuario, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
@@ -30,11 +36,14 @@ export const MAX_TEXTO = 2000;
 const POR_PAGINA = 20;
 const esSuperadmin = (s: Sesion) => !!s?.permisos?.includes('*');
 
-class AnotacionDto {
-  @IsString() @MaxLength(MAX_TEXTO) texto!: string;
-  /** ISO. Con recordatorio van los dos: cuándo y a quién. */
+/** ISO. Con recordatorio van los dos: cuándo y a quién; sin ninguno, no hay recordatorio. */
+class RecordatorioDto {
   @IsOptional() @IsString() recordarEn?: string;
   @IsOptional() @IsArray() @ArrayMaxSize(100) @IsInt({ each: true }) avisarA?: number[];
+}
+
+class AnotacionDto extends RecordatorioDto {
+  @IsString() @MaxLength(MAX_TEXTO) texto!: string;
 }
 
 @Injectable()
@@ -60,7 +69,7 @@ export class AnotacionesService {
     return {
       hayMas: filas.length > POR_PAGINA,
       filas: filas.slice(0, POR_PAGINA).map(({ usuarioId, ...a }) => ({
-        ...a, puedeBorrar: superadmin || usuarioId === sesion.usuarioId,
+        ...a, puedeBorrar: superadmin || usuarioId === sesion.usuarioId, puedeEditar: usuarioId === sesion.usuarioId,
       })),
     };
   }
@@ -72,26 +81,52 @@ export class AnotacionesService {
       .where(eq(usuarios.activo, true)).orderBy(asc(usuarios.nombre));
   }
 
+  /** El recordatorio pedido, validado: sin fecha ni usuarios = sin recordatorio. */
+  private async recordatorio(dto: RecordatorioDto) {
+    const avisarA = [...new Set(dto.avisarA ?? [])];
+    if (!dto.recordarEn && !avisarA.length) return { recordarEn: null, avisarA };
+    const recordarEn = new Date(dto.recordarEn ?? '');
+    if (!dto.recordarEn || Number.isNaN(recordarEn.getTime())) throw new BadRequestException('Poné el día y la hora del recordatorio.');
+    if (!avisarA.length) throw new BadRequestException('Elegí a quién avisarle.');
+    const activos = await this.db.select({ id: usuarios.id }).from(usuarios)
+      .where(and(inArray(usuarios.id, avisarA), eq(usuarios.activo, true)));
+    if (activos.length !== avisarA.length) throw new BadRequestException('Uno de los usuarios elegidos no existe o está desactivado.');
+    return { recordarEn, avisarA };
+  }
+
   async crear(sesion: Sesion, dto: AnotacionDto) {
     const texto = (dto.texto ?? '').trim();
     if (!texto) throw new BadRequestException('Escribí la anotación.');
-    const avisarA = [...new Set(dto.avisarA ?? [])];
-    const conRecordatorio = !!dto.recordarEn || avisarA.length > 0;
-    let recordarEn: Date | null = null;
-    if (conRecordatorio) {
-      recordarEn = new Date(dto.recordarEn ?? '');
-      if (!dto.recordarEn || Number.isNaN(recordarEn.getTime())) throw new BadRequestException('Poné el día y la hora del recordatorio.');
-      if (!avisarA.length) throw new BadRequestException('Elegí a quién avisarle.');
-      const activos = await this.db.select({ id: usuarios.id }).from(usuarios)
-        .where(and(inArray(usuarios.id, avisarA), eq(usuarios.activo, true)));
-      if (activos.length !== avisarA.length) throw new BadRequestException('Uno de los usuarios elegidos no existe o está desactivado.');
-    }
+    const { recordarEn, avisarA } = await this.recordatorio(dto);
     return this.db.transaction(async (tx) => {
       const [a] = await tx.insert(anotaciones)
         .values({ usuarioId: sesion.usuarioId, usuarioNombre: sesion.nombre, texto, recordarEn })
         .returning({ id: anotaciones.id });
       if (avisarA.length) await tx.insert(anotacionAvisos).values(avisarA.map((usuarioId) => ({ anotacionId: a.id, usuarioId })));
       return { ok: true, id: a.id };
+    });
+  }
+
+  /** Cambiar o sacar el recordatorio: solo quien escribió la anotación. */
+  async editarRecordatorio(sesion: Sesion, id: number, dto: RecordatorioDto) {
+    const { recordarEn, avisarA } = await this.recordatorio(dto);
+    return this.db.transaction(async (tx) => {
+      const [a] = await tx.select({ usuarioId: anotaciones.usuarioId, recordarEn: anotaciones.recordarEn }).from(anotaciones)
+        .where(and(eq(anotaciones.id, id), isNull(anotaciones.borradaEn))).for('update');
+      if (!a) throw new NotFoundException('Esa anotación no existe o ya se borró.');
+      if (a.usuarioId !== sesion.usuarioId) throw new ForbiddenException('El recordatorio lo cambia solo quien escribió la anotación.');
+      await tx.update(anotaciones).set({ recordarEn }).where(eq(anotaciones.id, id));
+      await tx.delete(anotacionAvisos).where(and(
+        eq(anotacionAvisos.anotacionId, id),
+        avisarA.length ? notInArray(anotacionAvisos.usuarioId, avisarA) : undefined,
+      ));
+      if (!avisarA.length) return { ok: true };
+      /* Otro día y hora es otro aviso: lo visto era del anterior. */
+      if (a.recordarEn?.getTime() !== recordarEn!.getTime()) {
+        await tx.update(anotacionAvisos).set({ vistoEn: null }).where(eq(anotacionAvisos.anotacionId, id));
+      }
+      await tx.insert(anotacionAvisos).values(avisarA.map((usuarioId) => ({ anotacionId: id, usuarioId }))).onConflictDoNothing();
+      return { ok: true };
     });
   }
 
@@ -144,6 +179,9 @@ export class AnotacionesController {
   @Get() listar(@Auth() s: Sesion, @Query('antes') antes?: string) { return this.svc.listar(soloJefe(s), antes); }
   @Get('usuarios') usuarios(@Auth() s: Sesion) { soloJefe(s); return this.svc.usuarios(); }
   @Post() crear(@Auth() s: Sesion, @Body() dto: AnotacionDto) { return this.svc.crear(soloJefe(s), dto); }
+  @Put(':id/recordatorio') editarRecordatorio(@Auth() s: Sesion, @Param('id', ParseIntPipe) id: number, @Body() dto: RecordatorioDto) {
+    return this.svc.editarRecordatorio(soloJefe(s), id, dto);
+  }
   @Delete(':id') borrar(@Auth() s: Sesion, @Param('id', ParseIntPipe) id: number) { return this.svc.borrar(soloJefe(s), id); }
 
   /* Cualquier usuario: solo los suyos. */
