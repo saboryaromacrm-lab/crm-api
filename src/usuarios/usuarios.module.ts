@@ -229,8 +229,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'gastos.gastos', nombre: 'Gastos (carga de comprobantes)' },
       { clave: 'gastos.pagos', nombre: 'Cuentas a pagar' },
       { clave: 'gastos.pagos_proveedor', nombre: 'Pagos a proveedores (bandeja y aplicación)' },
-      // «Gastos fijos» salió el 9/10/2026 (0152): con los sueldos adentro, es
-      // solo del superadmin (llave `gerencia.resultados`, fuera del catálogo).
+      // «Gastos fijos» salió el 9/10/2026 (0152): con los sueldos adentro, va
+      // con la llave de Resultados (Gerencia, `gerencia.resultados`).
       { clave: 'gastos.categorias', nombre: 'Rubros de gasto' },
       { clave: 'gastos.proveedores', nombre: 'Proveedores de gastos' },
       { clave: 'gastos.resumen', nombre: 'Resumen de gastos' },
@@ -262,12 +262,26 @@ export const CATALOGO_PERMISOS = [
   {
     grupo: 'Gerencia',
     modulo: 'gerencia',
+    /*
+     * 9/11/2026 (pedido del dueño: «habilitame más secciones para poder o no
+     * mostrar»): entran todas las de Gerencia. Hasta acá Vista profesional,
+     * Métricas, Resultados, Cash Flow, Asesor y Auditoría eran solo del
+     * superadmin porque su llave no estaba en esta lista. Sin migración: ningún
+     * rol las trae, se tildan en el rol. Quien edita roles igual no puede dar
+     * lo que no tiene (`validarPermisos`).
+     */
     secciones: [
+      { clave: 'gerencia.vista', nombre: 'Vista profesional (cómo le va al negocio, con montos)' },
       { clave: 'gerencia.usuarios', nombre: 'Usuarios y roles' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
+      { clave: 'gerencia.metricas', nombre: 'Métricas' },
       /* 0209: los números del negocio SOLO en % (sin montos), para la encargada. Cambiar los objetivos es solo del superadmin. */
       { clave: 'gerencia.indicadores', nombre: 'Indicadores (solo porcentajes)' },
-      /* Métricas, Cash Flow, Auditoría (0144) y Resultados (0152) no están acá a propósito: solo el superadmin. */
+      /* Una sola llave para las dos: Gastos fijos y sueldos carga lo que Resultados muestra. */
+      { clave: 'gerencia.resultados', nombre: 'Resultados y Gastos fijos y sueldos (ve y carga los sueldos)' },
+      { clave: 'gerencia.cashflow', nombre: 'Cash Flow (la caja central de efectivo: controlar sobres y mover plata)' },
+      { clave: 'gerencia.asesor', nombre: 'Asesor (IA que lee todos los números del negocio)' },
+      { clave: 'gerencia.auditoria', nombre: 'Auditoría (quién hizo qué)' },
     ],
     acciones: [],
   },

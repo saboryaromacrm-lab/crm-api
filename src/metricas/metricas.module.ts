@@ -22,8 +22,8 @@
  * madrugada los últimos 40 días (lo que se anuló o corrigió después) y la
  * primera vez, toda la historia. El botón «Sincronizar» hace lo mismo a pedido.
  *
- * SOLO EL SUPERADMIN: la llave `gerencia.metricas` no la tiene ningún rol ni se
- * puede asignar desde la pantalla de roles; solo pasa el comodín `*`.
+ * La llave `gerencia.metricas`: hasta el 9/11/2026 solo el superadmin; desde
+ * entonces está en el catálogo y se tilda en el rol.
  */
 import {
   BadRequestException, Body, Controller, Delete, Get, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Post, Query,
@@ -53,7 +53,7 @@ import { reporteOfertas } from './ofertas';
 import { reporteQuiebres } from './quiebres';
 import { GuardarAnteriorDto, guardarAnterior, localesConAnterior, quitarAnterior, reporteAnterior } from './anterior';
 
-/** La llave: no está en el catálogo de permisos, así que solo la tiene el superadmin (`*`). */
+/** La llave de Gerencia › Métricas (en el catálogo desde el 9/11/2026). */
 export const PERMISO_METRICAS = 'gerencia.metricas';
 
 const CADA_MS = 10 * 60_000;

@@ -21,7 +21,7 @@
  * Los «días» (de stock, de cobro, de pago) se miden contra el ritmo de los
  * últimos 90 días: un mes flojo no los dispara.
  *
- * Solo el superadmin (la llave de Resultados): son los números de la empresa.
+ * Llave propia, `gerencia.vista` (9/11/2026): se tilda en el rol aparte de Resultados.
  */
 import { BadRequestException, Controller, Get, Inject, Injectable, Module, Query } from '@nestjs/common';
 import { Permiso } from '../auth/auth.decoradores';
@@ -256,7 +256,7 @@ export class VistaProfesionalService {
 }
 
 @Controller('gerencia/vista-profesional')
-@Permiso('gerencia.resultados')
+@Permiso('gerencia.vista')
 export class VistaProfesionalController {
   constructor(private readonly svc: VistaProfesionalService) {}
 

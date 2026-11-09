@@ -126,7 +126,7 @@ export class AuditoriaController {
     return this.svc.list({ entidad, entidadId: id, limit: Number(limit) || undefined });
   }
 
-  /* `gerencia.auditoria` no está en el catálogo de permisos: solo el superadmin (0144). */
+  /* `gerencia.auditoria` (0144): solo el superadmin hasta el 9/11/2026; ahora se tilda en el rol. */
   @Get('gerencia') @Permiso('gerencia.auditoria')
   gerencia(@Query() q: Record<string, string | undefined>) {
     return this.svc.gerencia(q);

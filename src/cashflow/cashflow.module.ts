@@ -23,8 +23,8 @@
  *   · El arranque (fecha + saldo inicial) solo se cambia mientras no haya
  *     movimientos: después, la historia no se reescribe.
  *
- * SOLO EL SUPERADMIN: la llave `gerencia.cashflow` no está en el catálogo de
- * permisos (como `gerencia.metricas`), así que solo pasa el comodín `*`.
+ * La llave `gerencia.cashflow`: hasta el 9/11/2026 solo el superadmin; desde
+ * entonces está en el catálogo y se tilda en el rol.
  */
 import {
   BadRequestException, Body, ConflictException, Controller, Get, Inject, Injectable, Module, NotFoundException,

@@ -17,7 +17,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { IsOptional, IsString, MaxLength } from 'class-validator';
 import { sql } from 'drizzle-orm';
 
-/** La llave: fuera del catálogo, solo la tiene el superadmin (`*`). Marcar y resolver van con ella. */
+/** La llave (en el catálogo desde el 9/11/2026, se tilda en el rol). Marcar y resolver van con ella. */
 export const PERMISO_CASHFLOW = 'gerencia.cashflow';
 /** Sin arranque del Cash Flow todavía, el límite de la propuesta. */
 const UMBRAL_INICIAL = 5000;

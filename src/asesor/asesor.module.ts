@@ -1,8 +1,8 @@
 /**
  * LOS ASESORES (0193, 21/10/2026, pedidos del dueño)
  * ============================================================================
- *   Gerencia › Asesor            /asesor             llave `gerencia.asesor` (fuera del
- *                                                    catálogo: solo superadmin).
+ *   Gerencia › Asesor            /asesor             llave `gerencia.asesor` (en el
+ *                                                    catálogo desde el 9/11/2026).
  *   Ventas › Asesor comercial    /asesor-comercial   llave `ventas.asesor` (en el catálogo:
  *                                                    superadmin y administradores).
  *

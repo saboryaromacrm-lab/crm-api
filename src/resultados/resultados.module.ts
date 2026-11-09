@@ -20,7 +20,7 @@
  *   · Ganancias: persona humana (escala del artículo 94, por lo acumulado).
  *   · Objetivos por mes, celular y exportar.
  *
- * SOLO EL SUPERADMIN (`gerencia.resultados`, fuera del catálogo). La lectura
+ * Llave `gerencia.resultados` (en el catálogo desde el 9/11/2026). La lectura
  * va por el pool propio de Métricas: la caja nunca espera a este reporte.
  */
 import {
