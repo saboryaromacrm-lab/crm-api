@@ -24,11 +24,12 @@ import { conPermisosBase } from './permisos-base';
 const HORAS_VIDA = 12;
 
 /**
- * LA SESIÓN RECORDADA DEL SUPERADMIN (0210, pedido del dueño): desde la app
- * instalada en SU celular o SU PC no quiere volver a entrar cada día. Vence
- * igual por inactividad, pero a los 30 días. Los demás roles siguen en 12 h.
+ * LA SESIÓN RECORDADA (0210; 10/11/2026, pedido del dueño): quien entra desde
+ * la app instalada —cualquier rol, nunca en una caja registrada— no vuelve a
+ * poner la contraseña por 15 días. Es un plazo FIJO desde que la puso: no se
+ * estira con el uso, así que a los 15 días la pide sí o sí.
  */
-export const HORAS_VIDA_RECORDADA = 30 * 24;
+export const HORAS_VIDA_RECORDADA = 15 * 24;
 
 /*
  * Solo se estira el vencimiento cuando queda menos de la mitad de la ventana.
@@ -43,18 +44,20 @@ const enHoras = (h: number) => new Date(Date.now() + h * 3600_000);
 export class SesionesService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  /** Crea la sesión y devuelve el token EN CLARO — la única vez que existe. */
-  async crear(usuarioId: number, sucursalId: number, userAgent = '', vidaHoras = HORAS_VIDA): Promise<string> {
+  /** Crea la sesión y devuelve el token EN CLARO —la única vez que existe— y
+   *  hasta cuándo vale (el ERP lo usa para la sesión recordada). */
+  async crear(usuarioId: number, sucursalId: number, userAgent = '', vidaHoras = HORAS_VIDA) {
     const token = randomBytes(32).toString('base64url');
+    const expiraEn = enHoras(vidaHoras);
     await this.db.insert(sesiones).values({
       tokenHash: hashDe(token),
       usuarioId,
       sucursalId,
-      expiraEn: enHoras(vidaHoras),
+      expiraEn,
       vidaHoras,
       userAgent: userAgent.slice(0, 300),
     });
-    return token;
+    return { token, expiraEn };
   }
 
   /**
@@ -69,6 +72,7 @@ export class SesionesService {
     const [f] = await this.db
       .select({
         sesionId: sesiones.id,
+        creadaEn: sesiones.creadaEn,
         expiraEn: sesiones.expiraEn,
         vidaHoras: sesiones.vidaHoras,
         usuarioId: usuarios.id,
@@ -95,9 +99,17 @@ export class SesionesService {
 
     if (!f) return null;
 
+    /* La recordada vence a los 15 días de creada, sin estirarse. El tope se
+     * mide desde `creadaEn` y no solo con `expiraEn` para que las de antes (30
+     * días que se corrían con el uso) también caigan a los 15. */
+    const recordada = f.vidaHoras > HORAS_VIDA;
+    const vence = recordada
+      ? Math.min(f.expiraEn.getTime(), f.creadaEn.getTime() + HORAS_VIDA_RECORDADA * 3600_000)
+      : f.expiraEn.getTime();
+
     // Vencida: se borra en el momento. Dejarla acumularía basura que además
     // sigue apareciendo en la lista de sesiones del usuario.
-    if (f.expiraEn.getTime() <= Date.now()) {
+    if (vence <= Date.now()) {
       await this.db.delete(sesiones).where(eq(sesiones.id, f.sesionId));
       return null;
     }
@@ -108,14 +120,11 @@ export class SesionesService {
       return null;
     }
 
-    /* La ventana larga es SOLO del superadmin: si al dueño de una sesión
-     * recordada le cambian el rol, vuelve a las 12 h de todos en la request
-     * siguiente, sin esperar a que se le venzan los 30 días. */
-    const vida = f.rolClave === 'superadmin' ? (f.vidaHoras || HORAS_VIDA) : HORAS_VIDA;
-    const faltaHoras = (f.expiraEn.getTime() - Date.now()) / 3600_000;
-    if (faltaHoras < vida / 2 || faltaHoras > vida) {
+    // La de 12 h se corre con el uso; la recordada no se toca.
+    const faltaHoras = (vence - Date.now()) / 3600_000;
+    if (!recordada && (faltaHoras < HORAS_VIDA / 2 || faltaHoras > HORAS_VIDA)) {
       await this.db.update(sesiones)
-        .set({ expiraEn: enHoras(vida), vidaHoras: vida, ultimoUso: new Date() })
+        .set({ expiraEn: enHoras(HORAS_VIDA), ultimoUso: new Date() })
         .where(eq(sesiones.id, f.sesionId));
     }
 
@@ -137,6 +146,7 @@ export class SesionesService {
        * código que lo compara, y `sinSucursal` es el que manda. */
       sucursalId: f.sucursalId,
       sucursalNombre: f.modoSucursal === 'ninguna' ? '' : f.sucursalNombre,
+      recordadaHasta: recordada ? new Date(vence).toISOString() : null,
     };
   }
 

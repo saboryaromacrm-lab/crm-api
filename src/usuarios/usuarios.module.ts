@@ -857,13 +857,14 @@ export class UsuariosService {
      * poder cambiarse editando un número.
      */
     /*
-     * SESIÓN RECORDADA (0210, pedido del dueño): el superadmin que entra desde
-     * la app instalada (el ERP lo avisa con `recordar`) queda adentro 30 días
-     * de inactividad en vez de 12 h. Nunca en una terminal registrada: esa es
-     * la PC del mostrador, y ahí el que abre a la mañana entraría como el dueño.
+     * SESIÓN RECORDADA (0210; 10/11/2026 para todos los roles, pedido del
+     * dueño): quien entra desde la app instalada (el ERP lo avisa con
+     * `recordar`) no vuelve a poner la contraseña por 15 días fijos, en vez de
+     * 12 h de inactividad. Nunca en una terminal registrada: esa es la PC del
+     * mostrador, y ahí el que abre a la mañana entraría como el último que la usó.
      */
-    const recordada = o?.recordar === true && r?.clave === 'superadmin' && !terminal;
-    const token = await this.sesiones.crear(u.id, suc.id, userAgent, recordada ? HORAS_VIDA_RECORDADA : undefined);
+    const recordada = o?.recordar === true && !terminal;
+    const { token, expiraEn } = await this.sesiones.crear(u.id, suc.id, userAgent, recordada ? HORAS_VIDA_RECORDADA : undefined);
     // Barrido oportunista de las vencidas: pasa una vez por login, que es
     // exactamente la frecuencia que este sistema necesita. Un cron para esto
     // sería una pieza más que mantener.
@@ -888,7 +889,7 @@ export class UsuariosService {
        * preguntar quién es este equipo. */
       terminal: terminal ? { id: terminal.id, nombre: terminal.nombre } : null,
       /* Para que el ERP guarde la copia del navegador por el mismo plazo. */
-      recordada,
+      recordadaHasta: recordada ? expiraEn.toISOString() : null,
     };
   }
 
@@ -1257,6 +1258,8 @@ export class AuthController {
        * sucursales. Si acá viajara la sucursal de relleno, el primer F5 se la
        * devolvería al encabezado y el login habría servido de poco. */
       sucursal: sesion.sinSucursal ? null : { id: sesion.sucursalId, nombre: sesion.sucursalNombre },
+      /* Hasta cuándo no pide contraseña (sesión recordada), igual que el login. */
+      recordadaHasta: sesion.recordadaHasta,
     };
   }
 

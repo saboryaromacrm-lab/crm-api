@@ -79,6 +79,8 @@ export interface Sesion {
   sinSucursal: boolean;
   /** Entra en cualquier sucursal y cambia desde el encabezado (0224, `rolCruzaSucursales`). */
   cruzaSucursales: boolean;
+  /** Sesión recordada de la app instalada (0210): hasta cuándo vale, en ISO; `null` = la de 12 h. */
+  recordadaHasta: string | null;
 }
 
 /**
