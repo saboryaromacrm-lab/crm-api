@@ -196,6 +196,8 @@ export class ListarPagosDto {
   @IsOptional() @IsBooleanString() cambio?: string;
   /** Lo que salió de una cuenta propia (0207), también como parte de un pago mixto. */
   @IsOptional() @Matches(/^\d+$/) cuentaPropiaId?: string;
+  /** Compras › Pagos realizados (9/11/2026): por medio, también como parte de un pago mixto. */
+  @IsOptional() @IsIn(MEDIOS) medio?: string;
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
@@ -519,6 +521,11 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       const cuenta = Number(q.cuentaPropiaId);
       conds.push(or(eq(proveedorPagos.cuentaPropiaId, cuenta), sql`exists (select 1 from pago_formas f
         where f.pago_id = ${proveedorPagos.id} and f.cuenta_propia_id = ${cuenta})`));
+    }
+    /* El medio de un pago mixto vive en sus formas (la cabecera guarda solo el primero). */
+    if (q.medio) {
+      conds.push(sql`(exists (select 1 from pago_formas f where f.pago_id = ${proveedorPagos.id} and f.medio = ${q.medio})
+        or (${proveedorPagos.medio} = ${q.medio} and not exists (select 1 from pago_formas f where f.pago_id = ${proveedorPagos.id})))`);
     }
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
