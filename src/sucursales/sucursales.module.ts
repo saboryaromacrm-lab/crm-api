@@ -320,8 +320,8 @@ export class SucursalesService {
 
 /**
  * Las sucursales son estructura de la empresa: crearlas, renombrarlas y —sobre
- * todo— mover cuál es "la distribuidora" es una decisión de gerencia, no de
- * mostrador. Ese `tipo` no es una etiqueta: `distribuidoraId()` toma la primera
+ * todo— mover cuál es "la distribuidora" es una decisión de administración
+ * (`sistema.sucursales`, 0225), no de mostrador. Ese `tipo` no es una etiqueta: `distribuidoraId()` toma la primera
  * con `tipo='distribuidora'` y es el destino por defecto de toda compra y el
  * origen de todo envío a Cafetería, así que un `PATCH` lo redirigía en silencio.
  *
@@ -334,20 +334,20 @@ export class SucursalesController {
   @Get() list(@Query('todas') todas?: string) { return this.svc.list(todas === '1' || todas === 'true'); }
   @Get(':id') get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
-  @Post() @Permiso('gerencia.usuarios')
+  @Post() @Permiso('sistema.sucursales')
   create(@Body() dto: UpsertSucursalDto, @Auth() sesion: Sesion) { return this.svc.create(dto, sesion); }
 
-  @Patch(':id') @Permiso('gerencia.usuarios')
+  @Patch(':id') @Permiso('sistema.sucursales')
   update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpsertSucursalDto, @Auth() sesion: Sesion) { return this.svc.update(id, dto, sesion); }
 
-  @Delete(':id') @Permiso('gerencia.usuarios')
+  @Delete(':id') @Permiso('sistema.sucursales')
   remove(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.remove(id, sesion); }
 
   /** Un local que cerró (0143): sale de todas las listas para elegir; el historial queda. */
-  @Post(':id/desactivar') @Permiso('gerencia.usuarios')
+  @Post(':id/desactivar') @Permiso('sistema.sucursales')
   desactivar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.desactivar(id, sesion); }
 
-  @Post(':id/reactivar') @Permiso('gerencia.usuarios')
+  @Post(':id/reactivar') @Permiso('sistema.sucursales')
   reactivar(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.reactivar(id, sesion); }
 }
 

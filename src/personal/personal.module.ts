@@ -1,6 +1,6 @@
 /**
  * `/api/personal` — el personal para los adelantos de sueldo (0221). Reglas en `personal.ts`.
- *   · GET  /personal            los que NO usan el sistema (todos, también los desactivados) — Gerencia › Usuarios
+ *   · GET  /personal            los que NO usan el sistema (todos, también los desactivados) — Sistema › Usuarios y roles
  *   · POST /personal            alta de uno que no usa el sistema (solo el nombre)
  *   · PATCH /personal/:id       renombrar / desactivar / reactivar
  *   · GET  /personal/adelantos  la lista para elegir al sacar un adelanto (caja central o caja del local)
@@ -63,7 +63,7 @@ export class PersonalService {
 }
 
 @Controller('personal')
-@Permiso('gerencia.usuarios')
+@Permiso('sistema.usuarios')
 export class PersonalController {
   constructor(private readonly svc: PersonalService, @Inject(DRIZZLE) private readonly db: Database) {}
 

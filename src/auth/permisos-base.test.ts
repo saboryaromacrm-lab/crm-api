@@ -46,7 +46,7 @@ test('aguanta un rol sin permisos cargados (null/undefined) sin romperse', () =>
 });
 
 test('la base NO reparte llaves de caja, precios ni usuarios', () => {
-  const prohibidos = ['ventas.caja', 'precios', 'gerencia.usuarios', 'sistema.respaldos', 'nota_credito', '*'];
+  const prohibidos = ['ventas.caja', 'precios', 'sistema.usuarios', 'sistema.respaldos', 'nota_credito', '*'];
   for (const clave of prohibidos) {
     assert.ok(!PERMISOS_BASE.includes(clave), `${clave} NO puede venir de fábrica`);
   }

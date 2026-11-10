@@ -2219,7 +2219,7 @@ export class VentasService {
 
   /**
    * EL TOPE DE DESCUENTO A MANO de quien está en la caja (0147). 0 = no puede.
-   * Lo fija el dueño por usuario en Gerencia › Usuarios.
+   * Lo fija el dueño por usuario en Sistema › Usuarios y roles.
    */
   private async topeDescuentoManual(usuarioId: number | null | undefined) {
     if (!usuarioId) return 0;
@@ -4383,7 +4383,7 @@ export class VentasService {
     if (reserva?.nro && config.arcaHabilitado && !suc.habilitada) {
       throw new BadRequestException(
         `Este ticket quedó con una factura a medio emitir en ARCA y ${suc.nombre} ya no factura electrónicamente. `
-        + 'Volvé a habilitarla en Gerencia › Sucursales para terminarla, o consultá antes de cobrarlo de otra forma.',
+        + 'Volvé a habilitarla en Sistema › Sucursales para terminarla, o consultá antes de cobrarlo de otra forma.',
       );
     }
     const fiscal = await this.resolverFiscal(String(pedido).startsWith('factura'), cliente, this.configFiscal(config, suc), {
@@ -4622,7 +4622,7 @@ export class VentasService {
     const suc = await this.fiscalSucursal(v.sucursalId);
     if (!suc.habilitada) {
       throw new BadRequestException(
-        `${suc.nombre} todavía no factura electrónicamente (${suc.ptoVta ? 'la facturación está apagada en Gerencia › Sucursales' : 'no tiene su punto de venta de ARCA cargado'}). `
+        `${suc.nombre} todavía no factura electrónicamente (${suc.ptoVta ? 'la facturación está apagada en Sistema › Sucursales' : 'no tiene su punto de venta de ARCA cargado'}). `
         + 'La venta queda como ticket; se puede facturar desde acá cuando la sucursal esté habilitada.',
       );
     }

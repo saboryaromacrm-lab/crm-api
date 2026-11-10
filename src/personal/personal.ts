@@ -3,7 +3,7 @@
  *
  * Una sola lista de empleados (`personal`): los usuarios del ERP marcados «es
  * empleado» y los que no usan el sistema (solo el nombre, se cargan en
- * Gerencia › Usuarios › Empleados). Un egreso con concepto de ADELANTO, en la
+ * Sistema › Usuarios y roles › Empleados). Un egreso con concepto de ADELANTO, en la
  * caja central o en la de un local, exige elegir a uno de esta lista: queda su
  * `personal_id` y su nombre adelante del detalle («Sofía · semana 2»), así se
  * lee en todos los listados y la app de sueldos sabe de quién es.

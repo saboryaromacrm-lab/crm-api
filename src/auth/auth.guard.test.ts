@@ -8,14 +8,14 @@ import assert from 'node:assert/strict';
 import { claveDeServicioValida, esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from './auth.guard';
 
 const cajero = { rolClave: 'cajero', permisos: ['ventas.pos', 'ventas.caja'], sucursalId: 2 };
-const admin = { rolClave: 'admin', permisos: ['ventas.pos', 'gerencia.usuarios'], sucursalId: 1 };
+const admin = { rolClave: 'admin', permisos: ['ventas.pos', 'sistema.usuarios'], sucursalId: 1 };
 const superadmin = { rolClave: 'superadmin', permisos: ['*'], sucursalId: 1 };
 
 test('tienePermiso: el comodín pasa siempre; el resto necesita ALGUNA clave', () => {
   assert.equal(tienePermiso(['*'], ['lo.que.sea']), true);
   assert.equal(tienePermiso(cajero.permisos, ['ventas.pos']), true);
   assert.equal(tienePermiso(cajero.permisos, ['ventas.cobranzas', 'ventas.caja']), true, 'con una alcanza');
-  assert.equal(tienePermiso(cajero.permisos, ['gerencia.usuarios']), false);
+  assert.equal(tienePermiso(cajero.permisos, ['sistema.usuarios']), false);
   assert.equal(tienePermiso([], ['ventas.pos']), false);
 });
 

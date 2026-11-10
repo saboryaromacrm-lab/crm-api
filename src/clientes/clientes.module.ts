@@ -78,7 +78,7 @@ const conLlaveCredito = (sesion?: Sesion) =>
   !!sesion?.permisos && (sesion.permisos.includes('*') || sesion.permisos.includes('cta_cte'));
 
 const SIN_LLAVE_CREDITO =
-  'Habilitar la cuenta corriente y fijar su límite pide la llave "Cuenta corriente" (Gerencia › Usuarios y roles). El resto de la ficha se guarda igual si no tocás esos campos.';
+  'Habilitar la cuenta corriente y fijar su límite pide la llave "Cuenta corriente" (Sistema › Usuarios y roles). El resto de la ficha se guarda igual si no tocás esos campos.';
 
 @Injectable()
 export class ClientesService {

@@ -148,7 +148,7 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
     let [ms] = await this.db.select().from(mpSucursales).where(eq(mpSucursales.sucursalId, s.id)).limit(1);
     if (!ms) {
       const dir = String(s.direccion || '').split(',')[0].trim();
-      if (!dir) throw new BadRequestException(`Cargá el domicilio de ${s.nombre} en Gerencia › Sucursales: Mercado Pago lo pide para dar de alta la sucursal.`);
+      if (!dir) throw new BadRequestException(`Cargá el domicilio de ${s.nombre} en Sistema › Sucursales: Mercado Pago lo pide para dar de alta la sucursal.`);
       const m = /^(.*?)\s+(\d+[a-zA-Z]?)$/.exec(dir);
       const externalId = `SYA${s.id}`;
       try {

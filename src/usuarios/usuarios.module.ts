@@ -129,7 +129,7 @@ export const CATALOGO_PERMISOS = [
        * límite es OTORGAR CRÉDITO del negocio, y eso lo decide el superadmin.
        * Sin migración a propósito: ningún rol la trae, así que solo pasa el
        * `*` del superadmin — el día que quiera delegarla, se tilda en
-       * Gerencia › Usuarios y roles y listo, sin tocar código.
+       * Sistema › Usuarios y roles y listo, sin tocar código.
        */
       { clave: 'cta_cte', nombre: 'Clientes: habilitar cuenta corriente y fijar límite' },
       { clave: 'diferencias', nombre: 'Diferencias de caja (mover plata del cajón)' },
@@ -272,7 +272,6 @@ export const CATALOGO_PERMISOS = [
      */
     secciones: [
       { clave: 'gerencia.vista', nombre: 'Vista profesional (cómo le va al negocio, con montos)' },
-      { clave: 'gerencia.usuarios', nombre: 'Usuarios y roles' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
       { clave: 'gerencia.metricas', nombre: 'Métricas' },
       /* 0209: los números del negocio SOLO en % (sin montos), para la encargada. Cambiar los objetivos es solo del superadmin. */
@@ -289,11 +288,13 @@ export const CATALOGO_PERMISOS = [
     grupo: 'Sistema',
     modulo: 'sistema',
     secciones: [
+      /* 9/11/2026 (0225): mudadas de Gerencia. Repartir permisos es la llave de todas las demás. */
+      { clave: 'sistema.usuarios', nombre: 'Usuarios y roles (y Empleados)' },
+      { clave: 'sistema.sucursales', nombre: 'Sucursales (punto de venta, factura electrónica, fondo y cierre de caja)' },
       { clave: 'sistema.empresa', nombre: 'Empresa' },
       { clave: 'sistema.impresion', nombre: 'Impresión' },
       /* Registrar un equipo decide en qué sucursal opera TODO el que se siente
-       * ahí, así que es la misma llave que administrar usuarios y sucursales —
-       * no una preferencia de la máquina. */
+       * ahí: es administración, no una preferencia de la máquina. */
       { clave: 'sistema.terminales', nombre: 'Equipos (terminales)' },
       { clave: 'sistema.respaldos', nombre: 'Respaldos' },
       /* Los feriados de Formosa y qué hace cada sucursal (0182): administración; también les llega el aviso. */
@@ -327,7 +328,7 @@ const CLAVES_LEGADAS = new Set(['ver', 'config', 'usuarios']);
  *
  * `tienePermiso` y `esJefe` (auth.guard.ts) lo aceptan ANTES de mirar nada, así
  * que además de todas las claves del catálogo da el cruce de sucursales. Por eso
- * no se puede pedir por API ni siquiera teniendo `gerencia.usuarios`: existe
+ * no se puede pedir por API ni siquiera teniendo `sistema.usuarios`: existe
  * solo en el rol que planta la semilla.
  */
 const COMODIN = '*';
@@ -1032,7 +1033,7 @@ export class UsuariosService {
      *
      * Esta función miraba si el usuario existía y si era el último superadmin,
      * pero nunca QUIÉN estaba editando ni A QUIÉN. El bloque de contraseña no
-     * tenía ninguna condición, así que con `gerencia.usuarios` alcanzaba un
+     * tenía ninguna condición, así que con la llave de usuarios alcanzaba un
      * `PATCH /usuarios/<el dueño> {"password":"..."}` para entrar como él — y
      * el cierre de sesiones de más abajo, que está bien puesto, encima lo echaba
      * de las suyas. El comentario del encabezado decía "superadmin: no se edita,
@@ -1162,13 +1163,13 @@ export class UsuariosService {
 }
 
 /*
- * Quién puede tocar usuarios y roles: `gerencia.usuarios`, la misma clave que
- * gatea la pantalla. Repartir permisos es la operación que permite darse a uno
+ * Quién puede tocar usuarios y roles: `sistema.usuarios` (0225; antes
+ * `gerencia.usuarios`), la misma clave que gatea la pantalla. Repartir permisos es la operación que permite darse a uno
  * mismo cualquier otro permiso, así que es la que más tiene que estar cerrada:
  * sin esto, un cajero podía hacerse superadmin con una sola llamada.
  */
 @Controller('roles')
-@Permiso('gerencia.usuarios')
+@Permiso('sistema.usuarios')
 export class RolesController {
   constructor(private readonly svc: UsuariosService) {}
   @Get() list() { return this.svc.listRoles(); }
@@ -1181,7 +1182,7 @@ export class RolesController {
 }
 
 @Controller('usuarios')
-@Permiso('gerencia.usuarios')
+@Permiso('sistema.usuarios')
 export class UsuariosController {
   constructor(private readonly svc: UsuariosService) {}
   @Get() list() { return this.svc.listUsuarios(); }
@@ -1195,7 +1196,7 @@ export class UsuariosController {
  * EL RELEVO DE CAJA, del lado del POS (0088). Llaves de quien opera la
  * registradora (OR): el que puede vender, mover caja o cobrar puede pedir la
  * lista de relevos y verificar un PIN — administrar QUIÉNES son relevo sigue
- * siendo de `gerencia.usuarios`, por el ABM de arriba.
+ * siendo de `sistema.usuarios`, por el ABM de arriba.
  */
 @Controller('relevos')
 @Permiso('ventas.pos', 'ventas.caja', 'ventas.cobranzas')

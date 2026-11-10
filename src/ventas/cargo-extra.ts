@@ -7,7 +7,7 @@
  * buena parte dentro de una Factura B, que es un problema fiscal.
  *
  * Desde ahora escribir un cargo libre pide el permiso `cargo_extra`, que no
- * trae ningún rol (lo tilda el superadmin en Gerencia › Usuarios y roles).
+ * trae ningún rol (lo tilda el superadmin en Sistema › Usuarios y roles).
  * Sin el permiso NO se puede cargar ningún cargo a mano: ni siquiera Envío o
  * Bolsa (6/11/2026, el dueño: «que elimines todo hasta envío y bolsa»). El
  * botón ni aparece en la caja.
