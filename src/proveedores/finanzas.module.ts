@@ -41,7 +41,7 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { etiquetaDoc } from '../common/documentos';
-import { segunCorte, sinIvaHasta, ZONA_AR } from '../cafeteria/cuenta';
+import { hoyAr, segunCorte, sinIvaHasta, ZONA_AR } from '../cafeteria/cuenta';
 import {
   comprobantes, cuentaDisponiblePagos, cuentasDisponibles, cuentasPropias, facturacionesMes, facturacionesMesFacturas, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorCuentas, proveedorEcheqs, proveedorPagos, proveedores, sucursales, usuarios,
@@ -717,19 +717,38 @@ export class FinanzasProveedorService {
     }).from(proveedorEcheqs).where(eq(proveedorEcheqs.estado, 'pendiente'));
     /* COMPROMETIDO POR MES (28/10/2026, pedido del dueño): lo que va a debitar
      * cada mes, hechos y pendientes de confirmar por separado. Lo vencido sin
-     * cobrar de meses anteriores todavía sale de la cuenta: va en el mes actual. */
-    const mesAr = (f: any) => sql`to_char(${f} at time zone 'America/Argentina/Buenos_Aires', 'YYYY-MM')`;
-    const mes = sql<string>`greatest(${mesAr(proveedorEcheqs.fechaVenc)}, ${mesAr(sql`now()`)})`;
-    const esPend = sql`${proveedorEcheqs.estado} = 'pendiente'`;
-    const porMes = await this.db.select({
-      mes,
-      hechosN: sql<number>`count(*) filter (where not ${esPend})::int`,
-      hechos: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where not ${esPend}), 0)`,
-      pendientesN: sql<number>`count(*) filter (where ${esPend})::int`,
-      pendientes: sql<number>`coalesce(sum(${proveedorEcheqs.importe}) filter (where ${esPend}), 0)`,
-      atrasados: sql<number>`count(*) filter (where ${mesAr(proveedorEcheqs.fechaVenc)} < ${mesAr(sql`now()`)})::int`,
-    }).from(proveedorEcheqs).where(inArray(proveedorEcheqs.estado, ECHEQ_VIVOS))
-      .groupBy(mes).orderBy(mes);
+     * cobrar de meses anteriores todavía sale de la cuenta: va en el mes actual.
+     *
+     * DÍA POR DÍA (10/11/2026, pedido del dueño): cada mes trae sus días de
+     * débito, y el mes actual también lo que ya se cobró, para ver qué falta. */
+    const dia = sql<string>`to_char(${proveedorEcheqs.fechaVenc} at time zone 'America/Argentina/Buenos_Aires', 'YYYY-MM-DD')`;
+    const clase = sql<'cobrado' | 'pendiente' | 'hecho'>`case ${proveedorEcheqs.estado} when 'cobrado' then 'cobrado' when 'pendiente' then 'pendiente' else 'hecho' end`;
+    const mesActual = hoyAr().slice(0, 7);
+    const dias = await this.db.select({
+      dia, clase,
+      n: sql<number>`count(*)::int`,
+      monto: sql<number>`coalesce(sum(${proveedorEcheqs.importe}), 0)`,
+    }).from(proveedorEcheqs)
+      .where(or(
+        inArray(proveedorEcheqs.estado, ECHEQ_VIVOS),
+        and(eq(proveedorEcheqs.estado, 'cobrado'), sql`left(${dia}, 7) = ${mesActual}`),
+      ))
+      .groupBy(dia, clase).orderBy(dia, clase);
+    const porMes = new Map<string, any>();
+    for (const d of dias) {
+      const mes = d.dia.slice(0, 7) < mesActual ? mesActual : d.dia.slice(0, 7);
+      if (!porMes.has(mes)) {
+        porMes.set(mes, { mes, hechos: { n: 0, monto: 0 }, pendientes: { n: 0, monto: 0 }, cobrados: { n: 0, monto: 0 }, atrasados: 0, dias: [] });
+      }
+      const m = porMes.get(mes);
+      const n = Number(d.n) || 0;
+      const monto = money(Number(d.monto) || 0);
+      const tot = d.clase === 'cobrado' ? m.cobrados : d.clase === 'pendiente' ? m.pendientes : m.hechos;
+      tot.n += n;
+      tot.monto = money(tot.monto + monto);
+      if (d.clase !== 'cobrado' && d.dia.slice(0, 7) < mesActual) m.atrasados += n;
+      m.dias.push({ dia: d.dia, clase: d.clase, n, monto });
+    }
     return {
       pendientes: { n: Number(pend?.n) || 0, monto: money(Number(pend?.monto) || 0) },
       activos: { n: Number(r?.activosN) || 0, monto: money(Number(r?.activosM) || 0) },
@@ -738,13 +757,10 @@ export class FinanzasProveedorService {
       semana: { n: Number(r?.semanaN) || 0, monto: money(Number(r?.semanaM) || 0) },
       porBanco: porBanco.map((b) => ({ banco: b.banco, n: Number(b.n) || 0, monto: money(Number(b.monto) || 0) })),
       proximos: proximos.map((f) => ({ ...f, diasRest: diasHasta(f.fechaVenc) })),
-      porMes: porMes.map((m) => ({
-        mes: m.mes,
-        hechos: { n: Number(m.hechosN) || 0, monto: money(Number(m.hechos) || 0) },
-        pendientes: { n: Number(m.pendientesN) || 0, monto: money(Number(m.pendientes) || 0) },
-        /** Cuántos debitaban en meses anteriores y siguen sin cobrar (solo en el mes actual). */
-        atrasados: Number(m.atrasados) || 0,
-      })),
+      /** Por mes: hechos y pendientes (lo que falta debitar), `cobrados` (solo el
+       *  mes actual), `atrasados` (de meses anteriores sin cobrar, en el actual) y
+       *  `dias`: [{ dia 'YYYY-MM-DD', clase hecho|pendiente|cobrado, n, monto }]. */
+      porMes: [...porMes.values()].sort((a, b) => a.mes.localeCompare(b.mes)),
     };
   }
 
