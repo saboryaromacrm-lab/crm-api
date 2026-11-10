@@ -24,15 +24,16 @@
  *
  * UNA SOLA TARJETA ABIERTA POR PROVEEDOR (0223, 7/11/2026: «quedan muchos
  * repetidos, el que creás con la orden de pedido y el de Solicitado»). La
- * orden de pedido y «Ya lo pedí» usan la que ya está (la pasan a Pedido y le
- * suman la nota); Solicitar saltea a los que ya están en el tablero.
+ * orden de pedido y «Ya lo pedí» usan la que ya está y le suman la nota («Ya lo
+ * pedí» la pasa a Pedido; la orden, desde el 10/11/2026, la deja en Solicitado
+ * con «Pedido enviado»); Solicitar saltea a los que ya están en el tablero.
  */
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
-  ArrayMaxSize, IsArray, IsIn, IsInt, IsOptional, IsString, MaxLength,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, MaxLength,
 } from 'class-validator';
 import { and, desc, eq, gte, inArray, ne, sql } from 'drizzle-orm';
 import { Auth, CualquierUsuario, Permiso, type Sesion } from '../auth/auth.decoradores';
@@ -53,6 +54,8 @@ class AltaPedidosDto {
 class PedidoDirectoDto {
   @IsInt() proveedorId!: number;
   @IsOptional() @IsString() @MaxLength(8000) notas?: string;
+  /** La orden de pedido al cerrarse (10/11/2026): a Solicitado con «Pedido enviado», no a Pedido. */
+  @IsOptional() @IsBoolean() enviado?: boolean;
 }
 
 class EditarPedidoDto {
@@ -278,7 +281,7 @@ export class PedidosProveedorService {
   }
 
   /**
-   * "Ya lo pedí, registralo" (y la orden de pedido de Almacén): nace en Pedido
+   * "Ya lo pedí, registralo" (la orden de pedido, con `enviado`: ver abajo): nace en Pedido
    * con fecha. Si el proveedor ya tiene su tarjeta abierta, es esa: pasa a
    * Pedido (sin pisar el día en que se pidió) y la nota nueva va debajo de la
    * que tenía. `yaEstaba` dice en qué columna estaba.
@@ -286,12 +289,19 @@ export class PedidosProveedorService {
   async directo(dto: PedidoDirectoDto, usuarioId: number | null): Promise<any> {
     await this.validarProveedor(dto.proveedorId);
     const notas = (dto.notas ?? '').trim();
+    /*
+     * `enviado` (la orden de pedido, 10/11/2026, pedido del dueño): queda en
+     * Solicitado con «Pedido enviado» —le mandaste el pedido y esperás que lo
+     * confirme—; a Pedido lo pasa uno a mano cuando confirma. Una tarjeta que
+     * ya estaba en Pedido no vuelve atrás: solo suma la nota.
+     */
+    const enSolicitado = (estado?: string) => !!dto.enviado && estado !== 'pedido';
     const abierta = await this.abiertaDe(dto.proveedorId);
     if (abierta) {
       await this.db.update(pedidosProveedor).set({
-        estado: 'pedido',
-        fechaPedido: abierta.fechaPedido ?? new Date(),
-        pedidoEnviado: false,
+        ...(enSolicitado(abierta.estado)
+          ? { estado: 'solicitado' as const, pedidoEnviado: true }
+          : { estado: 'pedido' as const, fechaPedido: abierta.fechaPedido ?? new Date(), pedidoEnviado: false }),
         revisadoAt: null,
         notas: abierta.notas === notas ? notas : [abierta.notas.trim(), notas].filter(Boolean).join('\n\n'),
       }).where(eq(pedidosProveedor.id, abierta.id));
@@ -299,8 +309,7 @@ export class PedidosProveedorService {
     }
     const [p] = await this.db.insert(pedidosProveedor).values({
       proveedorId: dto.proveedorId,
-      estado: 'pedido',
-      fechaPedido: new Date(),
+      ...(enSolicitado() ? { estado: 'solicitado' as const, pedidoEnviado: true } : { estado: 'pedido' as const, fechaPedido: new Date() }),
       notas,
       usuarioId,
     }).onConflictDoNothing().returning();
