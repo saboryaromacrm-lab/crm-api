@@ -1307,14 +1307,20 @@ export class FinanzasProveedorService {
       const saldo = mov.saldo(p.id);
 
       let estado: 'a_favor' | 'al_dia' | 'pendiente' | 'vencido' = 'al_dia';
+      /* Días desde que venció la factura impaga más vieja (11/11/2026, pedido del dueño). */
+      let diasVencido: number | null = null;
       if (saldo < -EPS) estado = 'a_favor';
       else if (saldo > EPS) {
         estado = 'pendiente';
         const desdeRaw = impagaComp.get(p.id) ?? mov.gasto.get(p.id)?.impagaDesde ?? null;
         if (desdeRaw && p.diasPago != null && p.diasPago > 0) {
           const desde = new Date(desdeRaw);
-          if (!Number.isNaN(desde.getTime())
-            && hoy.getTime() - desde.getTime() > p.diasPago * 86400000) estado = 'vencido';
+          const pasados = hoy.getTime() - desde.getTime();
+          if (!Number.isNaN(desde.getTime()) && pasados > p.diasPago * 86400000) {
+            estado = 'vencido';
+            const dia0 = new Date(desde); dia0.setHours(0, 0, 0, 0); // por días de calendario: la factura trae hora
+            diasVencido = Math.max(1, Math.round((hoy.getTime() - dia0.getTime()) / 86400000) - p.diasPago);
+          }
         }
       }
 
@@ -1331,6 +1337,7 @@ export class FinanzasProveedorService {
         saldoProyectado: money(saldo - pendientes),
         ultimoPago: mov.pago.get(p.id)?.ultimoPago ?? null,
         estado,
+        diasVencido,
       });
     }
     return filas;
