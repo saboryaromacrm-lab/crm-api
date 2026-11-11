@@ -1441,6 +1441,7 @@ export class FinanzasProveedorService {
       movs.push({
         kind: esNc ? 'nc' : 'comprobante',
         id: c.id,
+        tipoDoc: c.tipo, // el ERP abre el detalle y sabe si es una liquidación
         fecha: c.fecha,
         asentado: c.fechaCarga,
         etiqueta: etiquetaDoc(c),

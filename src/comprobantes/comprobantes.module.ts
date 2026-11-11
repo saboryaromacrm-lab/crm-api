@@ -2652,9 +2652,12 @@ export class ComprobantesController {
     return this.svc.referenciables(proveedorId);
   }
 
+  /** Con el mismo corte que la lista: sin `liquidaciones`, la mitad no facturada no viaja. */
   @Get(':id')
-  get(@Param('id', ParseIntPipe) id: number) {
-    return this.svc.get(id);
+  async get(@Auth() auth: Sesion, @Param('id', ParseIntPipe) id: number) {
+    const c = await this.svc.get(id);
+    if (c.tipo === 'liquidacion' && !tienePermiso(auth.permisos, ['liquidaciones'])) throw new NotFoundException('Comprobante inexistente.');
+    return c;
   }
 
   /**
