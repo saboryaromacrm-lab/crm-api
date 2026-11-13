@@ -5,9 +5,12 @@
  * Reglas puras, sin base: el Cash Flow y la caja las usan iguales.
  *   · Dónde se ofrece: `enCashflow` / `enCaja` (al menos uno).
  *   · `pideDetalle`: la descripción es obligatoria («Otro egreso»).
- *   · Se reconoce por el NOMBRE (decisión del dueño): «depósito» se puede
- *     aplicar a un proveedor; «efectivo por transferencia» es un cambio y solo
- *     va en el Cash Flow, con quién y a qué cuenta.
+ *   · `aplicaProveedor` (0226): el egreso se puede pasar a la cuenta de un
+ *     proveedor. Si además dice «depósito», el pago es un depósito; si no, es
+ *     en efectivo (el proveedor que pasa a cobrar por el local).
+ *   · Se reconoce por el NOMBRE (decisión del dueño): «efectivo por
+ *     transferencia» es un cambio y solo va en el Cash Flow, con quién y a qué
+ *     cuenta; «adelanto» pide el empleado.
  */
 import { BadRequestException } from '@nestjs/common';
 
@@ -15,6 +18,9 @@ const normal = (v: unknown) => String(v ?? '').normalize('NFD').replace(/[̀-ͯ]
 
 /** Un concepto de depósito (16/10/2026): todo egreso que diga «depósito», con o sin tilde. */
 export const esConceptoDeposito = (nombre: unknown) => normal(nombre).includes('deposito');
+
+/** Con qué le llega al proveedor un egreso de concepto aplicado a su cuenta: depósito si lo dice el nombre, si no efectivo. */
+export const medioAlProveedor = (nombre: unknown): 'deposito' | 'efectivo' => (esConceptoDeposito(nombre) ? 'deposito' : 'efectivo');
 
 /** Un concepto que es en sí un cambio (0191): «Cambio a mi cuenta (efectivo por transferencia)». */
 export const esConceptoCambio = (nombre: unknown) => normal(nombre).includes('efectivo por transferencia');

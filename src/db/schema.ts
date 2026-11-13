@@ -2802,6 +2802,8 @@ export const cashflowConceptos = pgTable('cashflow_conceptos', {
   enCashflow: boolean('en_cashflow').notNull().default(true),
   enCaja: boolean('en_caja').notNull().default(true),
   pideDetalle: boolean('pide_detalle').notNull().default(false),
+  /** 0226: el egreso se puede pasar a la cuenta de un proveedor (antes: solo si el nombre decía «depósito»). */
+  aplicaProveedor: boolean('aplica_proveedor').notNull().default(false),
 });
 /** El control de un sobre: lo que mandó el cajero contra lo que contó el dueño. Uno vigente por sobre. */
 export const cashflowSobres = pgTable('cashflow_sobres', {

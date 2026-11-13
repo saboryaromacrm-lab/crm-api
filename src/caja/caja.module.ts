@@ -286,7 +286,7 @@ export class CajaService {
     const filas = await this.db.select({
       id: cashflowConceptos.id, nombre: cashflowConceptos.nombre, tipo: cashflowConceptos.tipo, clase: cashflowConceptos.clase,
       gastoCategoriaId: cashflowConceptos.gastoCategoriaId, gastoCategoria: gastoCategorias.nombre,
-      pideDetalle: cashflowConceptos.pideDetalle, activo: cashflowConceptos.activo,
+      pideDetalle: cashflowConceptos.pideDetalle, activo: cashflowConceptos.activo, aplicaProveedor: cashflowConceptos.aplicaProveedor,
     }).from(cashflowConceptos)
       .leftJoin(gastoCategorias, eq(gastoCategorias.id, cashflowConceptos.gastoCategoriaId))
       .where(todos ? eq(cashflowConceptos.enCaja, true) : and(eq(cashflowConceptos.enCaja, true), eq(cashflowConceptos.activo, true)))

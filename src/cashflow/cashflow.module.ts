@@ -47,7 +47,7 @@ import { cerrarHastaSql } from '../caja/plazo';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import type { OpcionesCashflow } from './vinculo';
-import { esConceptoAdelanto, esConceptoCambio, esConceptoDeposito, exigirConcepto } from './conceptos';
+import { esConceptoAdelanto, esConceptoCambio, esConceptoDeposito, exigirConcepto, medioAlProveedor } from './conceptos';
 import { empleadoDelMovimiento } from '../personal/personal';
 import {
   MarcaDto, PERMISO_CASHFLOW, cambiarUmbral, cuantasPendientes, listarCajas, marcarCaja, marcarDesdePantalla, resolverCaja, umbralControlar,
@@ -169,6 +169,8 @@ class ConceptoDto {
   @IsOptional() @IsBoolean() enCashflow?: boolean;
   @IsOptional() @IsBoolean() enCaja?: boolean;
   @IsOptional() @IsBoolean() pideDetalle?: boolean;
+  /** 0226: el egreso se puede aplicar a un proveedor. */
+  @IsOptional() @IsBoolean() aplicaProveedor?: boolean;
 }
 /** Una imputación del pago a proveedor: a qué factura (o gasto cargado) y cuánto. */
 class ImputacionCfDto {
@@ -187,12 +189,12 @@ class PagoProveedorDto {
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) detalle?: string;
   @IsOptional() @IsString() fecha?: string;
-  /** El depósito cargado desde «Sacar plata» (16/10/2026): el egreso queda con su concepto. */
+  /** El egreso cargado desde «Sacar plata» con un concepto que se aplica a un proveedor (0226): queda con su concepto. */
   @IsOptional() @IsInt() conceptoId?: number;
   @IsBoolean() confirmado!: boolean;
 }
-/** Un depósito ya cargado que se aplica a un proveedor: el importe y la fecha son los del depósito. */
-class AplicarDepositoDto {
+/** Un egreso ya cargado que se aplica a un proveedor: el importe y la fecha son los del egreso. */
+class AplicarProveedorDto {
   @IsInt() proveedorId!: number;
   @IsIn(['mercaderia', 'gastos']) destino!: 'mercaderia' | 'gastos';
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ImputacionCfDto) imputaciones?: ImputacionCfDto[];
@@ -825,6 +827,7 @@ export class CashflowService {
       gastoCategoriaId: cashflowConceptos.gastoCategoriaId, activo: cashflowConceptos.activo, orden: cashflowConceptos.orden,
       gastoCategoria: gastoCategorias.nombre,
       enCashflow: cashflowConceptos.enCashflow, enCaja: cashflowConceptos.enCaja, pideDetalle: cashflowConceptos.pideDetalle,
+      aplicaProveedor: cashflowConceptos.aplicaProveedor,
       usos: sql<number>`(select count(*)::int from cashflow_movimientos m where m.concepto_id = ${cashflowConceptos.id})`,
       usosCaja: sql<number>`(select count(*)::int from caja_movimientos m where m.concepto_id = ${cashflowConceptos.id})`,
     }).from(cashflowConceptos)
@@ -852,9 +855,15 @@ export class CashflowService {
     const enCaja = dto.enCaja ?? actual?.enCaja ?? true;
     if (!enCashflow && !enCaja) throw new BadRequestException('El concepto tiene que usarse en algún lado: en el Cash Flow, en la caja de los locales o en los dos.');
     if (enCaja && esConceptoCambio(nombre)) throw new BadRequestException('Un cambio por efectivo por transferencia se usa solo en el Cash Flow (pide quién y a qué cuenta).');
+    /* Se aplica a un proveedor (0226): solo un egreso que es movimiento de plata (un gasto ya va a Gastos). */
+    const aplicaProveedor = dto.aplicaProveedor ?? actual?.aplicaProveedor ?? false;
+    if (aplicaProveedor && (tipo !== 'egreso' || clase !== 'movimiento')) {
+      throw new BadRequestException('Solo un egreso que es movimiento de plata se aplica a un proveedor: un gasto ya se carga en Gastos.');
+    }
+    if (aplicaProveedor && esConceptoCambio(nombre)) throw new BadRequestException('El efectivo por transferencia ya tiene su propia forma de ir a un proveedor («Le transfirió a un proveedor»).');
     return {
       nombre, tipo, clase, gastoCategoriaId, activo: dto.activo ?? actual?.activo ?? true, orden: dto.orden ?? actual?.orden ?? 0,
-      enCashflow, enCaja, pideDetalle: dto.pideDetalle ?? actual?.pideDetalle ?? false,
+      enCashflow, enCaja, pideDetalle: dto.pideDetalle ?? actual?.pideDetalle ?? false, aplicaProveedor,
     };
   }
 
@@ -915,7 +924,7 @@ export class CashflowService {
     if (Number.isInteger(suc) && suc > 0) cond.push(sql`cs.sucursal_id = ${suc}`);
     const limite = Math.min(Math.max(Number(q.limite) || 500, 1), 2000);
     const r = await this.db.execute(sql`
-      select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto,
+      select m.id, m.fecha, m.tipo, m.origen, m.importe, m.detalle, m.concepto_id as "conceptoId", c.nombre as concepto, c.aplica_proveedor as "aplicaProveedor",
         m.sobre_id as "sobreId", s.caja_sesion_id as "cajaSesionId", su.nombre as sucursal, s.diferencia as "sobreDiferencia", cs.cierre as "cierreCaja",
         m.pago_id as "pagoId", m.gasto_id as "gastoId", u.nombre as usuario,
         pr.nombre as proveedor, pp.medio, coalesce(m.cambio_por, pp.cambio_por) as "cambioPor", m.cambio_cuenta as "cambioCuenta", pp.referencia, pp.aplicado as "pagoAplicado", g.descripcion as "gastoDescripcion", gc.nombre as "gastoCategoria",
@@ -1049,12 +1058,14 @@ export class CashflowService {
       const [caja] = await tx.select().from(cashflowCaja).limit(1).for('update');
       if (!caja) throw new BadRequestException('Primero arrancá el Cash Flow con la fecha y el saldo inicial.');
       if (fecha < caja.fechaInicio) throw new BadRequestException(`La fecha es anterior al arranque del Cash Flow (${caja.fechaInicio}).`);
-      /* El depósito cargado desde «Sacar plata» se queda con su concepto (16/10/2026). */
+      /* El egreso cargado desde «Sacar plata» se queda con su concepto (16/10/2026; desde 0226, cualquiera que se aplique a un proveedor). */
       if (dto.conceptoId != null) {
         const [c] = await tx.select().from(cashflowConceptos).where(eq(cashflowConceptos.id, dto.conceptoId)).limit(1);
-        if (!c || c.tipo !== 'egreso' || !c.activo || !c.enCashflow || !esConceptoDeposito(c.nombre) || dto.medio !== 'deposito') {
-          throw new BadRequestException('Solo un concepto de depósito (activo) se aplica a un proveedor, y como depósito.');
+        if (!c || c.tipo !== 'egreso' || !c.activo || !c.enCashflow || !c.aplicaProveedor) {
+          throw new BadRequestException('Ese concepto no se aplica a un proveedor: tildalo en Configuración › Conceptos o elegí otro.');
         }
+        const medio = medioAlProveedor(c.nombre);
+        if (dto.medio !== medio) throw new BadRequestException(`«${c.nombre}» se le paga al proveedor ${medio === 'deposito' ? 'como depósito' : 'en efectivo'}.`);
       }
       const instante = instanteDe(fecha);
       await this.exigirEfectivo(tx, fecha, instante, importe, 'el pago');
@@ -1092,13 +1103,14 @@ export class CashflowService {
   }
 
   /**
-   * UN DEPÓSITO YA CARGADO SE APLICA A UN PROVEEDOR (16/10/2026, pedido del
-   * dueño). La plata ya salió de la caja: no se vuelve a sacar. Se crea el pago
-   * (depósito, con el importe y el día del egreso, aplicado a lo tildado; lo que
-   * sobra queda a cuenta) y el egreso pasa a ser ese pago: anularlo después lo
-   * desaplica y lo anula en la cuenta del proveedor, como cualquier pago.
+   * UN EGRESO YA CARGADO SE APLICA A UN PROVEEDOR (16/10/2026 el depósito;
+   * desde 0226 todo concepto tildado «se aplica a un proveedor»). La plata ya
+   * salió de la caja: no se vuelve a sacar. Se crea el pago (depósito o
+   * efectivo según el concepto, con el importe y el día del egreso, aplicado a
+   * lo tildado; lo que sobra queda a cuenta) y el egreso pasa a ser ese pago:
+   * anularlo después lo desaplica y lo anula en la cuenta del proveedor.
    */
-  async aplicarDeposito(id: number, dto: AplicarDepositoDto, sesion: Sesion) {
+  async aplicarAProveedor(id: number, dto: AplicarProveedorDto, sesion: Sesion) {
     if (dto.confirmado !== true) throw new BadRequestException('Confirmá el pago.');
     const prov = await this.proveedor(dto.proveedorId);
     const detalle = String(dto.detalle ?? '').trim();
@@ -1107,15 +1119,17 @@ export class CashflowService {
       const [m] = await tx.select().from(cashflowMovimientos).where(eq(cashflowMovimientos.id, id)).limit(1).for('update');
       if (!m) throw new NotFoundException('Ese movimiento no existe.');
       if (m.anuladoEn) throw new BadRequestException('Ese movimiento está anulado.');
-      if (m.origen !== 'concepto' || m.tipo !== 'egreso' || !m.conceptoId) throw new BadRequestException('Ese movimiento ya no es un depósito suelto: actualizá la pantalla.');
-      const [c] = await tx.select({ nombre: cashflowConceptos.nombre }).from(cashflowConceptos).where(eq(cashflowConceptos.id, m.conceptoId)).limit(1);
-      if (!esConceptoDeposito(c?.nombre)) throw new BadRequestException('Ese egreso no es un depósito: solo se aplican a un proveedor los conceptos que dicen «depósito».');
+      if (m.origen !== 'concepto' || m.tipo !== 'egreso' || !m.conceptoId) throw new BadRequestException('Ese movimiento ya no es un egreso suelto: actualizá la pantalla.');
+      const [c] = await tx.select({ nombre: cashflowConceptos.nombre, aplicaProveedor: cashflowConceptos.aplicaProveedor })
+        .from(cashflowConceptos).where(eq(cashflowConceptos.id, m.conceptoId)).limit(1);
+      if (!c?.aplicaProveedor) throw new BadRequestException('Ese concepto no se aplica a un proveedor: tildalo en Configuración › Conceptos.');
+      const medio = medioAlProveedor(c.nombre);
       const importe = money(m.importe);
       const imputaciones = imputacionesDe(dto, importe);
-      const pago = await this.crearPago(prov, { ...dto, medio: 'deposito', importe, fecha: diaAr(m.fecha), detalle, imputaciones }, sesion);
+      const pago = await this.crearPago(prov, { ...dto, medio, importe, fecha: diaAr(m.fecha), detalle, imputaciones }, sesion);
       await tx.update(cashflowMovimientos).set({
         origen: 'pago_proveedor', pagoId: pago.id,
-        detalle: [`Pago a ${prov.nombre} (depósito)`, m.detalle, detalle].filter(Boolean).join(' · '),
+        detalle: [`Pago a ${prov.nombre} (${medio === 'deposito' ? 'depósito' : 'efectivo'})`, m.detalle, detalle].filter(Boolean).join(' · '),
       }).where(eq(cashflowMovimientos.id, id));
       return { ok: true, id, pagoId: pago.id, saldo: await this.saldo(tx) };
     });
@@ -1216,8 +1230,8 @@ export class CashflowController {
   @Get('gasto-categorias') gastoCategorias() { return this.svc.gastoCategorias(); }
   @Post('pagos') pagar(@Body() dto: PagoProveedorDto, @Auth() s: Sesion) { return this.svc.pagarProveedor(dto, s); }
   @Post('movimientos/:id/aplicar-proveedor')
-  aplicarDeposito(@Param('id', ParseIntPipe) id: number, @Body() dto: AplicarDepositoDto, @Auth() s: Sesion) {
-    return this.svc.aplicarDeposito(id, dto, s);
+  aplicarAProveedor(@Param('id', ParseIntPipe) id: number, @Body() dto: AplicarProveedorDto, @Auth() s: Sesion) {
+    return this.svc.aplicarAProveedor(id, dto, s);
   }
   @Post('movimientos/:id/anular')
   anularMovimiento(@Param('id', ParseIntPipe) id: number, @Body() dto: AnularDto, @Auth() s: Sesion) {
