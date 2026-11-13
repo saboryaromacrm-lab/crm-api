@@ -86,6 +86,18 @@ export const mp = {
    */
   buscarPagos: (filtros: Record<string, string>) => llamar<{ results?: any[] }>('GET', `/v1/payments/search?${new URLSearchParams(filtros).toString()}`),
   pago: (id: string) => llamar('GET', `/v1/payments/${encodeURIComponent(id)}`),
+  /*
+   * EL REPORTE DE LIBERACIONES (13/11/2026, diagnóstico de la cuenta): todo lo
+   * que mueve el saldo disponible. Se genera aparte (tarda) y después se baja.
+   *   GET  /v1/account/release_report/config   cómo está configurado
+   *   GET  /v1/account/release_report/list     los reportes ya generados
+   *   POST /v1/account/release_report          pedir uno (begin_date/end_date ISO con Z)
+   *   GET  /v1/account/release_report/{nombre} bajar uno (CSV)
+   */
+  configReporte: () => llamar('GET', '/v1/account/release_report/config'),
+  listaReportes: () => llamar<any[]>('GET', '/v1/account/release_report/list'),
+  pedirReporte: (desde: string, hasta: string) => llamar('POST', '/v1/account/release_report', { begin_date: desde, end_date: hasta }),
+  bajarReporte: (nombre: string) => llamar<string>('GET', `/v1/account/release_report/${encodeURIComponent(nombre)}`),
 };
 
 /**

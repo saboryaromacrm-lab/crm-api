@@ -45,6 +45,12 @@ import { mpCajas, mpCobros, mpSucursales, sucursales, terminales } from '../db/s
 import { terminalPorToken } from '../sucursales/sucursales.module';
 import { VentasModule, VentasService } from '../ventas/ventas.module';
 import { MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve, resumenPago } from './api';
+import { resumirPagos, resumirReporte } from './diagnostico';
+
+/** El diagnóstico de la cuenta: solo el superadmin (la llave no está en el catálogo de los roles). */
+const PERMISO_CUENTA = 'gerencia.mercadopago';
+/** Tope de pagos que trae el diagnóstico (Mercado Pago da 50 por página). */
+const TOPE_DIAGNOSTICO = 3000;
 
 /* ------------------------------- DTOs ------------------------------- */
 
@@ -98,6 +104,66 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   /* ------------------------------ la cuenta ------------------------------ */
+
+  /**
+   * DIAGNÓSTICO DE LA CUENTA (13/11/2026): solo lectura. Trae los pagos de los
+   * últimos `dias` días y los resume (tipo, medio, origen, comisiones, lo que
+   * falta liberar, por caja), y mira si el reporte de liberaciones está
+   * disponible. No guarda nada: es para decidir cómo armar «Mi Mercado Pago».
+   */
+  async diagnostico(diasIn: unknown) {
+    const dias = Math.min(Math.max(Math.round(Number(diasIn) || 7), 1), 31);
+    const cuenta = await mp.yo().then((yo) => ({ id: yo.id, nombre: yo.nickname ?? '', pais: yo.site_id ?? '' }));
+    const pagos: any[] = [];
+    let totalEnMp = 0;
+    for (let offset = 0; offset < Math.min(TOPE_DIAGNOSTICO, 10_000); offset += 50) {
+      const r: any = await mp.buscarPagos({
+        sort: 'date_created', criteria: 'desc', range: 'date_created',
+        begin_date: `NOW-${dias}DAYS`, end_date: 'NOW', limit: '50', offset: String(offset),
+      });
+      const lote = Array.isArray(r?.results) ? r.results : [];
+      totalEnMp = Number(r?.paging?.total ?? totalEnMp) || totalEnMp;
+      pagos.push(...lote);
+      if (lote.length < 50 || pagos.length >= totalEnMp) break;
+    }
+    const cajas = await this.db.select({ mpPosId: mpCajas.mpPosId, nombre: mpCajas.nombre, sucursal: sucursales.nombre })
+      .from(mpCajas).innerJoin(sucursales, eq(sucursales.id, mpCajas.sucursalId));
+    /* El reporte de liberaciones: si está configurado y qué reportes hay. Un error acá no tapa lo de arriba. */
+    const reporte = { config: null as any, lista: [] as any[], error: '' };
+    try { reporte.config = await mp.configReporte(); } catch (e) { reporte.error = `Configuración: ${(e as Error).message}`; }
+    try {
+      const l = await mp.listaReportes();
+      reporte.lista = (Array.isArray(l) ? l : []).slice(0, 10).map((x: any) => ({
+        nombre: x?.file_name ?? '', creado: x?.date_created ?? null, desde: x?.begin_date ?? null, hasta: x?.end_date ?? null, origen: x?.created_from ?? '',
+      }));
+    } catch (e) { reporte.error = [reporte.error, `Lista: ${(e as Error).message}`].filter(Boolean).join(' · '); }
+    return { cuenta, dias, totalEnMp, truncado: totalEnMp > pagos.length, pagos: resumirPagos(pagos, cajas), reporte };
+  }
+
+  /** Pide a Mercado Pago el reporte de liberaciones de los últimos `dias` días (se genera aparte; tarda unos minutos). */
+  async pedirReporte(diasIn: unknown) {
+    const dias = Math.min(Math.max(Math.round(Number(diasIn) || 7), 1), 31);
+    const hasta = new Date();
+    const desde = new Date(hasta.getTime() - dias * 86_400_000);
+    const iso = (d: Date) => `${d.toISOString().slice(0, 19)}Z`;
+    const r = await mp.pedirReporte(iso(desde), iso(hasta));
+    return { ok: true, desde: iso(desde), hasta: iso(hasta), respuesta: r };
+  }
+
+  /** Baja un reporte de liberaciones ya generado (el más nuevo si no se dice cuál) y lo resume. */
+  async leerReporte(nombreIn: unknown) {
+    let nombre = String(nombreIn ?? '').trim();
+    if (!nombre) {
+      const l = await mp.listaReportes();
+      const lista = (Array.isArray(l) ? l : []).filter((x: any) => x?.file_name)
+        .sort((a: any, b: any) => String(b?.date_created ?? '').localeCompare(String(a?.date_created ?? '')));
+      nombre = lista[0]?.file_name ?? '';
+    }
+    if (!nombre) throw new BadRequestException('Todavía no hay ningún reporte de liberaciones generado: pedí uno y esperá unos minutos.');
+    if (!/^[\w.-]+$/.test(nombre)) throw new BadRequestException('Ese nombre de reporte no es válido.');
+    const texto = await mp.bajarReporte(nombre);
+    return { nombre, ...resumirReporte(typeof texto === 'string' ? texto : JSON.stringify(texto)) };
+  }
 
   private async cuentaId(): Promise<number> {
     if (this.userId) return this.userId;
@@ -685,6 +751,16 @@ export class MercadoPagoController {
 
   @Get('estado') @Permiso('ventas.configuracion')
   estado() { return this.svc.estado(); }
+
+  /* Diagnóstico de la cuenta (13/11/2026): solo el superadmin. */
+  @Get('cuenta/diagnostico') @Permiso(PERMISO_CUENTA)
+  diagnostico(@Query('dias') dias?: string) { return this.svc.diagnostico(dias); }
+
+  @Post('cuenta/reporte') @Permiso(PERMISO_CUENTA)
+  pedirReporte(@Body() body: { dias?: number }) { return this.svc.pedirReporte(body?.dias); }
+
+  @Get('cuenta/reporte') @Permiso(PERMISO_CUENTA)
+  leerReporte(@Query('nombre') nombre?: string) { return this.svc.leerReporte(nombre); }
 
   @Post('cajas') @Permiso('ventas.configuracion')
   crearCaja(@Body() dto: CrearCajaDto) { return this.svc.crearCaja(dto); }
