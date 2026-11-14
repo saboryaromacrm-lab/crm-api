@@ -44,11 +44,13 @@ import { esJefe } from '../auth/auth.guard';
 import { mpCajas, mpCobros, mpSucursales, sucursales, terminales } from '../db/schema';
 import { terminalPorToken } from '../sucursales/sucursales.module';
 import { VentasModule, VentasService } from '../ventas/ventas.module';
-import { MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve, resumenPago } from './api';
+import { ErrorMp, MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve, resumenPago } from './api';
 import { resumirPagos, resumirReporte } from './diagnostico';
 
-/** El diagnóstico de la cuenta: solo el superadmin (la llave no está en el catálogo de los roles). */
-const PERMISO_CUENTA = 'gerencia.mercadopago';
+/** Gerencia › Pagos electrónicos (13/11/2026): la llave está en el catálogo; ningún rol la trae, se tilda. */
+export const PERMISO_PAGOS_ELECTRONICOS = 'gerencia.pagos_electronicos';
+/** Lo que contestó Mercado Pago, legible en la pantalla (sin esto llega como «falló algo en el servidor»). */
+const legible = (e: unknown): never => { throw e instanceof ErrorMp ? new BadRequestException(e.message) : e; };
 /** Tope de pagos que trae el diagnóstico (Mercado Pago da 50 por página). */
 const TOPE_DIAGNOSTICO = 3000;
 
@@ -752,15 +754,15 @@ export class MercadoPagoController {
   @Get('estado') @Permiso('ventas.configuracion')
   estado() { return this.svc.estado(); }
 
-  /* Diagnóstico de la cuenta (13/11/2026): solo el superadmin. */
-  @Get('cuenta/diagnostico') @Permiso(PERMISO_CUENTA)
-  diagnostico(@Query('dias') dias?: string) { return this.svc.diagnostico(dias); }
+  /* Diagnóstico de la cuenta (13/11/2026): Gerencia › Pagos electrónicos. */
+  @Get('cuenta/diagnostico') @Permiso(PERMISO_PAGOS_ELECTRONICOS)
+  diagnostico(@Query('dias') dias?: string) { return this.svc.diagnostico(dias).catch(legible); }
 
-  @Post('cuenta/reporte') @Permiso(PERMISO_CUENTA)
-  pedirReporte(@Body() body: { dias?: number }) { return this.svc.pedirReporte(body?.dias); }
+  @Post('cuenta/reporte') @Permiso(PERMISO_PAGOS_ELECTRONICOS)
+  pedirReporte(@Body() body: { dias?: number }) { return this.svc.pedirReporte(body?.dias).catch(legible); }
 
-  @Get('cuenta/reporte') @Permiso(PERMISO_CUENTA)
-  leerReporte(@Query('nombre') nombre?: string) { return this.svc.leerReporte(nombre); }
+  @Get('cuenta/reporte') @Permiso(PERMISO_PAGOS_ELECTRONICOS)
+  leerReporte(@Query('nombre') nombre?: string) { return this.svc.leerReporte(nombre).catch(legible); }
 
   @Post('cajas') @Permiso('ventas.configuracion')
   crearCaja(@Body() dto: CrearCajaDto) { return this.svc.crearCaja(dto); }

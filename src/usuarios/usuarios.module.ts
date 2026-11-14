@@ -279,6 +279,8 @@ export const CATALOGO_PERMISOS = [
       /* Una sola llave para las dos: Gastos fijos y sueldos carga lo que Resultados muestra. */
       { clave: 'gerencia.resultados', nombre: 'Resultados y Gastos fijos y sueldos (ve y carga los sueldos)' },
       { clave: 'gerencia.cashflow', nombre: 'Cash Flow (la caja central de efectivo: controlar sobres y mover plata)' },
+      /* 13/11/2026: la plata que entra por Mercado Pago (cobros, comisiones, lo que falta liberar). */
+      { clave: 'gerencia.pagos_electronicos', nombre: 'Pagos electrónicos (Mercado Pago: cobros, comisiones y lo que falta liberar)' },
       { clave: 'gerencia.asesor', nombre: 'Asesor (IA que lee todos los números del negocio)' },
       { clave: 'gerencia.auditoria', nombre: 'Auditoría (quién hizo qué)' },
     ],
