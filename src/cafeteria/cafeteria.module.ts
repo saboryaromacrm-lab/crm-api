@@ -33,7 +33,7 @@
  * un período ya mirado); solo un renglón NUEVO entra al costo del día.
  */
 import {
-  Body, Controller, Get, Inject, Injectable, Module, Param, ParseIntPipe, Patch, Post, Put, Query,
+  Body, Controller, Delete, Get, Inject, Injectable, Module, Param, ParseIntPipe, Patch, Post, Put, Query,
   BadRequestException, ConflictException, ForbiddenException, NotFoundException,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -57,7 +57,7 @@ import { InventarioService } from '../inventario/inventario.service';
 import { escalaPaquete, formatoActivo, formatoDeCosto, precioVentaFila } from '../inventario/pricing';
 import {
   type CostoCafe, costoCafe, costoUltimaFactura, cupoCafe, exigirCuentaAbierta, finDia, hoyAr, inicioDia, lineasCuenta, saldoAl,
-  segunCorte, sinIvaHasta, sumaTotales, sumarDias, totalesCuenta, totalesDeLineas, ultimoCierre,
+  segunCorte, sinIvaHasta, sumaTotales, conciliacionCoffit, corteCuenta, sumarDias, totalesCuenta, totalesDeLineas, ultimoCierre,
 } from './cuenta';
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -2197,7 +2197,33 @@ export class CafeteriaService {
       saldoHoy: hasta >= hoy ? saldoFinal : await saldoAl(this.db, hoy),
       ultimoCierre: cierre ? { id: cierre.id, hasta: cierre.hasta, saldoFinal: cierre.saldoFinal } : null,
       cierres,
+      conciliado: await this.conciliado(),
+      /* El último día congelado (cierre o conciliación): lo de esa fecha o antes no se anula ni se carga. */
+      corte: await corteCuenta(this.db),
     };
+  }
+
+  /** La marca de conciliación (16/11/2026), con quién la puso. */
+  private async conciliado() {
+    const k = await conciliacionCoffit(this.db);
+    if (!k) return null;
+    const [u] = k.usuarioId
+      ? await this.db.select({ nombre: usuarios.nombre }).from(usuarios).where(eq(usuarios.id, k.usuarioId)).limit(1)
+      : [];
+    return { at: k.at.toISOString(), usuario: u?.nombre ?? null };
+  }
+
+  /** «Concilié con Coffit»: lo de antes de hoy queda congelado, como en los proveedores. */
+  async conciliar(usuarioId: number | null) {
+    const valor = JSON.stringify({ at: new Date().toISOString(), usuarioId });
+    await this.db.execute(sql`insert into configuracion (clave, valor, updated_at) values ('coffit_conciliado', ${valor}::jsonb, now())
+      on conflict (clave) do update set valor = excluded.valor, updated_at = now()`);
+    return { conciliado: await this.conciliado() };
+  }
+
+  async desconciliar() {
+    await this.db.execute(sql`delete from configuracion where clave = 'coffit_conciliado'`);
+    return { conciliado: null };
   }
 
   /** Un pago, una compensación, un ajuste o el saldo inicial. */
@@ -2645,6 +2671,18 @@ export class CafeteriaController {
   @Permiso(PERMISO_METRICAS)
   anularMovimiento(@Param('id', ParseIntPipe) id: number, @Body() dto: MotivoDto, @Auth() sesion: Sesion) {
     return this.svc.anularMovimiento(id, dto.motivo, sesion?.usuarioId ?? null);
+  }
+
+  @Post('cuenta/conciliar')
+  @Permiso(PERMISO_METRICAS)
+  conciliar(@Auth() sesion: Sesion) {
+    return this.svc.conciliar(sesion?.usuarioId ?? null);
+  }
+
+  @Delete('cuenta/conciliar')
+  @Permiso(PERMISO_METRICAS)
+  desconciliar() {
+    return this.svc.desconciliar();
   }
 
   @Post('cuenta/cierres')

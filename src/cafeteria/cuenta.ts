@@ -263,13 +263,36 @@ export async function saldoAl(db: any, dia: string): Promise<number> {
 }
 
 /**
+ * LA MARCA DE CONCILIACIÓN (16/11/2026, pedido del dueño: «una marca hasta donde
+ * concilié, igual que en los demás proveedores»). Un sello sin saldo firmado,
+ * más liviano que el cierre: se toca «Concilié con Coffit» y lo de antes de ESE
+ * DÍA queda congelado igual que un mes cerrado (el mismo día sí se sigue
+ * trabajando, como en los proveedores). Vive en `configuracion`, sin migración.
+ */
+export async function conciliacionCoffit(db: any): Promise<{ at: Date; usuarioId: number | null } | null> {
+  const r = await db.execute(sql`select valor from configuracion where clave = 'coffit_conciliado'`);
+  const v = filasDe(r)[0]?.valor;
+  return v?.at ? { at: new Date(v.at), usuarioId: v.usuarioId ?? null } : null;
+}
+
+/** El último día congelado de la cuenta: el del último cierre o el anterior al día conciliado, el más nuevo. */
+export async function corteCuenta(db: any): Promise<{ hasta: string; por: 'cierre' | 'conciliacion' } | null> {
+  const c = await ultimoCierre(db);
+  const k = await conciliacionCoffit(db);
+  const hc: string | null = c?.hasta ?? null;
+  const hk = k ? sumarDias(k.at.toLocaleDateString('sv-SE', { timeZone: ZONA_AR }), -1) : null;
+  if (hk && (!hc || hk > hc)) return { hasta: hk, por: 'conciliacion' };
+  return hc ? { hasta: hc, por: 'cierre' } : null;
+}
+
+/**
  * LA FECHA EN QUE UN PAPEL ENTRA A LA CUENTA (0120). Una factura o un gasto
  * con fecha de un mes ya cerrado no se puede rechazar —es el papel fiscal, y
  * su fecha es la que es—: entra a la cuenta HOY. Devuelve null cuando cuenta
  * en su propia fecha.
  */
 export async function fechaDeCuenta(db: any, fecha: Date | null | undefined): Promise<Date | null> {
-  const c = await ultimoCierre(db);
+  const c = await corteCuenta(db);
   if (!c || !fecha) return null;
   return fecha.getTime() <= finDia(c.hasta).getTime() ? new Date() : null;
 }
@@ -284,11 +307,11 @@ export async function ajustePorAnulacion(tx: any, o: {
   fechaCuenta: Date; efecto: number; documento: string; usuarioId?: number | null;
 }) {
   if (Math.abs(o.efecto) < 0.005) return;
-  const c = await ultimoCierre(tx);
+  const c = await corteCuenta(tx);
   if (!c || o.fechaCuenta.getTime() > finDia(c.hasta).getTime()) return;
   await tx.insert(coffitMovimientos).values({
     fecha: new Date(), tipo: 'ajuste', aFavor: o.efecto > 0 ? 'coffit' : 'sya', importe: r2(Math.abs(o.efecto)),
-    descripcion: `Anulación de ${o.documento}, que ya estaba en un mes cerrado`,
+    descripcion: `Anulación de ${o.documento}, que ya estaba en ${c.por === 'cierre' ? 'un mes cerrado' : 'lo conciliado'}`,
     usuarioId: o.usuarioId ?? null,
   });
 }
@@ -299,16 +322,17 @@ export async function ajustePorAnulacion(tx: any, o: {
  * atrás. Lo que haya que corregir va como ajuste en el mes en curso.
  */
 export async function exigirCuentaAbierta(db: any, fecha: Date | string | null | undefined, que: string) {
-  const c = await ultimoCierre(db);
+  const c = await corteCuenta(db);
   if (!c) return;
   const f = fecha == null ? new Date() : (fecha instanceof Date ? fecha : new Date(String(fecha).length <= 10 ? `${fecha}T00:00:00` : String(fecha)));
   if (Number.isNaN(f.getTime())) return;
   if (f.getTime() <= finDia(c.hasta).getTime()) {
     const [a, m, d] = c.hasta.split('-');
-    throw new BadRequestException(
-      `No se puede ${que}: la cuenta con Coffit está cerrada hasta el ${d}/${m}/${a}. `
-      + 'Cargalo con fecha de hoy (o como ajuste en la cuenta corriente), o reabrí el último cierre.',
-    );
+    throw new BadRequestException(c.por === 'cierre'
+      ? `No se puede ${que}: la cuenta con Coffit está cerrada hasta el ${d}/${m}/${a}. `
+        + 'Cargalo con fecha de hoy (o como ajuste en la cuenta corriente), o reabrí el último cierre.'
+      : `No se puede ${que}: la cuenta con Coffit está conciliada hasta el ${d}/${m}/${a} inclusive. `
+        + 'Cargalo con fecha de hoy (o como ajuste en la cuenta corriente), o quitá la conciliación en la cuenta corriente.');
   }
 }
 
