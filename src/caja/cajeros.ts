@@ -10,7 +10,8 @@
  *    —«cierran su usuario y vuelve a abrir el que releva»—; también el relevo
  *    con PIN sin cambiar de sesión (0088). Solo la PC de la caja: el dueño que
  *    entra a mirar desde su casa no está en la caja;
- *  · el que cierra se elige al cerrar y firma con su PIN (`cerrado_por`).
+ *  · el que cierra se elige al cerrar y firma con la contraseña con la que
+ *    entra al sistema (`cerrado_por`).
  */
 import { BadRequestException } from '@nestjs/common';
 import { and, asc, desc, eq } from 'drizzle-orm';
@@ -77,14 +78,10 @@ export async function cajerosDelTurno(db: Database, turno: { id: number; usuario
   ];
 }
 
-/**
- * QUIÉNES PUEDEN CERRAR la caja de una sucursal: activos, que atienden la caja
- * y trabajan en ese local. `tienePin`: firman con el PIN; sin PIN, con la
- * contraseña con la que entran (nadie se queda sin poder cerrar).
- */
+/** QUIÉNES PUEDEN CERRAR la caja de una sucursal: activos, que atienden la caja y trabajan en ese local. */
 export async function quienesCierran(db: any, sucursalId: number) {
   const us = await db.select({
-    id: usuarios.id, nombre: usuarios.nombre, pinHash: usuarios.pinHash, sucursales: usuarios.sucursales,
+    id: usuarios.id, nombre: usuarios.nombre, sucursales: usuarios.sucursales,
     rolClave: roles.clave, permisos: roles.permisos, modoSucursal: roles.modoSucursal,
   }).from(usuarios).innerJoin(roles, eq(roles.id, usuarios.rolId))
     .where(eq(usuarios.activo, true)).orderBy(asc(usuarios.nombre));
@@ -94,10 +91,10 @@ export async function quienesCierran(db: any, sucursalId: number) {
       const locales = Array.isArray(u.sucursales) ? u.sucursales : [];
       return atiendeCaja(rol) && (!locales.length || rolCruzaSucursales(rol) || locales.includes(sucursalId));
     })
-    .map((u) => ({ id: u.id, nombre: u.nombre, tienePin: !!u.pinHash }));
+    .map((u) => ({ id: u.id, nombre: u.nombre }));
 }
 
-/** El que cierra tiene que poder cerrar esa caja: si no, se rechaza antes de mirar el PIN. */
+/** El que cierra tiene que poder cerrar esa caja: si no, se rechaza antes de mirar la contraseña. */
 export async function exigirQuienCierra(db: any, sucursalId: number, usuarioId: unknown) {
   const id = Number(usuarioId) || 0;
   if (!id) throw new BadRequestException('Elegí quién cierra la caja. Si no aparece la opción, recargá la página.');

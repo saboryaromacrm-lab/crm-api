@@ -400,24 +400,24 @@ export function verificarPassword(pw: string, hash: string): boolean {
 }
 
 /**
- * LA FIRMA CON PIN EN LA CAJA (0088 relevo, 0229 cierre): freno en memoria y
- * POR USUARIO, compartido por los dos: 5 fallos seguidos lo bloquean 5 minutos.
- * Un PIN de 4 dígitos sin freno se adivina probando, y el que prueba ya tiene
- * una sesión abierta adelante. Sin PIN (`soloPin` apagado) firma con su
- * contraseña. 403 y NO 401: para el ERP un 401 es «la sesión venció» y echaría
- * al login a quien está trabajando bien.
+ * LA FIRMA EN LA CAJA: el relevo con su PIN (0088) y el cierre con la
+ * contraseña con la que entra al sistema (0229, decisión del dueño). Freno en
+ * memoria y POR USUARIO, compartido por las dos: 5 fallos seguidos la bloquean
+ * 5 minutos. Una clave corta sin freno se adivina probando, y el que prueba ya
+ * tiene una sesión abierta adelante. 403 y NO 401: para el ERP un 401 es «la
+ * sesión venció» y echaría al login a quien está trabajando bien.
  */
 const fallosFirma = new Map<number, { n: number; hasta: number }>();
-export function exigirFirma(u: { id: number; pinHash: string; passwordHash: string }, clave: unknown, soloPin = false) {
+export function exigirFirma(u: { id: number; pinHash: string; passwordHash: string }, clave: unknown, con: 'pin' | 'contraseña') {
+  const que = con === 'pin' ? 'el PIN' : 'la contraseña';
   const f = fallosFirma.get(u.id);
   if (f && f.hasta > Date.now()) {
-    throw new ForbiddenException('Demasiados intentos fallidos: el PIN queda bloqueado unos minutos.');
+    throw new ForbiddenException(`Demasiados intentos fallidos: ${que} queda bloqueado unos minutos.`);
   }
-  const hash = u.pinHash || (soloPin ? '' : u.passwordHash);
-  if (!verificarPassword(String(clave ?? ''), hash)) {
+  if (!verificarPassword(String(clave ?? ''), con === 'pin' ? u.pinHash : u.passwordHash)) {
     const n = (f && f.hasta === 0 ? f.n : 0) + 1;
     fallosFirma.set(u.id, { n, hasta: n >= 5 ? Date.now() + 5 * 60_000 : 0 });
-    throw new ForbiddenException(u.pinHash || soloPin ? 'PIN incorrecto.' : 'Contraseña incorrecta.');
+    throw new ForbiddenException(con === 'pin' ? 'PIN incorrecto.' : 'Contraseña incorrecta.');
   }
   fallosFirma.delete(u.id);
 }
@@ -999,7 +999,7 @@ export class UsuariosService {
     if (!u || !u.activo || !u.relevoCaja || !u.pinHash) {
       throw new BadRequestException('Ese usuario no está habilitado para relevar en caja.');
     }
-    exigirFirma(u, o?.pin, true);
+    exigirFirma(u, o?.pin, 'pin');
 
     /* El relevo MISMO queda auditado: quién tomó la caja, en la sesión de
      * quién y en qué turno. El día que Gerencia › Auditoría exista, esto ya

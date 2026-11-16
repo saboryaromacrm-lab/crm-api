@@ -66,7 +66,7 @@ class EnviarCierreDto {
   /** La segunda confirmación de la pantalla, también exigida acá. */
   @IsBoolean() confirmado!: boolean;
   @IsOptional() @IsInt() usuarioId?: number;
-  /** QUIÉN CIERRA (0229): se elige de la lista y firma con su PIN (o su contraseña si no tiene PIN). */
+  /** QUIÉN CIERRA (0229): se elige de la lista y firma con la contraseña con la que entra al sistema. */
   @IsOptional() @IsInt() cerradoPor?: number;
   @IsOptional() @IsString() @MaxLength(100) firma?: string;
   /** El tilde «Mandar a Cajas a controlar» (0145): solo el dueño, en la misma transacción del cierre. */
@@ -832,9 +832,9 @@ export class CajaService {
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
-      /* Quién cierra (0229): elegido y firmado con su PIN, antes de tocar nada. */
+      /* Quién cierra (0229): elegido y firmado con su contraseña, antes de tocar nada. */
       const cierra = await exigirQuienCierra(tx, sesion.sucursalId, dto.cerradoPor);
-      exigirFirma(cierra, dto.firma);
+      exigirFirma(cierra, dto.firma, 'contraseña');
       await sinCobrosQrVivos(tx, sesion.sucursalId);
 
       const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
