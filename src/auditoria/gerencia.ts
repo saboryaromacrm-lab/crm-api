@@ -88,6 +88,12 @@ export interface EventoAuditoria {
   informativo?: boolean;
   /** La otra persona del caso: quién cobró la venta anulada, quién hizo el control. */
   otro?: { etiqueta: string; usuarioId: number };
+  /**
+   * La otra persona que RESPONDE por el monto (0229): una diferencia de caja es
+   * del que abrió y también del que cerró, cuando no es el mismo («de los dos»,
+   * decisión del dueño). Le suma a cada uno; el total general la cuenta una vez.
+   */
+  tambien?: { etiqueta: string; usuarioId: number };
 }
 
 /** Cada producto ajustado o dado de baja, suelto (también los de un control): la base de la alerta «se ajusta seguido». */
@@ -154,7 +160,7 @@ export async function auditoriaGerencia(db: Database, f: FiltroAuditoria) {
           LEFT JOIN conteos co ON co.id = m.ref_conteo_id
          WHERE m.tipo IN ('ajuste', 'merma', 'vencido', 'defectuoso') AND m.signo <> 0 AND ${en('m.fecha')} ${deSuc('m.sucursal_id')}`),
       cierres: await q(sql`
-        SELECT cs.id, cs.cierre AS fecha, cs.usuario_id AS u, cs.sucursal_id AS suc, cs.diferencia,
+        SELECT cs.id, cs.cierre AS fecha, cs.usuario_id AS u, cs.cerrado_por AS cerro, cs.sucursal_id AS suc, cs.diferencia,
                cs.sistema_efectivo, cs.declarado_efectivo, cs.observaciones
           FROM caja_sesiones cs
          WHERE cs.estado = 'cerrada' AND abs(cs.diferencia) >= ${NULA} AND ${en('cs.cierre')} ${deSuc('cs.sucursal_id')}`),
@@ -166,7 +172,7 @@ export async function auditoriaGerencia(db: Database, f: FiltroAuditoria) {
            -- El cierre por envío firma su propio conteo como control (caja.module): ese ES el cierre, no va dos veces.
            AND cc.observaciones NOT LIKE 'Cierre por envío%'`),
       sobres: await q(sql`
-        SELECT so.id, so.controlado_en AS fecha, cs.usuario_id AS u, so.controlado_por AS controlo, cs.sucursal_id AS suc,
+        SELECT so.id, so.controlado_en AS fecha, cs.usuario_id AS u, cs.cerrado_por AS cerro, so.controlado_por AS controlo, cs.sucursal_id AS suc,
                so.diferencia, so.enviado, so.contado, so.motivo, cs.id AS turno
           FROM cashflow_sobres so JOIN caja_sesiones cs ON cs.id = so.caja_sesion_id
          WHERE so.anulado_en IS NULL AND NOT so.descartado AND abs(so.diferencia) >= ${NULA}
@@ -237,7 +243,7 @@ export async function auditoriaGerencia(db: Database, f: FiltroAuditoria) {
   }, { isolationLevel: 'repeatable read', accessMode: 'read only' });
 
   const { eventos, ajustes } = armarEventos(datos);
-  const deLaPersona = f.usuarioId ? eventos.filter((e) => e.usuarioId === f.usuarioId) : eventos;
+  const deLaPersona = f.usuarioId ? eventos.filter((e) => e.usuarioId === f.usuarioId || e.tambien?.usuarioId === f.usuarioId) : eventos;
   const cobradas = datos.cobradas.map((x) => ({ u: x.u == null ? null : Number(x.u), n: Number(x.n), total: Number(x.total) }));
 
   /* Los números de arriba: todos los tipos, siempre (el tipo elegido solo achica la lista). */
@@ -268,6 +274,7 @@ export async function auditoriaGerencia(db: Database, f: FiltroAuditoria) {
   for (const e of eventos) {
     if (e.usuarioId) usados.add(e.usuarioId);
     if (e.otro) usados.add(e.otro.usuarioId);
+    if (e.tambien) usados.add(e.tambien.usuarioId);
     if (e.sucursalId) sucsUsadas.add(e.sucursalId);
   }
   for (const c of cobradas) if (c.u) usados.add(c.u);
@@ -397,12 +404,16 @@ function armarEventos(d: Datos): { eventos: EventoAuditoria[]; ajustes: AjusteSu
     });
   }
 
+  /* Abrió uno y cerró otro (0229): la diferencia es de los dos. */
+  const yCerro = (x: any) => (x.cerro != null && num(x.cerro) !== num(x.u)
+    ? { tambien: { etiqueta: 'Cerró la caja', usuarioId: Number(x.cerro) } } : {});
   for (const x of d.cierres) {
     push({
       id: `caja-cierre-${x.id}`, tipo: 'caja', fecha: iso(x.fecha), usuarioId: num(x.u), sucursalId: num(x.suc), monto: r2(x.diferencia),
       titulo: `Cierre de caja (turno #${x.id}) ${Number(x.diferencia) < 0 ? 'con faltante' : 'con sobrante'}`,
       detalle: [`Tenía que haber ${$(x.sistema_efectivo)} en efectivo y se contaron ${$(x.declarado_efectivo)}`],
       motivo: x.observaciones ?? '',
+      ...yCerro(x),
     });
   }
   for (const x of d.controles) {
@@ -422,6 +433,7 @@ function armarEventos(d: Datos): { eventos: EventoAuditoria[]; ajustes: AjusteSu
       detalle: [`Se mandaron ${$(x.enviado)} y en el Cash Flow se contaron ${$(x.contado)}`],
       motivo: x.motivo ?? '',
       ...(x.controlo ? { otro: { etiqueta: 'Lo contó', usuarioId: Number(x.controlo) } } : {}),
+      ...yCerro(x),
     });
   }
   for (const x of d.cajaDueno) {
@@ -563,12 +575,16 @@ function porPersona(eventos: EventoAuditoria[], cobradas: { u: number | null; n:
     return p;
   };
   for (const c of cobradas) { const p = de(c.u); p.cobradas += c.n; p.totalCobrado += c.total; }
+  const sumarCaja = (p: Persona, monto: number) => {
+    if (monto < 0) { p.caja.faltantes += 1; p.caja.faltante += monto; } else { p.caja.sobrantes += 1; p.caja.sobrante += monto; }
+  };
   for (const e of eventos) {
     if (e.informativo) continue;
     const p = de(e.usuarioId);
     if (e.tipo === 'cambios') p.cambios += 1;
     else if (e.tipo === 'caja') {
-      if ((e.monto ?? 0) < 0) { p.caja.faltantes += 1; p.caja.faltante += e.monto!; } else { p.caja.sobrantes += 1; p.caja.sobrante += e.monto ?? 0; }
+      sumarCaja(p, e.monto ?? 0);
+      if (e.tambien) sumarCaja(de(e.tambien.usuarioId), e.monto ?? 0);
     } else { p[e.tipo].n += 1; p[e.tipo].monto += e.monto ?? 0; }
   }
   const redondear = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, r2(v)]));

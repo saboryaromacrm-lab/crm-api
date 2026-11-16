@@ -23,7 +23,8 @@ import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
 import { MarcaDto, PERMISO_CASHFLOW, marcarCaja } from '../cashflow/a-controlar';
-import { resolverOperador } from '../usuarios/usuarios.module';
+import { exigirFirma, resolverOperador } from '../usuarios/usuarios.module';
+import { cajerosDelTurno, exigirQuienCierra, quienesCierran } from './cajeros';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { GastosModule, GastosService } from '../gastos/gastos.module';
 import { type ConceptoRegla, esConceptoAdelanto, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
@@ -65,7 +66,9 @@ class EnviarCierreDto {
   /** La segunda confirmación de la pantalla, también exigida acá. */
   @IsBoolean() confirmado!: boolean;
   @IsOptional() @IsInt() usuarioId?: number;
-  @IsOptional() @IsInt() operadorId?: number;
+  /** QUIÉN CIERRA (0229): se elige de la lista y firma con su PIN (o su contraseña si no tiene PIN). */
+  @IsOptional() @IsInt() cerradoPor?: number;
+  @IsOptional() @IsString() @MaxLength(100) firma?: string;
   /** El tilde «Mandar a Cajas a controlar» (0145): solo el dueño, en la misma transacción del cierre. */
   @IsOptional() @ValidateNested() @Type(() => MarcaDto) aControlar?: MarcaDto;
 }
@@ -409,11 +412,7 @@ export class CajaService {
       join caja_sesiones cs on cs.id = m.caja_sesion_id
       join sucursales su on su.id = cs.sucursal_id
       left join usuarios ua on ua.id = cs.usuario_id
-      left join lateral (
-        select cc.usuario_id from caja_controles cc
-        where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1
-      ) cx on true
-      left join usuarios uc on uc.id = cx.usuario_id
+      left join usuarios uc on uc.id = cs.cerrado_por
       left join usuarios um on um.id = m.usuario_id
       left join proveedor_pagos pp on pp.caja_movimiento_id = m.id
       left join proveedores pr on pr.id = pp.proveedor_id
@@ -532,6 +531,8 @@ export class CajaService {
       /** De lo cobrado, cuánto fue recargo por cuotas y no venta (0100). */
       recargos,
       ctaCte: { total: money(Number(ctaCte?.total) || 0), cantidad: Number(ctaCte?.n) || 0 },
+      /** Quién estuvo en la caja (0229): el que abrió y los cambios de cajero; quién cerró va en `sesion.cerradoPor`. */
+      cajeros: await cajerosDelTurno(this.db, sesion),
       ciego: false,
     };
     /* Ciego SIEMPRE para el que no es jefe (0111): también el turno cerrado,
@@ -794,6 +795,13 @@ export class CajaService {
     });
   }
 
+  /** Quiénes pueden cerrar el turno (0229), de su sucursal. */
+  async quienCierra(id: number, sucursalSesion: number | null) {
+    const turno = await this.get(id);
+    if (sucursalSesion != null && turno.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+    return quienesCierran(this.db, turno.sucursalId);
+  }
+
   /**
    * EL CIERRE DEL CAJERO: CONTAR, DEJAR EL FONDO Y ENVIAR (0111, pedido del dueño).
    *
@@ -817,7 +825,6 @@ export class CajaService {
       throw new BadRequestException('Confirmá el envío: el turno se cierra y no se puede reabrir.');
     }
     const { billetes, total: contado } = totalDeBilletes(dto.billetes);
-    const cerrador = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
 
     return this.db.transaction(async (tx) => {
       const [sesion] = await tx.select().from(cajaSesiones)
@@ -825,6 +832,9 @@ export class CajaService {
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+      /* Quién cierra (0229): elegido y firmado con su PIN, antes de tocar nada. */
+      const cierra = await exigirQuienCierra(tx, sesion.sucursalId, dto.cerradoPor);
+      exigirFirma(cierra, dto.firma);
       await sinCobrosQrVivos(tx, sesion.sucursalId);
 
       const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
@@ -870,6 +880,7 @@ export class CajaService {
         billetesEnvio,
         envioEfectivo: envio,
         fondoQueda: queda,
+        cerradoPor: cierra.id,
         observaciones: sesion.observaciones ? `${sesion.observaciones} · ${nota}` : nota,
       }).where(eq(cajaSesiones.id, id)).returning();
       /* El conteo del cierre también queda firmado por quien contó, como control
@@ -880,7 +891,7 @@ export class CajaService {
         contadoEfectivo: contado,
         diferencia,
         observaciones: `Cierre por envío (conteo por billetes): envió ${$(envio)}, quedan ${$(queda)} de fondo`,
-        usuarioId: cerrador ?? null,
+        usuarioId: cierra.id,
       });
       if (dto.aControlar) await marcarCaja(tx, { cajaSesionId: id, origen: 'cierre', nota: dto.aControlar.nota, usuarioId: marcadaPor });
       /* El esperado y la diferencia viajan: el controlador los saca si el que
@@ -1236,6 +1247,12 @@ export class CajaController {
   @Post(':id/cerrar')
   cerrar() {
     throw new ForbiddenException('La caja se cierra contando los billetes y enviando («Cerrar caja»). El cierre con monto se dio de baja.');
+  }
+
+  /** Quiénes pueden cerrar este turno (0229): la lista del «¿Quién cierra la caja?». */
+  @Get(':id/quien-cierra')
+  quienCierra(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    return this.svc.quienCierra(id, soloSuSucursal(sesion));
   }
 
   /** El cierre: contar billetes, dejar el fondo y enviar el resto (0111). Para todos. */

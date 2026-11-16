@@ -83,18 +83,15 @@ const diaVisible = (p: string) => `${p.slice(8, 10)}/${p.slice(5, 7)}/${p.slice(
  * cuenta y lo que entró después no. El arranque va al COMIENZO de su día.
  */
 /**
- * QUIÉN ES EL CAJERO DE UN TURNO: el que firmó el cierre por envío; si no hay,
- * el que abrió. Los joins van juntos (alias `cs` = caja_sesiones) y se leen
+ * QUIÉN ES EL CAJERO DE UN TURNO: el que lo cerró (`cerrado_por`, 0229: se
+ * elige al cerrar con PIN; los viejos, el que firmó el cierre por envío); si
+ * no hay, el que abrió. Los joins van juntos (alias `cs` = caja_sesiones) y se leen
  * con `coalesce(uc.nombre, ua.nombre, '')`: Sobres y la planilla del día dicen
  * el mismo nombre.
  */
 const CAJERO_DEL_TURNO = sql`
   left join usuarios ua on ua.id = cs.usuario_id
-  left join lateral (
-    select cc.usuario_id from caja_controles cc
-    where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1
-  ) cx on true
-  left join usuarios uc on uc.id = cx.usuario_id`;
+  left join usuarios uc on uc.id = cs.cerrado_por`;
 
 const instanteDe = (dia: string) => (dia === hoyAr() ? new Date() : new Date(`${dia}T23:59:59-03:00`));
 const inicioDelDia = (dia: string) => new Date(`${dia}T00:00:00-03:00`);
@@ -539,8 +536,7 @@ export class CashflowService {
           coalesce(sum(s.diferencia) filter (where s.diferencia > 0), 0) as sobrantes
         from cashflow_sobres s join caja_sesiones cs on cs.id = s.caja_sesion_id
         left join usuarios ua on ua.id = cs.usuario_id
-        left join lateral (select cc.usuario_id from caja_controles cc where cc.caja_sesion_id = cs.id and cc.observaciones like 'Cierre por envío%' order by cc.id desc limit 1) cx on true
-        left join usuarios uc on uc.id = cx.usuario_id
+        left join usuarios uc on uc.id = cs.cerrado_por
         where ${conSobres ? sql`true` : sql`false`} and s.anulado_en is null and not s.descartado and ${desdeDia('cs.cierre', desde)} and ${hastaDia('cs.cierre', hasta)} ${sucSobres}
         group by 1, 2 order by 5 asc`),
     ]);

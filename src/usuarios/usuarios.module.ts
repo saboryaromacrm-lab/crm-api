@@ -32,6 +32,7 @@ import { rolCruzaSucursales } from '../auth/modo-sucursal';
  * exista sesión y así Usuarios no tiene que importar el módulo Sucursales
  * entero por una consulta. */
 import { marcarUsoTerminal, terminalPorToken } from '../sucursales/sucursales.module';
+import { cambioDeCajeroAlEntrar, registrarCajero } from '../caja/cajeros';
 
 /* ---------------- Catálogo de permisos (fuente de verdad) ---------------- */
 /**
@@ -396,6 +397,29 @@ export function verificarPassword(pw: string, hash: string): boolean {
   const calc = scryptSync(pw, salt, 64);
   const guardado = Buffer.from(h, 'hex');
   return calc.length === guardado.length && timingSafeEqual(calc, guardado);
+}
+
+/**
+ * LA FIRMA CON PIN EN LA CAJA (0088 relevo, 0229 cierre): freno en memoria y
+ * POR USUARIO, compartido por los dos: 5 fallos seguidos lo bloquean 5 minutos.
+ * Un PIN de 4 dígitos sin freno se adivina probando, y el que prueba ya tiene
+ * una sesión abierta adelante. Sin PIN (`soloPin` apagado) firma con su
+ * contraseña. 403 y NO 401: para el ERP un 401 es «la sesión venció» y echaría
+ * al login a quien está trabajando bien.
+ */
+const fallosFirma = new Map<number, { n: number; hasta: number }>();
+export function exigirFirma(u: { id: number; pinHash: string; passwordHash: string }, clave: unknown, soloPin = false) {
+  const f = fallosFirma.get(u.id);
+  if (f && f.hasta > Date.now()) {
+    throw new ForbiddenException('Demasiados intentos fallidos: el PIN queda bloqueado unos minutos.');
+  }
+  const hash = u.pinHash || (soloPin ? '' : u.passwordHash);
+  if (!verificarPassword(String(clave ?? ''), hash)) {
+    const n = (f && f.hasta === 0 ? f.n : 0) + 1;
+    fallosFirma.set(u.id, { n, hasta: n >= 5 ? Date.now() + 5 * 60_000 : 0 });
+    throw new ForbiddenException(u.pinHash || soloPin ? 'PIN incorrecto.' : 'Contraseña incorrecta.');
+  }
+  fallosFirma.delete(u.id);
 }
 
 /** Usuario sin secretos, con su rol resuelto: lo que viaja al frontend. */
@@ -874,7 +898,11 @@ export class UsuariosService {
     /* Recién acá, con el login YA aceptado: si se marcara antes, el `ultimoUso`
      * de la terminal contaría también los intentos fallidos y dejaría de servir
      * para lo que sirve — reconocer qué equipos están realmente en uso. */
-    if (terminal) await marcarUsoTerminal(this.db, terminal.id, userAgent);
+    if (terminal) {
+      await marcarUsoTerminal(this.db, terminal.id, userAgent);
+      /* En la PC de la caja con otro usuario y el turno abierto: cambio de cajero (0229). */
+      if (!sinSucursal) await cambioDeCajeroAlEntrar(this.db, { usuarioId: u.id, rol: r, sucursalId: suc.id, terminalId: terminal.id });
+    }
 
     return {
       ok: true,
@@ -948,14 +976,6 @@ export class UsuariosService {
 
   /* ---------------- Relevo de caja (0088) ---------------- */
 
-  /**
-   * Freno del PIN, en memoria y POR USUARIO: 5 fallos seguidos lo bloquean 5
-   * minutos. Un PIN de 4 dígitos sin freno se adivina probando — y acá el que
-   * prueba ya tiene una sesión ajena abierta adelante, así que el freno es lo
-   * único entre él y firmar con el nombre de otro.
-   */
-  private pinFallos = new Map<number, { n: number; hasta: number }>();
-
   /** Los usuarios que pueden tomar la caja: activos, con la marca y con PIN. */
   async listRelevos() {
     const us = await this.db.select().from(usuarios)
@@ -979,19 +999,7 @@ export class UsuariosService {
     if (!u || !u.activo || !u.relevoCaja || !u.pinHash) {
       throw new BadRequestException('Ese usuario no está habilitado para relevar en caja.');
     }
-    /* 403 y NO 401 a propósito: para el httpClient un 401 significa "la sesión
-     * venció" y ECHA a la cajera al login — acá la sesión de la titular está
-     * perfecta, lo que falla es el PIN del relevo. */
-    const f = this.pinFallos.get(u.id);
-    if (f && f.hasta > Date.now()) {
-      throw new ForbiddenException('Demasiados intentos fallidos: el PIN queda bloqueado unos minutos.');
-    }
-    if (!verificarPassword(String(o?.pin ?? ''), u.pinHash)) {
-      const n = (f && f.hasta === 0 ? f.n : 0) + 1;
-      this.pinFallos.set(u.id, { n, hasta: n >= 5 ? Date.now() + 5 * 60_000 : 0 });
-      throw new ForbiddenException('PIN incorrecto.');
-    }
-    this.pinFallos.delete(u.id);
+    exigirFirma(u, o?.pin, true);
 
     /* El relevo MISMO queda auditado: quién tomó la caja, en la sesión de
      * quién y en qué turno. El día que Gerencia › Auditoría exista, esto ya
@@ -1007,6 +1015,8 @@ export class UsuariosService {
       despues: u.nombre,
       usuarioId: sesion?.usuarioId ?? null,
     }]);
+    /* Y es un cambio de cajero del turno (0229): queda en la lista de quién estuvo en la caja. */
+    if (turno) await registrarCajero(this.db, { cajaSesionId: turno, usuarioId: u.id, origen: 'relevo', sucursalId: sesion?.sucursalId ?? null });
     return { ok: true, usuario: { id: u.id, nombre: u.nombre } };
   }
 
@@ -1023,6 +1033,7 @@ export class UsuariosService {
       despues: sesion?.nombre ?? '',
       usuarioId: sesion?.usuarioId ?? null,
     }]);
+    if (turno && sesion) await registrarCajero(this.db, { cajaSesionId: turno, usuarioId: sesion.usuarioId, origen: 'relevo', sucursalId: sesion.sucursalId });
     return { ok: true };
   }
 

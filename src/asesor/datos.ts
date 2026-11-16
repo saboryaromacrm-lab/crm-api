@@ -459,9 +459,7 @@ export async function caja(c: PoolClient, f: Filtro) {
       `SELECT su.nombre AS sucursal, coalesce(uc.nombre, ua.nombre, '') AS cajero, cs.diferencia::float8 AS dif
        FROM caja_sesiones cs JOIN sucursales su ON su.id = cs.sucursal_id
        LEFT JOIN usuarios ua ON ua.id = cs.usuario_id
-       LEFT JOIN LATERAL (SELECT cc.usuario_id FROM caja_controles cc WHERE cc.caja_sesion_id = cs.id
-         AND cc.observaciones LIKE 'Cierre por envío%' ORDER BY cc.id DESC LIMIT 1) cx ON true
-       LEFT JOIN usuarios uc ON uc.id = cx.usuario_id
+       LEFT JOIN usuarios uc ON uc.id = cs.cerrado_por
        WHERE cs.cierre IS NOT NULL AND ${enRango('cs.cierre', 1)}${suc}`, params),
     () => c.query(
       `SELECT coalesce(co.nombre, CASE WHEN pp.id IS NOT NULL THEN 'Pago a proveedor' WHEN m.motivo LIKE 'Devolución %' THEN 'Devoluciones a clientes'

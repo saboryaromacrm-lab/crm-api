@@ -2140,6 +2140,8 @@ export const cajaSesiones = pgTable('caja_sesiones', {
   billetesEnvio: jsonb('billetes_envio'),
   /** El último día para cerrarla, fijado al abrir (0214): el próximo día de cierre del local. Vacío = local de todos los días. */
   cerrarHasta: date('cerrar_hasta', { mode: 'string' }),
+  /** Quién cerró (0229): se elige al cerrar y firma con su PIN. Puede no ser el que abrió (`usuarioId`). */
+  cerradoPor: integer('cerrado_por').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixSucursal: index('ix_caja_sesiones_sucursal').on(t.sucursalId, t.estado),
   /* UNA sola abierta por sucursal (0085): el candado vive en la base porque el
@@ -2147,6 +2149,23 @@ export const cajaSesiones = pgTable('caja_sesiones', {
    * clic abría dos turnos. Índice parcial: las cerradas no cuentan. */
   uqAbierta: uniqueIndex('uq_caja_abierta_por_sucursal').on(t.sucursalId)
     .where(sql`${t.estado} = 'abierta'`),
+}));
+
+/**
+ * LOS CAMBIOS DE CAJERO DE UN TURNO (0229, pedido del dueño). El primero es el
+ * que abrió (`caja_sesiones.usuario_id`); cada fila es alguien que tomó la caja
+ * después: entró en la PC de la caja con su usuario (`ingreso`) o la tomó con
+ * su PIN sin cambiar de sesión (`relevo`, 0088).
+ */
+export const cajaCajeros = pgTable('caja_cajeros', {
+  id: serial('id').primaryKey(),
+  cajaSesionId: integer('caja_sesion_id').notNull().references(() => cajaSesiones.id, { onDelete: 'cascade' }),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  desde: timestamp('desde', { withTimezone: true }).notNull().defaultNow(),
+  origen: text('origen').$type<'ingreso' | 'relevo'>().notNull(),
+  terminalId: integer('terminal_id').references(() => terminales.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixSesion: index('ix_caja_cajeros_sesion').on(t.cajaSesionId, t.id),
 }));
 
 /** Entradas y salidas de dinero que no son ventas ni cobranzas (retiros, gastos). */
@@ -4220,7 +4239,7 @@ export const schema = {
   ofertas, ofertaAlcances, ofertaComponentes, precioHistorial, descuentos,
   productoProveedorCostos, stock, movimientos, conteos, conteoItems, transferencias, transferenciaItems, transferenciaHist,
   incidencias, comprobantes, comprobanteItems, facturaLecturas, facturaArchivos,
-  clientes, cajaSesiones, cajaMovimientos, cajaControles, ventas, ventaItems, ventaExtras, ventaPagos,
+  clientes, cajaSesiones, cajaMovimientos, cajaControles, cajaCajeros, ventas, ventaItems, ventaExtras, ventaPagos,
   cobranzas, cobranzaPagos, cobranzaImputaciones, presupuestos, presupuestoItems, configuracion,
   webImagenes, webEventos,
   gastoCategorias, gastos, gastoItems, gastosRecurrentes, gastoAdjuntos,

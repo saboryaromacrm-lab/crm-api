@@ -1604,6 +1604,13 @@
       "when": 1795384800000,
       "tag": "0228_pago_coffit",
       "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1795471200000,
+      "tag": "0229_caja_quien_cierra",
+      "breakpoints": true
     }
   ]
 }
