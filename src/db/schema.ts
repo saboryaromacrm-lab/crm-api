@@ -2226,6 +2226,10 @@ export const medioPagoEnum = pgEnum('medio_pago', [
   // reportes y en la conciliación bancaria no puede contarse como plata
   // que entró al banco.
   'transferencia_proveedor',
+  // 0228 · LO PAGÓ COFFIT: un pago a proveedor que hizo Coffit con su plata.
+  // Salda la factura, no toca caja ni Mis cuentas, y entra a favor de Coffit
+  // en la cuenta entre los dos negocios (cafeteria/cuenta.ts).
+  'pago_coffit',
 ]);
 
 /* ============================================================================

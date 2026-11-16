@@ -44,6 +44,7 @@ import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ECHEQ_EN_CARTERA, ECHEQ_VIVOS, ajustarPendientesTx, faltaCompromiso } from '../proveedores/echeqs';
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia, nombreCuentaSql } from './cuentas-propias';
+import { ajustePorAnulacion, exigirCuentaAbierta } from '../cafeteria/cuenta';
 import {
   cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, cuentasPropias, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores,
@@ -55,7 +56,32 @@ const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const EPS = 0.009;
 
 // 0068: se suman 'deposito' y 'echeq' (los medios del módulo Proveedores).
-const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'deposito', 'echeq'] as const;
+// 0228: 'pago_coffit' — la factura la pagó Coffit con su plata (ver `exigirPagoCoffit`).
+const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'deposito', 'echeq', 'pago_coffit'] as const;
+
+/**
+ * LO PAGÓ COFFIT (0228, 16/11/2026, pedido del dueño). Coffit le pagó directo
+ * al proveedor una factura que está cargada acá: la factura queda pagada y la
+ * cuenta con Coffit lo toma a su favor por el mismo importe (cuenta.ts), así
+ * la compra no le queda cobrada dos veces.
+ *
+ *   · Es un pago de UN SOLO medio: mezclado con plata propia en un pago mixto,
+ *     la cuenta con Coffit no sabría qué parte fue suya. Si pagaron entre los
+ *     dos, son dos pagos.
+ *   · No sale de ningún cajón ni de ninguna cuenta propia: no es plata de la
+ *     empresa (solo el efectivo genera egreso y solo la transferencia pide cuenta).
+ *   · No puede caer en un mes ya cerrado con Coffit: ese saldo se firmó.
+ */
+async function exigirPagoCoffit(db: any, dto: { medio?: string; formas?: { medio: string }[]; fecha?: string; cambioPor?: string }) {
+  if (dto.formas?.some((f) => f.medio === 'pago_coffit')) {
+    throw new BadRequestException(
+      'Lo que pagó Coffit va en un pago aparte, de un solo medio: si pagaron entre los dos, registrá un pago para cada uno.',
+    );
+  }
+  if (dto.formas?.length || dto.medio !== 'pago_coffit') return;
+  if ((dto.cambioPor ?? '').trim()) throw new BadRequestException('Un pago de Coffit no lleva efectivo por transferencia.');
+  await exigirCuentaAbierta(db, dto.fecha ?? null, 'registrar un pago de Coffit con esa fecha');
+}
 
 /* --------------------------------- DTOs --------------------------------- */
 
@@ -959,6 +985,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
      * parte, para que los listados simples sigan teniendo qué mostrar sin
      * agregar sobre el split.
      */
+    await exigirPagoCoffit(this.db, dto);
     const formas = await Promise.all((dto.formas ?? []).map(async (f) => ({
       medio: f.medio as any,
       importe: money(f.importe),
@@ -1742,6 +1769,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
         cajaMovimientoId: null,
         observaciones: nota ? `${p.observaciones ? `${p.observaciones}\n` : ''}Anulado: ${nota}` : p.observaciones,
       }).where(eq(proveedorPagos.id, id));
+      /* Un pago de Coffit (0228) de un mes ya cerrado con ella: el cierre lo
+       * contó, así que su anulación entra como ajuste en el mes abierto. */
+      if (p.medio === 'pago_coffit') {
+        await ajustePorAnulacion(tx, {
+          fechaCuenta: p.fecha, efecto: -Number(p.importe), documento: `el pago de Coffit #${id}`, usuarioId: null,
+        });
+      }
 
       /*
        * El puente (0068), rama de los compromisos MANUALES: los de factura ya

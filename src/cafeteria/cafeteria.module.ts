@@ -2295,6 +2295,94 @@ export class CafeteriaService {
    * condiciones, mismo signo por tipo de documento, a precio final (0176) salvo
    * lo que ya estaba firmado sin IVA.
    */
+  /**
+   * LOS PROVEEDORES DE COFFIT (16/11/2026, pedido del dueño: «una parte donde me
+   * liste los proveedores que Coffit tiene», también los que se comparten).
+   * Salen solos de las facturas con parte de Coffit: no hay una agenda aparte.
+   * Por proveedor: sus facturas con parte de Coffit (las compartidas marcadas),
+   * lo que le tocó a Coffit (lo mismo que suma su cuenta), lo que Coffit le
+   * pagó directo (0228) y lo que queda impago de esas facturas en la cuenta del
+   * proveedor. «Compartido» = Sabor y Aroma también le compra (en esas mismas
+   * facturas o en otras). Fechas optativas: sin ellas, desde siempre.
+   */
+  async proveedoresDelCafe(q: { desde?: string; hasta?: string }) {
+    const desde = fechaLocal(q.desde);
+    const hasta = fechaLocal(q.hasta);
+    if (hasta) hasta.setHours(23, 59, 59, 999);
+    const fc = sql`coalesce(c.cuenta_fecha, c.fecha)`;
+    const rango = (col: any) => sql`${desde ? sql` and ${col} >= ${desde}` : sql``}${hasta ? sql` and ${col} <= ${hasta}` : sql``}`;
+    const [rDocs, rPagos, rSya, corte] = await Promise.all([
+      this.db.execute(sql`
+        select c.id, c.proveedor_id as "proveedorId", c.tipo, c.letra, c.punto_venta as "puntoVenta", c.numero, c.fecha,
+          c.cuenta_fecha as "cuentaFecha", c.total, c.pagado, c.subtotal_neto as "subtotalNeto",
+          c.neto_cafeteria as "netoCafeteria", c.final_cafeteria as "finalCafeteria",
+          coalesce((select sum(i.importe) from proveedor_imputaciones i join proveedor_pagos pp on pp.id = i.pago_id
+            where i.comprobante_id = c.id and pp.estado = 'activo' and pp.medio = 'pago_coffit'), 0) as "pagadoCoffit"
+        from comprobantes c
+        where c.estado = 'confirmado' and c.neto_cafeteria > 0
+          and c.tipo in ('factura', 'liquidacion', 'nota_debito', 'nota_credito')${rango(fc)}
+        order by c.fecha desc, c.id desc
+        limit 5000`),
+      this.db.execute(sql`
+        select p.proveedor_id as "proveedorId", sum(p.importe) as total, count(*)::int as cantidad, max(p.fecha) as ultimo
+        from proveedor_pagos p
+        where p.estado = 'activo' and p.medio = 'pago_coffit' and p.proveedor_id is not null${rango(sql`p.fecha`)}
+        group by p.proveedor_id`),
+      /* Los que también le venden a Sabor y Aroma: algún papel con parte que no es de Coffit. */
+      this.db.execute(sql`
+        select distinct c.proveedor_id as "proveedorId"
+        from comprobantes c
+        where c.estado = 'confirmado' and c.tipo in ('factura', 'liquidacion', 'nota_debito', 'remito')
+          and c.subtotal_neto - coalesce(c.neto_cafeteria, 0) > 0.01${rango(sql`c.fecha`)}`),
+      sinIvaHasta(this.db),
+    ]);
+    const filas = (r: any) => (r?.rows ?? r) as any[];
+    const docs = filas(rDocs);
+    const ids = [...new Set(docs.map((d) => Number(d.proveedorId)))];
+    const provs = ids.length
+      ? await this.db.select({
+        id: proveedores.id, nombre: proveedores.nombre, cuit: proveedores.cuit, telefono: proveedores.telefono, email: proveedores.email,
+      }).from(proveedores).where(inArray(proveedores.id, ids))
+      : [];
+    const pagos = new Map(filas(rPagos).map((x) => [Number(x.proveedorId), x]));
+    const conSya = new Set(filas(rSya).map((x) => Number(x.proveedorId)));
+    const etiqueta = (d: any) => `${{ nota_credito: 'NC', nota_debito: 'ND', liquidacion: 'Liquidación' }[d.tipo as string] ?? 'Factura'} `
+      + `${d.letra} ${String(d.puntoVenta).padStart(4, '0')}-${String(d.numero ?? d.id).padStart(8, '0')}`;
+    const porProv = new Map<number, any[]>();
+    for (const d of docs) {
+      const signo = d.tipo === 'nota_credito' ? -1 : 1;
+      const total = r2(Number(d.total));
+      const pagado = r2(Number(d.pagado));
+      const doc = {
+        id: Number(d.id), tipo: d.tipo, documento: etiqueta(d), fecha: new Date(d.fecha).toISOString(),
+        total, pagado, saldo: d.tipo === 'nota_credito' ? 0 : Math.max(0, r2(total - pagado)),
+        parteCoffit: r2(signo * segunCorte(corte, new Date(d.cuentaFecha ?? d.fecha), Number(d.netoCafeteria), Number(d.finalCafeteria))),
+        compartida: Number(d.subtotalNeto) - Number(d.netoCafeteria) > 0.01,
+        pagadoCoffit: r2(Number(d.pagadoCoffit)),
+      };
+      const arr = porProv.get(Number(d.proveedorId)) ?? [];
+      arr.push(doc);
+      porProv.set(Number(d.proveedorId), arr);
+    }
+    const lista = provs.map((p) => {
+      const ds = porProv.get(p.id) ?? [];
+      const pg = pagos.get(p.id);
+      return {
+        ...p,
+        compartido: conSya.has(p.id) || ds.some((d) => d.compartida),
+        facturas: ds.filter((d) => d.tipo !== 'nota_credito').length,
+        compartidas: ds.filter((d) => d.compartida && d.tipo !== 'nota_credito').length,
+        parteCoffit: r2(ds.reduce((a, d) => a + d.parteCoffit, 0)),
+        ultimaCompra: ds[0]?.fecha ?? null,
+        pagadoPorCoffit: r2(Number(pg?.total ?? 0)),
+        pagosDeCoffit: Number(pg?.cantidad ?? 0),
+        impago: r2(ds.reduce((a, d) => a + d.saldo, 0)),
+        docs: ds,
+      };
+    }).sort((a, b) => b.parteCoffit - a.parteCoffit);
+    return { desde: q.desde ?? null, hasta: q.hasta ?? null, proveedores: lista };
+  }
+
   async comprasDelCafe(q: { desde?: string; hasta?: string }) {
     const desde = fechaLocal(q.desde);
     const hasta = fechaLocal(q.hasta);
@@ -2589,6 +2677,13 @@ export class CafeteriaController {
   @Permiso(PERMISO_METRICAS)
   compras(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
     return this.svc.comprasDelCafe({ desde, hasta });
+  }
+
+  /* Los proveedores de Coffit (16/11/2026): los de sus facturas, también los compartidos. */
+  @Get('proveedores')
+  @Permiso(PERMISO_METRICAS)
+  proveedoresDelCafe(@Query('desde') desde?: string, @Query('hasta') hasta?: string) {
+    return this.svc.proveedoresDelCafe({ desde, hasta });
   }
 
   @Get('gastos')

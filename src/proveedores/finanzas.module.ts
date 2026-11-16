@@ -1535,7 +1535,7 @@ export class FinanzasProveedorService {
           ? `Flete (${p.medio})`
           : formas.length > 1
             ? `Pago mixto (${formas.map((f) => f.medio).join(' + ')})`
-            : `Pago (${p.medio})`,
+            : p.medio === 'pago_coffit' ? 'Pago (lo pagó Coffit)' : `Pago (${p.medio})`,
         detalle: p.concepto || '',
         debe: 0,
         haber: money(p.importe),

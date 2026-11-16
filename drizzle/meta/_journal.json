@@ -1597,6 +1597,13 @@
       "when": 1795298400000,
       "tag": "0227_anotacion_aviso_hasta_importante",
       "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "version": "7",
+      "when": 1795384800000,
+      "tag": "0228_pago_coffit",
+      "breakpoints": true
     }
   ]
 }

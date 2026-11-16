@@ -25,6 +25,11 @@
  *   · manuales      — `coffit_movimientos`: saldo inicial, pagos,
  *                     compensaciones, ajustes y el stock que pasa a Coffit al
  *                     marcar un artículo exclusivo.
+ *   · pago_proveedor — una factura que Coffit le pagó directo al proveedor
+ *                     (pago a proveedor con medio «pago_coffit», 0228): resta
+ *                     por lo que pagó, en la fecha del pago. Cuenta con los
+ *                     manuales (Pagos y ajustes); Gerencia no lo mira, porque
+ *                     la compra igual fue de Coffit.
  *
  * COFFIT PAGA PRECIO FINAL (0176, 16/10/2026, decisión del dueño): lo que se
  * compra para Coffit, lo que se le manda y sus gastos se le cobran CON IVA y
@@ -50,7 +55,7 @@ import {
 
 export type TipoLinea =
   | 'compra' | 'envio' | 'dif_envio' | 'entrada' | 'dif_entrada' | 'gasto'
-  | 'saldo_inicial' | 'pago' | 'compensacion' | 'ajuste' | 'marca_exclusivo';
+  | 'saldo_inicial' | 'pago' | 'compensacion' | 'ajuste' | 'marca_exclusivo' | 'pago_proveedor';
 
 export interface LineaCuenta {
   tipo: TipoLinea;
@@ -69,7 +74,7 @@ export const TOTALES_VACIOS = (): Totales => ({ compras: 0, envios: 0, entradas:
 const GRUPO: Record<TipoLinea, keyof Totales> = {
   compra: 'compras', envio: 'envios', dif_envio: 'envios', entrada: 'entradas', dif_entrada: 'entradas',
   gasto: 'gastos', saldo_inicial: 'manuales', pago: 'manuales', compensacion: 'manuales', ajuste: 'manuales',
-  marca_exclusivo: 'manuales',
+  marca_exclusivo: 'manuales', pago_proveedor: 'manuales',
 };
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -196,7 +201,13 @@ function unionCuenta(desde: Date | null, hasta: Date | null, modo: ModoCuenta = 
     select m.tipo, m.fecha, m.id, trim(m.medio || ' ' || m.referencia), m.descripcion,
       case m.a_favor when 'sya' then m.importe else -m.importe end
     from coffit_movimientos m
-    where not m.anulado${rango(sql`m.fecha`)}`;
+    where not m.anulado${rango(sql`m.fecha`)}${gerencia ? sql`` : sql`
+    union all
+    select 'pago_proveedor', p.fecha, p.id, 'Pago #' || p.id || coalesce(nullif(' · ' || p.referencia, ' · '), ''),
+      coalesce(pr.nombre, 'Sin proveedor') || coalesce(nullif(' · ' || p.concepto, ' · '), ''),
+      -p.importe
+    from proveedor_pagos p left join proveedores pr on pr.id = p.proveedor_id
+    where p.estado = 'activo' and p.medio = 'pago_coffit'${rango(sql`p.fecha`)}`}`;
 }
 
 const filasDe = (r: any) => (r?.rows ?? r) as any[];
