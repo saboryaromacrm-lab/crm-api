@@ -4582,6 +4582,10 @@ export const anotaciones = pgTable('anotaciones', {
   texto: text('texto').notNull(),
   /** Recordatorio (optativo): desde cuándo les sale el aviso a los de `anotacion_avisos`. */
   recordarEn: timestamp('recordar_en', { withTimezone: true }),
+  /** 0227: último día (de Argentina) del aviso. Con fecha sale todos los días hasta ahí; sin fecha, hasta «Listo». */
+  avisoHasta: date('aviso_hasta', { mode: 'string' }),
+  /** 0227: el aviso sale en rojo y primero. */
+  importante: boolean('importante').notNull().default(false),
   borradaEn: timestamp('borrada_en', { withTimezone: true }),
   borradaPor: integer('borrada_por').references(() => usuarios.id, { onDelete: 'set null' }),
 });
