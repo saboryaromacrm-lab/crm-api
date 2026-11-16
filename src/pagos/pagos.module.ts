@@ -224,6 +224,8 @@ export class ListarPagosDto {
   @IsOptional() @Matches(/^\d+$/) cuentaPropiaId?: string;
   /** Compras › Pagos realizados (9/11/2026): por medio, también como parte de un pago mixto. */
   @IsOptional() @IsIn(MEDIOS) medio?: string;
+  /** Gerencia › Pagos realizados (16/11/2026): sin o solo los pagos que nacen de una cuenta disponible. */
+  @IsOptional() @IsIn(['sin', 'solo']) cuentasDisponibles?: string;
   @IsOptional() @Matches(/^\d+$/) limit?: string;
 }
 
@@ -516,6 +518,9 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       cambioPor: proveedorPagos.cambioPor,
       cuentaPropiaId: proveedorPagos.cuentaPropiaId,
       cuentaPropiaNombre: nombreCuentaSql('proveedor_pagos'),
+      /* Nace de una cuenta disponible (0095): la transferencia de un cliente
+       * directo al proveedor, o el pago propio a esa cuenta (0151). */
+      cuentaDisponible: sql<boolean>`exists (select 1 from cuenta_disponible_pagos cdp where cdp.proveedor_pago_id = proveedor_pagos.id)`,
     };
   }
 
@@ -552,6 +557,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
     if (q.medio) {
       conds.push(sql`(exists (select 1 from pago_formas f where f.pago_id = ${proveedorPagos.id} and f.medio = ${q.medio})
         or (${proveedorPagos.medio} = ${q.medio} and not exists (select 1 from pago_formas f where f.pago_id = ${proveedorPagos.id})))`);
+    }
+    /* Gerencia › Pagos realizados (16/11/2026, pedido del dueño): las cuentas
+     * disponibles son plata de clientes que va directo al proveedor; se pueden
+     * sacar del listado para ver solo lo que pagó el negocio. */
+    if (q.cuentasDisponibles === 'sin' || q.cuentasDisponibles === 'solo') {
+      const hay = sql`exists (select 1 from cuenta_disponible_pagos cdp where cdp.proveedor_pago_id = proveedor_pagos.id)`;
+      conds.push(q.cuentasDisponibles === 'sin' ? sql`not ${hay}` : hay);
     }
     // La bandeja que importa: lo que se pagó y todavía no se aplicó a nada.
     if (q.sinAplicar === 'true' || q.sinAplicar === true) {
