@@ -2018,7 +2018,8 @@ export class PagosProveedorController {
   @Post(':id/imputar') @Permiso(...ADMIN_PAGOS) imputar(
     @Param('id', ParseIntPipe) id: number, @Body() dto: ImputarDto, @Auth() auth: Sesion,
   ) {
-    return this.svc.imputar(id, dto, esJefe(auth));
+    // Quién aplicó lo dice la sesión, no el cuerpo (17/11/2026: «Aplicar a facturas» del estado de cuenta).
+    return this.svc.imputar(id, { ...dto, usuarioId: auth.usuarioId }, esJefe(auth));
   }
   @Post('descontar-fletes') @Permiso(...ADMIN_PAGOS) descontarFletes(@Body() dto: DescontarFletesDto, @Auth() auth: Sesion) {
     return this.svc.descontarFletes(dto.proveedorId, dto.fletes, dto.usuarioId, esJefe(auth));

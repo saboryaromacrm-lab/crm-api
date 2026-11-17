@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm';
 import type { Database } from '../db/drizzle';
 import { fechaLocal } from '../common/documentos';
 import { claveSaldo, deltasDe, incoherencias, saldosHaciaAtras, type Delta, type ItemFraccion } from './kardex';
+import { AJUSTE_MANUAL, esAjusteManual } from './ajusteManual';
 
 const ESTADOS = ['disponible', 'comprometido', 'en_transito', 'vencido', 'defectuoso', 'retenido'] as const;
 /** Lo que se lista de un período: más que eso no se lee en una pantalla (el saldo se calcula igual con todo). */
@@ -107,7 +108,8 @@ export async function kardexProducto(db: Database, productoId: number, o: { sucu
     }
   }
 
-  const lista = (o.tipo ? delPeriodo.filter((m) => m.tipo === o.tipo) : delPeriodo).slice(-MAX_LISTA).reverse();
+  const delTipo = o.tipo === AJUSTE_MANUAL ? esAjusteManual : (m: any) => m.tipo === o.tipo;
+  const lista = (o.tipo ? delPeriodo.filter(delTipo) : delPeriodo).slice(-MAX_LISTA).reverse();
   const orden = (a: { sucursalId: number; presentacionId: number }, b: { sucursalId: number; presentacionId: number }) => a.sucursalId - b.sucursalId || a.presentacionId - b.presentacionId;
   return {
     producto: { id: prod.id, nombre: prod.nombre, tipo: prod.tipo },

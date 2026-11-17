@@ -17,6 +17,7 @@ import { ConfiguracionService } from '../configuracion/configuracion.module';
 import { ListasService } from '../listas/listas.module';
 import { costoNetoEntry, costoNetoPresentacion, costoPrecioEntry, costosFormato, escalaPaquete, formatoActivo, formatoDeCosto, precioLista, precioVentaFila } from './pricing';
 import { conPermisosBase } from '../auth/permisos-base';
+import { AJUSTE_MANUAL, condAjusteManual } from './ajusteManual';
 
 /** Metadatos de tipos de movimiento (dir: +1 entrada, −1 salida, 0 contextual). */
 /**
@@ -3336,7 +3337,8 @@ export class InventarioService {
     if (q.productoId) conds.push(eq(movimientos.productoId, Number(q.productoId)));
     if (q.productoIds?.length) conds.push(inArray(movimientos.productoId, q.productoIds));
     if (q.sucursalId) conds.push(eq(movimientos.sucursalId, Number(q.sucursalId)));
-    if (q.tipo) conds.push(eq(movimientos.tipo, q.tipo as any));
+    if (q.tipo === AJUSTE_MANUAL) conds.push(condAjusteManual());
+    else if (q.tipo) conds.push(eq(movimientos.tipo, q.tipo as any));
     /* Mismo criterio que el libro del almacén: `fechaLocal` para el desde (un
      * '2026-08-13' pelado es las 21 h del 12 en Formosa) y fin de día para el
      * hasta — un rango de UN día tiene que traer ese día completo. */
