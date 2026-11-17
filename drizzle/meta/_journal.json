@@ -1611,6 +1611,20 @@
       "when": 1795471200000,
       "tag": "0229_caja_quien_cierra",
       "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1795557600000,
+      "tag": "0230_stock_valorizado",
+      "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "version": "7",
+      "when": 1795644000000,
+      "tag": "0231_stock_fotos",
+      "breakpoints": true
     }
   ]
 }

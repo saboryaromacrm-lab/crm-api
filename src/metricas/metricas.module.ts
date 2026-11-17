@@ -34,7 +34,7 @@ import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolClient } from 'pg';
 import { Permiso } from '../auth/auth.decoradores';
-import { hoyAr } from '../cafeteria/cuenta';
+import { hoyAr, sumarDias } from '../cafeteria/cuenta';
 import type { Database } from '../db/drizzle';
 import { schema } from '../db/schema';
 import { resolverDatabaseUrl } from '../db/url';
@@ -46,6 +46,7 @@ import { reporteIva } from './iva';
 import { CUENTAS, FIRMA_TIPOS, MODOS, porMeses, rangoDe, rearmarRango, type ModoSync } from './sincronizar';
 import { reporteProductos } from './productos';
 import { reporteStock, valorizarStock } from './stock';
+import { detalleDeFoto, fotosDeFinDeMes, tomarFoto } from './fotos';
 import { montosPorProveedor } from './montos';
 import { reporteVariaciones } from './variaciones';
 import { reporteLocales } from './locales';
@@ -55,6 +56,8 @@ import { GuardarAnteriorDto, guardarAnterior, localesConAnterior, quitarAnterior
 
 /** La llave de Gerencia › Métricas (en el catálogo desde el 9/11/2026). */
 export const PERMISO_METRICAS = 'gerencia.metricas';
+/** La llave de Gerencia › Stock valorizado (0230: la recibe quien tenía Métricas). */
+export const PERMISO_STOCK_VALORIZADO = 'gerencia.stock';
 
 const CADA_MS = 10 * 60_000;
 /** La madrugada (hora argentina) en que se rearman los últimos 40 días. */
@@ -66,6 +69,9 @@ const TOPE_SYNC_MS = 120_000;
 const MAX_DIAS = 1100;
 /** Quiebres de stock lee los movimientos (no un resumen): hasta un año por consulta. */
 const MAX_DIAS_QUIEBRES = 366;
+
+/** La sucursal de un filtro: un id válido o null (= todas). */
+const sucursalPedida = (v: unknown) => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
 
 const diaValido = (v?: string) => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
 
@@ -231,9 +237,26 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
 
   quitarAnterior(sucursalId: number, mes: string) { return this.escribir((c) => quitarAnterior(c, sucursalId, mes)); }
 
+  /** Gerencia › Stock valorizado (17/11/2026; antes, la pestaña Stock de Métricas). */
   stock(q: any) {
-    const suc = Number(q.sucursalId);
-    return reporteStock(this.db, this.pool, { sucursalId: Number.isInteger(suc) && suc > 0 ? suc : null, ventana: Number(q.ventana) || 60 });
+    return reporteStock(this.db, this.pool, { sucursalId: sucursalPedida(q.sucursalId), ventana: Number(q.ventana) || 60 });
+  }
+
+  /** Las fotos de fin de mes del stock valorizado (0231). */
+  fotosStock(q: any) { return this.leer((c) => fotosDeFinDeMes(c, sucursalPedida(q.sucursalId))); }
+
+  /** El detalle de una foto: el inventario de cierre para el contador. */
+  fotoStock(dia: string) { return this.leer((c) => detalleDeFoto(c, dia)); }
+
+  /**
+   * LA FOTO DEL DÍA QUE CERRÓ (0231): la saca el reloj una vez, en la primera
+   * vuelta después de las 4 de la mañana. Si el servidor estuvo caído, la saca
+   * cuando vuelve (la hora queda guardada); los días perdidos no se inventan.
+   */
+  private async fotoDeAnoche() {
+    const dia = sumarDias(hoyAr(), -1);
+    const { rowCount } = await this.pool.query('SELECT 1 FROM stock_fotos WHERE dia = $1', [dia]);
+    if (!rowCount && await tomarFoto(this.db, this.pool, dia)) this.log.log(`Foto del stock valorizado del ${dia} guardada`);
   }
 
   /**
@@ -361,13 +384,14 @@ export class MetricasService implements OnModuleInit, OnModuleDestroy {
     try {
       if (this.corriendo) return;
       const e = await this.estado();
-      if (e.vacio || e.tiposCambiaron) { await this.sincronizar('todo'); return; }
       const ahora = new Date();
       const horaAr = Number(ahora.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires', hour: 'numeric', hour12: false }));
       const noche = e.ultimaNoche ? new Date(e.ultimaNoche) : null;
       const horasDesdeNoche = noche ? (ahora.getTime() - noche.getTime()) / 3_600_000 : Infinity;
-      if (horaAr >= HORA_NOCHE && horasDesdeNoche > 20) { await this.sincronizar('noche'); return; }
-      await this.sincronizar('reciente');
+      if (e.vacio || e.tiposCambiaron) await this.sincronizar('todo');
+      else if (horaAr >= HORA_NOCHE && horasDesdeNoche > 20) await this.sincronizar('noche');
+      else await this.sincronizar('reciente');
+      if (horaAr >= HORA_NOCHE) await this.fotoDeAnoche();
     } catch (err) {
       this.log.warn(`reloj: ${(err as Error).message}`);
     }
@@ -387,7 +411,6 @@ export class MetricasController {
   @Get('granel') granel(@Query() q: any) { return this.svc.granel(q); }
   @Get('productos') productos(@Query() q: any) { return this.svc.productos(q); }
   @Get('comparar') comparar(@Query() q: any) { return this.svc.comparar(q); }
-  @Get('stock') stock(@Query() q: any) { return this.svc.stock(q); }
   @Get('iva') iva(@Query() q: any) { return this.svc.iva(q); }
   @Get('ofertas') ofertas(@Query() q: any) { return this.svc.ofertas(q); }
   @Get('anterior') anterior(@Query() q: any) { return this.svc.anterior(q); }
@@ -414,6 +437,19 @@ export class MontosProveedoresController {
   @Get() montos(@Query() q: any) { return this.svc.montos(q); }
 }
 
+/** Gerencia › Stock valorizado (17/11/2026): sobre el pool propio de Métricas, con la llave de su sección. */
+@Controller('stock-valorizado')
+@Permiso(PERMISO_STOCK_VALORIZADO)
+export class StockValorizadoController {
+  constructor(private readonly svc: MetricasService) {}
+
+  @Get() stock(@Query() q: any) { return this.svc.stock(q); }
+
+  @Get('fotos') fotos(@Query() q: any) { return this.svc.fotosStock(q); }
+
+  @Get('fotos/:dia') foto(@Param('dia') dia: string) { return this.svc.fotoStock(dia); }
+}
+
 /** Almacén › Quiebres de stock (4/11/2026): sobre el pool propio de Métricas, con la llave de su sección. */
 @Controller('quiebres-stock')
 @Permiso('almacen.quiebres')
@@ -433,7 +469,7 @@ export class VariacionesController {
 }
 
 @Module({
-  controllers: [MetricasController, MontosProveedoresController, QuiebresStockController, VariacionesController],
+  controllers: [MetricasController, MontosProveedoresController, StockValorizadoController, QuiebresStockController, VariacionesController],
   providers: [MetricasService],
   exports: [MetricasService],
 })

@@ -94,6 +94,8 @@ const TABLAS_PRACTICA = [
   // métricas (0122): son resúmenes de las ventas; vaciadas, se rearman solas
   'metricas_venta_prod_dia', 'metricas_venta_dia', 'metricas_venta_hora', 'metricas_venta_cliente_dia',
   'metricas_venta_pago_dia', 'metricas_compra_prov_dia', 'metricas_venta_mezcla_dia', 'metricas_estado',
+  // las fotos nocturnas del stock valorizado (0231): son de ese stock de práctica
+  'stock_fotos',
   // cobros por QR de Mercado Pago (0126): cuelgan de las ventas de práctica
   'mp_cobros',
   // cash flow (0133/0134): el arranque, los sobres controlados, los conteos y el

@@ -275,6 +275,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'gerencia.vista', nombre: 'Vista profesional (cómo le va al negocio, con montos)' },
       { clave: 'gerencia.rentabilidad', nombre: 'Rentabilidad' },
       { clave: 'gerencia.metricas', nombre: 'Métricas' },
+      /* 17/11/2026 (0230): la plata en mercadería a costo, antes una pestaña de Métricas. */
+      { clave: 'gerencia.stock', nombre: 'Stock valorizado (la plata en mercadería, a costo)' },
       /* 0209: los números del negocio SOLO en % (sin montos), para la encargada. Cambiar los objetivos es solo del superadmin. */
       { clave: 'gerencia.indicadores', nombre: 'Indicadores (solo porcentajes)' },
       /* Una sola llave para las dos: Gastos fijos y sueldos carga lo que Resultados muestra. */

@@ -2,7 +2,7 @@
  * PROVEEDORES › MONTOS (14/10/2026, pedido del dueño)
  * ============================================================================
  * Cuánta plata en mercadería hay de cada proveedor, con la MISMA valuación que
- * Métricas › Stock (`valorizarStock`: costo de hoy, neto, en estados que siguen
+ * Gerencia › Stock valorizado (`valorizarStock`: costo de hoy, neto, en estados que siguen
  * siendo mercadería propia). Cada producto cuenta en el proveedor que FIJA SU
  * PRECIO (el formato que manda), igual que en Bajos en stock.
  *
