@@ -760,7 +760,7 @@ export class VentasService {
 
   async list(q: {
     clienteId?: number; sucursalId?: number; estado?: string;
-    desde?: string; hasta?: string; limit?: number; incluirItems?: boolean;
+    desde?: string; hasta?: string; limit?: number; incluirItems?: boolean; incluirPagos?: boolean;
   }) {
     const conds: any[] = [];
     if (q.clienteId) conds.push(eq(ventas.clienteId, Number(q.clienteId)));
@@ -783,14 +783,34 @@ export class VentasService {
     // Los ítems se piden solo si el llamador los necesita (la lista de ventas
     // abiertas los usa para mostrar el último producto cargado); una consulta
     // para todo el lote, no una por venta.
-    const items = q.incluirItems
-      ? await this.db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids))
-      : null;
+    const [items, pagos, notas] = await Promise.all([
+      q.incluirItems ? this.db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids)) : null,
+      /* Con qué se pagó cada una (18/11/2026, la ficha del cliente). */
+      q.incluirPagos
+        ? this.db.select({ ventaId: ventaPagos.ventaId, medio: ventaPagos.medio, importe: ventaPagos.importe, cuotas: ventaPagos.cuotas })
+          .from(ventaPagos).where(inArray(ventaPagos.ventaId, ids)).orderBy(ventaPagos.id)
+        : null,
+      /* Lo que le bajan las notas de crédito vivas, como en `cuenta()` y el listado. */
+      this.db.select({ refVentaId: ventas.refVentaId, total: sql<number>`coalesce(sum(${ventas.total}), 0)` }).from(ventas)
+        .where(and(inArray(ventas.refVentaId, ids), ne(ventas.estado, 'anulada'))).groupBy(ventas.refVentaId),
+    ]);
+    const acreditado = new Map(notas.map((n) => [Number(n.refVentaId), Number(n.total) || 0]));
 
     return rows.map((v) => {
       const cobrado = imput.get(v.id) ?? 0;
-      const base = { ...v, cobrado, saldo: money(v.total - cobrado) };
-      return items ? { ...base, items: items.filter((i) => i.ventaId === v.id) } : base;
+      /* SALDO solo tiene la de cuenta corriente viva, menos lo cobrado y lo
+       * acreditado con notas de crédito (igual que la pestaña Cuenta
+       * corriente). La de contado se cobró en la caja (sus pagos no son
+       * imputaciones de un recibo): antes figuraba debiendo entera. */
+      const vive = v.estado === 'confirmada' || v.estado === 'pendiente_cae';
+      const saldo = v.condicionPago === 'contado' || esNotaCredito(v.tipo) || !vive
+        ? 0
+        : Math.max(0, money(v.total - cobrado - (acreditado.get(v.id) ?? 0)));
+      return {
+        ...v, cobrado, saldo,
+        ...(items ? { items: items.filter((i) => i.ventaId === v.id) } : {}),
+        ...(pagos ? { pagos: pagos.filter((p) => p.ventaId === v.id) } : {}),
+      };
     });
   }
 
@@ -5596,6 +5616,7 @@ export class VentasController {
     @Query('hasta') hasta?: string,
     @Query('limit') limit?: string,
     @Query('incluirItems') incluirItems?: string,
+    @Query('incluirPagos') incluirPagos?: string,
   ) {
     /* El enum se valida ACÁ también: `?estado=xyz` entraba crudo a Postgres y
      * salía un 500 donde corresponde un 400. `listado` ya lo hacía; este método
@@ -5610,6 +5631,7 @@ export class VentasController {
       estado, desde, hasta,
       limit: limit ? Number(limit) : undefined,
       incluirItems: incluirItems === 'true',
+      incluirPagos: incluirPagos === 'true',
     });
   }
 

@@ -62,14 +62,21 @@ export function seGuarda(p: any, cuentaId: number): boolean {
 }
 
 /**
- * CON QUÉ SE COBRÓ DE VERDAD, en los medios del ERP: lo que dice Mercado Pago.
- * Un QR es QR aunque el cliente lo haya pagado con tarjeta; en el Point, la
- * tarjeta de crédito es crédito y la de débito o prepaga, débito (el ERP no
- * tiene prepaga).
+ * CON QUÉ SE COBRÓ DE VERDAD, en los medios del ERP: lo que dice Mercado Pago,
+ * o null si no lo dice sin dudas (entonces no se corrige nada):
+ *   · un QR del local es QR, aunque el cliente lo haya pagado con tarjeta;
+ *   · una tarjeta (en el Point o en un link de pago): crédito es crédito;
+ *     débito y prepaga, débito (el ERP no tiene prepaga);
+ *   · fuera del local, dinero en cuenta o transferencia bancaria: transferencia.
+ * Lo demás (el Point cobrando con dinero en cuenta, créditos de Mercado Pago…)
+ * no tiene un medio claro en el ERP.
  */
-export function medioReal(p: { familia: Familia; tipo: string }): string {
-  if (p.familia === 'tarjeta') return p.tipo === 'credit_card' ? 'tarjeta_credito' : 'tarjeta_debito';
-  return p.familia;
+export function medioReal(p: { familia: Familia; tipo: string }): string | null {
+  if (p.familia === 'qr') return 'qr';
+  if (p.tipo === 'credit_card') return 'tarjeta_credito';
+  if (p.tipo === 'debit_card' || p.tipo === 'prepaid_card') return 'tarjeta_debito';
+  if (p.familia === 'transferencia' && (p.tipo === 'account_money' || p.tipo === 'bank_transfer')) return 'transferencia';
+  return null;
 }
 
 /** Lo que Mercado Pago le descontó al comercio (`fee_payer` collector). */
@@ -153,8 +160,9 @@ export function atarSolos(cobros: CobroErp[], pagos: PagoMp[]): Par[] {
   for (const c of cobros) {
     if (c.mpId && ids.has(c.mpId) && !usados.has(c.mpId)) { pares.push({ clave: c.clave, mpId: c.mpId }); usados.add(c.mpId); }
   }
-  const atados = new Set(pares.map((x) => x.clave));
-  const sueltosErp = cobros.filter((c) => !atados.has(c.clave));
+  /* Un cobro que trae número de pago y no se encontró ESE pago (todavía no
+   * bajó, se devolvió, se deshizo) no se ata a otro que se le parezca. */
+  const sueltosErp = cobros.filter((c) => !c.mpId);
   const sueltosMp = pagos.filter((p) => !usados.has(p.id));
 
   /* 2. Grupos de candidatos (componentes conexos): tantos como tantos → en orden de hora. */
@@ -178,6 +186,9 @@ export function atarSolos(cobros: CobroErp[], pagos: PagoMp[]): Par[] {
   const porHora = (a: { fecha: Date }, b: { fecha: Date }) => a.fecha.getTime() - b.fecha.getTime();
   for (const g of grupos.values()) {
     if (g.erp.length !== g.mp.length) continue;
+    /* Una transferencia solo se ata sola si es la única candidata de cada lado:
+     * entre dos de igual importe en días distintos, el orden de hora no dice cuál es de quién. */
+    if (g.erp[0].familia === 'transferencia' && g.erp.length > 1) continue;
     g.erp.sort(porHora); g.mp.sort(porHora);
     /* Cada par en orden de hora tiene que ser candidato él mismo; si no, el grupo se deja para una persona. */
     if (!g.erp.every((c, i) => aristas.has(`${c.clave}|${g.mp[i].id}`))) continue;

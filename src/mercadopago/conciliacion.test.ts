@@ -83,10 +83,26 @@ test('sugerencias: varios posibles, otro medio, monto distinto; cada pago una so
   assert.deepEqual(s.map((x) => `${x.clave}=${x.mpId}:${x.motivo}`).sort(), ['v1=a:varios', 'v3=b:otro_medio', 'v4=c:monto_distinto']);
 });
 
-test('el medio de verdad, en los medios del ERP', () => {
+test('el medio de verdad, en los medios del ERP (o nada si no es claro)', () => {
   assert.equal(medioReal({ familia: 'tarjeta', tipo: 'credit_card' }), 'tarjeta_credito');
   assert.equal(medioReal({ familia: 'tarjeta', tipo: 'debit_card' }), 'tarjeta_debito');
   assert.equal(medioReal({ familia: 'tarjeta', tipo: 'prepaid_card' }), 'tarjeta_debito');
   assert.equal(medioReal({ familia: 'qr', tipo: 'credit_card' }), 'qr', 'un QR pagado con tarjeta sigue siendo QR');
   assert.equal(medioReal({ familia: 'transferencia', tipo: 'account_money' }), 'transferencia');
+  assert.equal(medioReal({ familia: 'transferencia', tipo: 'bank_transfer' }), 'transferencia');
+  assert.equal(medioReal({ familia: 'transferencia', tipo: 'credit_card' }), 'tarjeta_credito', 'link de pago con tarjeta');
+  assert.equal(medioReal({ familia: 'tarjeta', tipo: 'account_money' }), null, 'el Point cobrando con dinero en cuenta: no se corrige');
+  assert.equal(medioReal({ familia: 'transferencia', tipo: 'digital_currency' }), null);
+});
+
+test('un cobro con número de pago no se ata a otro que se le parezca', () => {
+  const pares = atarSolos([cobro('v1', '10:00', 5000, 'qr', { mpId: '111' })], [pago('222', '10:05', 5000, 'qr')]);
+  assert.deepEqual(pares, []);
+});
+
+test('transferencias: solo se atan solas si hay una de cada lado', () => {
+  const t = (clave: string, dia: string, importe: number) => cobro(clave, '12:00', importe, 'transferencia', { fecha: new Date(`2026-11-${dia}T12:00:00-03:00`) });
+  const p = (id: string, dia: string, importe: number) => pago(id, '12:00', importe, 'transferencia', { fecha: new Date(`2026-11-${dia}T11:00:00-03:00`) });
+  assert.deepEqual(atarSolos([t('v1', '17', 20000), t('v2', '18', 20000)], [p('a', '17', 20000), p('b', '18', 20000)]), []);
+  assert.deepEqual(atarSolos([t('v1', '17', 20000)], [p('a', '17', 20000)]), [{ clave: 'v1', mpId: 'a' }]);
 });

@@ -24,18 +24,24 @@
  *   avisos      atados cuyo pago se devolvió o reclamó, o cuya venta se anuló
  *   conciliados (solo si se piden) lo que ya está atado o explicado
  *
- * La comisión y el neto de Mercado Pago solo los ve un jefe.
+ * La comisión y el neto de Mercado Pago solo los ve un jefe. Quien no es jefe
+ * ve y opera solo lo de su local.
+ *
+ * EL MEDIO DE LA VENTA (18/11/2026): un cobro atado a UN pago, por el MISMO
+ * importe, puede tomar el medio que dice Mercado Pago (`medioReal`; si no lo
+ * dice sin dudas, no se toca). Cada cambio y cada vuelta atrás quedan en
+ * Auditoría (quién, cuándo, antes → después).
  */
-import { BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Logger, NotFoundException,
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Logger, NotFoundException,
   OnModuleDestroy, OnModuleInit, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
 import { type SQL, and, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
-import { cobranzaPagos, mpCajas, mpConciliacionErp, mpConciliaciones, mpMovimientos, mpSucursales, ventaPagos } from '../db/schema';
+import { auditoria, cobranzaPagos, mpCajas, mpConciliacionErp, mpConciliaciones, mpMovimientos, mpSucursales, ventaPagos } from '../db/schema';
 import { ZONA } from '../metricas/sincronizar';
-import { MP, mp } from './api';
-import { FAMILIA_DE_MEDIO, MEDIOS_ELECTRONICOS, atarSolos, medioReal, movimientoDe, seGuarda, sugerir, type CobroErp, type PagoMp } from './conciliacion';
+import { ErrorMp, MP, mp } from './api';
+import { FAMILIA_DE_MEDIO, MEDIOS_ELECTRONICOS, atarSolos, medioReal, movimientoDe, seGuarda, sugerir, type CobroErp, type Familia, type PagoMp } from './conciliacion';
 
 export const PERMISO_CONCILIACION = 'ventas.conciliacion_mp';
 /** Desde cuándo se concilia (decisión del dueño, 18/11/2026). Lo anterior no se baja ni se muestra. */
@@ -156,18 +162,33 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Lo guardado que el barrido ya no trae (no lo cobró esta cuenta) y nadie
-   * ató: se borra. Solo dentro de lo que el barrido cubrió entero (un día de
-   * margen en la punta vieja y una hora en la nueva, por lo que llega mientras tanto).
+   * Lo guardado que el barrido ya no trajo. La búsqueda de Mercado Pago pagina
+   * de forma inestable (puede saltear un pago en una pasada), así que no
+   * alcanza con «no vino»: se le pregunta a Mercado Pago por ESE pago y se
+   * borra solo si confirma que no lo cobró esta cuenta (o que no existe). Si
+   * estaba atado (pasó antes del filtro por cobrador), primero se deshace el
+   * atado y queda en Auditoría. Ante cualquier duda, se deja.
    */
   private async borrarQueNoVolvieron(dias: number, vistos: Set<string>) {
     const desde = new Date(Date.now() - (dias - 1) * DIA);
     const hasta = new Date(Date.now() - 3_600_000);
-    const guardados = await this.db.select({ id: mpMovimientos.id }).from(mpMovimientos).where(and(
-      isNull(mpMovimientos.conciliacionId), sql`${mpMovimientos.fecha} >= ${desde} and ${mpMovimientos.fecha} < ${hasta}`,
-    ));
-    const sobran = guardados.map((g) => g.id).filter((id) => !vistos.has(id));
-    if (sobran.length) await this.db.delete(mpMovimientos).where(inArray(mpMovimientos.id, sobran));
+    const guardados = await this.db.select({ id: mpMovimientos.id, conciliacionId: mpMovimientos.conciliacionId })
+      .from(mpMovimientos).where(sql`${mpMovimientos.fecha} >= ${desde} and ${mpMovimientos.fecha} < ${hasta}`);
+    for (const g of guardados.filter((x) => !vistos.has(x.id)).slice(0, 300)) {
+      let esDeLaCuenta = true;
+      try {
+        const p: any = await mp.pago(g.id);
+        const cobrador = p?.collector_id ?? p?.collector?.id;
+        esDeLaCuenta = cobrador != null && Number(cobrador) === this.cuentaId && seGuarda(p, this.cuentaId!);
+      } catch (e) {
+        esDeLaCuenta = !(e instanceof ErrorMp && (e.status === 403 || e.status === 404));
+      }
+      if (esDeLaCuenta) continue;
+      await this.db.transaction(async (tx) => {
+        if (g.conciliacionId) await this.deshacerEn(tx, g.conciliacionId, null, 'no lo cobró esta cuenta (lo confirmó Mercado Pago)');
+        await tx.delete(mpMovimientos).where(eq(mpMovimientos.id, g.id));
+      });
+    }
   }
 
   /** Limpia atados que perdieron un lado (se borró el pago del ERP) y ata solo lo seguro de los últimos 45 días. */
@@ -191,7 +212,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       try {
         await this.db.transaction(async (tx) => {
           const [c] = await tx.insert(mpConciliaciones).values({ tipo: 'auto' }).returning({ id: mpConciliaciones.id });
-          await this.unir(tx, c.id, [p.clave], [p.mpId]);
+          await this.unir(tx, c.id, [p.clave], [p.mpId], true);
         });
         atados++;
       } catch (e) {
@@ -202,8 +223,12 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     return atados;
   }
 
-  /** Mete cobros y pagos en el atado `id`. Falla si alguno ya estaba atado (la transacción se deshace entera). */
-  private async unir(tx: any, id: number, claves: string[], pagos: string[]) {
+  /**
+   * Mete cobros y pagos en el atado `id`. Falla si alguno ya estaba atado (la
+   * transacción se deshace entera). `auto`: además, el pago no puede estar «a
+   * mano» (alguien deshizo su atado mientras el automático corría).
+   */
+  private async unir(tx: any, id: number, claves: string[], pagos: string[], auto = false) {
     if (claves.length) {
       await tx.insert(mpConciliacionErp).values(claves.map((k) => (k.startsWith('v')
         ? { conciliacionId: id, ventaPagoId: Number(k.slice(1)) }
@@ -211,7 +236,8 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     }
     if (pagos.length) {
       const hechos = await tx.update(mpMovimientos).set({ conciliacionId: id })
-        .where(and(inArray(mpMovimientos.id, pagos), isNull(mpMovimientos.conciliacionId))).returning({ id: mpMovimientos.id });
+        .where(and(inArray(mpMovimientos.id, pagos), isNull(mpMovimientos.conciliacionId), ...(auto ? [eq(mpMovimientos.aMano, false)] : [])))
+        .returning({ id: mpMovimientos.id });
       if (hechos.length !== pagos.length) throw new BadRequestException('Alguno de esos pagos de Mercado Pago ya está atado o no existe: actualizá la pantalla.');
     }
   }
@@ -271,7 +297,8 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
    */
   async ver(q: { desde?: string; hasta?: string; conciliados?: string; sucursalId?: string }, sesion: Sesion) {
     const { desde, hasta } = q;
-    const suc = q.sucursalId ? Number(q.sucursalId) : null;
+    const suLocal = this.localDe(sesion);
+    const suc = suLocal ?? (q.sucursalId ? Number(q.sucursalId) : null);
     if (!valido(desde) || !valido(hasta) || desde! > hasta!) throw new BadRequestException('Elegí un rango de días válido.');
     if (suc != null && !(Number.isInteger(suc) && suc > 0)) throw new BadRequestException('Ese local no es válido.');
     if (desdeDia(hasta!).getTime() - desdeDia(desde!).getTime() > 62 * DIA) throw new BadRequestException('Elegí hasta dos meses.');
@@ -279,15 +306,17 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const fin = sumaDias(hasta!, 1);
     const enRango = (col: string) => sql`${sql.raw(col)} >= ${desdeDia(ini)} and ${sql.raw(col)} < ${desdeDia(fin)}`;
 
-    const [cobrosTodos, pagosRango, pagosCerca] = await Promise.all([
+    const [cobrosRango, pagosRango, pagosCerca] = await Promise.all([
       this.cobrosErp(enRango('v.fecha'), enRango('c.fecha')),
       this.pagosMp(sql`${mpMovimientos.fecha} >= ${desdeDia(ini)} and ${mpMovimientos.fecha} < ${desdeDia(fin)}`),
       /* Los sueltos de alrededor, para sugerir (una transferencia llega días antes). */
       this.pagosMp(sql`${mpMovimientos.conciliacionId} is null and ${mpMovimientos.estado} = 'approved'
         and ${mpMovimientos.fecha} >= ${desdeDia(sumaDias(ini, -3))} and ${mpMovimientos.fecha} < ${desdeDia(sumaDias(fin, 1))}`),
     ]);
-    const pagosTodos = pagosRango.map((x) => ({ ...x.m, dia: x.dia }));
     const delLocal = (x: { sucursalId: number | null }) => suc == null || x.sucursalId === suc;
+    /* Quien no es jefe no ve otros locales, ni siquiera en la tabla «por local». */
+    const cobrosTodos = suLocal != null ? cobrosRango.filter(delLocal) : cobrosRango;
+    const pagosTodos = pagosRango.map((x) => ({ ...x.m, dia: x.dia }));
     const cobros = cobrosTodos.filter(delLocal);
     const pagos = pagosTodos.filter(delLocal);
     const recientes = (a: { fecha: Date }, b: { fecha: Date }) => b.fecha.getTime() - a.fecha.getTime();
@@ -337,6 +366,17 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       return motivos.length ? [{ ...g, avisos: motivos }] : [];
     });
 
+    /* CONFIRMADO = lo que de verdad entró: en un atado donde Mercado Pago trajo
+     * menos que el ERP (se tipeó mal en el Point), cada cobro cuenta en esa
+     * proporción. «No entró a MP» no confirma nada. */
+    const parteConfirmada = new Map<number, number>();
+    for (const g of grupos.values()) {
+      const erp = g.cobros.reduce((a, c) => a + c.importe, 0);
+      const enMp = g.pagos.reduce((a, p) => a + p.bruto, 0);
+      parteConfirmada.set(g.id, g.tipo === 'sin_mp' || erp <= 0 ? 0 : Math.min(1, enMp / erp));
+    }
+    const confirmadoDe = (c: FilaErp) => (c.conciliacionId ? c.importe * (parteConfirmada.get(c.conciliacionId) ?? 0) : 0);
+
     /* Por día: lo vendido, lo que entró y cuánto quedó pendiente. */
     const dias = new Map<string, { dia: string; vendido: number; confirmado: number; entro: number; faltan: number; sugeridos: number; sinVenta: number; avisos: number }>();
     const delDia = (dia: string) => {
@@ -348,7 +388,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       if (!c.vigente) continue;
       const d = delDia(c.dia);
       d.vendido += c.importe;
-      if (c.conciliacionId && grupos.get(c.conciliacionId)?.tipo !== 'sin_mp') d.confirmado += c.importe;
+      d.confirmado += confirmadoDe(c);
     }
     for (const p of pagos) if (p.estado === 'approved') delDia(p.dia).entro += p.bruto;
     for (const c of faltan) delDia(c.dia).faltan += c.importe;
@@ -365,7 +405,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const porMedio = new Map<string, any>();
     for (const c of cobrosTodos) {
       if (!c.vigente) continue;
-      const confirmado = c.conciliacionId && grupos.get(c.conciliacionId)?.tipo !== 'sin_mp' ? c.importe : 0;
+      const confirmado = confirmadoDe(c);
       const filas = [abrir(porSucursal, c.sucursal || '—', { sucursalId: c.sucursalId, sucursal: c.sucursal || '—' })];
       if (delLocal(c)) filas.push(abrir(porMedio, familia(c.medio), { familia: familia(c.medio) }));
       for (const g of filas) { g.vendido += c.importe; g.confirmado += confirmado; }
@@ -397,7 +437,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Lo suelto de los dos lados en un rango corto: para atar a mano. */
-  async sueltos(q: { desde?: string; hasta?: string }) {
+  async sueltos(q: { desde?: string; hasta?: string }, sesion: Sesion) {
     const { desde, hasta } = q;
     if (!valido(desde) || !valido(hasta) || desde! > hasta! || desdeDia(hasta!).getTime() - desdeDia(desde!).getTime() > 7 * DIA) {
       throw new BadRequestException('Elegí hasta una semana.');
@@ -405,11 +445,14 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const fin = desdeDia(sumaDias(hasta!, 1));
     const [cobros, pagos] = await Promise.all([
       this.cobrosErp(sql`v.fecha >= ${desdeDia(desde!)} and v.fecha < ${fin}`, sql`c.fecha >= ${desdeDia(desde!)} and c.fecha < ${fin}`),
-      this.pagosMp(sql`${mpMovimientos.conciliacionId} is null and ${mpMovimientos.fecha} >= ${desdeDia(desde!)} and ${mpMovimientos.fecha} < ${fin}`),
+      this.pagosMp(sql`${mpMovimientos.conciliacionId} is null and ${mpMovimientos.estado} = 'approved'
+        and ${mpMovimientos.fecha} >= ${desdeDia(desde!)} and ${mpMovimientos.fecha} < ${fin}`),
     ]);
+    const suLocal = this.localDe(sesion);
     return {
-      cobros: cobros.filter((c) => c.vigente && !c.conciliacionId),
-      pagos: pagos.map((x) => ({
+      cobros: cobros.filter((c) => c.vigente && !c.conciliacionId && (suLocal == null || c.sucursalId === suLocal)),
+      /* A quien no es jefe: lo de su local y lo que no tiene local (transferencias, posnets sin registrar). */
+      pagos: pagos.filter((x) => suLocal == null || x.m.sucursalId == null || x.m.sucursalId === suLocal).map((x) => ({
         id: x.m.id, fecha: x.m.fecha, dia: x.dia, estado: x.m.estado, familia: x.m.familia, tipo: x.m.tipo, operacion: x.m.operacion, bruto: x.m.bruto,
         pagador: x.m.pagador, sucursalId: x.m.sucursalId, medioErp: medioReal(x.m),
       })),
@@ -418,16 +461,57 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
 
   /* ------------------------------ las acciones ------------------------------ */
 
+  /** El local de quien no es jefe (ve y opera solo ese); null = jefe, todos. */
+  private localDe(sesion: Sesion): number | null {
+    return esJefe(sesion) ? null : sesion.sucursalId;
+  }
+
+  /** Quien no es jefe solo toca cobros de su local. */
+  private soloSuLocal(sesion: Sesion, filas: { sucursalId: number | null }[]) {
+    const suLocal = this.localDe(sesion);
+    if (suLocal != null && filas.some((f) => f.sucursalId !== suLocal)) throw new ForbiddenException('Eso es de otro local.');
+  }
+
+  /** Los renglones de pago del ERP por su clave («v12», «r3»). */
+  private filasErp(claves: string[]) {
+    const ids = (letra: string) => sql.join([0, ...claves.filter((k) => k[0] === letra).map((k) => Number(k.slice(1)))].map((i) => sql`${i}`), sql`, `);
+    return this.cobrosErp(sql`vp.id in (${ids('v')})`, sql`cp.id in (${ids('r')})`);
+  }
+
+  /**
+   * ¿Corresponde corregir el medio de este cobro con lo que dice este pago?
+   * Solo uno con uno y por el MISMO importe (con otro importe puede ser otro
+   * cobro), si Mercado Pago dice un medio claro (`medioReal`) y distinto. El QR
+   * del ERP (referencia «MP n») ya es el de Mercado Pago: no se toca.
+   */
+  private cambioDeMedio(fila: FilaErp, pago: { bruto: number; familia: Familia; tipo: string }) {
+    const ahora = medioReal(pago);
+    if (!ahora || ahora === fila.medio || Math.abs(fila.importe - pago.bruto) > EPS || fila.referencia.startsWith('MP ')) return null;
+    return { antes: fila.medio, ahora };
+  }
+
+  /** Cambia el medio del renglón, guarda el anterior en el atado (una sola vez) y lo deja en Auditoría. */
+  private async aplicarMedio(tx: any, conciliacionId: number, fila: FilaErp, pagoId: string, cambio: { antes: string; ahora: string }, usuarioId: number) {
+    const marcados = await tx.update(mpConciliacionErp).set({ medioAnterior: cambio.antes as any })
+      .where(and(eq(mpConciliacionErp.conciliacionId, conciliacionId), isNull(mpConciliacionErp.medioAnterior)))
+      .returning({ id: mpConciliacionErp.id });
+    if (!marcados.length) throw new BadRequestException('Ese medio ya se corrigió: actualizá la pantalla.');
+    const id = Number(fila.clave.slice(1));
+    if (fila.clave[0] === 'v') await tx.update(ventaPagos).set({ medio: cambio.ahora as any }).where(eq(ventaPagos.id, id));
+    else await tx.update(cobranzaPagos).set({ medio: cambio.ahora as any }).where(eq(cobranzaPagos.id, id));
+    await tx.insert(auditoria).values({
+      usuarioId, entidad: fila.clave[0] === 'v' ? 'venta_pago' : 'cobranza_pago', entidadId: id, ambito: 'Conciliación MP',
+      detalle: `${fila.origen === 'venta' ? 'Venta' : 'Recibo'} ${fila.puntoVenta}-${fila.numero ?? ''} · pago de Mercado Pago N° ${pagoId}`,
+      campo: 'medio', antes: cambio.antes, despues: cambio.ahora,
+    });
+  }
+
   /**
    * Atar a mano: cobros del ERP con pagos de Mercado Pago (uno o varios de
    * cada lado), o explicar lo que queda de un solo lado: `sin_venta` (entró
    * plata que no es una venta) o `sin_mp` (el cobro no entró a Mercado Pago).
-   * Si los dos lados no suman lo mismo, hace falta decir por qué.
-   *
-   * EL MEDIO SE CORRIGE (18/11/2026, pedido del dueño): un cobro atado a UN
-   * pago pasa a tener el medio que dice Mercado Pago (se marcó QR y fue
-   * tarjeta de crédito → tarjeta de crédito). El importe no se toca. El medio
-   * anterior queda guardado: se muestra, y «Deshacer» lo devuelve.
+   * Si los dos lados no suman lo mismo, hace falta decir por qué. Uno con uno y
+   * por el mismo importe: el cobro toma el medio que dice Mercado Pago.
    */
   async atarAMano(dto: { cobros?: string[]; pagos?: string[]; motivo?: string }, sesion: Sesion) {
     const claves = [...new Set((dto.cobros ?? []).map(String))];
@@ -437,32 +521,29 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     if (!claves.length && !pagos.length) throw new BadRequestException('Elegí qué atar.');
     const tipo = claves.length && pagos.length ? 'manual' : claves.length ? 'sin_mp' : 'sin_venta';
     if (tipo !== 'manual' && !motivo) throw new BadRequestException(tipo === 'sin_mp' ? 'Decí por qué no entró a Mercado Pago.' : 'Decí qué es esa plata.');
-    let medio: { clave: string; antes: string; ahora: string } | null = null;
+    const enMp = pagos.length
+      ? await this.db.select({ id: mpMovimientos.id, bruto: mpMovimientos.bruto, familia: mpMovimientos.familia, tipo: mpMovimientos.tipo, sucursalId: mpMovimientos.sucursalId })
+        .from(mpMovimientos).where(inArray(mpMovimientos.id, pagos))
+      : [];
+    if (enMp.length !== pagos.length) throw new BadRequestException('Alguno de los pagos ya no existe: actualizá la pantalla.');
+    const filas = claves.length ? await this.filasErp(claves) : [];
+    if (filas.length !== claves.length) throw new BadRequestException('Alguno de los cobros ya no existe: actualizá la pantalla.');
+    this.soloSuLocal(sesion, filas);
+    /* «No es venta» sobre plata de toda la cuenta (sin local): solo un jefe. */
+    if (tipo === 'sin_venta') this.soloSuLocal(sesion, enMp);
+    let medio: { fila: FilaErp; pagoId: string; cambio: { antes: string; ahora: string } } | null = null;
     if (tipo === 'manual') {
-      const filas = await this.cobrosErp(
-        sql`vp.id in (${sql.join([0, ...claves.filter((k) => k[0] === 'v').map((k) => Number(k.slice(1)))].map((i) => sql`${i}`), sql`, `)})`,
-        sql`cp.id in (${sql.join([0, ...claves.filter((k) => k[0] === 'r').map((k) => Number(k.slice(1)))].map((i) => sql`${i}`), sql`, `)})`,
-      );
-      const enMp = await this.db.select({ bruto: mpMovimientos.bruto, familia: mpMovimientos.familia, tipo: mpMovimientos.tipo })
-        .from(mpMovimientos).where(inArray(mpMovimientos.id, pagos));
-      if (filas.length !== claves.length || enMp.length !== pagos.length) throw new BadRequestException('Alguno de los elegidos ya no existe: actualizá la pantalla.');
       const dif = r2(filas.reduce((a, f) => a + f.importe, 0) - enMp.reduce((a, p) => a + p.bruto, 0));
       if (Math.abs(dif) > EPS && !motivo) throw new BadRequestException(`Los dos lados no suman lo mismo (diferencia $${dif.toFixed(2)}): decí por qué.`);
-      if (filas.length === 1 && enMp.length === 1 && medioReal(enMp[0]) !== filas[0].medio) {
-        medio = { clave: filas[0].clave, antes: filas[0].medio, ahora: medioReal(enMp[0]) };
-      }
+      const cambio = filas.length === 1 && enMp.length === 1 ? this.cambioDeMedio(filas[0], enMp[0]) : null;
+      if (cambio) medio = { fila: filas[0], pagoId: enMp[0].id, cambio };
     }
     try {
       return await this.db.transaction(async (tx) => {
         const [c] = await tx.insert(mpConciliaciones).values({ tipo, motivo, usuarioId: sesion.usuarioId }).returning({ id: mpConciliaciones.id });
         await this.unir(tx, c.id, claves, pagos);
-        if (medio) {
-          const id = Number(medio.clave.slice(1));
-          if (medio.clave[0] === 'v') await tx.update(ventaPagos).set({ medio: medio.ahora as any }).where(eq(ventaPagos.id, id));
-          else await tx.update(cobranzaPagos).set({ medio: medio.ahora as any }).where(eq(cobranzaPagos.id, id));
-          await tx.update(mpConciliacionErp).set({ medioAnterior: medio.antes as any }).where(eq(mpConciliacionErp.conciliacionId, c.id));
-        }
-        return { id: c.id, medio: medio && { antes: medio.antes, ahora: medio.ahora } };
+        if (medio) await this.aplicarMedio(tx, c.id, medio.fila, medio.pagoId, medio.cambio, sesion.usuarioId);
+        return { id: c.id, medio: medio?.cambio ?? null };
       });
     } catch (e: any) {
       if (e?.code === '23505' || e?.cause?.code === '23505') throw new BadRequestException('Alguno de esos cobros ya está atado: actualizá la pantalla.');
@@ -470,18 +551,52 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** «Pasar a …» en un atado que ya existe (uno con uno, mismo importe): el cobro toma el medio que dice Mercado Pago. */
+  async corregirMedio(id: number, sesion: Sesion) {
+    const [filas, pagos] = await Promise.all([
+      this.cobrosErp(sql`ce.conciliacion_id = ${id}`, sql`ce.conciliacion_id = ${id}`),
+      this.db.select({ id: mpMovimientos.id, bruto: mpMovimientos.bruto, familia: mpMovimientos.familia, tipo: mpMovimientos.tipo })
+        .from(mpMovimientos).where(eq(mpMovimientos.conciliacionId, id)),
+    ]);
+    if (filas.length !== 1 || pagos.length !== 1) throw new BadRequestException('Solo se corrige un cobro atado a un solo pago.');
+    this.soloSuLocal(sesion, filas);
+    const cambio = this.cambioDeMedio(filas[0], pagos[0]);
+    if (!cambio || filas[0].medioAnterior) throw new BadRequestException('No hay medio para corregir: Mercado Pago dice el mismo, no es claro, o los importes no coinciden.');
+    await this.db.transaction((tx) => this.aplicarMedio(tx, id, filas[0], pagos[0].id, cambio, sesion.usuarioId));
+    return cambio;
+  }
+
   /** Deshacer un atado: el medio corregido vuelve al de antes, y sus pagos quedan «a mano» (el automático no los vuelve a atar). */
-  async deshacer(id: number) {
+  async deshacer(id: number, sesion: Sesion) {
+    const filas = await this.cobrosErp(sql`ce.conciliacion_id = ${id}`, sql`ce.conciliacion_id = ${id}`);
+    this.soloSuLocal(sesion, filas);
+    /* «No es venta» (sin cobros del ERP) lo deshace solo un jefe, igual que lo marca. */
+    if (!filas.length && this.localDe(sesion) != null) throw new ForbiddenException('Eso lo deshace un jefe.');
     return this.db.transaction(async (tx) => {
-      await tx.execute(sql`update venta_pagos vp set medio = e.medio_anterior from mp_conciliacion_erp e
-        where e.conciliacion_id = ${id} and e.venta_pago_id = vp.id and e.medio_anterior is not null`);
-      await tx.execute(sql`update cobranza_pagos cp set medio = e.medio_anterior from mp_conciliacion_erp e
-        where e.conciliacion_id = ${id} and e.cobranza_pago_id = cp.id and e.medio_anterior is not null`);
       await tx.update(mpMovimientos).set({ aMano: true }).where(eq(mpMovimientos.conciliacionId, id));
-      const borrados = await tx.delete(mpConciliaciones).where(eq(mpConciliaciones.id, id)).returning({ id: mpConciliaciones.id });
-      if (!borrados.length) throw new NotFoundException('Ese atado ya no existe.');
+      await this.deshacerEn(tx, id, sesion.usuarioId, 'Se deshizo el atado');
       return { ok: true };
     });
+  }
+
+  /** Vuelve atrás un atado dentro de `tx`: cada medio corregido vuelve al anterior (queda en Auditoría) y el atado se borra. */
+  private async deshacerEn(tx: any, id: number, usuarioId: number | null, porque: string) {
+    const corregidos: any = await tx.execute(sql`
+      select e.venta_pago_id, e.cobranza_pago_id, e.medio_anterior::text as anterior, coalesce(vp.medio, cp.medio)::text as actual
+      from mp_conciliacion_erp e
+      left join venta_pagos vp on vp.id = e.venta_pago_id
+      left join cobranza_pagos cp on cp.id = e.cobranza_pago_id
+      where e.conciliacion_id = ${id} and e.medio_anterior is not null`);
+    for (const r of corregidos.rows as any[]) {
+      if (r.venta_pago_id != null) await tx.update(ventaPagos).set({ medio: r.anterior }).where(eq(ventaPagos.id, Number(r.venta_pago_id)));
+      else await tx.update(cobranzaPagos).set({ medio: r.anterior }).where(eq(cobranzaPagos.id, Number(r.cobranza_pago_id)));
+      await tx.insert(auditoria).values({
+        usuarioId, entidad: r.venta_pago_id != null ? 'venta_pago' : 'cobranza_pago', entidadId: Number(r.venta_pago_id ?? r.cobranza_pago_id),
+        ambito: 'Conciliación MP', detalle: porque, campo: 'medio', antes: r.actual, despues: r.anterior,
+      });
+    }
+    const borrados = await tx.delete(mpConciliaciones).where(eq(mpConciliaciones.id, id)).returning({ id: mpConciliaciones.id });
+    if (!borrados.length) throw new NotFoundException('Ese atado ya no existe.');
   }
 }
 
@@ -493,7 +608,7 @@ export class ConciliacionMpController {
   ver(@Query() q: { desde?: string; hasta?: string; conciliados?: string; sucursalId?: string }, @Auth() sesion: Sesion) { return this.svc.ver(q, sesion); }
 
   @Get('sueltos') @Permiso(PERMISO_CONCILIACION)
-  sueltos(@Query() q: { desde?: string; hasta?: string }) { return this.svc.sueltos(q); }
+  sueltos(@Query() q: { desde?: string; hasta?: string }, @Auth() sesion: Sesion) { return this.svc.sueltos(q, sesion); }
 
   /** Bajar ya lo nuevo de Mercado Pago (además del reloj de cada 5 minutos). */
   @Post('actualizar') @Permiso(PERMISO_CONCILIACION)
@@ -502,6 +617,10 @@ export class ConciliacionMpController {
   @Post() @Permiso(PERMISO_CONCILIACION)
   atar(@Body() body: { cobros?: string[]; pagos?: string[]; motivo?: string }, @Auth() sesion: Sesion) { return this.svc.atarAMano(body ?? {}, sesion); }
 
+  /** «Pasar a …»: corrige el medio de un atado uno con uno. */
+  @Post(':id/medio') @Permiso(PERMISO_CONCILIACION)
+  corregirMedio(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.corregirMedio(id, sesion); }
+
   @Delete(':id') @Permiso(PERMISO_CONCILIACION)
-  deshacer(@Param('id', ParseIntPipe) id: number) { return this.svc.deshacer(id); }
+  deshacer(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) { return this.svc.deshacer(id, sesion); }
 }
