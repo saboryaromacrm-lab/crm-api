@@ -1,9 +1,13 @@
 /**
  * VENTAS › CONCILIACIÓN MP — LA BAJADA Y LA PANTALLA (18/11/2026)
  * ============================================================================
- * Cada 5 minutos se bajan de Mercado Pago los pagos nuevos o cambiados (desde
- * el último que se vio, con 2 h de margen) a `mp_movimientos`, y se ata solo
- * lo seguro (`conciliacion.ts`). La pantalla pide un rango de días y recibe:
+ * Se bajan los pagos de Mercado Pago a `mp_movimientos` y se ata solo lo
+ * seguro (`conciliacion.ts`). La bajada pide de a UN DÍA por fecha de creación
+ * (como el diagnóstico, que trae todo): cada 5 minutos los últimos 2 días, y
+ * al arrancar y una vez por día los últimos 35 (lo que faltó, devoluciones y
+ * contracargos tardíos). Pedirlo todo de una vez por fecha de modificación,
+ * paginando hasta el final, dejó días a medias en producción (18/11/2026).
+ * La pantalla pide un rango de días y recibe:
  *
  *   dias        por día: vendido electrónico, entró a MP y qué quedó pendiente
  *   faltan      cobros del ERP sin pago en Mercado Pago (lo que importa)
@@ -31,9 +35,9 @@ const ARRANQUE = '2026-11-01';
 const CADA = 5 * 60_000;
 const DIA = 86_400_000;
 const EPS = 0.01;
-
-/** Fecha y hora en Argentina como la acepta la búsqueda de Mercado Pago (Argentina no tiene horario de verano). */
-const isoAr = (d: Date) => `${new Date(d.getTime() - 3 * 3_600_000).toISOString().slice(0, 23)}-03:00`;
+/** Cuántos días se vuelven a pedir en cada pasada, y en el barrido largo (al arrancar y una vez por día). */
+const DIAS_RECIENTES = 2;
+const DIAS_BARRIDO = 35;
 const desdeDia = (dia: string) => new Date(`${dia}T00:00:00-03:00`);
 const sumaDias = (dia: string, n: number) => new Date(desdeDia(dia).getTime() + n * DIA).toLocaleDateString('en-CA', { timeZone: ZONA });
 const valido = (dia: unknown) => typeof dia === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dia) && !Number.isNaN(desdeDia(dia).getTime());
@@ -60,6 +64,8 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
   private cuentaId: number | null = null;
   /** Cómo salió la última bajada (la pantalla la muestra). */
   private ultima: { en: string; nuevos: number; atados: number; error: string } | null = null;
+  /** Cuándo terminó el último barrido largo (0 = todavía no: el primero va al arrancar). */
+  private ultimoBarrido = 0;
 
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
@@ -95,8 +101,6 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
 
   private async bajarYAtar() {
     this.cuentaId ??= Number((await mp.yo()).id);
-    const [{ ultimo }] = await this.db.select({ ultimo: sql<Date | null>`max(${mpMovimientos.actualizadoMp})` }).from(mpMovimientos);
-    let desde = ultimo ? new Date(new Date(ultimo).getTime() - 2 * 3_600_000) : desdeDia(ARRANQUE);
     const [cajas, sucs] = await Promise.all([
       this.db.select({ pos: mpCajas.mpPosId, sucursalId: mpCajas.sucursalId }).from(mpCajas),
       this.db.select({ store: mpSucursales.mpStoreId, sucursalId: mpSucursales.sucursalId }).from(mpSucursales),
@@ -105,30 +109,37 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const porStore = new Map(sucs.map((s) => [s.store, s.sucursalId]));
     const sucursalDe = (pos: string, store: string) => porPos.get(pos) ?? porStore.get(store) ?? null;
 
+    const barrido = Date.now() - this.ultimoBarrido > 20 * 3_600_000;
+    const desdeArranque = Math.ceil((Date.now() - desdeDia(ARRANQUE).getTime()) / DIA);
+    const dias = Math.max(1, Math.min(barrido ? DIAS_BARRIDO : DIAS_RECIENTES, desdeArranque));
     let nuevos = 0;
-    let offset = 0;
-    /* Mercado Pago no deja pasar del renglón 10.000: al llegar, se sigue desde la fecha del último visto. */
-    for (let pagina = 0; pagina < 400; pagina++) {
+    /* De a 24 h hacia atrás. Cada ventana se calcula con su propio «ahora», así que se pisan unos segundos: nunca queda un hueco. */
+    for (let k = 0; k < dias; k++) nuevos += await this.bajarVentana(`NOW-${k + 1}DAYS`, k ? `NOW-${k}DAYS` : 'NOW', sucursalDe);
+    if (barrido) this.ultimoBarrido = Date.now();
+    const atados = await this.atar();
+    this.ultima = { en: new Date().toISOString(), nuevos, atados, error: '' };
+  }
+
+  /** Los pagos creados en una ventana (un día: 2 o 3 páginas de 50), guardados. Lo que dice Mercado Pago se pisa; el atado no se toca. */
+  private async bajarVentana(desde: string, hasta: string, sucursalDe: (pos: string, store: string) => number | null) {
+    let guardados = 0;
+    for (let offset = 0; offset < 10_000; offset += 50) {
       const r: any = await mp.buscarPagos({
-        sort: 'date_last_updated', criteria: 'asc', range: 'date_last_updated',
-        begin_date: isoAr(desde), end_date: isoAr(new Date()), limit: '50', offset: String(offset),
+        sort: 'date_created', criteria: 'desc', range: 'date_created',
+        begin_date: desde, end_date: hasta, limit: '50', offset: String(offset),
       });
       const lote: any[] = Array.isArray(r?.results) ? r.results : [];
       const filas = lote.filter((p) => seGuarda(p, this.cuentaId!)).map((p) => movimientoDe(p, sucursalDe));
       if (filas.length) {
-        /* Lo que dice Mercado Pago se pisa; el atado (`conciliacion_id`, `a_mano`) no se toca. */
         await this.db.insert(mpMovimientos).values(filas).onConflictDoUpdate({
           target: mpMovimientos.id,
           set: Object.fromEntries(Object.keys(filas[0]).filter((k) => k !== 'id').map((k) => [k, sql.raw(`excluded.${COLUMNAS[k as keyof typeof COLUMNAS].name}`)])),
         });
-        nuevos += filas.length;
+        guardados += filas.length;
       }
       if (lote.length < 50) break;
-      offset += 50;
-      if (offset >= 9_950) { desde = new Date(lote[lote.length - 1].date_last_updated); offset = 0; }
     }
-    const atados = await this.atar();
-    this.ultima = { en: new Date().toISOString(), nuevos, atados, error: '' };
+    return guardados;
   }
 
   /** Limpia atados que perdieron un lado (se borró el pago del ERP) y ata solo lo seguro de los últimos 45 días. */
@@ -225,26 +236,35 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
   /**
    * LA PANTALLA: el rango `desde`..`hasta` (días en Argentina, hasta 62).
    * `conciliados`: también la lista de lo ya atado (para un día; en un mes son miles).
+   * `sucursalId`: solo lo de ese local (la tabla «por local» sigue mostrando todos,
+   * para poder cambiar). Un pago de Mercado Pago sin local conocido no es de ninguno.
+   * Las listas van de lo más reciente a lo más viejo.
    */
-  async ver(q: { desde?: string; hasta?: string; conciliados?: string }, sesion: Sesion) {
+  async ver(q: { desde?: string; hasta?: string; conciliados?: string; sucursalId?: string }, sesion: Sesion) {
     const { desde, hasta } = q;
+    const suc = q.sucursalId ? Number(q.sucursalId) : null;
     if (!valido(desde) || !valido(hasta) || desde! > hasta!) throw new BadRequestException('Elegí un rango de días válido.');
+    if (suc != null && !(Number.isInteger(suc) && suc > 0)) throw new BadRequestException('Ese local no es válido.');
     if (desdeDia(hasta!).getTime() - desdeDia(desde!).getTime() > 62 * DIA) throw new BadRequestException('Elegí hasta dos meses.');
     const ini = [desde!, ARRANQUE].sort()[1];
     const fin = sumaDias(hasta!, 1);
     const enRango = (col: string) => sql`${sql.raw(col)} >= ${desdeDia(ini)} and ${sql.raw(col)} < ${desdeDia(fin)}`;
 
-    const [cobros, pagosRango, pagosCerca] = await Promise.all([
+    const [cobrosTodos, pagosRango, pagosCerca] = await Promise.all([
       this.cobrosErp(enRango('v.fecha'), enRango('c.fecha')),
       this.pagosMp(sql`${mpMovimientos.fecha} >= ${desdeDia(ini)} and ${mpMovimientos.fecha} < ${desdeDia(fin)}`),
       /* Los sueltos de alrededor, para sugerir (una transferencia llega días antes). */
       this.pagosMp(sql`${mpMovimientos.conciliacionId} is null and ${mpMovimientos.estado} = 'approved'
         and ${mpMovimientos.fecha} >= ${desdeDia(sumaDias(ini, -3))} and ${mpMovimientos.fecha} < ${desdeDia(sumaDias(fin, 1))}`),
     ]);
-    const pagos = pagosRango.map((x) => ({ ...x.m, dia: x.dia }));
+    const pagosTodos = pagosRango.map((x) => ({ ...x.m, dia: x.dia }));
+    const delLocal = (x: { sucursalId: number | null }) => suc == null || x.sucursalId === suc;
+    const cobros = cobrosTodos.filter(delLocal);
+    const pagos = pagosTodos.filter(delLocal);
+    const recientes = (a: { fecha: Date }, b: { fecha: Date }) => b.fecha.getTime() - a.fecha.getTime();
 
-    /* Los atados de lo que se ve, con su otro lado aunque sea de otro día. */
-    const idsConc = [...new Set([...cobros.map((c) => c.conciliacionId), ...pagos.map((p) => p.conciliacionId)].filter((x): x is number => x != null))];
+    /* Los atados de lo que se ve (de todos los locales: la tabla por local los usa), con su otro lado aunque sea de otro día. */
+    const idsConc = [...new Set([...cobrosTodos.map((c) => c.conciliacionId), ...pagosTodos.map((p) => p.conciliacionId)].filter((x): x is number => x != null))];
     const [concs, cobrosDeConc, pagosDeConc] = idsConc.length ? await Promise.all([
       this.db.execute(sql`select c.id, c.tipo, c.motivo, c.creado_en, u.nombre as usuario from mp_conciliaciones c
         left join usuarios u on u.id = c.usuario_id where c.id in (${sql.join(idsConc.map((i) => sql`${i}`), sql`, `)})`),
@@ -267,9 +287,10 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const sugPago = new Set(sugs.map((s) => s.mpId));
     const porClave = new Map(cobros.map((c) => [c.clave, c]));
 
-    const faltan = sueltosErp.filter((c) => !sugCobro.has(c.clave));
-    const sinVenta = pagos.filter((p) => !p.conciliacionId && p.estado === 'approved' && !sugPago.has(p.id));
-    const sugeridos = sugs.map((s) => ({ motivo: s.motivo, cobro: porClave.get(s.clave)!, pago: verPago(sueltosMp.get(s.mpId)!) }));
+    const faltan = sueltosErp.filter((c) => !sugCobro.has(c.clave)).sort(recientes);
+    const sinVenta = pagos.filter((p) => !p.conciliacionId && p.estado === 'approved' && !sugPago.has(p.id)).sort(recientes);
+    const sugeridos = sugs.map((s) => ({ motivo: s.motivo, cobro: porClave.get(s.clave)!, pago: verPago(sueltosMp.get(s.mpId)!) }))
+      .sort((a, b) => recientes(a.cobro, b.cobro));
 
     /* Los atados, agrupados, y los avisos: plata devuelta o reclamada, o venta anulada con la plata en Mercado Pago. */
     const grupos = new Map<number, { id: number; tipo: string; motivo: string; usuario: string; creadoEn: Date; cobros: FilaErp[]; pagos: ReturnType<typeof verPago>[] }>();
@@ -278,7 +299,8 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     }
     for (const c of cobrosDeConc) grupos.get(c.conciliacionId!)?.cobros.push(c);
     for (const x of pagosDeConc) grupos.get(x.m.conciliacionId!)?.pagos.push(verPago({ ...x.m, dia: x.dia }));
-    const avisos = [...grupos.values()].flatMap((g) => {
+    const delFiltro = (g: { cobros: FilaErp[]; pagos: { sucursalId: number | null }[] }) => suc == null || g.cobros.some(delLocal) || g.pagos.some(delLocal);
+    const avisos = [...grupos.values()].filter(delFiltro).flatMap((g) => {
       const motivos = [
         g.pagos.some((p) => p.estado !== 'approved' || p.devuelto > EPS) ? 'Mercado Pago devolvió o tiene reclamado el pago' : null,
         g.cobros.some((c) => !c.vigente) && g.pagos.some((p) => p.estado === 'approved') ? 'La venta o el recibo se anuló y la plata sigue en Mercado Pago' : null,
@@ -312,12 +334,12 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const abrir = <K extends string | number>(m: Map<K, any>, k: K, base: object) => { if (!m.has(k)) m.set(k, { ...base, vendido: 0, confirmado: 0 }); return m.get(k); };
     const porSucursal = new Map<string, any>();
     const porMedio = new Map<string, any>();
-    for (const c of cobros) {
+    for (const c of cobrosTodos) {
       if (!c.vigente) continue;
       const confirmado = c.conciliacionId && grupos.get(c.conciliacionId)?.tipo !== 'sin_mp' ? c.importe : 0;
-      for (const g of [abrir(porSucursal, c.sucursal || '—', { sucursal: c.sucursal || '—' }), abrir(porMedio, familia(c.medio), { familia: familia(c.medio) })]) {
-        g.vendido += c.importe; g.confirmado += confirmado;
-      }
+      const filas = [abrir(porSucursal, c.sucursal || '—', { sucursalId: c.sucursalId, sucursal: c.sucursal || '—' })];
+      if (delLocal(c)) filas.push(abrir(porMedio, familia(c.medio), { familia: familia(c.medio) }));
+      for (const g of filas) { g.vendido += c.importe; g.confirmado += confirmado; }
     }
     const redondear = (o: any) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'number' ? r2(v) : v]));
     const aprobados = pagos.filter((p) => p.estado === 'approved');
@@ -326,6 +348,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       ...this.estado(),
       desde: ini,
       hasta: hasta!,
+      sucursalId: suc,
       resumen: redondear({
         vendido: cobros.filter((c) => c.vigente).reduce((a, c) => a + c.importe, 0),
         entro: aprobados.reduce((a, p) => a + p.bruto, 0),
@@ -340,7 +363,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       sugeridos,
       sinVenta: sinVenta.map(verPago),
       avisos,
-      conciliados: q.conciliados === '1' ? [...grupos.values()] : null,
+      conciliados: q.conciliados === '1' ? [...grupos.values()].filter(delFiltro) : null,
     };
   }
 
@@ -415,7 +438,7 @@ export class ConciliacionMpController {
   constructor(private readonly svc: ConciliacionMpService) {}
 
   @Get() @Permiso(PERMISO_CONCILIACION)
-  ver(@Query() q: { desde?: string; hasta?: string; conciliados?: string }, @Auth() sesion: Sesion) { return this.svc.ver(q, sesion); }
+  ver(@Query() q: { desde?: string; hasta?: string; conciliados?: string; sucursalId?: string }, @Auth() sesion: Sesion) { return this.svc.ver(q, sesion); }
 
   @Get('sueltos') @Permiso(PERMISO_CONCILIACION)
   sueltos(@Query() q: { desde?: string; hasta?: string }) { return this.svc.sueltos(q); }
