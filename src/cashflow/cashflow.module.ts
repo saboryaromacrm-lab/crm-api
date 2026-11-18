@@ -657,7 +657,11 @@ export class CashflowService {
           coalesce(uc.nombre, ua.nombre, '') as cajero,
           s.id as "sobreId", s.contado, s.diferencia as "diferenciaSobre", coalesce(s.descartado, false) as descartado,
           s.controlado_en as "controladoEn",
-          exists (select 1 from cajas_a_controlar ac where ac.caja_sesion_id = cs.id and ac.resuelta_en is null) as "aControlar"
+          exists (select 1 from cajas_a_controlar ac where ac.caja_sesion_id = cs.id and ac.resuelta_en is null) as "aControlar",
+          (select json_build_object('hora', cc.fecha, 'contado', cc.contado_efectivo, 'diferencia', cc.diferencia, 'quien', coalesce(uq.nombre, ''))
+             from caja_controles cc left join usuarios uq on uq.id = cc.usuario_id
+             where cc.caja_sesion_id = cs.id and cc.arqueo_dia and (cc.fecha at time zone ${ZONA})::date = ${dia}::date
+             order by cc.fecha desc limit 1) as "arqueoDia"
         from caja_sesiones cs
         ${CAJERO_DEL_TURNO}
         left join cashflow_sobres s on s.caja_sesion_id = cs.id and s.anulado_en is null
@@ -687,6 +691,10 @@ export class CashflowService {
         contado: x.contado == null ? null : money(x.contado),
         diferenciaSobre: x.diferenciaSobre == null ? null : money(x.diferenciaSobre),
         controladoEn: iso(x.controladoEn), aControlar: !!x.aControlar,
+        /** El arqueo de la noche de ese día, si la caja no cerraba ese día (18/11/2026). */
+        arqueoDia: x.arqueoDia
+          ? { hora: iso(x.arqueoDia.hora), contado: money(x.arqueoDia.contado), diferencia: money(x.arqueoDia.diferencia), quien: x.arqueoDia.quien }
+          : null,
       };
       const l = turnosDe.get(Number(x.sucursalId));
       if (l) l.push(t); else turnosDe.set(Number(x.sucursalId), [t]);

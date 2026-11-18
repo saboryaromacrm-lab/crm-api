@@ -22,7 +22,7 @@ import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { esJefe, soloSuSucursal, sucursalDeOperacion, tienePermiso } from '../auth/auth.guard';
-import { MarcaDto, PERMISO_CASHFLOW, marcarCaja } from '../cashflow/a-controlar';
+import { MarcaDto, PERMISO_CASHFLOW, marcarCaja, umbralControlar } from '../cashflow/a-controlar';
 import { exigirFirma, resolverOperador } from '../usuarios/usuarios.module';
 import { cajerosDelTurno, exigirQuienCierra, quienesCierran } from './cajeros';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
@@ -189,6 +189,16 @@ class ControlCajaDto {
   /** El relevo de caja (0088): quién está en la registradora. El interceptor
    *  no lo toca (significa OTRO usuario) y el servidor valida la marca. */
   @IsOptional() @IsInt() operadorId?: number;
+}
+
+/** El arqueo del día (los días que no son de cierre): contar el cajón y firmar, sin cerrar ni enviar. */
+class ArqueoDelDiaDto {
+  @IsObject() billetes!: Record<string, number>;
+  /** Quién cuenta (de la lista de los que cierran) y su contraseña: firma como en el cierre. */
+  @IsOptional() @IsInt() cerradoPor?: number;
+  @IsOptional() @IsString() @MaxLength(100) firma?: string;
+  /** El tilde «Mandar a Cajas a controlar» (0145): solo el dueño. */
+  @IsOptional() @ValidateNested() @Type(() => MarcaDto) aControlar?: MarcaDto;
 }
 
 class ExplicarControlDto {
@@ -820,7 +830,7 @@ export class CajaService {
    * Misma transacción y mismo candado que `cerrar`: nada entra al turno
    * mientras se cierra.
    */
-  async enviarYCerrar(id: number, dto: EnviarCierreDto, sucursalSesion: number | null, marcadaPor: number | null = null) {
+  async enviarYCerrar(id: number, dto: EnviarCierreDto, sucursalSesion: number | null, marcadaPor: number | null = null, jefe = false) {
     if (dto.confirmado !== true) {
       throw new BadRequestException('Confirmá el envío: el turno se cierra y no se puede reabrir.');
     }
@@ -832,6 +842,14 @@ export class CajaService {
       if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
+      /* Un día que no es de cierre la caja no se cierra: se arquea (18/11/2026). Un jefe sí puede. */
+      const plazo = plazoDelTurno(sesion);
+      if (plazo.arqueoDelDia && !jefe) {
+        throw new BadRequestException(
+          `Hoy no es día de cierre de este local: la caja se cierra el ${diaEnPalabras(plazo.cerrarHasta)}. `
+          + 'Hacé el «Arqueo del día»: se cuenta el cajón, se firma y la plata queda en la caja.',
+        );
+      }
       /* Quién cierra (0229): elegido y firmado con su contraseña, antes de tocar nada. */
       const cierra = await exigirQuienCierra(tx, sesion.sucursalId, dto.cerradoPor);
       exigirFirma(cierra, dto.firma, 'contraseña');
@@ -915,18 +933,61 @@ export class CajaService {
     if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado: los controles son entre la apertura y el cierre.');
     const contado = money(dto.contadoEfectivo);
     if (contado < 0) throw new BadRequestException('El efectivo contado no puede ser negativo.');
+    // El relevo (0088): el conteo lo firma quien está parado en la caja.
+    const usuarioId = await resolverOperador(this.db, dto.operadorId, dto.usuarioId);
+    return this.registrarControl(this.db, id, contado, (dto.observaciones ?? '').trim(), usuarioId, false);
+  }
 
+  /** La foto de un conteo (control intermedio o arqueo del día): esperado, contado, diferencia y quién. No mueve plata. */
+  private async registrarControl(db: any, id: number, contado: number, observaciones: string, usuarioId: number | null, arqueoDia: boolean) {
     const a = await this.arqueo(id);
-    const [c] = await this.db.insert(cajaControles).values({
+    const [c] = await db.insert(cajaControles).values({
       cajaSesionId: id,
       esperadoEfectivo: a.esperadoEfectivo,
       contadoEfectivo: contado,
       diferencia: money(contado - a.esperadoEfectivo),
-      observaciones: (dto.observaciones ?? '').trim(),
-      // El relevo (0088): el conteo lo firma quien está parado en la caja.
-      usuarioId: await resolverOperador(this.db, dto.operadorId, dto.usuarioId),
+      observaciones,
+      usuarioId,
+      arqueoDia,
     }).returning();
     return c;
+  }
+
+  /**
+   * EL ARQUEO DEL DÍA (18/11/2026, pedido del dueño). Un local con días de
+   * cierre, un día que no es de cierre: a la noche se cuenta TODO el cajón
+   * billete por billete (el servidor suma), lo firma quien cuenta con su
+   * contraseña —igual que el cierre— y queda la foto (esperado, contado,
+   * diferencia). El turno sigue abierto y la plata queda en la caja: el sobre
+   * sale el día de cierre con todo junto. A ciegas igual que el cierre.
+   *
+   * Si la diferencia pasa del límite del dueño, la caja queda en «Cajas a
+   * controlar» sola (el dueño no está mirando cada noche); el dueño, además,
+   * puede marcarla con el tilde.
+   */
+  async arqueoDelDia(id: number, dto: ArqueoDelDiaDto, sucursalSesion: number | null, marcadaPor: number | null = null) {
+    const { total: contado } = totalDeBilletes(dto.billetes);
+    return this.db.transaction(async (tx) => {
+      const [sesion] = await tx.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1).for('update');
+      if (!sesion) throw new NotFoundException('Turno de caja inexistente.');
+      if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
+      if (sesion.estado !== 'abierta') throw new BadRequestException('El turno está cerrado.');
+      const plazo = plazoDelTurno(sesion);
+      if (!plazo.arqueoDelDia) throw new BadRequestException('Hoy es día de cierre de este local: cerrá la caja (cuenta, deja el fondo y manda el sobre).');
+      const cuenta = await exigirQuienCierra(tx, sesion.sucursalId, dto.cerradoPor);
+      exigirFirma(cuenta, dto.firma, 'contraseña');
+      const $ = (n: number) => `$${n.toLocaleString('es-AR')}`;
+      const c = await this.registrarControl(tx, id, contado,
+        `Arqueo del día (conteo por billetes): contó ${$(contado)} · la plata queda en la caja hasta el ${diaEnPalabras(plazo.cerrarHasta)}`, cuenta.id, true);
+      const pasa = Math.abs(c.diferencia) > (await umbralControlar(tx)) + 0.009;
+      if (dto.aControlar || pasa) {
+        await marcarCaja(tx, {
+          cajaSesionId: id, origen: 'control', usuarioId: dto.aControlar ? marcadaPor : null,
+          nota: dto.aControlar?.nota || (pasa ? `Arqueo del día con diferencia de ${$(money(c.diferencia))}` : ''),
+        });
+      }
+      return { control: c, contado, esperadoEfectivo: c.esperadoEfectivo, diferencia: c.diferencia, aControlar: !!dto.aControlar || pasa };
+    });
   }
 
   async movimiento(id: number, dto: MovimientoCajaDto, sucursalSesion: number | null, sesion: Sesion) {
@@ -1261,9 +1322,21 @@ export class CajaController {
     if (dto.aControlar && !tienePermiso(sesion?.permisos ?? [], [PERMISO_CASHFLOW])) {
       throw new ForbiddenException('Mandar una caja a «Cajas a controlar» es solo del dueño.');
     }
-    const r = await this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion), sesion?.usuarioId ?? null);
+    const r = await this.svc.enviarYCerrar(id, dto, soloSuSucursal(sesion), sesion?.usuarioId ?? null, esJefe(sesion));
     return (await this.ciego(sesion))
       ? { ...r, sesion: sesionCiega(r.sesion), esperadoEfectivo: null, diferencia: null, ciego: true }
+      : { ...r, ciego: false };
+  }
+
+  /** El arqueo del día (los días que no son de cierre): contar y firmar, sin cerrar. A ciegas como el cierre. */
+  @Post(':id/arqueo-dia')
+  async arqueoDelDia(@Param('id', ParseIntPipe) id: number, @Body() dto: ArqueoDelDiaDto, @Auth() sesion: Sesion) {
+    if (dto.aControlar && !tienePermiso(sesion?.permisos ?? [], [PERMISO_CASHFLOW])) {
+      throw new ForbiddenException('Mandar una caja a «Cajas a controlar» es solo del dueño.');
+    }
+    const r = await this.svc.arqueoDelDia(id, dto, soloSuSucursal(sesion), sesion?.usuarioId ?? null);
+    return (await this.ciego(sesion))
+      ? { contado: r.contado, esperadoEfectivo: null, diferencia: null, aControlar: false, ciego: true }
       : { ...r, ciego: false };
   }
 

@@ -2206,6 +2206,8 @@ export const cajaControles = pgTable('caja_controles', {
   diferencia: doublePrecision('diferencia').notNull().default(0),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  /** El arqueo del día (0234): el conteo de la noche de un día que no es de cierre. */
+  arqueoDia: boolean('arqueo_dia').notNull().default(false),
 }, (t) => ({
   ixSesion: index('ix_caja_controles_sesion').on(t.cajaSesionId),
 }));

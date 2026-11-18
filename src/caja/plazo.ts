@@ -18,6 +18,11 @@
  * Una caja con días de cierre vencida no vende ni cobra hasta que se cierre
  * (la pantalla lleva directo al cierre). La de todos los días sigue como
  * siempre: se avisa, pero no se frena.
+ *
+ * EL ARQUEO DEL DÍA (18/11/2026, pedido del dueño): los días que NO son de
+ * cierre, la caja no se cierra: a la noche se cuenta el cajón («arqueo del
+ * día», firmado como el cierre) y la plata queda. El sobre sale solo el día de
+ * cierre, con todo lo de esos días. Un jefe puede cerrar antes igual.
  */
 import { sql, type SQL } from 'drizzle-orm';
 import { ZONA_AR, hoyAr, sumarDias } from '../cafeteria/cuenta';
@@ -64,6 +69,8 @@ export function plazoDelTurno(t: { apertura: Date | string; cerrarHasta?: string
     estado,
     /** Una caja con días de cierre que pasó su último día: no vende hasta cerrarla. */
     bloquea: estado === 'vencida' && programada,
+    /** Hoy no es día de cierre: se hace el arqueo del día y la caja sigue abierta. */
+    arqueoDelDia: estado === 'en_plazo' && programada,
   };
 }
 

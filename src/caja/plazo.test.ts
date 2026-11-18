@@ -63,3 +63,12 @@ test('en palabras', () => {
   assert.equal(textoDiasCierre([5]), 'Los viernes');
   assert.equal(textoDiasCierre([1, 2, 3, 4, 5, 6, 7]), 'Todos los días');
 });
+
+test('arqueo del día: solo un local con días de cierre, un día que no es de cierre', () => {
+  const t = { apertura: '2026-11-17T08:00:00-03:00', cerrarHasta: '2026-11-19' };
+  assert.equal(plazoDelTurno(t, '2026-11-17').arqueoDelDia, true, 'martes: se arquea');
+  assert.equal(plazoDelTurno(t, '2026-11-18').arqueoDelDia, true, 'el día siguiente, todavía antes del de cierre');
+  assert.equal(plazoDelTurno(t, '2026-11-19').arqueoDelDia, false, 'día de cierre: se cierra');
+  assert.equal(plazoDelTurno(t, '2026-11-20').arqueoDelDia, false, 'vencida: se cierra');
+  assert.equal(plazoDelTurno({ apertura: '2026-11-17T08:00:00-03:00', cerrarHasta: null }, '2026-11-17').arqueoDelDia, false, 'todos los días: se cierra como siempre');
+});
