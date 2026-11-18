@@ -3955,6 +3955,8 @@ export const mpConciliacionErp = pgTable('mp_conciliacion_erp', {
   conciliacionId: integer('conciliacion_id').notNull().references(() => mpConciliaciones.id, { onDelete: 'cascade' }),
   ventaPagoId: integer('venta_pago_id').unique().references(() => ventaPagos.id, { onDelete: 'cascade' }),
   cobranzaPagoId: integer('cobranza_pago_id').unique().references(() => cobranzaPagos.id, { onDelete: 'cascade' }),
+  /** El medio que tenía el renglón antes de corregirlo con lo que dijo Mercado Pago (0233); NULL = no se tocó. Deshacer lo devuelve. */
+  medioAnterior: medioPagoEnum('medio_anterior'),
 });
 
 export const arcaTokens = pgTable('arca_tokens', {

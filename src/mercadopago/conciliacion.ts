@@ -61,6 +61,17 @@ export function seGuarda(p: any, cuentaId: number): boolean {
   return !(p?.payer?.id != null && Number(p.payer.id) === cuentaId);
 }
 
+/**
+ * CON QUÉ SE COBRÓ DE VERDAD, en los medios del ERP: lo que dice Mercado Pago.
+ * Un QR es QR aunque el cliente lo haya pagado con tarjeta; en el Point, la
+ * tarjeta de crédito es crédito y la de débito o prepaga, débito (el ERP no
+ * tiene prepaga).
+ */
+export function medioReal(p: { familia: Familia; tipo: string }): string {
+  if (p.familia === 'tarjeta') return p.tipo === 'credit_card' ? 'tarjeta_credito' : 'tarjeta_debito';
+  return p.familia;
+}
+
 /** Lo que Mercado Pago le descontó al comercio (`fee_payer` collector). */
 const comisionDe = (p: any) => (Array.isArray(p?.fee_details) ? p.fee_details : [])
   .filter((f: any) => String(f?.fee_payer ?? 'collector') === 'collector')

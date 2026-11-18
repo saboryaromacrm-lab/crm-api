@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { atarSolos, familiaMp, movimientoDe, seGuarda, sugerir, type CobroErp, type PagoMp } from './conciliacion';
+import { atarSolos, familiaMp, medioReal, movimientoDe, seGuarda, sugerir, type CobroErp, type PagoMp } from './conciliacion';
 
 const t = (hhmm: string, dia = '2026-11-17') => new Date(`${dia}T${hhmm}:00-03:00`);
 const cobro = (clave: string, hhmm: string, importe: number, familia: CobroErp['familia'], extra: Partial<CobroErp> = {}): CobroErp =>
@@ -81,4 +81,12 @@ test('sugerencias: varios posibles, otro medio, monto distinto; cada pago una so
     ],
   );
   assert.deepEqual(s.map((x) => `${x.clave}=${x.mpId}:${x.motivo}`).sort(), ['v1=a:varios', 'v3=b:otro_medio', 'v4=c:monto_distinto']);
+});
+
+test('el medio de verdad, en los medios del ERP', () => {
+  assert.equal(medioReal({ familia: 'tarjeta', tipo: 'credit_card' }), 'tarjeta_credito');
+  assert.equal(medioReal({ familia: 'tarjeta', tipo: 'debit_card' }), 'tarjeta_debito');
+  assert.equal(medioReal({ familia: 'tarjeta', tipo: 'prepaid_card' }), 'tarjeta_debito');
+  assert.equal(medioReal({ familia: 'qr', tipo: 'credit_card' }), 'qr', 'un QR pagado con tarjeta sigue siendo QR');
+  assert.equal(medioReal({ familia: 'transferencia', tipo: 'account_money' }), 'transferencia');
 });

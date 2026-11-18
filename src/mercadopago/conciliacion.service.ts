@@ -9,6 +9,12 @@
  * día 35 tramos (lo que faltó, devoluciones y contracargos tardíos). Pedirlo
  * todo junto por fecha de modificación dejó días a medias, y los tramos de un
  * día dejaron huecos de mañana (producción, 18/11/2026).
+ *
+ * SOLO LO QUE COBRÓ LA CUENTA: la búsqueda trae también lo que la cuenta PAGA
+ * (compras con la tarjeta de débito de Mercado Pago, servicios, débitos
+ * automáticos) y esos pagos no siempre dicen quién cobró. Se le pide a Mercado
+ * Pago que filtre por cobrador (`collector.id`), y el barrido borra lo que se
+ * había guardado y ya no vuelve (si no está atado).
  * La pantalla pide un rango de días y recibe:
  *
  *   dias        por día: vendido electrónico, entró a MP y qué quedó pendiente
@@ -26,10 +32,10 @@ import { type SQL, and, eq, getTableColumns, inArray, isNull, sql } from 'drizzl
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
-import { mpCajas, mpConciliacionErp, mpConciliaciones, mpMovimientos, mpSucursales } from '../db/schema';
+import { cobranzaPagos, mpCajas, mpConciliacionErp, mpConciliaciones, mpMovimientos, mpSucursales, ventaPagos } from '../db/schema';
 import { ZONA } from '../metricas/sincronizar';
 import { MP, mp } from './api';
-import { FAMILIA_DE_MEDIO, MEDIOS_ELECTRONICOS, atarSolos, movimientoDe, seGuarda, sugerir, type CobroErp, type PagoMp } from './conciliacion';
+import { FAMILIA_DE_MEDIO, MEDIOS_ELECTRONICOS, atarSolos, medioReal, movimientoDe, seGuarda, sugerir, type CobroErp, type PagoMp } from './conciliacion';
 
 export const PERMISO_CONCILIACION = 'ventas.conciliacion_mp';
 /** Desde cuándo se concilia (decisión del dueño, 18/11/2026). Lo anterior no se baja ni se muestra. */
@@ -50,6 +56,8 @@ type FilaErp = {
   clave: string; origen: 'venta' | 'recibo'; docId: number; fecha: Date; dia: string; importe: number; medio: string; referencia: string;
   sucursalId: number | null; sucursal: string; tipoDoc: string; puntoVenta: string; numero: number | null; cliente: string;
   cajero: string; turno: number | null; vigente: boolean; conciliacionId: number | null;
+  /** El medio que tenía antes de que la conciliación lo corrigiera (0233). */
+  medioAnterior: string | null;
 };
 
 const familia = (medio: string) => FAMILIA_DE_MEDIO[medio];
@@ -114,21 +122,26 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const desdeArranque = Math.ceil((Date.now() - desdeDia(ARRANQUE).getTime()) / DIA);
     const tramos = barrido ? Math.max(1, Math.min(DIAS_BARRIDO, desdeArranque)) : 1;
     let nuevos = 0;
-    for (let k = 0; k < tramos; k++) nuevos += await this.bajarVentana(`NOW-${k + 2}DAYS`, k ? `NOW-${k}DAYS` : 'NOW', sucursalDe);
-    if (barrido) this.ultimoBarrido = Date.now();
+    const vistos = new Set<string>();
+    for (let k = 0; k < tramos; k++) nuevos += await this.bajarVentana(`NOW-${k + 2}DAYS`, k ? `NOW-${k}DAYS` : 'NOW', sucursalDe, vistos);
+    if (barrido) {
+      await this.borrarQueNoVolvieron(tramos, vistos);
+      this.ultimoBarrido = Date.now();
+    }
     const atados = await this.atar();
     this.ultima = { en: new Date().toISOString(), nuevos, atados, error: '' };
   }
 
   /** Los pagos creados en un tramo (2 días: unas 6 páginas de 50), guardados. Lo que dice Mercado Pago se pisa; el atado no se toca. */
-  private async bajarVentana(desde: string, hasta: string, sucursalDe: (pos: string, store: string) => number | null) {
+  private async bajarVentana(desde: string, hasta: string, sucursalDe: (pos: string, store: string) => number | null, vistos: Set<string>) {
     let guardados = 0;
     for (let offset = 0; offset < 10_000; offset += 50) {
       const r: any = await mp.buscarPagos({
-        sort: 'date_created', criteria: 'desc', range: 'date_created',
+        sort: 'date_created', criteria: 'desc', range: 'date_created', 'collector.id': String(this.cuentaId),
         begin_date: desde, end_date: hasta, limit: '50', offset: String(offset),
       });
       const lote: any[] = Array.isArray(r?.results) ? r.results : [];
+      for (const p of lote) vistos.add(String(p.id));
       const filas = lote.filter((p) => seGuarda(p, this.cuentaId!)).map((p) => movimientoDe(p, sucursalDe));
       if (filas.length) {
         await this.db.insert(mpMovimientos).values(filas).onConflictDoUpdate({
@@ -140,6 +153,21 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       if (lote.length < 50) break;
     }
     return guardados;
+  }
+
+  /**
+   * Lo guardado que el barrido ya no trae (no lo cobró esta cuenta) y nadie
+   * ató: se borra. Solo dentro de lo que el barrido cubrió entero (un día de
+   * margen en la punta vieja y una hora en la nueva, por lo que llega mientras tanto).
+   */
+  private async borrarQueNoVolvieron(dias: number, vistos: Set<string>) {
+    const desde = new Date(Date.now() - (dias - 1) * DIA);
+    const hasta = new Date(Date.now() - 3_600_000);
+    const guardados = await this.db.select({ id: mpMovimientos.id }).from(mpMovimientos).where(and(
+      isNull(mpMovimientos.conciliacionId), sql`${mpMovimientos.fecha} >= ${desde} and ${mpMovimientos.fecha} < ${hasta}`,
+    ));
+    const sobran = guardados.map((g) => g.id).filter((id) => !vistos.has(id));
+    if (sobran.length) await this.db.delete(mpMovimientos).where(inArray(mpMovimientos.id, sobran));
   }
 
   /** Limpia atados que perdieron un lado (se borró el pago del ERP) y ata solo lo seguro de los últimos 45 días. */
@@ -197,7 +225,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       select 'v' || vp.id as clave, 'venta' as origen, v.id as doc_id, v.fecha, to_char(v.fecha at time zone ${ZONA}, 'YYYY-MM-DD') as dia,
         vp.importe, vp.medio::text as medio, vp.referencia, v.sucursal_id, s.nombre as sucursal, v.tipo::text as tipo_doc,
         v.punto_venta, v.numero, cl.nombre as cliente, u.nombre as cajero, v.caja_sesion_id as turno,
-        v.estado in ('confirmada', 'pendiente_cae') as vigente, ce.conciliacion_id
+        v.estado in ('confirmada', 'pendiente_cae') as vigente, ce.conciliacion_id, ce.medio_anterior::text as medio_anterior
       from venta_pagos vp
       join ventas v on v.id = vp.venta_id
       left join sucursales s on s.id = v.sucursal_id
@@ -209,7 +237,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       select 'r' || cp.id, 'recibo', c.id, c.fecha, to_char(c.fecha at time zone ${ZONA}, 'YYYY-MM-DD'),
         cp.importe, cp.medio::text, cp.referencia, c.sucursal_id, s.nombre, 'recibo',
         c.punto_venta, c.numero, cl.nombre, u.nombre, c.caja_sesion_id,
-        c.estado = 'confirmada', ce.conciliacion_id
+        c.estado = 'confirmada', ce.conciliacion_id, ce.medio_anterior::text
       from cobranza_pagos cp
       join cobranzas c on c.id = cp.cobranza_id
       left join sucursales s on s.id = c.sucursal_id
@@ -224,6 +252,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
       tipoDoc: x.tipo_doc, puntoVenta: x.punto_venta ?? '', numero: x.numero == null ? null : Number(x.numero), cliente: x.cliente ?? '',
       cajero: x.cajero ?? '', turno: x.turno == null ? null : Number(x.turno), vigente: !!x.vigente,
       conciliacionId: x.conciliacion_id == null ? null : Number(x.conciliacion_id),
+      medioAnterior: x.medio_anterior ?? null,
     }));
   }
 
@@ -276,7 +305,7 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     const verPago = (m: typeof mpMovimientos.$inferSelect & { dia?: string }) => ({
       id: m.id, fecha: m.fecha, dia: m.dia ?? m.fecha.toLocaleDateString('en-CA', { timeZone: ZONA }), estado: m.estado, familia: m.familia,
       tipo: m.tipo, metodo: m.metodo, operacion: m.operacion, cuotas: m.cuotas, bruto: m.bruto, devuelto: m.devuelto,
-      sucursalId: m.sucursalId, pagador: m.pagador, ...(jefe ? { comision: m.comision, neto: m.neto } : {}),
+      sucursalId: m.sucursalId, pagador: m.pagador, medioErp: medioReal(m), ...(jefe ? { comision: m.comision, neto: m.neto } : {}),
     });
 
     /* Lo suelto de cada lado y las sugerencias. */
@@ -380,7 +409,10 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     ]);
     return {
       cobros: cobros.filter((c) => c.vigente && !c.conciliacionId),
-      pagos: pagos.map((x) => ({ id: x.m.id, fecha: x.m.fecha, dia: x.dia, estado: x.m.estado, familia: x.m.familia, tipo: x.m.tipo, bruto: x.m.bruto, pagador: x.m.pagador, sucursalId: x.m.sucursalId })),
+      pagos: pagos.map((x) => ({
+        id: x.m.id, fecha: x.m.fecha, dia: x.dia, estado: x.m.estado, familia: x.m.familia, tipo: x.m.tipo, operacion: x.m.operacion, bruto: x.m.bruto,
+        pagador: x.m.pagador, sucursalId: x.m.sucursalId, medioErp: medioReal(x.m),
+      })),
     };
   }
 
@@ -391,6 +423,11 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
    * cada lado), o explicar lo que queda de un solo lado: `sin_venta` (entró
    * plata que no es una venta) o `sin_mp` (el cobro no entró a Mercado Pago).
    * Si los dos lados no suman lo mismo, hace falta decir por qué.
+   *
+   * EL MEDIO SE CORRIGE (18/11/2026, pedido del dueño): un cobro atado a UN
+   * pago pasa a tener el medio que dice Mercado Pago (se marcó QR y fue
+   * tarjeta de crédito → tarjeta de crédito). El importe no se toca. El medio
+   * anterior queda guardado: se muestra, y «Deshacer» lo devuelve.
    */
   async atarAMano(dto: { cobros?: string[]; pagos?: string[]; motivo?: string }, sesion: Sesion) {
     const claves = [...new Set((dto.cobros ?? []).map(String))];
@@ -400,21 +437,32 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     if (!claves.length && !pagos.length) throw new BadRequestException('Elegí qué atar.');
     const tipo = claves.length && pagos.length ? 'manual' : claves.length ? 'sin_mp' : 'sin_venta';
     if (tipo !== 'manual' && !motivo) throw new BadRequestException(tipo === 'sin_mp' ? 'Decí por qué no entró a Mercado Pago.' : 'Decí qué es esa plata.');
+    let medio: { clave: string; antes: string; ahora: string } | null = null;
     if (tipo === 'manual') {
       const filas = await this.cobrosErp(
         sql`vp.id in (${sql.join([0, ...claves.filter((k) => k[0] === 'v').map((k) => Number(k.slice(1)))].map((i) => sql`${i}`), sql`, `)})`,
         sql`cp.id in (${sql.join([0, ...claves.filter((k) => k[0] === 'r').map((k) => Number(k.slice(1)))].map((i) => sql`${i}`), sql`, `)})`,
       );
-      const enMp = await this.db.select({ bruto: mpMovimientos.bruto }).from(mpMovimientos).where(inArray(mpMovimientos.id, pagos));
+      const enMp = await this.db.select({ bruto: mpMovimientos.bruto, familia: mpMovimientos.familia, tipo: mpMovimientos.tipo })
+        .from(mpMovimientos).where(inArray(mpMovimientos.id, pagos));
       if (filas.length !== claves.length || enMp.length !== pagos.length) throw new BadRequestException('Alguno de los elegidos ya no existe: actualizá la pantalla.');
       const dif = r2(filas.reduce((a, f) => a + f.importe, 0) - enMp.reduce((a, p) => a + p.bruto, 0));
       if (Math.abs(dif) > EPS && !motivo) throw new BadRequestException(`Los dos lados no suman lo mismo (diferencia $${dif.toFixed(2)}): decí por qué.`);
+      if (filas.length === 1 && enMp.length === 1 && medioReal(enMp[0]) !== filas[0].medio) {
+        medio = { clave: filas[0].clave, antes: filas[0].medio, ahora: medioReal(enMp[0]) };
+      }
     }
     try {
       return await this.db.transaction(async (tx) => {
         const [c] = await tx.insert(mpConciliaciones).values({ tipo, motivo, usuarioId: sesion.usuarioId }).returning({ id: mpConciliaciones.id });
         await this.unir(tx, c.id, claves, pagos);
-        return { id: c.id };
+        if (medio) {
+          const id = Number(medio.clave.slice(1));
+          if (medio.clave[0] === 'v') await tx.update(ventaPagos).set({ medio: medio.ahora as any }).where(eq(ventaPagos.id, id));
+          else await tx.update(cobranzaPagos).set({ medio: medio.ahora as any }).where(eq(cobranzaPagos.id, id));
+          await tx.update(mpConciliacionErp).set({ medioAnterior: medio.antes as any }).where(eq(mpConciliacionErp.conciliacionId, c.id));
+        }
+        return { id: c.id, medio: medio && { antes: medio.antes, ahora: medio.ahora } };
       });
     } catch (e: any) {
       if (e?.code === '23505' || e?.cause?.code === '23505') throw new BadRequestException('Alguno de esos cobros ya está atado: actualizá la pantalla.');
@@ -422,9 +470,13 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Deshacer un atado. Sus pagos quedan «a mano»: el automático no los vuelve a atar. */
+  /** Deshacer un atado: el medio corregido vuelve al de antes, y sus pagos quedan «a mano» (el automático no los vuelve a atar). */
   async deshacer(id: number) {
     return this.db.transaction(async (tx) => {
+      await tx.execute(sql`update venta_pagos vp set medio = e.medio_anterior from mp_conciliacion_erp e
+        where e.conciliacion_id = ${id} and e.venta_pago_id = vp.id and e.medio_anterior is not null`);
+      await tx.execute(sql`update cobranza_pagos cp set medio = e.medio_anterior from mp_conciliacion_erp e
+        where e.conciliacion_id = ${id} and e.cobranza_pago_id = cp.id and e.medio_anterior is not null`);
       await tx.update(mpMovimientos).set({ aMano: true }).where(eq(mpMovimientos.conciliacionId, id));
       const borrados = await tx.delete(mpConciliaciones).where(eq(mpConciliaciones.id, id)).returning({ id: mpConciliaciones.id });
       if (!borrados.length) throw new NotFoundException('Ese atado ya no existe.');
