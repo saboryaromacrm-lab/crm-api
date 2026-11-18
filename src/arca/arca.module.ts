@@ -464,7 +464,7 @@ export class ArcaService implements OnApplicationBootstrap {
     const autenticado = vivo && await paso('ticket', 'El certificado autentica (WSAA)', async () => {
       const ta = await obtenerTicket(this.db, 'wsfe');
       return `Ticket de acceso vigente hasta ${ta.expiresAt.toLocaleString('es-AR', {
-        timeZone: 'America/Argentina/Buenos_Aires',
+        timeZone: 'America/Argentina/Buenos_Aires', hourCycle: 'h23',
       })}.`;
     });
 

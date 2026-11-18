@@ -54,7 +54,8 @@ const ENTERO = new Intl.NumberFormat('es-AR', { maximumFractionDigits: 0 });
 const CENTAVOS = new Intl.NumberFormat('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const CANTIDAD = new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 });
 const PORCENTAJE = new Intl.NumberFormat('es-AR', { maximumFractionDigits: 1 });
-const FECHA_HORA = new Intl.DateTimeFormat('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', dateStyle: 'short', timeStyle: 'short' });
+/* La hora de 0 a 24 en todo el sistema (18/11/2026): «19:53», nunca «7:53 p. m.». */
+const FECHA_HORA = new Intl.DateTimeFormat('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' });
 /** «$1.500» o «$96,80»: los centavos, completos o ninguno. */
 const $ = (n: number) => {
   const v = Math.abs(r2(n));

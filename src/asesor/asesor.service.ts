@@ -340,7 +340,7 @@ export class AsesorService {
       if (alEmpezar) throw new BadRequestException('Ese análisis no tiene texto de la IA para preguntarle.');
       return '';
     }
-    const fecha = i.fecha.toLocaleString('es-AR', { timeZone: ZONA, dateStyle: 'short', timeStyle: 'short' });
+    const fecha = i.fecha.toLocaleString('es-AR', { timeZone: ZONA, dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' });
     return `Análisis del ${fecha}${i.enfoque ? `, con el enfoque «${i.enfoque}»` : ''}:\n${JSON.stringify(i.informe)}`;
   }
 

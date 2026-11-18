@@ -446,7 +446,7 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
     const [c] = await this.db.select().from(mpCobros).where(eq(mpCobros.orderId, orderId)).limit(1);
     if (!c || !ESTADOS_VIVOS.includes(c.estado)) return;
     const ref = `SYA-V${c.ventaId}-C${c.id}`;
-    const hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'America/Argentina/Buenos_Aires' });
+    const hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZone: 'America/Argentina/Buenos_Aires' });
     /*
      * LO QUE CONTESTÓ MERCADO PAGO QUEDA A LA VISTA (3/10/2026). El primer cobro
      * real quedó «esperando» con la plata acreditada y el motivo solo estaba en
