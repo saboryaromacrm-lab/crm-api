@@ -16,6 +16,8 @@ test('qué es cada pago de Mercado Pago y cuáles se guardan', () => {
   assert.equal(seGuarda({ status: 'rejected' }, 9), false);
   assert.equal(seGuarda({ status: 'approved', operation_type: 'partition_transfer' }, 9), false, 'movimiento entre reservas');
   assert.equal(seGuarda({ status: 'approved', payer: { id: 9 } }, 9), false, 'lo pagamos nosotros');
+  assert.equal(seGuarda({ status: 'approved', operation_type: 'pos_payment', collector_id: 9, payer: { id: 9 } }, 9), true, 'Point con tarjeta anónima');
+  assert.equal(seGuarda({ status: 'approved', collector: { id: 9 } }, 9), true);
   assert.equal(seGuarda({ status: 'approved', collector_id: 5 }, 9), false);
 });
 

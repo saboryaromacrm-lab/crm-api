@@ -48,13 +48,17 @@ export function familiaMp(p: any): Familia {
 /**
  * ¿Este pago es plata que ENTRÓ a la cuenta? Fuera: los rechazados y
  * pendientes, los movimientos entre las «reservas» de la misma cuenta
- * (`partition_transfer`) y lo que pagamos nosotros.
+ * (`partition_transfer`) y lo que pagamos nosotros. Manda el COBRADOR: un
+ * cobro del Point con tarjeta anónima trae a la propia cuenta como pagador
+ * (18/11/2026, en producción se perdían así la mitad de las tarjetas). Solo si
+ * Mercado Pago no dice quién cobró, se descarta lo que figura pagado por nosotros.
  */
 export function seGuarda(p: any, cuentaId: number): boolean {
   if (!ESTADOS_GUARDADOS.includes(String(p?.status ?? ''))) return false;
   if (String(p?.operation_type ?? '') === 'partition_transfer') return false;
-  if (p?.payer?.id != null && Number(p.payer.id) === cuentaId) return false;
-  return p?.collector_id == null || Number(p.collector_id) === cuentaId;
+  const cobrador = p?.collector_id ?? p?.collector?.id;
+  if (cobrador != null) return Number(cobrador) === cuentaId;
+  return !(p?.payer?.id != null && Number(p.payer.id) === cuentaId);
 }
 
 /** Lo que Mercado Pago le descontó al comercio (`fee_payer` collector). */
