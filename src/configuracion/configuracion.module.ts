@@ -265,6 +265,10 @@ export const EMPRESA_DEFAULTS = {
   direccion: '' as string,
   telefono: '' as string,
   logo: '' as string,
+  /* El logo del ticket de rollo (18/11/2026), en blanco y negro puro: la
+   * térmica no imprime grises. Cargado, el rollo sale como el de Coffit: el
+   * logo grande y abajo la dirección de la casa central. */
+  logoTicket: '' as string,
   colorMarca: '#166534' as string,   // acentos en documentos A4 (los rollos son B/N)
   /* Datos que la factura electrónica tiene que llevar impresos (28/9/2026). */
   ingresosBrutos: '' as string,      // N° de inscripción (o "Convenio Multilateral …")
