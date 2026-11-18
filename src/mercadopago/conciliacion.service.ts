@@ -2,11 +2,13 @@
  * VENTAS › CONCILIACIÓN MP — LA BAJADA Y LA PANTALLA (18/11/2026)
  * ============================================================================
  * Se bajan los pagos de Mercado Pago a `mp_movimientos` y se ata solo lo
- * seguro (`conciliacion.ts`). La bajada pide de a UN DÍA por fecha de creación
- * (como el diagnóstico, que trae todo): cada 5 minutos los últimos 2 días, y
- * al arrancar y una vez por día los últimos 35 (lo que faltó, devoluciones y
- * contracargos tardíos). Pedirlo todo de una vez por fecha de modificación,
- * paginando hasta el final, dejó días a medias en producción (18/11/2026).
+ * seguro (`conciliacion.ts`). La bajada pide por fecha de creación en tramos
+ * de 2 DÍAS que avanzan de a uno (cada día entra en dos tramos, redondee como
+ * redondee Mercado Pago los «NOW-xDAYS»): cada 5 minutos un tramo (los últimos
+ * 2 días, la misma consulta que el diagnóstico), y al arrancar y una vez por
+ * día 35 tramos (lo que faltó, devoluciones y contracargos tardíos). Pedirlo
+ * todo junto por fecha de modificación dejó días a medias, y los tramos de un
+ * día dejaron huecos de mañana (producción, 18/11/2026).
  * La pantalla pide un rango de días y recibe:
  *
  *   dias        por día: vendido electrónico, entró a MP y qué quedó pendiente
@@ -35,8 +37,7 @@ const ARRANQUE = '2026-11-01';
 const CADA = 5 * 60_000;
 const DIA = 86_400_000;
 const EPS = 0.01;
-/** Cuántos días se vuelven a pedir en cada pasada, y en el barrido largo (al arrancar y una vez por día). */
-const DIAS_RECIENTES = 2;
+/** Cuántos días hacia atrás mira el barrido largo (al arrancar y una vez por día). */
 const DIAS_BARRIDO = 35;
 const desdeDia = (dia: string) => new Date(`${dia}T00:00:00-03:00`);
 const sumaDias = (dia: string, n: number) => new Date(desdeDia(dia).getTime() + n * DIA).toLocaleDateString('en-CA', { timeZone: ZONA });
@@ -111,16 +112,15 @@ export class ConciliacionMpService implements OnModuleInit, OnModuleDestroy {
 
     const barrido = Date.now() - this.ultimoBarrido > 20 * 3_600_000;
     const desdeArranque = Math.ceil((Date.now() - desdeDia(ARRANQUE).getTime()) / DIA);
-    const dias = Math.max(1, Math.min(barrido ? DIAS_BARRIDO : DIAS_RECIENTES, desdeArranque));
+    const tramos = barrido ? Math.max(1, Math.min(DIAS_BARRIDO, desdeArranque)) : 1;
     let nuevos = 0;
-    /* De a 24 h hacia atrás. Cada ventana se calcula con su propio «ahora», así que se pisan unos segundos: nunca queda un hueco. */
-    for (let k = 0; k < dias; k++) nuevos += await this.bajarVentana(`NOW-${k + 1}DAYS`, k ? `NOW-${k}DAYS` : 'NOW', sucursalDe);
+    for (let k = 0; k < tramos; k++) nuevos += await this.bajarVentana(`NOW-${k + 2}DAYS`, k ? `NOW-${k}DAYS` : 'NOW', sucursalDe);
     if (barrido) this.ultimoBarrido = Date.now();
     const atados = await this.atar();
     this.ultima = { en: new Date().toISOString(), nuevos, atados, error: '' };
   }
 
-  /** Los pagos creados en una ventana (un día: 2 o 3 páginas de 50), guardados. Lo que dice Mercado Pago se pisa; el atado no se toca. */
+  /** Los pagos creados en un tramo (2 días: unas 6 páginas de 50), guardados. Lo que dice Mercado Pago se pisa; el atado no se toca. */
   private async bajarVentana(desde: string, hasta: string, sucursalDe: (pos: string, store: string) => number | null) {
     let guardados = 0;
     for (let offset = 0; offset < 10_000; offset += 50) {
