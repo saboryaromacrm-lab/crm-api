@@ -3911,6 +3911,52 @@ export const mpCobros = pgTable('mp_cobros', {
   actualizadoEn: timestamp('actualizado_en', { withTimezone: true }).notNull().defaultNow(),
 });
 
+/* ============================================================================
+ * VENTAS › CONCILIACIÓN MP (0232). Ver `mercadopago/conciliacion.ts`.
+ * ========================================================================== */
+/** Un atado: `auto` y `manual` unen cobros del ERP con pagos de Mercado Pago; `sin_venta` y `sin_mp` explican lo que queda de un solo lado. */
+export const mpConciliaciones = pgTable('mp_conciliaciones', {
+  id: serial('id').primaryKey(),
+  tipo: text('tipo').notNull().$type<'auto' | 'manual' | 'sin_venta' | 'sin_mp'>(),
+  motivo: text('motivo').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Un pago que entró a la cuenta de Mercado Pago (se baja solo). `aMano`: alguien deshizo su atado; el automático no lo vuelve a tocar. */
+export const mpMovimientos = pgTable('mp_movimientos', {
+  id: text('id').primaryKey(),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull(),
+  estado: text('estado').notNull(),
+  familia: text('familia').notNull().$type<'qr' | 'tarjeta' | 'transferencia'>(),
+  tipo: text('tipo').notNull().default(''),
+  metodo: text('metodo').notNull().default(''),
+  operacion: text('operacion').notNull().default(''),
+  cuotas: integer('cuotas').notNull().default(1),
+  bruto: doublePrecision('bruto').notNull().default(0),
+  comision: doublePrecision('comision').notNull().default(0),
+  neto: doublePrecision('neto').notNull().default(0),
+  devuelto: doublePrecision('devuelto').notNull().default(0),
+  liberacion: timestamp('liberacion', { withTimezone: true }),
+  posId: text('pos_id').notNull().default(''),
+  storeId: text('store_id').notNull().default(''),
+  sucursalId: integer('sucursal_id').references(() => sucursales.id, { onDelete: 'set null' }),
+  pagador: text('pagador').notNull().default(''),
+  referencia: text('referencia').notNull().default(''),
+  actualizadoMp: timestamp('actualizado_mp', { withTimezone: true }).notNull(),
+  traidoEn: timestamp('traido_en', { withTimezone: true }).notNull().defaultNow(),
+  conciliacionId: integer('conciliacion_id').references(() => mpConciliaciones.id, { onDelete: 'set null' }),
+  aMano: boolean('a_mano').notNull().default(false),
+});
+
+/** Los renglones de pago del ERP de cada atado: de una venta o de un recibo (uno de los dos). */
+export const mpConciliacionErp = pgTable('mp_conciliacion_erp', {
+  id: serial('id').primaryKey(),
+  conciliacionId: integer('conciliacion_id').notNull().references(() => mpConciliaciones.id, { onDelete: 'cascade' }),
+  ventaPagoId: integer('venta_pago_id').unique().references(() => ventaPagos.id, { onDelete: 'cascade' }),
+  cobranzaPagoId: integer('cobranza_pago_id').unique().references(() => cobranzaPagos.id, { onDelete: 'cascade' }),
+});
+
 export const arcaTokens = pgTable('arca_tokens', {
   service: text('service').primaryKey(),
   token: text('token').notNull(),

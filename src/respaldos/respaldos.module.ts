@@ -98,6 +98,9 @@ const TABLAS_PRACTICA = [
   'stock_fotos',
   // cobros por QR de Mercado Pago (0126): cuelgan de las ventas de práctica
   'mp_cobros',
+  // la conciliación de Mercado Pago (0232): los atados cuelgan de los pagos de práctica;
+  // los pagos bajados de Mercado Pago se vuelven a bajar solos
+  'mp_conciliacion_erp', 'mp_conciliaciones', 'mp_movimientos',
   // cash flow (0133/0134): el arranque, los sobres controlados, los conteos y el
   // libro cuelgan de cajas, pagos y gastos de práctica. Vacía la caja central
   // también: sin su libro el saldo no cerraría, así que se vuelve a arrancar.

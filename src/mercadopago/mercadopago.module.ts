@@ -45,6 +45,7 @@ import { mpCajas, mpCobros, mpSucursales, sucursales, terminales } from '../db/s
 import { terminalPorToken } from '../sucursales/sucursales.module';
 import { VentasModule, VentasService } from '../ventas/ventas.module';
 import { ErrorMp, MP, firmaValida, importeMp, mp, pagoDeOrden, pagoSirve, resumenPago } from './api';
+import { ConciliacionMpController, ConciliacionMpService } from './conciliacion.service';
 import { resumirPagos, resumirReporte } from './diagnostico';
 
 /** Gerencia › Pagos electrónicos (13/11/2026): la llave está en el catálogo; ningún rol la trae, se tilda. */
@@ -804,8 +805,8 @@ export class MercadoPagoController {
 
 @Module({
   imports: [VentasModule],
-  controllers: [MercadoPagoController],
-  providers: [MercadoPagoService],
+  controllers: [MercadoPagoController, ConciliacionMpController],
+  providers: [MercadoPagoService, ConciliacionMpService],
 })
 export class MercadoPagoModule {}
 

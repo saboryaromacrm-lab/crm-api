@@ -98,6 +98,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'ventas.presupuestos', nombre: 'Presupuestos' },
       { clave: 'ventas.clientes', nombre: 'Clientes' },
       { clave: 'ventas.cobranzas', nombre: 'Cobranzas' },
+      /* 0232: cobros del ERP contra lo que entró a la cuenta de Mercado Pago (comisión y neto, solo jefes). */
+      { clave: 'ventas.conciliacion_mp', nombre: 'Conciliación MP (qué cobros electrónicos entraron a Mercado Pago)' },
       { clave: 'ventas.caja', nombre: 'Caja' },
       { clave: 'ventas.listas', nombre: 'Formato de venta' },
       { clave: 'ventas.ofertas', nombre: 'Ofertas' },

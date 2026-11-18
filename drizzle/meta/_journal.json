@@ -1625,6 +1625,13 @@
       "when": 1795644000000,
       "tag": "0231_stock_fotos",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1795730400000,
+      "tag": "0232_conciliacion_mp",
+      "breakpoints": true
     }
   ]
 }
