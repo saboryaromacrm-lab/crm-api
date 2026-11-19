@@ -33,13 +33,14 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
-  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, MaxLength,
+  ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsPositive, IsString, MaxLength, ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 import { and, desc, eq, gte, inArray, ne, sql } from 'drizzle-orm';
 import { Auth, CualquierUsuario, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { esJefe } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
-import { pedidosProveedor, productoProveedores, proveedores } from '../db/schema';
+import { pedidosProveedor, pedidosProveedorEnviados, productoProveedores, proveedores } from '../db/schema';
 import { desdeDe, sinFactura } from './sin-factura';
 
 const ESTADOS = ['solicitado', 'pedido', 'recibido', 'retomar'] as const;
@@ -50,12 +51,21 @@ class AltaPedidosDto {
   @IsOptional() @IsString() @MaxLength(2000) notas?: string;
 }
 
+class RenglonEnviadoDto {
+  @IsInt() productoId!: number;
+  @IsNumber() @IsPositive() cantidad!: number;
+  @IsString() @MaxLength(30) unidad!: string;
+}
+
 /* 8000: la orden de pedido de Almacén (12/10/2026) anota la lista entera como nota. */
 class PedidoDirectoDto {
   @IsInt() proveedorId!: number;
   @IsOptional() @IsString() @MaxLength(8000) notas?: string;
   /** La orden de pedido al cerrarse (10/11/2026): a Solicitado con «Pedido enviado», no a Pedido. */
   @IsOptional() @IsBoolean() enviado?: boolean;
+  /** Lo pedido, renglón por renglón (0235): la próxima orden lo muestra como «pedido anterior». */
+  @IsOptional() @IsArray() @ArrayMaxSize(1000) @ValidateNested({ each: true }) @Type(() => RenglonEnviadoDto)
+  renglones?: RenglonEnviadoDto[];
 }
 
 class EditarPedidoDto {
@@ -284,9 +294,21 @@ export class PedidosProveedorService {
    * "Ya lo pedí, registralo" (la orden de pedido, con `enviado`: ver abajo): nace en Pedido
    * con fecha. Si el proveedor ya tiene su tarjeta abierta, es esa: pasa a
    * Pedido (sin pisar el día en que se pidió) y la nota nueva va debajo de la
-   * que tenía. `yaEstaba` dice en qué columna estaba.
+   * que tenía. `yaEstaba` dice en qué columna estaba. Los `renglones` de la
+   * orden de pedido quedan guardados para la próxima (0235).
    */
   async directo(dto: PedidoDirectoDto, usuarioId: number | null): Promise<any> {
+    const tarjeta = await this.anotarTarjeta(dto, usuarioId);
+    if (dto.renglones?.length) {
+      await this.db.insert(pedidosProveedorEnviados).values({
+        proveedorId: dto.proveedorId, pedidoId: tarjeta.id, usuarioId,
+        renglones: dto.renglones.map(({ productoId, cantidad, unidad }) => ({ productoId, cantidad, unidad: unidad.trim() })),
+      });
+    }
+    return tarjeta;
+  }
+
+  private async anotarTarjeta(dto: PedidoDirectoDto, usuarioId: number | null): Promise<any> {
     await this.validarProveedor(dto.proveedorId);
     const notas = (dto.notas ?? '').trim();
     /*
@@ -314,7 +336,7 @@ export class PedidosProveedorService {
       usuarioId,
     }).onConflictDoNothing().returning();
     /* Otro la creó en el mismo instante: ahora está, y se usa esa. */
-    return p ? this.get(p.id) : this.directo(dto, usuarioId);
+    return p ? this.get(p.id) : this.anotarTarjeta(dto, usuarioId);
   }
 
   async editar(id: number, dto: EditarPedidoDto) {

@@ -45,8 +45,9 @@ import { ECHEQ_EN_CARTERA, ECHEQ_VIVOS, ajustarPendientesTx, faltaCompromiso } f
 import { exigirFueraDeCashflow, type OpcionesCashflow } from '../cashflow/vinculo';
 import { CuentasPropiasController, CuentasPropiasService, cuentaDeTransferencia, nombreCuentaSql } from './cuentas-propias';
 import { ajustePorAnulacion, exigirCuentaAbierta } from '../cafeteria/cuenta';
+import { bloqueosEdicion, diaAuditoria, pesosAuditoria, textoForma, type InfoEdicion } from './editar-pago';
 import {
-  cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, cuentasPropias, gastos, pagoFormas,
+  auditoria, cajaMovimientos, cajaSesiones, cobranzaPagos, cobranzas, comprobantes, cuentaDisponiblePagos, cuentasPropias, gastos, pagoFormas,
   proveedorAjustes, proveedorCompromisos, proveedorEcheqs, proveedorImputaciones, proveedorPagos, proveedores,
   sucursales, usuarios, ventaPagos, ventas,
 } from '../db/schema';
@@ -251,6 +252,28 @@ export class AnularPagoDto {
 export class PapelPagoDto {
   @IsOptional() @IsString() @MaxLength(200) referencia?: string;
   @IsOptional() @IsString() @MaxLength(300) concepto?: string;
+}
+
+/**
+ * MODIFICAR EL PAGO (19/11/2026, ver `editar-pago.ts`). La pantalla manda el
+ * estado COMPLETO de la plata (fecha, importe, medio o partes, cuenta, cambio):
+ * el servidor compara con lo guardado y solo toca lo que cambió de verdad.
+ * `formas` vacío = un solo medio.
+ */
+export class EditarPagoDto {
+  @Matches(SOLO_FECHA, { message: 'La fecha va como AAAA-MM-DD.' }) fecha!: string;
+  @IsNumber() @Min(0.01, { message: 'El importe del pago tiene que ser mayor a 0.' }) importe!: number;
+  @IsIn(MEDIOS as unknown as string[]) medio!: string;
+  @IsOptional() @IsArray() @ArrayMaxSize(10) @ValidateNested({ each: true }) @Type(() => FormaPagoDto)
+  formas?: FormaPagoDto[];
+  @IsOptional() @IsString() @MaxLength(80) cambioPor?: string;
+  @IsOptional() @IsInt() cuentaPropiaId?: number;
+  @IsOptional() @IsString() @MaxLength(80) cuentaAMano?: string;
+  @IsOptional() @IsString() @MaxLength(200) referencia?: string;
+  @IsOptional() @IsString() @MaxLength(300) concepto?: string;
+  @IsOptional() @IsString() @MaxLength(1000) observaciones?: string;
+  /** Por qué se corrige (opcional): queda en la auditoría junto a cada cambio. */
+  @IsOptional() @IsString() @MaxLength(200) motivo?: string;
 }
 
 /** Solo fletes, sin pago nuevo (ver `descontarFletes`). */
@@ -1728,6 +1751,189 @@ export class PagosProveedorService implements OnApplicationBootstrap {
     return this.get(id);
   }
 
+  /* ==================================================================== *
+   * Modificar un pago (19/11/2026) — ver `editar-pago.ts`
+   * ==================================================================== */
+
+  /** Lo que decide qué se puede cambiar del pago (`bloqueosEdicion`). */
+  private async infoEdicion(ex: any, p: any): Promise<InfoEdicion> {
+    const [r] = (await ex.execute(sql`select
+        exists (select 1 from cuenta_disponible_pagos c where c.proveedor_pago_id = ${p.id} and c.anulado_en is null) as "cuentaDisponible",
+        exists (select 1 from cashflow_movimientos m where m.pago_id = ${p.id} and m.anulado_en is null) as "desdeCashflow",
+        exists (select 1 from proveedor_echeqs e where e.pago_id = ${p.id}) as "conEcheq",
+        exists (select 1 from proveedor_compromisos k where k.pago_id = ${p.id} and k.origen = 'manual') as "cierraCompromisoManual",
+        (select s.estado = 'abierta' from caja_sesiones s where s.id = ${p.cajaSesionId ?? -1}) as "turnoAbierto"`)).rows;
+    return {
+      estado: p.estado, medio: p.medio, cajaMovimientoId: p.cajaMovimientoId ?? null,
+      cuentaDisponible: !!r?.cuentaDisponible, desdeCashflow: !!r?.desdeCashflow, conEcheq: !!r?.conEcheq,
+      cierraCompromisoManual: !!r?.cierraCompromisoManual, turnoAbierto: r?.turnoAbierto == null ? null : !!r.turnoAbierto,
+    };
+  }
+
+  /** Las partes del pago tal cual están guardadas (con la cuenta como id, para volver a elegirla). */
+  private async formasCrudas(ex: any, pagoId: number) {
+    return ex.select({
+      medio: pagoFormas.medio, importe: pagoFormas.importe, fecha: pagoFormas.fecha,
+      cuentaPropiaId: pagoFormas.cuentaPropiaId, cuentaAMano: pagoFormas.cuentaAMano,
+      cuenta: nombreCuentaSql('pago_formas'),
+    }).from(pagoFormas)
+      .leftJoin(cuentasPropias, eq(cuentasPropias.id, pagoFormas.cuentaPropiaId))
+      .where(eq(pagoFormas.pagoId, pagoId)).orderBy(pagoFormas.id);
+  }
+
+  /** Para abrir «Modificar el pago»: el pago, sus partes y qué no se puede cambiar (y por qué). */
+  async edicion(id: number) {
+    const pago = await this.get(id);
+    const [raw] = await this.db.select().from(proveedorPagos).where(eq(proveedorPagos.id, id)).limit(1);
+    const [prov] = pago.proveedorId
+      ? await this.db.select({ modoCuenta: proveedores.modoCuenta }).from(proveedores).where(eq(proveedores.id, pago.proveedorId)).limit(1)
+      : [];
+    return {
+      pago: { ...pago, cuentaAMano: raw?.cuentaAMano ?? null },
+      formas: await this.formasCrudas(this.db, id),
+      bloqueos: bloqueosEdicion(await this.infoEdicion(this.db, raw)),
+      modoCuenta: prov?.modoCuenta ?? null,
+    };
+  }
+
+  async editar(id: number, dto: EditarPagoDto, usuarioId: number | null) {
+    const importe = money(dto.importe);
+    if (importe <= 0) throw new BadRequestException('El importe del pago tiene que ser mayor a 0.');
+    const formasDto = dto.formas ?? [];
+    if (formasDto.length === 1) throw new BadRequestException('Un pago mixto tiene al menos dos partes: si es de un solo medio, elegí «Un solo medio».');
+    await exigirPagoCoffit(this.db, { medio: dto.medio, formas: formasDto, cambioPor: dto.cambioPor, fecha: dto.fecha });
+    const formas = await Promise.all(formasDto.map(async (f) => ({
+      medio: f.medio as any,
+      importe: money(f.importe),
+      fecha: f.fecha ? new Date(`${f.fecha}T00:00:00`) : null,
+      ...await cuentaDeTransferencia(this.db, f.medio, f),
+    })));
+    if (formas.length) {
+      const suma = money(formas.reduce((a, f) => a + f.importe, 0));
+      if (Math.abs(suma - importe) > EPS) {
+        throw new BadRequestException(`Las partes del pago suman ${suma.toFixed(2)} pero el pago dice ${importe.toFixed(2)}: tienen que coincidir.`);
+      }
+    }
+    const medio = (formas[0]?.medio ?? dto.medio) as any;
+    const cambioPor = formas.length ? null : ((dto.cambioPor ?? '').trim() || null);
+    if (cambioPor && medio !== 'transferencia') throw new BadRequestException('El efectivo por transferencia es un pago de un solo medio, por transferencia.');
+    const cuenta = formas.length ? { cuentaPropiaId: null, cuentaAMano: null } : await cuentaDeTransferencia(this.db, medio, dto, cambioPor);
+    const importeEfectivo = formas.length
+      ? money(formas.filter((f) => f.medio === 'efectivo').reduce((a, f) => a + f.importe, 0))
+      : (medio === 'efectivo' || cambioPor ? importe : 0);
+
+    await this.db.transaction(async (tx) => {
+      const [p] = await tx.select().from(proveedorPagos).where(eq(proveedorPagos.id, id)).limit(1).for('update');
+      if (!p) throw new NotFoundException('Pago inexistente.');
+      if (p.estado !== 'activo') throw new BadRequestException('El pago está anulado: no se le cambian los datos.');
+      const bloqueos = bloqueosEdicion(await this.infoEdicion(tx, p));
+      const viejas = await this.formasCrudas(tx, id);
+
+      /* ¿Cambió la plata? Se compara la forma COMPLETA (medio, partes, cuentas,
+       * fechas de cada parte, cambio) y el importe: guardar sin tocar no es un cambio. */
+      const diaDe = (f: Date | null | undefined) => (f ? diaAuditoria(f) : '');
+      const clave = (x: { importe: number; medio: string; cambioPor: string | null; cuentaPropiaId: number | null; cuentaAMano: string | null; formas: any[] }) => JSON.stringify([
+        money(x.importe), x.medio, x.cambioPor ?? null, x.cuentaPropiaId ?? null, x.cuentaAMano ?? null,
+        x.formas.map((f) => [f.medio, money(f.importe), diaDe(f.fecha), f.cuentaPropiaId ?? null, f.cuentaAMano ?? null]),
+      ]);
+      const plataCambia = clave({ ...p, formas: viejas }) !== clave({ importe, medio, cambioPor, ...cuenta, formas });
+      const fechaNueva = new Date(`${dto.fecha}T00:00:00`);
+      const fechaCambia = diaDe(fechaNueva) !== diaDe(p.fecha);
+
+      if (plataCambia && bloqueos.plata) throw new BadRequestException(`No se puede cambiar la plata de este pago. ${bloqueos.plata}`);
+      if (fechaCambia && bloqueos.fecha) throw new BadRequestException(`No se puede cambiar la fecha de este pago. ${bloqueos.fecha}`);
+      const usa = (m: string, x: { medio: string }, fs: Array<{ medio: string }>) => x.medio === m || fs.some((f) => f.medio === m);
+      if (plataCambia && ['echeq', 'pago_coffit'].some((m) => usa(m, { medio }, formas) && !usa(m, p, viejas))) {
+        throw new BadRequestException('Un pago no pasa a ser de echeq ni de Coffit modificándolo: anulalo y registralo de nuevo con ese medio.');
+      }
+      if (fechaCambia) {
+        exigirFechaPago(dto.fecha);
+        await exigirFueraDeConciliado(tx, p.proveedorId, p.fecha, 'mover un pago');
+        await exigirFueraDeConciliado(tx, p.proveedorId, fechaNueva, 'mover un pago');
+      }
+      if (plataCambia) {
+        if (formas.some((f, i) => f.fecha && diaDe(f.fecha) !== diaDe(viejas[i]?.fecha))) exigirFechaPago(undefined, formasDto);
+        await exigirFueraDeConciliado(tx, p.proveedorId, p.fecha, 'cambiar el importe o el medio de un pago');
+        if (!p.proveedorId && Math.abs(importe - p.importe) > EPS) {
+          throw new BadRequestException('Este pago no tiene proveedor (es el de un gasto suelto): el importe se corrige desde el gasto.');
+        }
+
+        /* Lo que ya está aplicado a facturas. Si el pago baja de ahí: en cuenta
+         * libre las aplicaciones las hizo el sistema y se rehacen (FIFO); en
+         * «por facturas» las eligió una persona, así que se avisa. */
+        if (importe < p.aplicado - EPS) {
+          const [prov] = await tx.select({ modo: proveedores.modoCuenta }).from(proveedores).where(eq(proveedores.id, p.proveedorId!)).limit(1);
+          if (prov?.modo !== 'libre') {
+            throw new BadRequestException(
+              `Este pago tiene ${pesosAuditoria(p.aplicado)} aplicados a facturas: no puede quedar en menos. `
+              + 'Primero quitá esas aplicaciones (desde la factura, en «Pagos») o poné un importe de al menos ese monto.',
+            );
+          }
+          await this.quitarAplicaciones(tx, id);
+        }
+
+        /* El egreso del cajón, si salió de un turno (abierto: si no, `bloqueos.plata` ya frenó). */
+        let caja: { cajaMovimientoId: number | null; cajaSesionId: number | null } = { cajaMovimientoId: p.cajaMovimientoId, cajaSesionId: p.cajaSesionId };
+        if (p.cajaMovimientoId) {
+          const [sesion] = await tx.select().from(cajaSesiones).where(eq(cajaSesiones.id, p.cajaSesionId!)).limit(1).for('update');
+          if (!sesion || sesion.estado !== 'abierta') throw new BadRequestException('Salió de un turno de caja ya cerrado: el arqueo se firmó con ese egreso.');
+          if (importeEfectivo > EPS) {
+            await tx.update(cajaMovimientos).set({ importe: importeEfectivo }).where(eq(cajaMovimientos.id, p.cajaMovimientoId));
+          } else {
+            await tx.delete(cajaMovimientos).where(eq(cajaMovimientos.id, p.cajaMovimientoId));
+            caja = { cajaMovimientoId: null, cajaSesionId: null };
+          }
+        }
+        await tx.update(proveedorPagos).set({ importe, medio, cambioPor, ...cuenta, ...caja }).where(eq(proveedorPagos.id, id));
+        await tx.delete(pagoFormas).where(eq(pagoFormas.pagoId, id));
+        if (formas.length) {
+          await tx.insert(pagoFormas).values(formas.map((f) => ({
+            pagoId: id, medio: f.medio, importe: f.importe, fecha: f.fecha ?? undefined, cuentaPropiaId: f.cuentaPropiaId, cuentaAMano: f.cuentaAMano,
+          })));
+        }
+        await this.recalcularPago(tx, id);
+      }
+
+      const papel = {
+        referencia: dto.referencia !== undefined ? String(dto.referencia).trim() : p.referencia,
+        concepto: dto.concepto !== undefined ? String(dto.concepto).trim() : p.concepto,
+        observaciones: dto.observaciones !== undefined ? String(dto.observaciones).trim() : p.observaciones,
+      };
+      await tx.update(proveedorPagos).set({ ...papel, ...(fechaCambia ? { fecha: fechaNueva } : {}) }).where(eq(proveedorPagos.id, id));
+
+      /* La auditoría: una fila por campo que cambió, en esta misma transacción. */
+      const nombreCuenta = async (cuentaPropiaId: number | null, aMano: string | null) => {
+        if (aMano) return `${aMano} (a mano)`;
+        if (!cuentaPropiaId) return null;
+        const [c] = await tx.select({ nombre: cuentasPropias.nombre }).from(cuentasPropias).where(eq(cuentasPropias.id, cuentaPropiaId)).limit(1);
+        return c?.nombre ?? null;
+      };
+      const formaAntes = textoForma({ medio: p.medio, cambioPor: p.cambioPor, cuenta: await nombreCuenta(p.cuentaPropiaId, p.cuentaAMano), formas: viejas });
+      const formaDespues = textoForma({
+        medio, cambioPor, cuenta: await nombreCuenta(cuenta.cuentaPropiaId, cuenta.cuentaAMano),
+        formas: await Promise.all(formas.map(async (f) => ({ ...f, cuenta: await nombreCuenta(f.cuentaPropiaId, f.cuentaAMano) }))),
+      });
+      const cambios: Array<[string, string, string]> = [];
+      if (fechaCambia) cambios.push(['Fecha del pago', diaDe(p.fecha), diaDe(fechaNueva)]);
+      if (Math.abs(importe - p.importe) > EPS) cambios.push(['Importe', pesosAuditoria(p.importe), pesosAuditoria(importe)]);
+      if (formaAntes !== formaDespues) cambios.push(['Cómo se pagó', formaAntes, formaDespues]);
+      if (papel.referencia !== p.referencia) cambios.push(['Referencia', p.referencia, papel.referencia]);
+      if (papel.concepto !== p.concepto) cambios.push(['Concepto', p.concepto, papel.concepto]);
+      if (papel.observaciones !== p.observaciones) cambios.push(['Observaciones', p.observaciones, papel.observaciones]);
+      if (cambios.length && p.proveedorId) {
+        const motivo = (dto.motivo ?? '').trim();
+        await tx.insert(auditoria).values(cambios.map(([campo, antes, despues]) => ({
+          usuarioId, entidad: 'proveedor', entidadId: p.proveedorId!, ambito: 'Pago modificado',
+          detalle: `Pago #${id}${motivo ? ` · ${motivo}` : ''}`.slice(0, 200),
+          campo, antes: String(antes ?? '').slice(0, 300), despues: String(despues ?? '').slice(0, 300),
+        })));
+      }
+      /* Plata nueva, o un pago que se movió de día: la cuenta libre reparte de nuevo lo que quede sin aplicar. */
+      if (plataCambia || fechaCambia) await this.aplicarCuentaLibre(p.proveedorId, tx);
+    });
+    return this.get(id);
+  }
+
   /**
    * Anular el pago. Dos candados:
    *   · Si tiene imputaciones, primero se desaplican — anular por arriba
@@ -2030,6 +2236,13 @@ export class PagosProveedorController {
   }
   @Patch(':id/destino') @Permiso(...ADMIN_PAGOS) destino(@Param('id', ParseIntPipe) id: number, @Body() dto: CambiarDestinoDto) {
     return this.svc.cambiarDestino(id, dto.destino);
+  }
+  /* Modificar el pago (19/11/2026): solo administración, y quién lo cambió lo dice la sesión. */
+  @Get(':id/edicion') @Permiso(...ADMIN_PAGOS) edicion(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.edicion(id);
+  }
+  @Patch(':id') @Permiso(...ADMIN_PAGOS) editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarPagoDto, @Auth() auth: Sesion) {
+    return this.svc.editar(id, dto, auth.usuarioId ?? null);
   }
   @Patch(':id/papel') async papel(@Param('id', ParseIntPipe) id: number, @Body() dto: PapelPagoDto, @Auth() auth: Sesion) {
     await this.exigirPropio(id, auth);

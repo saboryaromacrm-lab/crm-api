@@ -17,7 +17,7 @@
  * sistema evita el clásico descuadre de centavos entre compras y ventas.
  */
 import {
-  Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
+  Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Logger, Module,
   BadRequestException, NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
@@ -27,6 +27,8 @@ import {
 } from 'class-validator';
 import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, notInArray, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
+import { mpDeLosRenglones, type CobroQr, type FilaAtado } from './mp-del-pago';
+import { listarNotasCredito } from './notas-credito';
 import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   cajaMovimientos, cajaSesiones,
@@ -724,6 +726,9 @@ type ListadoVentasQ = {
 
 @Injectable()
 export class VentasService {
+  private readonly log = new Logger(VentasService.name);
+  /** Para las consultas de solo lectura que viven en su propio archivo (`notas-credito.ts`). */
+  get baseDeDatos() { return this.db; }
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly inv: InventarioService,
@@ -1241,16 +1246,56 @@ export class VentasService {
     };
   }
 
+  /**
+   * SEGÚN MERCADO PAGO (19/11/2026): los atados de la Conciliación MP de los
+   * renglones de pago de esta venta (con la caja del QR, si vino de un QR del
+   * local) y, si algún renglón lo es, los cobros con el QR del ERP. Si algo
+   * falla, el detalle de la venta sale igual, sin esta parte.
+   */
+  private async lecturaMp(ventaId: number, conQrDelErp: boolean): Promise<{ atados: FilaAtado[]; cobrosQr: CobroQr[] }> {
+    try {
+      const [a, c]: any[] = await Promise.all([
+        this.db.execute(sql`
+          select ce.venta_pago_id as "ventaPagoId", mc.tipo as atado, mc.motivo, ce.medio_anterior as "medioAnterior",
+            m.id, m.estado, m.familia, m.tipo, m.metodo, m.cuotas, m.bruto, m.devuelto,
+            (select cj.nombre from mp_cajas cj where m.pos_id <> '' and cj.mp_pos_id = m.pos_id order by cj.id limit 1) as caja
+          from venta_pagos vp
+            join mp_conciliacion_erp ce on ce.venta_pago_id = vp.id
+            join mp_conciliaciones mc on mc.id = ce.conciliacion_id
+            left join mp_movimientos m on m.conciliacion_id = ce.conciliacion_id
+          where vp.venta_id = ${ventaId}
+          order by m.fecha nulls last, m.id`),
+        conQrDelErp
+          ? this.db.execute(sql`
+            select co.payment_id as "paymentId", co.order_id as "orderId", co.pago_info as info, co.monto, cj.nombre as caja
+            from mp_cobros co join mp_cajas cj on cj.id = co.caja_id
+            where co.venta_id = ${ventaId} and co.estado = 'pagado'`)
+          : { rows: [] },
+      ]);
+      return { atados: a.rows ?? [], cobrosQr: c.rows ?? [] };
+    } catch (e) {
+      this.log.warn(`Venta ${ventaId}: no se pudo leer lo de Mercado Pago: ${(e as Error).message}`);
+      return { atados: [], cobrosQr: [] };
+    }
+  }
+
   async get(id: number) {
     const [v] = await this.db.select().from(ventas).where(eq(ventas.id, id)).limit(1);
     if (!v) throw new NotFoundException('Venta inexistente.');
-    const [items, extras, pagos, imput, nc] = await Promise.all([
+    const [items, extras, pagosFilas, imput, nc] = await Promise.all([
       this.db.select().from(ventaItems).where(eq(ventaItems.ventaId, id)).orderBy(ventaItems.id),
       this.db.select().from(ventaExtras).where(eq(ventaExtras.ventaId, id)).orderBy(ventaExtras.id),
       this.db.select().from(ventaPagos).where(eq(ventaPagos.ventaId, id)),
       this.imputadoPorVenta([id]),
       this.acreditado(id),
     ]);
+    /* Cada renglón de pago con lo que dijo Mercado Pago (`mp-del-pago.ts`). Un
+     * borrador sin pagos —el autoguardado del ticket— no consulta nada. */
+    const mpFilas = pagosFilas.length
+      ? await this.lecturaMp(id, pagosFilas.some((p) => p.medio === 'qr' && p.referencia.startsWith('MP ')))
+      : { atados: [], cobrosQr: [] };
+    const mpDe = mpDeLosRenglones(pagosFilas, mpFilas.atados, mpFilas.cobrosQr);
+    const pagos = pagosFilas.map((p) => ({ ...p, mp: mpDe.get(p.id) ?? null }));
     const cobrado = imput.get(id) ?? 0;
 
     /*
@@ -5552,6 +5597,44 @@ export class VentasController {
    * ventas de las cinco sucursales con cliente, cajero, medios de pago y el
    * bloque de totales del período. La facturación del negocio en una URL.
    */
+  /* VENTAS › NOTAS DE CRÉDITO (19/11/2026): todas, con lo que hizo cada una
+   * (`notas-credito.ts`). Misma llave y mismo recorte que el listado: el que no
+   * es jefe ve las de su sucursal y sin totales. */
+  @Get('notas-credito')
+  @Permiso('ventas.listado')
+  async notasCredito(
+    @Auth() sesion: Sesion,
+    @Query('desde') desde?: string,
+    @Query('hasta') hasta?: string,
+    @Query('sucursalId') sucursalId?: string,
+    @Query('clase') clase?: string,
+    @Query('arca') arca?: string,
+    @Query('plata') plata?: string,
+    @Query('q') q?: string,
+    @Query('offset') offset?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const fecha = (v?: string) => {
+      if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new BadRequestException(`Fecha inválida: ${v}`);
+      return v || undefined;
+    };
+    const uno = <T extends string>(v: string | undefined, validos: readonly T[], campo: string): T | undefined => {
+      if (!v) return undefined;
+      if (!validos.includes(v as T)) throw new BadRequestException(`${campo} inválido: ${v}`);
+      return v as T;
+    };
+    const jefe = esJefe(sesion);
+    const r = await listarNotasCredito(this.svc.baseDeDatos, {
+      desde: fecha(desde), hasta: fecha(hasta), q,
+      sucursalId: jefe ? (Number(sucursalId) || undefined) : sesion.sucursalId,
+      clase: uno(clase, ['fiscal', 'devolucion'] as const, 'Clase'),
+      arca: uno(arca, ['cae', 'pendiente', 'interna'] as const, 'ARCA'),
+      plata: uno(plata, ['efectivo', 'ctacte', 'medio'] as const, 'Plata'),
+      offset: Number(offset) || 0, limit: Number(limit) || 50,
+    });
+    return jefe ? r : { ...r, totales: { cantidad: r.totales.cantidad } };
+  }
+
   @Get('listado')
   @Permiso('ventas.listado')
   async listado(

@@ -53,9 +53,9 @@ import { datosBajosStock } from './bajos-stock';
 import { coherenciaStock, kardexProducto } from './kardex-consulta';
 import { sinStockDesde } from './sin-stock-desde';
 import { ConfiguracionService } from '../configuracion/configuracion.module';
-import { eq, sql } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import {
-  productos as productosT, proveedores as proveedoresT, sucursales as sucursalesT, ultimoPedidoProveedor, usuarios as usuariosT,
+  pedidosProveedorEnviados, productos as productosT, proveedores as proveedoresT, sucursales as sucursalesT, ultimoPedidoProveedor, usuarios as usuariosT,
 } from '../db/schema';
 
 /*
@@ -950,18 +950,28 @@ class NotaPedidoDto {
 export class OrdenPedidoController {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  /** Al elegir el proveedor: su pedido anterior (0165) y sus recordatorios (0181), en una sola vuelta. */
+  /**
+   * Al elegir el proveedor, en una sola vuelta: su pedido anterior como texto
+   * (0165), el último anotado en Proveedores › Pedidos con sus renglones (0235)
+   * y sus recordatorios (0181).
+   */
   @Get('ultimo/:proveedorId')
   async ultimo(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
-    const [[p], nota] = await Promise.all([
+    const [[p], [enviado], nota] = await Promise.all([
       this.db.select({
         texto: ultimoPedidoProveedor.texto, fecha: ultimoPedidoProveedor.fecha, usuario: usuariosT.nombre,
       }).from(ultimoPedidoProveedor)
         .leftJoin(usuariosT, eq(usuariosT.id, ultimoPedidoProveedor.usuarioId))
         .where(eq(ultimoPedidoProveedor.proveedorId, proveedorId)).limit(1),
+      this.db.select({
+        fecha: pedidosProveedorEnviados.fecha, usuario: usuariosT.nombre, renglones: pedidosProveedorEnviados.renglones,
+      }).from(pedidosProveedorEnviados)
+        .leftJoin(usuariosT, eq(usuariosT.id, pedidosProveedorEnviados.usuarioId))
+        .where(eq(pedidosProveedorEnviados.proveedorId, proveedorId))
+        .orderBy(desc(pedidosProveedorEnviados.id)).limit(1),
       this.nota(proveedorId),
     ]);
-    return { pedido: p ?? null, nota };
+    return { pedido: p ?? null, enviado: enviado ?? null, nota };
   }
 
   /** Los recordatorios del proveedor, o null si no tiene. */

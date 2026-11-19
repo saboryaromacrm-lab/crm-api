@@ -4036,6 +4036,25 @@ export const ultimoPedidoProveedor = pgTable('ultimo_pedido_proveedor', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 });
 
+/** Un renglón de lo pedido: la cantidad en lo que se pidió (`unidad`: bolsas, bultos, u., kg). */
+export type RenglonEnviado = { productoId: number; cantidad: number; unidad: string };
+
+/**
+ * LO QUE SE LE PIDIÓ AL PROVEEDOR (0235, 19/11/2026): cada orden de pedido
+ * anotada en Proveedores › Pedidos deja sus renglones. La próxima orden de ese
+ * proveedor muestra, producto por producto, cuánto se pidió la vez anterior.
+ */
+export const pedidosProveedorEnviados = pgTable('pedidos_proveedor_enviados', {
+  id: serial('id').primaryKey(),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'cascade' }),
+  pedidoId: integer('pedido_id').references(() => pedidosProveedor.id, { onDelete: 'set null' }),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  renglones: jsonb('renglones').$type<RenglonEnviado[]>().notNull(),
+}, (t) => ({
+  ixProv: index('ix_pedidos_proveedor_enviados_prov').on(t.proveedorId, t.id),
+}));
+
 export const origenCompromisoEnum = pgEnum('origen_compromiso', ['factura', 'manual']);
 
 /**

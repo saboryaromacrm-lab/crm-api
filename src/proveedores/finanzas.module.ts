@@ -1520,6 +1520,16 @@ export class FinanzasProveedorService {
         sinAplicar: money(g.haber - g.aplicado),
       });
     }
+    /* «Modificar el pago» (19/11/2026): la última corrección de cada uno, leída de la auditoría. */
+    const modificados = new Map<number, { fecha: Date; usuario: string }>();
+    for (const r of ((await this.db.execute(sql`
+      select distinct on (pago) pago, fecha, usuario from (
+        select substring(a.detalle from '^Pago #([0-9]+)')::int as pago, a.fecha, coalesce(u.nombre, '') as usuario
+        from auditoria a left join usuarios u on u.id = a.usuario_id
+        where a.entidad = 'proveedor' and a.entidad_id = ${proveedorId} and a.ambito = 'Pago modificado'
+      ) x where pago is not null order by pago, fecha desc`)).rows as any[])) {
+      modificados.set(Number(r.pago), { fecha: r.fecha, usuario: r.usuario });
+    }
     for (const p of pgs) {
       if (cuentaDe.has(p.id)) continue;
       const formas = formasPorPago.get(p.id) ?? [];
@@ -1556,6 +1566,7 @@ export class FinanzasProveedorService {
         cajaSesionId: p.cajaSesionId,
         usuarioNombre: p.usuarioNombre || '',
         sucursalNombre: p.sucursalNombre || '',
+        modificado: modificados.get(p.id) ?? null,
       });
     }
     /* LAS FACTURAS DEL MES (0158), a la vista y en CERO: son el papel fiscal de
