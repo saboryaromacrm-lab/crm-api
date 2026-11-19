@@ -653,6 +653,39 @@ export class GastosService {
    * período puede tener miles de filas y no tiene sentido traerlas para sumar
    * en JavaScript.
    */
+  /**
+   * PROVEEDORES DE GASTOS (19/11/2026, pedido del dueño): por cada proveedor
+   * que factura gastos, lo del período (comprobantes y total, como el resumen:
+   * sin anulados, las notas de crédito restan), lo que FALTA PAGARLE de
+   * siempre, el último gasto y su rubro de siempre. La ficha (CUIT, contacto)
+   * la pide la pantalla del padrón aparte, detrás del mismo permiso.
+   */
+  async porProveedor(q: ConsultaGastosDto) {
+    const enPeriodo = sql.join([
+      sql`true`,
+      ...(q.desde ? [sql`g.fecha >= ${fechaLocal(q.desde)}`] : []),
+      ...(q.hasta ? [sql`g.fecha <= ${new Date(`${String(q.hasta).slice(0, 10)}T23:59:59.999`)}`] : []),
+      ...(q.negocio ? [sql`g.negocio = ${q.negocio}`] : []),
+    ], sql` and `);
+    const r: any = await this.db.execute(sql`
+      select p.id as "proveedorId",
+        count(g.id) filter (where ${enPeriodo})::int as comprobantes,
+        coalesce(sum(g.total) filter (where ${enPeriodo}), 0)::float8 as total,
+        coalesce(sum(greatest(g.total - g.pagado, 0)), 0)::float8 as "faltaPagar",
+        max(g.fecha) as ultimo,
+        (select c.nombre from gastos g2 join gasto_categorias c on c.id = g2.categoria_id
+          where g2.proveedor_id = p.id and g2.estado <> 'anulado'
+          group by c.nombre order by count(*) desc, c.nombre limit 1) as rubro
+      from proveedores p
+      left join gastos g on g.proveedor_id = p.id and g.estado <> 'anulado'
+      where p.provee_gastos
+      group by p.id`);
+    return (r.rows as any[]).map((x) => ({
+      proveedorId: Number(x.proveedorId), comprobantes: Number(x.comprobantes), total: money(Number(x.total)),
+      faltaPagar: money(Number(x.faltaPagar)), ultimo: x.ultimo ? new Date(x.ultimo).toISOString() : null, rubro: x.rubro ?? '',
+    }));
+  }
+
   async resumen(q: any) {
     const conds: any[] = [ne(gastos.estado, 'anulado')];
     if (q.desde) conds.push(gte(gastos.fecha, fechaLocal(q.desde)!));
@@ -1678,6 +1711,10 @@ export class GastosController {
   }
   @Get('resumen') @Permiso('gastos.resumen') resumen(@Query() q: ConsultaGastosDto) {
     return this.svc.resumen(q ?? {});
+  }
+  /* Gastos › Proveedores (19/11/2026): lo gastado y lo que falta pagar por proveedor. */
+  @Get('por-proveedor') @Permiso('gastos.proveedores') porProveedor(@Query() q: ConsultaGastosDto) {
+    return this.svc.porProveedor(q ?? {});
   }
 
   // Leer el plan de rubros lo necesita cualquier pantalla del módulo (el

@@ -217,6 +217,25 @@ export class OfertasService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * EL USO DE CADA OFERTA (19/11/2026, Ventas › Ofertas): desde que existe,
+   * cuántas unidades se vendieron con ella, en cuántos renglones, la venta neta,
+   * el descuento que dio (sin IVA, las devoluciones restan) y el último día que
+   * se usó. Sale de `metricas_oferta_dia` (al día cada 10 minutos). Va aparte de
+   * `listar` porque esa la lee cualquier sesión (el POS) y esto es plata.
+   */
+  async uso() {
+    const r: any = await this.db.execute(sql`
+      select oferta_id as "ofertaId", sum(unidades)::float8 as unidades, sum(renglones)::int as renglones,
+        sum(venta_neta)::float8 as neto, sum(descuento)::float8 as descuento, max(dia)::text as ultimo
+      from metricas_oferta_dia where oferta_id > 0 group by oferta_id`);
+    const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+    return (r.rows as any[]).map((x) => ({
+      ofertaId: Number(x.ofertaId), unidades: Math.round(Number(x.unidades) * 1000) / 1000, renglones: Number(x.renglones),
+      neto: r2(x.neto), descuento: r2(x.descuento), ultimo: x.ultimo,
+    }));
+  }
+
+  /**
    * Las que embarca el catálogo del POS: solo activas. La vigencia por fecha,
    * día y sucursal la evalúa el motor con SU reloj — el catálogo se cachea al
    * abrir la caja y una promo puede arrancar o vencer en el medio del turno.
@@ -378,6 +397,9 @@ export class OfertasController {
   constructor(private readonly svc: OfertasService) {}
 
   @Get() listar() { return this.svc.listar(); }
+
+  /** Cuánto se usó cada oferta (19/11/2026): solo quien administra ofertas. Antes de `:id`. */
+  @Get('uso') @Permiso('ventas.ofertas', 'ofertas') uso() { return this.svc.uso(); }
 
   @Post() @Permiso('ventas.ofertas', 'ofertas')
   crear(@Body() dto: UpsertOfertaDto, @Auth() sesion: Sesion) { return this.svc.crear(dto, sesion.usuarioId); }
