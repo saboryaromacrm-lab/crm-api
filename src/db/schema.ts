@@ -2251,6 +2251,9 @@ export const medioPagoEnum = pgEnum('medio_pago', [
   // Salda la factura, no toca caja ni Mis cuentas, y entra a favor de Coffit
   // en la cuenta entre los dos negocios (cafeteria/cuenta.ts).
   'pago_coffit',
+  // 0236 · EL CAMBIO: la nota de crédito de una devolución paga la venta que
+  // se arma en el momento. No es plata que entra: la caja no la espera.
+  'nota_credito',
 ]);
 
 /* ============================================================================
@@ -2430,6 +2433,15 @@ export const ventas = pgTable('ventas', {
    * movimiento de stock.
    */
   cobradoPor: integer('cobrado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  /**
+   * EL CAMBIO (0236), solo en notas de crédito: el cliente devolvió y se lleva
+   * otra cosa en el momento. La nota queda como crédito para esa venta (medio
+   * `nota_credito` en `venta_pagos.nc_venta_id`) y lo que sobra se devuelve en
+   * el acto: en efectivo del turno o por el mismo medio con que se cobró.
+   */
+  cambio: boolean('cambio').notNull().default(false),
+  cambioEfectivo: doublePrecision('cambio_efectivo').notNull().default(0),
+  cambioMedio: doublePrecision('cambio_medio').notNull().default(0),
 }, (t) => ({
   ixCliente: index('ix_ventas_cliente').on(t.clienteId),
   ixFecha: index('ix_ventas_fecha').on(t.fecha),
@@ -2576,8 +2588,11 @@ export const ventaPagos = pgTable('venta_pagos', {
    * responder "cuánto me llevó la financiación este mes" sin estimar nada.
    */
   recargo: doublePrecision('recargo').notNull().default(0),
+  /** Medio `nota_credito` (0236): la nota de crédito del cambio que paga esta parte. */
+  ncVentaId: integer('nc_venta_id').references(() => ventas.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixVenta: index('ix_venta_pagos_venta').on(t.ventaId),
+  ixNc: index('ix_venta_pagos_nc').on(t.ncVentaId).where(sql`${t.ncVentaId} is not null`),
 }));
 
 /* ---------------- Cobranzas (recibos) ---------------- */
@@ -4689,4 +4704,61 @@ export const anotacionAvisos = pgTable('anotacion_avisos', {
   vistoEn: timestamp('visto_en', { withTimezone: true }),
 }, (t) => ({
   pk: primaryKey({ columns: [t.anotacionId, t.usuarioId] }),
+}));
+
+/* ============================== EL BOT DE WHATSAPP (0237) ============================== */
+
+/** Una charla por número de WhatsApp; `prueba`: la del chat de prueba de un usuario del ERP (wa_id «prueba-<usuarioId>»). */
+export const waChats = pgTable('wa_chats', {
+  id: serial('id').primaryKey(),
+  /** El número como lo manda Meta (549370…), o el de la prueba. */
+  waId: text('wa_id').notNull(),
+  /** 10 dígitos (`telefonoArgentino`) o '' si no es argentino. */
+  telefono: text('telefono').notNull().default(''),
+  /** El nombre del perfil de WhatsApp. */
+  nombre: text('nombre').notNull().default(''),
+  prueba: boolean('prueba').notNull().default(false),
+  /** Verificado como mayorista habilitado (por su número o su DNI): ve los precios mayoristas. */
+  accesoId: integer('acceso_id').references(() => tiendaAccesos.id, { onDelete: 'set null' }),
+  /** Una persona del local tomó la charla (o el bot la derivó): la IA no contesta hasta acá. */
+  iaPausadaHasta: timestamp('ia_pausada_hasta', { withTimezone: true }),
+  derivadoEn: timestamp('derivado_en', { withTimezone: true }),
+  derivadoMotivo: text('derivado_motivo').notNull().default(''),
+  /** El último `wa_mensajes.id` que ya leyó la IA. */
+  ultimoIncluido: integer('ultimo_incluido').notNull().default(0),
+  /** La conversación con la IA arranca acá (se renueva tras horas sin hablar). */
+  sesionDesde: timestamp('sesion_desde', { withTimezone: true }).notNull().defaultNow(),
+  ultimoMensajeEn: timestamp('ultimo_mensaje_en', { withTimezone: true }).notNull().defaultNow(),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  uxWa: uniqueIndex('ux_wa_chats_wa').on(t.waId, t.prueba),
+  ixUltimo: index('ix_wa_chats_ultimo').on(t.ultimoMensajeEn),
+}));
+
+/** Lo que se ve en WhatsApp: `cliente`, `bot` o `humano` (alguien del local, desde la app). */
+export const waMensajes = pgTable('wa_mensajes', {
+  id: serial('id').primaryKey(),
+  chatId: integer('chat_id').notNull().references(() => waChats.id, { onDelete: 'cascade' }),
+  rol: text('rol').$type<'cliente' | 'bot' | 'humano'>().notNull(),
+  texto: text('texto').notNull().default(''),
+  /** El id del mensaje en Meta: el mismo aviso dos veces no se procesa dos veces. */
+  metaId: text('meta_id'),
+  /** Si no se pudo mandar, por qué. */
+  error: text('error').notNull().default(''),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixChat: index('ix_wa_mensajes_chat').on(t.chatId, t.id),
+}));
+
+/** La conversación con la IA, turno por turno, TAL CUAL la devolvió la API. */
+export const waTurnos = pgTable('wa_turnos', {
+  id: serial('id').primaryKey(),
+  chatId: integer('chat_id').notNull().references(() => waChats.id, { onDelete: 'cascade' }),
+  rol: text('rol').$type<'user' | 'assistant'>().notNull(),
+  contenido: jsonb('contenido').notNull(),
+  modelo: text('modelo').notNull().default(''),
+  costo: doublePrecision('costo').notNull().default(0),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixChat: index('ix_wa_turnos_chat').on(t.chatId, t.id),
 }));

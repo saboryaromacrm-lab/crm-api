@@ -25,10 +25,14 @@ import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString,
   Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, ne, notInArray, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, lte, ne, notInArray, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { mpDeLosRenglones, type CobroQr, type FilaAtado } from './mp-del-pago';
 import { listarNotasCredito } from './notas-credito';
+import {
+  cambiosConSaldo, COMO_DEVOLVER, DEVOLUCIONES, saldoDelCambio, soloEfectivo,
+  type CambioConSaldo, type ComoDevolver, type Devolucion,
+} from './cambio';
 import { exigirNoExclusivoCoffit } from '../productos/exclusivoCoffit';
 import {
   cajaMovimientos, cajaSesiones,
@@ -80,10 +84,13 @@ const TIPOS_CREABLES = ['ticket', 'factura_a', 'factura_b', 'factura_c'] as cons
 // 0095: 'transferencia_proveedor' es la transferencia del cliente DIRECTO a la
 // cuenta de un proveedor (Cuentas disponibles). Lleva `cuentaDisponibleId`.
 const MEDIOS = ['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'cheque', 'qr', 'otro', 'transferencia_proveedor'] as const;
+/** Con qué se cobra una venta: los medios, más la nota de crédito de un cambio (0236), que no se configura. */
+const MEDIOS_COBRO = [...MEDIOS, 'nota_credito'] as const;
 /** Cómo se dice cada medio en un mensaje al cajero. */
 const NOMBRE_MEDIO: Record<string, string> = {
   efectivo: 'efectivo', transferencia: 'transferencia', tarjeta_debito: 'débito', tarjeta_credito: 'crédito',
   cheque: 'cheque', qr: 'QR', otro: 'otro medio', transferencia_proveedor: 'transferencia a proveedor',
+  nota_credito: 'nota de crédito (cambio)',
 };
 
 /**
@@ -567,7 +574,7 @@ class VentaExtraDto {
 }
 
 class VentaPagoDto {
-  @IsIn(MEDIOS as unknown as string[]) medio!: (typeof MEDIOS)[number];
+  @IsIn(MEDIOS_COBRO as unknown as string[]) medio!: (typeof MEDIOS_COBRO)[number];
   /**
    * Lo que se cobra por este medio, RECARGO INCLUIDO: es el número que pasa
    * por el posnet y el que tiene que cerrar contra el total de la venta.
@@ -586,6 +593,8 @@ class VentaPagoDto {
   @IsOptional() @IsInt() @IsIn(PLANES_CUOTAS) cuotas?: number;
   /** A qué cuenta disponible va, cuando el medio es 'transferencia_proveedor'. */
   @IsOptional() @IsInt() cuentaDisponibleId?: number;
+  /** La nota de crédito del cambio, cuando el medio es 'nota_credito' (0236). */
+  @IsOptional() @IsInt() ncVentaId?: number;
 }
 
 export class CreateVentaDto {
@@ -663,6 +672,8 @@ class ConfirmarVentaDto {
   @IsOptional() @IsInt() operadorId?: number;
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => VentaPagoDto)
   pagos?: VentaPagoDto[];
+  /** Un cambio que paga más que el ticket (0236): cómo se devuelve lo que sobra de la nota. */
+  @IsOptional() @IsIn(COMO_DEVOLVER as unknown as string[]) sobranteCambio?: ComoDevolver;
 }
 
 /*
@@ -694,8 +705,8 @@ class NotaCreditoItemDto {
  * LA NOTA DE CRÉDITO. Sin `items`, es TOTAL (todos los renglones completos más
  * los extras); con `items`, devuelve solo eso.
  *
- * `devuelveMercaderia` y `devolverEfectivo` son dos cosas distintas y por eso
- * son dos campos: una nota por un error de precio no mueve stock, y una
+ * `devuelveMercaderia` y `devolucion` son dos cosas distintas y por eso son
+ * dos campos: una nota por un error de precio no mueve stock, y una
  * devolución de un cliente de cuenta corriente no saca plata de la caja.
  */
 class NotaCreditoDto {
@@ -704,8 +715,21 @@ class NotaCreditoDto {
   items?: NotaCreditoItemDto[];
   /** Default `true`: lo normal es que la mercadería vuelva al depósito. */
   @IsOptional() @IsBoolean() devuelveMercaderia?: boolean;
-  /** Default `false`: sacar plata de la caja se pide explícito. */
+  /**
+   * CÓMO SE LE DEVUELVE LA PLATA (0236): `efectivo` sale del turno abierto,
+   * `medio` va por el mismo medio con que se cobró (fuera de la caja, queda
+   * anotado) y `cambio` deja la nota como crédito para la venta que se arma en
+   * el momento (ver cambio.ts). Sin el campo vale `devolverEfectivo`, el tilde
+   * de antes (una pestaña vieja del ERP durante el deploy).
+   */
+  @IsOptional() @IsIn(DEVOLUCIONES as unknown as string[]) devolucion?: Devolucion;
+  /** El tilde de antes: `true` = `devolucion: 'efectivo'`. */
   @IsOptional() @IsBoolean() devolverEfectivo?: boolean;
+  @IsOptional() @IsInt() usuarioId?: number;
+}
+
+class DevolverCambioDto {
+  @IsIn(COMO_DEVOLVER as unknown as string[]) como!: ComoDevolver;
   @IsOptional() @IsInt() usuarioId?: number;
 }
 
@@ -1310,7 +1334,7 @@ export class VentasService {
     const prodIds = [...new Set(items.map((i) => i.productoId))];
     const presIds = [...new Set(items.map((i) => i.presentacionId).filter(Boolean) as number[])];
     const nada: any[] = [];
-    const [[origen], filasProd, filasPres, [cli], [suc], [usr], [cobrador]] = await Promise.all([
+    const [[origen], filasProd, filasPres, [cli], [suc], [usr], [cobrador], usadoEn] = await Promise.all([
       /* Si ESTE comprobante es una nota, de quién viene: el detalle y el
        * impreso tienen que decir a qué factura ajusta. */
       v.refVentaId
@@ -1365,6 +1389,14 @@ export class VentasService {
       v.cobradoPor && v.cobradoPor !== v.usuarioId
         ? this.db.select({ nombre: usuarios.nombre })
           .from(usuarios).where(eq(usuarios.id, v.cobradoPor)).limit(1)
+        : nada,
+      /* La nota de un cambio (0236): en qué venta se usó. */
+      v.cambio
+        ? this.db.select({
+          id: ventas.id, tipo: ventas.tipo, puntoVenta: ventas.puntoVenta, numero: ventas.numero,
+          fecha: ventas.fecha, estado: ventas.estado, importe: ventaPagos.importe,
+        }).from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
+          .where(eq(ventaPagos.ncVentaId, id)).orderBy(ventas.id)
         : nada,
     ]);
     const prods = new Map<number, { nombre: string; tipo: string }>();
@@ -1454,6 +1486,18 @@ export class VentasService {
        * tiene que volver a sumar en su vista previa. */
       extrasAcreditados: nc.extras,
       origen: origen ?? null,
+      /* El cambio (0236): dónde se usó la nota, lo devuelto y lo que le queda. */
+      cambio: v.cambio
+        ? {
+          usadoEn,
+          efectivo: v.cambioEfectivo,
+          medio: v.cambioMedio,
+          saldo: saldoDelCambio({
+            total: v.total, cambioEfectivo: v.cambioEfectivo, cambioMedio: v.cambioMedio,
+            usado: usadoEn.filter((u: any) => u.estado !== 'anulada').reduce((a: number, u: any) => a + u.importe, 0),
+          }),
+        }
+        : null,
       cotizados: await this.cotizadosDelBorrador(v),
     };
   }
@@ -3035,6 +3079,12 @@ export class VentasService {
       if (p.medio === 'transferencia_proveedor' && !p.cuentaDisponibleId) {
         throw new BadRequestException('Elegí a qué cuenta del proveedor va la transferencia.');
       }
+      if (p.medio === 'nota_credito' && !p.ncVentaId) {
+        throw new BadRequestException('Elegí la nota de crédito del cambio.');
+      }
+    }
+    if (validos.filter((p) => p.medio === 'nota_credito').length > 1) {
+      throw new BadRequestException('Un cambio usa una sola nota de crédito.');
     }
     return validos;
   }
@@ -3052,6 +3102,7 @@ export class VentasService {
     if (!pagos.length) return;
     const filas = await tx.insert(ventaPagos).values(pagos.map((p) => ({
       ventaId, medio: p.medio, importe: money(p.importe), referencia: p.referencia ?? '',
+      ncVentaId: p.ncVentaId ?? null,
       /* El plan y su recargo quedan CONGELADOS en el pago (0100): cambiar el %
        * en configuración mañana no puede mover lo que ya se cobró. Es lo que
        * hace que "cuánto me llevó la financiación" se responda sumando, sin
@@ -3648,6 +3699,23 @@ export class VentasService {
   }
 
   /**
+   * EL EFECTIVO QUE TODAVÍA PUEDE SALIR DEL CAJÓN POR UNA VENTA: lo que entró en
+   * efectivo (en el mostrador y por cobranzas) menos lo ya devuelto en efectivo
+   * —notas con egreso del turno y sobrantes de cambios (0236)—. Del cajón solo
+   * sale lo que entró ahí: lo cobrado con tarjeta, transferencia o QR vuelve por
+   * el mismo medio. `tx`: la transacción que relee con candado.
+   */
+  private async efectivoDevolvible(ventaId: number, tx: any = this.db) {
+    const [pagado] = await tx.select({ t: sql<number>`coalesce(sum(${ventaPagos.importe}), 0)` }).from(ventaPagos)
+      .where(and(eq(ventaPagos.ventaId, ventaId), eq(ventaPagos.medio, 'efectivo')));
+    const [devuelto] = await tx.select({
+      t: sql<number>`coalesce(sum((case when ${ventas.cajaSesionId} is not null then ${ventas.total} else 0 end) + ${ventas.cambioEfectivo}), 0)`,
+    }).from(ventas).where(and(eq(ventas.refVentaId, ventaId), ne(ventas.estado, 'anulada')));
+    const entro = money((Number(pagado?.t) || 0) + await this.efectivoDeCobranzas(ventaId));
+    return { entro, disponible: money(entro - (Number(devuelto?.t) || 0)) };
+  }
+
+  /**
    * LAS OFERTAS, RELEÍDAS AL COBRAR (26/9/2026) — el gemelo de los descuentos
    * de arriba. Entre el último autoguardado y el cobro pueden pasar horas: la
    * promo pudo vencer (el ticket de las 23:50 cobrado a las 00:10), apagarse o
@@ -3915,6 +3983,11 @@ export class VentasService {
       throw new BadRequestException(
         'Una venta en cuotas con recargo se cobra desde la caja (armá el ticket y cobralo): así se suma la financiación.',
       );
+    }
+    /* El cambio (0236) también: la nota se toma con candado y el sobrante se
+     * devuelve al cobrar, y eso vive en `confirmar`. */
+    if ((dto.pagos ?? []).some((p) => p.medio === 'nota_credito')) {
+      throw new BadRequestException('Un cambio con nota de crédito se cobra desde la caja: armá el ticket y cobralo.');
     }
     const pagos = this.validarPagos(condicionPago, dto.pagos ?? [], tot.total);
     // Sobre el tipo PEDIDO: si se pidió factura y ARCA cae, el ticket
@@ -4381,6 +4454,7 @@ export class VentasService {
     }
 
     const pagos = this.validarPagos(condicionPago, fin.pagos, borrador.total);
+    const pagoCambio = pagos.find((p) => p.medio === 'nota_credito');
     /* El interruptor (0150) pudo apagarse con el ticket abierto: confirmar no
      * vuelve a resolver los renglones, así que se mira acá. */
     const sinMayorista = await this.sinMayoristaEn(borrador.sucursalId, config);
@@ -4487,6 +4561,9 @@ export class VentasService {
           + '(o se reintentó el cobro). Buscalo en Ventas antes de rehacerlo — la venta ya existe.',
         );
       }
+      /* La nota del cambio (0236), con candado ANTES que el turno: el mismo
+       * orden que `devolverCambio` (nota, turno), para no trabarse entre sí. */
+      const ncCambio = pagoCambio ? await this.bloquearVenta(tx, pagoCambio.ncVentaId!) : null;
 
       /*
        * Y EL TURNO DE CAJA, con el mismo candado y por el mismo motivo.
@@ -4566,6 +4643,12 @@ export class VentasService {
         observaciones: dto.observaciones ?? borrador.observaciones,
       }).where(eq(ventas.id, id));
 
+      if (ncCambio) {
+        await this.aplicarCambio(tx, ncCambio, pagoCambio!, {
+          sucursalId, total: borrador.total, sobrante: dto.sobranteCambio,
+          turnoId: turno?.id ?? null, usuarioId: cobrador ?? borrador.usuarioId ?? null,
+        });
+      }
       await this.insertarPagos(tx, id, pagos, {
         sucursalId, usuarioId: cobrador ?? borrador.usuarioId,
         documento: `Venta ${puntoVentaFinal}-${String(numero).padStart(8, '0')}`, clienteNombre: cliente.nombre,
@@ -4814,9 +4897,9 @@ export class VentasService {
    *  2. **El stock vuelve** — solo lo devuelto, y solo si `devuelveMercaderia`.
    *     Una NC por un error de precio no mueve un gramo de mercadería.
    *  3. **La cuenta corriente baja**: `cuenta()` resta las notas de crédito.
-   *  4. **La plata**, si se pide: un egreso del turno abierto. Opcional a
-   *     propósito — devolver efectivo es una decisión de mostrador, y hacerlo
-   *     automático descuadraría el arqueo de quien no lo esperaba.
+   *  4. **La plata**, según `devolucion` (0236): un egreso del turno abierto,
+   *     anotada «por el mismo medio» (fuera de la caja), o un CAMBIO: la nota
+   *     queda como crédito para la venta que se arma en el momento (cambio.ts).
    *
    * LO QUE NO SE PUEDE DEVOLVER DOS VECES: se suma lo ya acreditado por notas
    * anteriores y se descuenta del tope. Sin eso, tres notas de crédito del 50%
@@ -4886,6 +4969,21 @@ export class VentasService {
     }
     const motivo = (dto.motivo ?? '').trim();
     if (!motivo) throw new BadRequestException(`Indicá por qué se registra ${doc}.`);
+    /* Cómo se le devuelve la plata (0236). Sin el campo, el tilde de antes. */
+    const devolucion: Devolucion = dto.devolucion ?? (dto.devolverEfectivo ? 'efectivo' : 'medio');
+    if (devolucion === 'cambio' && original.condicionPago !== 'contado') {
+      throw new BadRequestException(
+        'Esta venta fue a cuenta corriente: la nota ya le baja la deuda al cliente. El cambio es para ventas al contado.',
+      );
+    }
+    /* Elegido a propósito (el tilde viejo sin marcar sigue como antes). */
+    if (dto.devolucion === 'medio' && original.condicionPago === 'contado'
+      && soloEfectivo((original.pagos ?? []).map((p: any) => p.medio))) {
+      throw new BadRequestException(
+        'Esta venta se cobró toda en efectivo: no hay otro medio por donde devolver. '
+        + 'Devolvé en efectivo del cajón, o elegí «se lleva otra mercadería» si es un cambio.',
+      );
+    }
 
     /* -- Lo ya acreditado por notas anteriores, renglón por renglón -- */
     const previo = await this.acreditado(ventaId);
@@ -4975,12 +5073,7 @@ export class VentasService {
 
     /* -- El turno, solo si se va a devolver efectivo -- */
     let turnoId: number | null = null;
-    /* Lo que ENTRÓ por esta venta, calculado acá y revalidado dentro de la
-     * transacción: `original.pagos` y `original.cobrado` no se mueven (los
-     * pagos quedan fijos al confirmar, y una cobranza nueva solo sumaría), pero
-     * lo ya devuelto sí, y esa es la parte que se relee con candado. */
-    let entroPorLaVenta = 0;
-    if (dto.devolverEfectivo) {
+    if (devolucion === 'efectivo') {
       const turno = await this.caja.actual(sucursalId);
       if (!turno) {
         throw new BadRequestException(
@@ -5022,25 +5115,13 @@ export class VentasService {
        * transferencia o QR se devuelve por el mismo medio (la anulación en el
        * posnet, la transferencia de vuelta), fuera de la caja.
        */
-      const pagadoEnElActo = (original.pagos ?? [])
-        .filter((p: any) => p.medio === 'efectivo')
-        .reduce((a: number, p: any) => a + (Number(p.importe) || 0), 0);
       const pagadoOtrosMedios = money((original.pagos ?? [])
         .filter((p: any) => p.medio !== 'efectivo')
         .reduce((a: number, p: any) => a + (Number(p.importe) || 0), 0));
-      const efectivoCobranzas = await this.efectivoDeCobranzas(ventaId);
-      const [yaDevuelto] = await this.db
-        .select({ t: sql<number>`coalesce(sum(${ventas.total}), 0)` })
-        .from(ventas)
-        .where(and(
-          eq(ventas.refVentaId, ventaId),
-          isNotNull(ventas.cajaSesionId),
-          ne(ventas.estado, 'anulada'),
-        ));
-      const entro = money(pagadoEnElActo + efectivoCobranzas);
-      entroPorLaVenta = entro;
-      const disponible = money(entro - (Number(yaDevuelto?.t) || 0));
-
+      /* Lo que entró en efectivo y lo ya devuelto, revalidado dentro de la
+       * transacción: lo devuelto puede moverse, y esa es la parte que se relee
+       * con candado. */
+      const { entro, disponible } = await this.efectivoDevolvible(ventaId);
       if (tot.total > disponible + 0.009) {
         const otros = pagadoOtrosMedios > 0.009
           ? ` El resto se cobró con ${[...new Set((original.pagos ?? []).filter((p: any) => p.medio !== 'efectivo').map((p: any) => NOMBRE_MEDIO[p.medio] ?? p.medio))].join(' y ')} `
@@ -5103,18 +5184,11 @@ export class VentasService {
 
       // (3) La plata: lo devuelto por notas anteriores, releído con candado.
       if (turnoId) {
-        const [ya] = await tx.select({ t: sql<number>`coalesce(sum(${ventas.total}), 0)` })
-          .from(ventas)
-          .where(and(
-            eq(ventas.refVentaId, ventaId),
-            isNotNull(ventas.cajaSesionId),
-            ne(ventas.estado, 'anulada'),
-          ));
-        const disponibleReal = money(entroPorLaVenta - (Number(ya?.t) || 0));
-        if (tot.total > disponibleReal + 0.009) {
+        const real = await this.efectivoDevolvible(ventaId, tx);
+        if (tot.total > real.disponible + 0.009) {
           throw new BadRequestException(
-            `Otra devolución de esta venta salió del cajón hace un instante: de los ${money(entroPorLaVenta)} `
-            + `que habían entrado quedan ${money(Math.max(disponibleReal, 0))}. `
+            `Otra devolución de esta venta salió del cajón hace un instante: de los ${money(real.entro)} `
+            + `que habían entrado quedan ${money(Math.max(real.disponible, 0))}. `
             + 'Emití la nota SIN devolución: la deuda del cliente se ajusta igual.',
           );
         }
@@ -5131,6 +5205,7 @@ export class VentasService {
         estado: 'confirmada',
         condicionPago: original.condicionPago,
         refVentaId: ventaId,
+        cambio: devolucion === 'cambio',
         listaPrecio: original.listaPrecio,
         subtotalNeto: tot.subtotalNeto, descuentoTotal: tot.descuentoTotal,
         ivaTotal: tot.ivaTotal, total: tot.total,
@@ -5177,6 +5252,124 @@ export class VentasService {
     });
 
     return this.get(id);
+  }
+
+  /* ------------------------- El cambio (0236) ------------------------- */
+
+  /**
+   * LOS CAMBIOS SIN TERMINAR DE UN LOCAL, para el punto de venta: cuánto le
+   * queda a cada nota y cuánto de eso puede salir en efectivo del cajón (el
+   * mismo tope que la nota de crédito: lo que la venta original cobró en
+   * efectivo, menos lo ya devuelto).
+   */
+  async cambiosPendientes(sucursalId: number) {
+    const filas = await cambiosConSaldo(this.db, { sucursalId });
+    return Promise.all(filas.map(async (c) => ({
+      id: c.id, etiqueta: etiquetaVenta(c), fecha: c.fecha, total: c.total, saldo: c.saldo,
+      efectivoDisponible: Math.max(0, (await this.efectivoDevolvible(c.refVentaId)).disponible),
+      mismoMedio: c.otroMedio,
+    })));
+  }
+
+  /**
+   * DEVOLVER LO QUE LE QUEDA A UN CAMBIO: el cliente al final no se llevó nada,
+   * o se anuló la venta del cambio. En efectivo del turno abierto del local o
+   * anotado por el mismo medio con que se cobró la venta original.
+   */
+  async devolverCambio(ncId: number, como: ComoDevolver, usuarioId: number | null, opciones: OpcionesVenta = {}) {
+    const [fila] = await this.db.select({ sucursalId: ventas.sucursalId }).from(ventas).where(eq(ventas.id, ncId)).limit(1);
+    if (!fila) throw new NotFoundException('Esa nota de crédito no existe.');
+    if (opciones.soloSuSucursal && fila.sucursalId !== opciones.soloSuSucursal) {
+      throw new ForbiddenException('Esa nota de crédito es de otra sucursal.');
+    }
+    const turno = como === 'efectivo' && fila.sucursalId ? await this.caja.actual(fila.sucursalId) : null;
+    await this.db.transaction(async (tx) => {
+      const nc = await this.bloquearVenta(tx, ncId);
+      const [c] = await cambiosConSaldo(tx, { ncId });
+      if (!nc.cambio || !c) {
+        throw new BadRequestException('Esta nota de crédito no tiene un cambio pendiente: ya se usó en una venta o ya se devolvió.');
+      }
+      await this.devolverSaldoCambio(tx, c, c.saldo, como, turno?.id ?? null, usuarioId);
+    });
+    return this.get(ncId);
+  }
+
+  /**
+   * EL CAMBIO AL COBRAR: la venta paga con la nota de crédito de la devolución.
+   * Corre en la transacción del cobro, con la nota ya tomada con candado. El
+   * crédito es para este momento, así que lo que sobra se devuelve en el acto.
+   * Deja en la referencia del pago qué nota lo pagó: así lo dicen el ticket y
+   * el detalle de la venta.
+   */
+  private async aplicarCambio(
+    tx: any, nc: any, pago: VentaPagoDto,
+    ctx: { sucursalId: number; total: number; sobrante?: ComoDevolver; turnoId: number | null; usuarioId: number | null },
+  ) {
+    const nombre = etiquetaVenta(nc);
+    if (!nc.cambio || nc.estado !== 'confirmada') {
+      throw new BadRequestException(`${nombre} no es de un cambio: no paga ventas.`);
+    }
+    if (nc.sucursalId !== ctx.sucursalId) {
+      throw new BadRequestException(`${nombre} es de otro local: el cambio se cobra donde se hizo la devolución.`);
+    }
+    const [c] = await cambiosConSaldo(tx, { ncId: nc.id });
+    const saldo = c?.saldo ?? 0;
+    const importe = money(pago.importe);
+    if (importe > saldo + 0.009) {
+      throw new BadRequestException(saldo > 0.009
+        ? `A ${nombre} le quedan $${saldo}: no alcanza para $${importe}.`
+        : `${nombre} ya se usó en otra venta o ya se devolvió.`);
+    }
+    const sobra = money(saldo - importe);
+    if (sobra > 0.009) {
+      if (Math.abs(importe - ctx.total) > 0.009) {
+        throw new BadRequestException('La nota de crédito alcanza para todo el ticket: se cobra entero con ella, sin otro medio.');
+      }
+      if (!ctx.sobrante) {
+        throw new BadRequestException(`Sobran $${sobra} de la nota de crédito: elegí si se devuelven en efectivo o por el mismo medio.`);
+      }
+      await this.devolverSaldoCambio(tx, c, sobra, ctx.sobrante, ctx.turnoId, ctx.usuarioId);
+    }
+    pago.referencia = nombre;
+  }
+
+  /**
+   * DEVUELVE PARTE (o todo) DE UN CAMBIO. `medio`: queda anotado, la plata
+   * vuelve fuera de la caja (solo si la venta original tuvo otro medio que el
+   * efectivo). `efectivo`: egreso del turno con el tope de la nota de crédito
+   * —del cajón sale lo que la venta original cobró en efectivo—.
+   */
+  private async devolverSaldoCambio(
+    tx: any, nc: CambioConSaldo, importe: number, como: ComoDevolver, turnoId: number | null, usuarioId: number | null,
+  ) {
+    if (como === 'medio') {
+      if (!nc.otroMedio) {
+        throw new BadRequestException('La venta original se cobró toda en efectivo: lo que queda de la nota se devuelve en efectivo del cajón.');
+      }
+      await tx.update(ventas).set({ cambioMedio: sql`${ventas.cambioMedio} + ${importe}` }).where(eq(ventas.id, nc.id));
+      return;
+    }
+    if (!turnoId) {
+      throw new BadRequestException('No hay un turno de caja abierto en este local: no se puede devolver en efectivo. Abrí la caja, o devolvelo por el mismo medio.');
+    }
+    const { disponible } = await this.efectivoDevolvible(nc.refVentaId, tx);
+    if (importe > disponible + 0.009) {
+      throw new BadRequestException(
+        `No se pueden devolver $${importe} en efectivo: de la venta original quedan $${money(Math.max(disponible, 0))} cobrados en efectivo. `
+        + 'Lo cobrado con tarjeta, transferencia o QR se devuelve por el mismo medio.',
+      );
+    }
+    const [sesion] = await tx.select().from(cajaSesiones).where(eq(cajaSesiones.id, turnoId)).limit(1).for('update');
+    if (!sesion || sesion.estado !== 'abierta' || sesion.sucursalId !== nc.sucursalId) {
+      throw new BadRequestException('El turno de caja de este local se cerró: no se puede devolver en efectivo.');
+    }
+    await tx.insert(cajaMovimientos).values({
+      cajaSesionId: turnoId, tipo: 'egreso', importe: money(importe),
+      // Igual que el egreso de la nota en efectivo: «Devolución NC 00032-00000002 …» (la caja lo agrupa por ese prefijo).
+      motivo: `Devolución ${nc.tipo === 'nota_credito_ticket' ? '' : 'NC '}${nc.puntoVenta}-${String(nc.numero).padStart(8, '0')} · cambio`,
+      usuarioId,
+    });
+    await tx.update(ventas).set({ cambioEfectivo: sql`${ventas.cambioEfectivo} + ${importe}` }).where(eq(ventas.id, nc.id));
   }
 
   /**
@@ -5629,10 +5822,18 @@ export class VentasController {
       sucursalId: jefe ? (Number(sucursalId) || undefined) : sesion.sucursalId,
       clase: uno(clase, ['fiscal', 'devolucion'] as const, 'Clase'),
       arca: uno(arca, ['cae', 'pendiente', 'interna'] as const, 'ARCA'),
-      plata: uno(plata, ['efectivo', 'ctacte', 'medio'] as const, 'Plata'),
+      plata: uno(plata, ['efectivo', 'ctacte', 'medio', 'cambio'] as const, 'Plata'),
       offset: Number(offset) || 0, limit: Number(limit) || 50,
     });
     return jefe ? r : { ...r, totales: { cantidad: r.totales.cantidad } };
+  }
+
+  /** Los cambios sin terminar del local (0236): el punto de venta los muestra arriba del ticket. */
+  @Get('cambios-pendientes')
+  @Permiso('ventas.pos')
+  cambiosPendientes(@Auth() sesion: Sesion, @Query('sucursalId') sucursalId?: string) {
+    const suc = this.opciones(sesion, Number(sucursalId) || undefined).sucursalSesion;
+    return suc ? this.svc.cambiosPendientes(suc) : [];
   }
 
   @Get('listado')
@@ -5669,7 +5870,7 @@ export class VentasController {
     const r = await this.svc.listado({
       desde, hasta, q,
       estado: uno(estado, ['borrador', 'confirmada', 'anulada', 'pendiente_cae'], 'Estado'),
-      medioPago: uno(medioPago, [...MEDIOS, 'qr_mp'], 'Medio de pago'),
+      medioPago: uno(medioPago, [...MEDIOS_COBRO, 'qr_mp'], 'Medio de pago'),
       origen: uno(origen, ['pos', 'presupuesto', 'tienda', 'minorista', 'mayorista'], 'Origen'),
       sucursalId: esJefe(sesion) ? num(sucursalId) : sesion.sucursalId,
       usuarioId: num(usuarioId),
@@ -5830,6 +6031,13 @@ export class VentasController {
       { ...dto, usuarioId: sesion.usuarioId },
       { ...this.opciones(sesion), desdeTicket: true },
     );
+  }
+
+  /** Devolver lo que le queda a un cambio: en efectivo del turno o por el mismo medio (0236). */
+  @Post(':id/cambio/devolver')
+  @Permiso('devoluciones', 'nota_credito')
+  devolverCambio(@Param('id', ParseIntPipe) id: number, @Body() dto: DevolverCambioDto, @Auth() sesion: Sesion) {
+    return this.svc.devolverCambio(id, dto.como, sesion.usuarioId ?? null, this.opciones(sesion));
   }
 
   @Delete(':id')

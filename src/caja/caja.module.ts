@@ -30,6 +30,7 @@ import { GastosModule, GastosService } from '../gastos/gastos.module';
 import { type ConceptoRegla, esConceptoAdelanto, esConceptoCambio, exigirConcepto, textoConcepto } from '../cashflow/conceptos';
 import { empleadoDelMovimiento } from '../personal/personal';
 import { cerrarHastaDe, diaEnPalabras, plazoDelTurno } from './plazo';
+import { sinCambiosPendientes } from '../ventas/cambio';
 import {
   cajaControles, cajaMovimientos, cajaSesiones, cashflowConceptos, cobranzaPagos, cobranzas, gastoCategorias, mpCobros,
   proveedorImputaciones, proveedorPagos, sucursales, ventaPagos, ventas,
@@ -537,7 +538,8 @@ export class CajaService {
       egresos,
       montoInicial: sesion.montoInicial,
       esperadoEfectivo,
-      totalCobrado: money(Object.values(medios).reduce((a, m) => a + m.total, 0)),
+      /* La nota de crédito de un cambio (0236) se ve entre los medios, pero no es plata que entró. */
+      totalCobrado: money(Object.entries(medios).reduce((a, [medio, m]) => (medio === 'nota_credito' ? a : a + m.total), 0)),
       /** De lo cobrado, cuánto fue recargo por cuotas y no venta (0100). */
       recargos,
       ctaCte: { total: money(Number(ctaCte?.total) || 0), cantidad: Number(ctaCte?.n) || 0 },
@@ -767,6 +769,7 @@ export class CajaService {
       if (sucursalSesion != null && sesion.sucursalId !== sucursalSesion) throw new ForbiddenException('Ese turno es de otra sucursal.');
       if (sesion.estado === 'cerrada') throw new BadRequestException('El turno ya está cerrado.');
       await sinCobrosQrVivos(tx, sesion.sucursalId);
+      await sinCambiosPendientes(tx, sesion.sucursalId);
 
       const a = await this.arqueo(id);
       const diferencia = money(declarado - a.esperadoEfectivo);
@@ -850,10 +853,13 @@ export class CajaService {
           + 'Hacé el «Arqueo del día»: se cuenta el cajón, se firma y la plata queda en la caja.',
         );
       }
+      /* Lo que impide cerrar, ANTES de pedir la firma: que el cajero no ponga su
+       * contraseña para enterarse recién ahí de que tiene algo pendiente. */
+      await sinCobrosQrVivos(tx, sesion.sucursalId);
+      await sinCambiosPendientes(tx, sesion.sucursalId);
       /* Quién cierra (0229): elegido y firmado con su contraseña, antes de tocar nada. */
       const cierra = await exigirQuienCierra(tx, sesion.sucursalId, dto.cerradoPor);
       exigirFirma(cierra, dto.firma, 'contraseña');
-      await sinCobrosQrVivos(tx, sesion.sucursalId);
 
       const [suc] = await tx.select({ fondo: sucursales.fondoCaja }).from(sucursales)
         .where(eq(sucursales.id, sesion.sucursalId)).limit(1);

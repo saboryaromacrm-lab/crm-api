@@ -220,6 +220,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'web.contenido', nombre: 'Contenido (banners e imágenes)' },
       { clave: 'web.estadisticas', nombre: 'Métricas de la tienda online (mayorista y minorista)' },
       { clave: 'web.configuracion', nombre: 'Configuración de la tienda online (mayorista, minorista, logo, contacto, redes)' },
+      /* El bot de ventas por WhatsApp (0237): sus instrucciones, los números sin IA, las charlas y el chat de prueba. */
+      { clave: 'web.whatsapp', nombre: 'Bot de WhatsApp (instrucciones, números sin IA, charlas y chat de prueba)' },
       /* La llave conserva el nombre con que nació en 0155 (ya grabada en los roles). */
       { clave: 'ventas.accesos_tienda', nombre: 'Accesos a la tienda (habilitar o bloquear a quien pide comprar mayorista)' },
     ],

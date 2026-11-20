@@ -327,6 +327,9 @@ export class TiendaService {
     return { ...(await this.armado('mayorista')).catalogo, conPrecios: true, cliente: null };
   }
 
+  /** El catálogo de un modo CON precios: el del bot de WhatsApp (0237), que ya decidió qué modo le toca al cliente. */
+  async catalogoDelModo(modo: Modo) { return (await this.armado(modo)).catalogo; }
+
   /**
    * El catálogo del modo y, aparte, el POZO de cada granel (granel suelto
    * utilizable y paquetes armados), que solo usa el pedido para validar el

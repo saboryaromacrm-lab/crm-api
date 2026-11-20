@@ -48,6 +48,7 @@ import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IndicadoresModule } from './indicadores/indicadores.module';
 import { AsesorModule } from './asesor/asesor.module';
+import { WhatsappModule } from './whatsapp/whatsapp.module';
 import { IngredientesModule } from './cafeteria/ingredientes.module';
 // TEMPORAL (0138): se borra junto con su panel cuando el stock real esté bien.
 import { MercadoPagoModule } from './mercadopago/mercadopago.module';
@@ -102,6 +103,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     CobranzasModule,
     PresupuestosModule,
     TiendaModule,
+    WhatsappModule,
     WebModule,
     // Administración
     PagosModule,

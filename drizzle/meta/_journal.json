@@ -1653,6 +1653,20 @@
       "when": 1795824000000,
       "tag": "0235_pedidos_enviados",
       "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "version": "7",
+      "when": 1795910400000,
+      "tag": "0236_cambio_nc",
+      "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "version": "7",
+      "when": 1795996800000,
+      "tag": "0237_whatsapp_bot",
+      "breakpoints": true
     }
   ]
 }

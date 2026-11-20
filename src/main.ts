@@ -69,7 +69,11 @@ async function bootstrap() {
 
   // El logo de la empresa viaja como data-URL en la configuración: el body
   // default de 100kb no le alcanza a una imagen.
-  app.use(json({ limit: '4mb' }));
+  app.use(json({
+    limit: '4mb',
+    /* El aviso del bot de WhatsApp (0237) se firma sobre el cuerpo CRUDO: se guarda solo ese. */
+    verify: (req: any, _res, buf) => { if (req.url?.startsWith('/api/whatsapp/webhook')) req.rawBody = buf; },
+  }));
 
   /*
    * A QUIÉN LE CREE EXPRESS CUANDO DICE DE DÓNDE VIENE LA REQUEST.

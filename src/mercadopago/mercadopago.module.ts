@@ -58,8 +58,10 @@ const TOPE_DIAGNOSTICO = 3000;
 /* ------------------------------- DTOs ------------------------------- */
 
 class PagoOtroDto {
-  @IsIn(['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'qr', 'otro']) medio!: string;
+  @IsIn(['efectivo', 'transferencia', 'tarjeta_debito', 'tarjeta_credito', 'qr', 'otro', 'nota_credito']) medio!: string;
   @IsNumber() @Min(0) @Max(100_000_000) importe!: number;
+  /** La nota de crédito de un cambio (0236): el QR cobra la diferencia. */
+  @IsOptional() @IsInt() ncVentaId?: number;
 }
 
 /** Lo que se hace con la venta cuando el pago entra: lo mismo que manda el cobro de siempre. */
@@ -322,7 +324,8 @@ export class MercadoPagoService implements OnModuleInit, OnModuleDestroy {
     const confirmar = {
       tipo: dto.confirmar.tipo, condicionPago: 'contado',
       cajaSesionId: dto.confirmar.cajaSesionId, operadorId: dto.confirmar.operadorId, usuarioId: sesion.usuarioId,
-      observaciones: dto.confirmar.observaciones, pagos: otros.map((p) => ({ medio: p.medio, importe: Number(p.importe) })),
+      observaciones: dto.confirmar.observaciones,
+      pagos: otros.map((p) => ({ medio: p.medio, importe: Number(p.importe), ...(p.ncVentaId ? { ncVentaId: p.ncVentaId } : {}) })),
       ...(dto.confirmar.facturaCuit ? { facturaCuit: dto.confirmar.facturaCuit } : {}),
     };
 

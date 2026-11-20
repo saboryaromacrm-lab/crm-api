@@ -134,7 +134,7 @@ export class VistaProfesionalService {
       c.query(`
         select ${PER} as p, coalesce(v.sucursal_id, 0) as suc, vp.medio::text as medio, sum(vp.importe * ${SIGNO}) as importe
         from venta_pagos vp join ventas v on v.id = vp.venta_id
-        where ${VALIDA} and ${DESDE}
+        where ${VALIDA} and ${DESDE} and vp.medio <> 'nota_credito'
         group by 1, 2, 3`, [inicio]),
       /* El ritmo de los últimos 90 días: costo vendido, venta con IVA y compras con IVA. */
       c.query(`

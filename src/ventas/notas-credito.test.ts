@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { arcaDeLaNota, motivoDeLaNota, plataDeLaNota } from './notas-credito';
 
-test('la plata de la nota: efectivo del cajón, cuenta corriente o por el mismo medio', () => {
+test('la plata de la nota: efectivo del cajón, cuenta corriente, por el mismo medio o cambio', () => {
   assert.equal(plataDeLaNota({ cajaSesionId: 82, condicionPago: 'contado' }), 'efectivo');
   assert.equal(plataDeLaNota({ cajaSesionId: null, condicionPago: 'cuenta_corriente' }), 'ctacte');
   assert.equal(plataDeLaNota({ cajaSesionId: null, condicionPago: 'contado' }), 'medio');
+  assert.equal(plataDeLaNota({ cajaSesionId: null, condicionPago: 'contado', cambio: true }), 'cambio');
 });
 
 test('la nota ante ARCA', () => {

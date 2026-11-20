@@ -8,7 +8,8 @@
  *     observaciones; la segunda es la marca «[Nota de crédito de …]»);
  *   · qué pasó con la PLATA: se devolvió efectivo del cajón (la nota quedó
  *     atada a un turno y salió el egreso), se descontó de la cuenta corriente
- *     del cliente, o se devuelve por el mismo medio con que se cobró;
+ *     del cliente, se devuelve por el mismo medio con que se cobró, o fue un
+ *     CAMBIO (0236): pagó la venta que se armó en el momento (`cambioEn`);
  *   · si VOLVIÓ LA MERCADERÍA: la nota con devolución reingresa el stock con
  *     un movimiento «devolución» que lleva su número en la descripción (ver
  *     `notaCredito` en ventas.module.ts); una nota por un error de precio no;
@@ -20,11 +21,12 @@ import { sql } from 'drizzle-orm';
 export type FiltroNotas = {
   desde?: string; hasta?: string; sucursalId?: number;
   clase?: 'fiscal' | 'devolucion'; arca?: 'cae' | 'pendiente' | 'interna';
-  plata?: 'efectivo' | 'ctacte' | 'medio'; q?: string; offset?: number; limit?: number;
+  plata?: 'efectivo' | 'ctacte' | 'medio' | 'cambio'; q?: string; offset?: number; limit?: number;
 };
 
 /** Qué pasó con la plata de una nota. */
-export function plataDeLaNota(n: { cajaSesionId: number | null; condicionPago: string }): 'efectivo' | 'ctacte' | 'medio' {
+export function plataDeLaNota(n: { cajaSesionId: number | null; condicionPago: string; cambio?: boolean }): 'efectivo' | 'ctacte' | 'medio' | 'cambio' {
+  if (n.cambio) return 'cambio';
   if (n.cajaSesionId) return 'efectivo';
   if (n.condicionPago === 'cuenta_corriente') return 'ctacte';
   return 'medio';
@@ -55,7 +57,8 @@ export async function listarNotasCredito(db: any, f: FiltroNotas) {
   if (f.arca === 'interna') conds.push(sql`v.cae = '' and not v.facturar_pendiente`);
   if (f.plata === 'efectivo') conds.push(sql`v.caja_sesion_id is not null`);
   if (f.plata === 'ctacte') conds.push(sql`v.caja_sesion_id is null and v.condicion_pago = 'cuenta_corriente'`);
-  if (f.plata === 'medio') conds.push(sql`v.caja_sesion_id is null and v.condicion_pago <> 'cuenta_corriente'`);
+  if (f.plata === 'medio') conds.push(sql`v.caja_sesion_id is null and v.condicion_pago <> 'cuenta_corriente' and not v.cambio`);
+  if (f.plata === 'cambio') conds.push(sql`v.cambio`);
   const t = (f.q ?? '').trim();
   if (t) {
     /* Cliente, motivo, o el número de la nota o de la venta original. */
@@ -73,7 +76,10 @@ export async function listarNotasCredito(db: any, f: FiltroNotas) {
   const [filas, tot]: any[] = await Promise.all([
     db.execute(sql`
       select v.id, v.tipo::text as tipo, v.punto_venta as "puntoVenta", v.numero, v.fecha, v.estado::text as estado,
-        v.condicion_pago::text as "condicionPago", v.caja_sesion_id as "cajaSesionId",
+        v.condicion_pago::text as "condicionPago", v.caja_sesion_id as "cajaSesionId", v.cambio,
+        (select json_agg(json_build_object('id', u.id, 'tipo', u.tipo, 'puntoVenta', u.punto_venta, 'numero', u.numero) order by u.id)
+           from venta_pagos vp join ventas u on u.id = vp.venta_id
+           where vp.nc_venta_id = v.id and u.estado <> 'anulada') as "cambioEn",
         v.subtotal_neto as neto, v.iva_total as iva, v.total, v.cae, v.facturar_pendiente as "facturarPendiente",
         v.facturar_motivo as "facturarMotivo", v.observaciones,
         c.nombre as cliente, s.nombre as sucursal, u.nombre as usuario,
@@ -102,7 +108,8 @@ export async function listarNotasCredito(db: any, f: FiltroNotas) {
         coalesce(sum(v.total) filter (where v.estado <> 'anulada'), 0)::float8 as total,
         coalesce(sum(v.total) filter (where v.estado <> 'anulada' and v.caja_sesion_id is not null), 0)::float8 as efectivo,
         coalesce(sum(v.total) filter (where v.estado <> 'anulada' and v.caja_sesion_id is null and v.condicion_pago = 'cuenta_corriente'), 0)::float8 as ctacte,
-        coalesce(sum(v.total) filter (where v.estado <> 'anulada' and v.caja_sesion_id is null and v.condicion_pago <> 'cuenta_corriente'), 0)::float8 as medio,
+        coalesce(sum(v.total) filter (where v.estado <> 'anulada' and v.caja_sesion_id is null and v.condicion_pago <> 'cuenta_corriente' and not v.cambio), 0)::float8 as medio,
+        coalesce(sum(v.total) filter (where v.estado <> 'anulada' and v.cambio), 0)::float8 as cambio,
         count(*) filter (where v.cae = '' and v.facturar_pendiente and v.estado <> 'anulada')::int as pendientes,
         count(*) filter (where v.tipo = 'nota_credito_ticket')::int as devoluciones
       ${desdeFrom}
@@ -117,6 +124,7 @@ export async function listarNotasCredito(db: any, f: FiltroNotas) {
       motivo: motivoDeLaNota(x.observaciones),
       plata: plataDeLaNota(x), arca: arcaDeLaNota(x), cae: x.cae, facturarMotivo: x.facturarMotivo ?? '',
       volvioMercaderia: !!x.volvioMercaderia,
+      cambioEn: x.cambioEn ?? [],
       renglones: Number(x.renglones) || 0, articulos: x.articulos ?? '',
       original: x.origId ? {
         id: x.origId, tipo: x.origTipo, puntoVenta: x.origPuntoVenta, numero: x.origNumero, fecha: x.origFecha, total: r2(x.origTotal),
@@ -126,7 +134,7 @@ export async function listarNotasCredito(db: any, f: FiltroNotas) {
     totales: (() => {
       const y = (tot.rows as any[])[0] ?? {};
       return {
-        cantidad: Number(y.cantidad) || 0, total: r2(y.total), efectivo: r2(y.efectivo), ctacte: r2(y.ctacte), medio: r2(y.medio),
+        cantidad: Number(y.cantidad) || 0, total: r2(y.total), efectivo: r2(y.efectivo), ctacte: r2(y.ctacte), medio: r2(y.medio), cambio: r2(y.cambio),
         pendientes: Number(y.pendientes) || 0, devoluciones: Number(y.devoluciones) || 0,
       };
     })(),
