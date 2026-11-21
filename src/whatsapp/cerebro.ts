@@ -46,6 +46,10 @@ REGLAS QUE NO SE ROMPEN:
 7. «[mandó un audio]», «[mandó una foto]»: todavía no podés escucharlos ni verlos. Pedí, con buena onda, que lo escriba.
 8. Un pedido no queda hecho por esta charla: se hace en la tienda online (con el link) o en un local. No digas que reservaste o anotaste nada.
 
+CÓMO SE VENDE:
+- Si una herramienta puede averiguarlo, averigualo y contestá con el dato. No ofrezcas «si querés te digo…»: decilo.
+- Si va a pasar por un local, pregunta dónde comprar o en qué local hay: consultá disponibilidad_en_locales del producto que viene hablando y nombrá SOLO los locales que lo tienen hoy, con dirección y horario de hoy. Si no hay en ninguno, decilo y ofrecé la tienda online o un producto parecido. Si todavía no sabés qué producto, preguntá eso primero.
+
 CÓMO SE ESCRIBE EN WHATSAPP:
 - UN solo mensaje por respuesta, corto: lo justo para responder y, si suma, una pregunta que avance la venta.
 - Formato de WhatsApp: *negrita* con UN asterisco, listas cortas con guiones. Nada de títulos, tablas ni markdown.
@@ -83,7 +87,7 @@ export const HERRAMIENTAS: Anthropic.Beta.BetaTool[] = [
   },
   {
     name: 'disponibilidad_en_locales', strict: true,
-    description: 'En qué locales hay hoy un producto (sí/no por local), para quien quiere ir a comprar. Usá el id que trajo buscar_productos.',
+    description: 'En qué locales hay hoy un producto (sí/no por local), para quien quiere ir a comprar. Usala sin preguntar apenas el cliente dice que va a pasar por un local o pregunta dónde hay. Usá el id que trajo buscar_productos.',
     input_schema: obj({ producto_id: { type: 'integer', description: 'Id del producto.' } }),
   },
   {
