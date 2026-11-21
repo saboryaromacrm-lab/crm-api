@@ -62,6 +62,8 @@ class PagoDto {
   @IsNumber() @Min(0) @Max(MAX_IMPORTE) importe!: number;
   @IsOptional() @IsString() referencia?: string;
   @IsOptional() @IsInt() cuentaDisponibleId?: number;
+  /** El cliente YA le transfirió a esa cuenta más de lo que le faltaba (21/11/2026): entra entero. */
+  @IsOptional() @IsBoolean() deMas?: boolean;
 }
 
 class ImputacionDto {
@@ -445,7 +447,7 @@ export class CobranzasService {
       }))).returning({ id: cobranzaPagos.id });
       // El puente con Cuentas disponibles (0095): en la misma transacción.
       const tercerizados = pagos
-        .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), cobranzaPagoId: filasPago[i].id, medio: p.medio }))
+        .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), cobranzaPagoId: filasPago[i].id, medio: p.medio, deMas: p.deMas === true }))
         .filter((p) => p.medio === 'transferencia_proveedor');
       if (tercerizados.length) {
         await this.ctasDisp.registrarDeCobranza(tx, tercerizados, {

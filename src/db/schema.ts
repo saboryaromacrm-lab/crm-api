@@ -2208,6 +2208,8 @@ export const cajaControles = pgTable('caja_controles', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   /** El arqueo del día (0234): el conteo de la noche de un día que no es de cierre. */
   arqueoDia: boolean('arqueo_dia').notNull().default(false),
+  /** El de la apertura (0239): lo que se encontró al abrir contra lo que dejó el cierre anterior. */
+  apertura: boolean('apertura').notNull().default(false),
 }, (t) => ({
   ixSesion: index('ix_caja_controles_sesion').on(t.cajaSesionId),
 }));
@@ -4234,12 +4236,27 @@ export const cuentasDisponibles = pgTable('cuentas_disponibles', {
   /** Cerrada aunque no esté completa: deja de ofrecerse al cobrar. */
   corte: boolean('corte').notNull().default(false),
   corteEn: timestamp('corte_en', { withTimezone: true }),
+  /**
+   * CUÁNDO QUEDÓ CUBIERTA (0238, 20/11/2026): la pone el servidor con el pago
+   * que la cierra y vuelve a NULL si se reabre. Es lo que dispara el banner de
+   * «cuenta completa» para administración. Las cubiertas de antes, NULL.
+   */
+  completaEn: timestamp('completa_en', { withTimezone: true }),
   observaciones: text('observaciones').notNull().default(''),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
   creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   ixProveedor: index('ix_cuentas_disp_proveedor').on(t.proveedorId, t.corte),
   ixFecha: index('ix_cuentas_disp_fecha').on(t.fecha),
+}));
+
+/** Quién ya vio el aviso de «cuenta completa» (0238): cada admin el suyo. */
+export const cuentaDisponibleAvisos = pgTable('cuenta_disponible_avisos', {
+  cuentaId: integer('cuenta_id').notNull().references(() => cuentasDisponibles.id, { onDelete: 'cascade' }),
+  usuarioId: integer('usuario_id').notNull().references(() => usuarios.id, { onDelete: 'cascade' }),
+  vistoEn: timestamp('visto_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  pk: primaryKey({ columns: [t.cuentaId, t.usuarioId] }),
 }));
 
 export const cuentaDisponiblePagos = pgTable('cuenta_disponible_pagos', {

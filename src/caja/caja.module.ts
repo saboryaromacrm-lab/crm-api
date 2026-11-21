@@ -53,6 +53,12 @@ class AbrirCajaDto {
   @IsOptional() @IsBoolean() fondoCompleto?: boolean;
   @IsOptional() @IsObject() billetes?: Record<string, number>;
   @IsOptional() @IsString() observaciones?: string;
+  /**
+   * EL ADMINISTRADOR QUE ABRE CON OTRO MONTO (21/11/2026): si el último cierre
+   * dejó un fondo contado y se abre con otro, por qué. Obligatorio en ese caso:
+   * la diferencia queda como control del turno, igual que cuando cuenta un cajero.
+   */
+  @IsOptional() @IsString() @MaxLength(300) motivoDiferencia?: string;
 }
 
 /** El cierre del cajero (0111): el cajón contado billete por billete, confirmado dos veces. */
@@ -72,6 +78,19 @@ class EnviarCierreDto {
   @IsOptional() @IsString() @MaxLength(100) firma?: string;
   /** El tilde «Mandar a Cajas a controlar» (0145): solo el dueño, en la misma transacción del cierre. */
   @IsOptional() @ValidateNested() @Type(() => MarcaDto) aControlar?: MarcaDto;
+  /**
+   * DEJA MÁS QUE EL FONDO (21/11/2026): quien cierra volvió a contar lo que
+   * queda en el cajón y confirma este importe. Hace falta solo si queda más de
+   * lo necesario para el fondo (ver `excedenteDelFondo`).
+   */
+  @IsOptional() @IsNumber() quedaDeMas?: number;
+}
+
+/** Corregir lo que quedó en la caja de un turno ya cerrado por envío (21/11/2026): solo el superadmin. */
+class CorregirQuedaDto {
+  @IsNumber() @Min(0) @Max(100_000_000_000) fondoQueda!: number;
+  @IsString() @MaxLength(300) motivo!: string;
+  @IsBoolean() confirmado!: boolean;
 }
 
 /**
@@ -157,6 +176,44 @@ const soloPositivos = (den: number[], cant: number[]) => {
   den.forEach((d, i) => { if (cant[i] > 0) o[String(d)] = cant[i]; });
   return o;
 };
+
+/**
+ * CUÁNTO QUEDA EN LA CAJA DE MÁS (21/11/2026, pedido del dueño). El 20/11 un
+ * cajero contó $120.000 de más: el sistema dijo «quedan $240.000» con un fondo
+ * de $120.000 y nadie lo frenó. Con los billetes contados, lo MENOS que puede
+ * quedar es lo que propone el sistema (el fondo exacto o, si los billetes no
+ * dan exacto, lo más cerca por arriba). Lo que quede por encima de eso es «de
+ * más» y hay que confirmarlo contando de nuevo lo que queda en el cajón.
+ */
+export function excedenteDelFondo(billetes: Record<string, number>, queda: number, fondo: number) {
+  const contado = totalDeBilletes(billetes).total;
+  const minimo = money(totalDeBilletes(proponerSeparacion(billetes, Math.min(contado, fondo)).queda).total);
+  return { minimo, deMas: money(Math.max(0, queda - minimo)) };
+}
+
+/**
+ * EL CIERRE CORREGIDO (21/11/2026): lo que quedó en la caja era otro número.
+ * El sobre ya viajó y se cuenta aparte: el ENVÍO no cambia. Cambia lo contado
+ * (envío + lo que quedó de verdad) y, con eso, la diferencia contra lo esperado.
+ * Si el turno siguiente dejó un control de apertura medido contra el número
+ * malo, se vuelve a medir contra el bueno.
+ */
+export function correccionDeQueda(
+  t: { envio: number; esperado: number; contado: number; queda: number; diferencia: number },
+  nuevaQueda: number,
+  controlApertura: { contado: number } | null,
+) {
+  const queda = money(nuevaQueda);
+  const contado = money(t.envio + queda);
+  const diferencia = money(contado - t.esperado);
+  return {
+    antes: { queda: money(t.queda), contado: money(t.contado), diferencia: money(t.diferencia) },
+    despues: { queda, contado, diferencia },
+    apertura: controlApertura
+      ? { esperado: queda, diferencia: money(controlApertura.contado - queda) }
+      : null,
+  };
+}
 
 /**
  * EL TURNO SIN LOS NÚMEROS DEL SISTEMA, para el que no es jefe (0111).
@@ -644,7 +701,7 @@ export class CajaService {
    * cajero abría el turno de otra sucursal mandando otro número, y con eso le
    * arruinaba el fondo inicial del día o le bloqueaba la apertura.
    */
-  async abrir(dto: AbrirCajaDto, sucursalId: number, jefe = true) {
+  async abrir(dto: AbrirCajaDto, sucursalId: number, jefe = true, actorId: number | null = null) {
     const abierta = await this.actual(sucursalId);
     if (abierta) {
       throw new BadRequestException('Ya hay un turno de caja abierto en esta sucursal. Cerralo antes de abrir otro.');
@@ -687,6 +744,26 @@ export class CajaService {
       // no se puede arquear (no hay punto de partida contra el cual comparar).
       if (!(montoInicial > 0)) throw new BadRequestException('Declará el fondo inicial: la caja siempre arranca con un monto.');
     }
+    /*
+     * EL ADMINISTRADOR QUE ABRE CON OTRO MONTO QUE EL QUE DEJÓ EL CIERRE
+     * (21/11/2026, pedido del dueño). El cierre anterior dejó un fondo contado
+     * y se abre con otro número: esa diferencia es plata que apareció o que
+     * falta entre una caja y la otra. Antes pasaba sin rastro (el cajero que
+     * cuenta sí dejaba el control); ahora pide el motivo y queda el mismo
+     * control de apertura. Contra el fondo fijo no se mide: si el último turno
+     * lo cerró un jefe con el cierre de siempre, no se sabe qué quedó.
+     */
+    let motivoAdmin = '';
+    if (jefe && ap.dejadoEnCaja != null && Math.abs(montoInicial - ap.dejadoEnCaja) > 0.009) {
+      motivoAdmin = String(dto.motivoDiferencia ?? '').trim();
+      if (motivoAdmin.length < 5) {
+        const dif = money(montoInicial - ap.dejadoEnCaja);
+        throw new BadRequestException(
+          `El último cierre (turno #${ap.ultimoTurnoId}) dejó ${$(ap.dejadoEnCaja)} en la caja y abrís con ${$(montoInicial)}: `
+          + `${dif < 0 ? 'faltan' : 'sobran'} ${$(Math.abs(dif))}. Escribí el motivo: queda registrado como diferencia al abrir.`,
+        );
+      }
+    }
 
     /*
      * EL CHEQUEO DE ARRIBA ES CORTESÍA; EL CANDADO ES LA BASE (0085). Entre el
@@ -723,6 +800,21 @@ export class CajaService {
             observaciones: `Apertura: ${ap.dejadoEnCaja != null ? `el cierre anterior (turno #${ap.ultimoTurnoId}) dejó ${$(propuesto)} en la caja` : `el fondo fijo es ${$(propuesto)}`} `
               + `y se contaron ${$(conteoApertura)} (${dif < 0 ? 'faltan' : 'sobran'} ${$(Math.abs(dif))}).`,
             usuarioId: dto.usuarioId ?? null,
+            apertura: true,
+          });
+        }
+        /* El administrador abrió con otro monto que el que dejó el cierre: el mismo control, con su motivo y su firma. */
+        if (motivoAdmin && ap.dejadoEnCaja != null) {
+          const dif = money(montoInicial - ap.dejadoEnCaja);
+          await tx.insert(cajaControles).values({
+            cajaSesionId: nueva.id,
+            esperadoEfectivo: ap.dejadoEnCaja,
+            contadoEfectivo: montoInicial,
+            diferencia: dif,
+            observaciones: `Apertura: el cierre anterior (turno #${ap.ultimoTurnoId}) dejó ${$(ap.dejadoEnCaja)} en la caja `
+              + `y la abrió un administrador con ${$(montoInicial)} (${dif < 0 ? 'faltan' : 'sobran'} ${$(Math.abs(dif))}). Motivo: ${motivoAdmin}`,
+            usuarioId: actorId ?? dto.usuarioId ?? null,
+            apertura: true,
           });
         }
         return nueva;
@@ -886,12 +978,21 @@ export class CajaService {
         throw new BadRequestException(`Así quedarían $${queda.toLocaleString('es-AR')} en la caja y el fondo es $${fondo.toLocaleString('es-AR')}: dejá por lo menos el fondo y mandá el resto.`);
       }
       const faltaFondo = money(Math.max(0, fondo - queda));
+      /* Queda más de lo necesario para el fondo (21/11/2026): se confirma contando de nuevo lo que queda. */
+      const { deMas } = excedenteDelFondo(billetes, queda, fondo);
+      if (deMas > 0.009 && (dto.quedaDeMas == null || Math.abs(money(dto.quedaDeMas) - queda) > 0.009)) {
+        throw new BadRequestException(
+          `Así quedan $${queda.toLocaleString('es-AR')} en la caja y el fondo es $${fondo.toLocaleString('es-AR')}: `
+          + `son $${deMas.toLocaleString('es-AR')} de más. Contá de nuevo los billetes que dejás en el cajón: si están, confirmalo; si no, volvé a contar.`,
+        );
+      }
 
       const a = await this.arqueo(id);
       const diferencia = money(contado - a.esperadoEfectivo);
       const $ = (n: number) => `$${n.toLocaleString('es-AR')}`;
       const nota = `Cierre por envío: contó ${$(contado)}, envió ${$(envio)}, quedan ${$(queda)} de fondo`
-        + (faltaFondo > 0.009 ? ` · FONDO INCOMPLETO: faltan ${$(faltaFondo)} para los ${$(fondo)}` : '');
+        + (faltaFondo > 0.009 ? ` · FONDO INCOMPLETO: faltan ${$(faltaFondo)} para los ${$(fondo)}` : '')
+        + (deMas > 0.009 ? ` · DEJÓ ${$(deMas)} MÁS QUE EL FONDO (lo volvió a contar y lo confirmó)` : '');
 
       const [c] = await tx.update(cajaSesiones).set({
         cierre: new Date(),
@@ -1127,6 +1228,128 @@ export class CajaService {
     });
   }
 
+  /**
+   * CORREGIR LO QUE QUEDÓ EN LA CAJA (21/11/2026, pedido del dueño). El cajero
+   * contó mal al cerrar: el 20/11 en Distribuidora contó $1.210.000, mandó el
+   * sobre de $970.000 y el sistema anotó «quedaron $240.000»; a la mañana
+   * había $120.000. El sobre estaba bien. Sin esto, ese cierre mostraba un
+   * sobrante falso de $112.036,50 y el turno siguiente, un faltante falso al
+   * abrir.
+   *
+   * Solo el superadmin, con motivo y confirmación. El ENVÍO no se toca (el
+   * sobre ya viajó y se controla aparte); cambian lo que quedó, lo contado
+   * (envío + lo que quedó) y la diferencia. Si el turno siguiente dejó un
+   * control de apertura, se vuelve a medir contra el número corregido. Queda en
+   * las observaciones del turno, en su control de cierre y en la auditoría.
+   */
+  async infoCorreccionQueda(id: number) {
+    const [s] = await this.db.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1);
+    if (!s) throw new NotFoundException('Turno de caja inexistente.');
+    const sig = await this.turnoSiguiente(this.db, s);
+    const ctrl = sig ? await this.controlApertura(this.db, sig.id) : null;
+    return {
+      id: s.id,
+      corregible: s.estado === 'cerrada' && s.envioEfectivo != null,
+      envio: s.envioEfectivo == null ? null : money(s.envioEfectivo),
+      queda: s.fondoQueda == null ? null : money(s.fondoQueda),
+      contado: money(s.declaradoEfectivo),
+      esperado: money(s.sistemaEfectivo),
+      diferencia: money(s.diferencia),
+      siguiente: sig ? {
+        id: sig.id, apertura: sig.apertura, estado: sig.estado, montoInicial: money(sig.montoInicial),
+        control: ctrl ? {
+          id: ctrl.id, contado: money(ctrl.contadoEfectivo), esperado: money(ctrl.esperadoEfectivo),
+          diferencia: money(ctrl.diferencia), observaciones: ctrl.observaciones,
+        } : null,
+      } : null,
+    };
+  }
+
+  async corregirQueda(id: number, dto: CorregirQuedaDto, usuarioId: number | null) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá la corrección.');
+    const motivo = String(dto.motivo ?? '').trim();
+    if (motivo.length < 10) {
+      throw new BadRequestException('Escribí el motivo: qué pasó y cómo lo sabés (por ejemplo: «contó $120.000 de más; el turno siguiente abrió con $120.000»).');
+    }
+    const nueva = money(dto.fondoQueda);
+    if (!Number.isFinite(nueva) || nueva < 0) throw new BadRequestException('Lo que quedó en la caja tiene que ser un importe de $0 en adelante.');
+    const $ = (n: number) => `$${money(n).toLocaleString('es-AR')}`;
+    const sg = (n: number) => `${n > 0 ? '+' : n < 0 ? '−' : ''}$${Math.abs(money(n)).toLocaleString('es-AR')}`;
+    return this.db.transaction(async (tx) => {
+      const sesion = await this.turnoCerrado(tx, id);
+      if (sesion.envioEfectivo == null) {
+        throw new BadRequestException('Este turno no se cerró con sobre: no tiene «quedó en la caja» para corregir.');
+      }
+      if (Math.abs(nueva - money(sesion.fondoQueda)) <= 0.009) {
+        throw new BadRequestException(`El cierre ya dice que quedaron ${$(nueva)}: no hay nada que corregir.`);
+      }
+      const sig = await this.turnoSiguiente(tx, sesion);
+      const ctrl = sig ? await this.controlApertura(tx, sig.id, true) : null;
+      const c = correccionDeQueda({
+        envio: money(sesion.envioEfectivo), esperado: money(sesion.sistemaEfectivo), contado: money(sesion.declaradoEfectivo),
+        queda: money(sesion.fondoQueda), diferencia: money(sesion.diferencia),
+      }, nueva, ctrl ? { contado: money(ctrl.contadoEfectivo) } : null);
+      const { antes, despues } = c;
+      const hoy = new Date().toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+      const nota = `CORREGIDO el ${hoy}: en la caja quedaron ${$(despues.queda)}, no ${$(antes.queda)} `
+        + `(contado ${$(antes.contado)} → ${$(despues.contado)}, diferencia ${sg(antes.diferencia)} → ${sg(despues.diferencia)}). Motivo: ${motivo}`;
+
+      const [turno] = await tx.update(cajaSesiones).set({
+        declaradoEfectivo: despues.contado,
+        fondoQueda: despues.queda,
+        diferencia: despues.diferencia,
+        observaciones: sesion.observaciones ? `${sesion.observaciones} · ${nota}` : nota,
+      }).where(eq(cajaSesiones.id, id)).returning();
+      /* El control que firmó el cierre queda como lo firmó el cajero, con la corrección anotada al final. */
+      await tx.execute(sql`
+        UPDATE caja_controles SET observaciones = left(observaciones || ${` · ${nota}`}, 2000)
+         WHERE caja_sesion_id = ${id} AND observaciones LIKE 'Cierre por envío%'`);
+      /* La apertura del turno siguiente, medida otra vez contra lo que quedó de verdad. */
+      if (ctrl && c.apertura) {
+        await tx.update(cajaControles).set({
+          esperadoEfectivo: c.apertura.esperado,
+          diferencia: c.apertura.diferencia,
+          observaciones: `${ctrl.observaciones} · CORREGIDO el ${hoy}: el cierre del turno #${id} dejó ${$(despues.queda)}, no ${$(antes.queda)}; `
+            + `diferencia al abrir ${sg(c.apertura.diferencia)}.`,
+        }).where(eq(cajaControles.id, ctrl.id));
+      }
+      await this.audit.registrar([{
+        entidad: 'caja', entidadId: id, ambito: 'Caja', campo: 'Lo que quedó en la caja (corregido)', usuarioId,
+        detalle: `${motivo}${sig ? ` · Turno siguiente #${sig.id}: abrió con ${$(sig.montoInicial)}${ctrl && c.apertura ? `; su diferencia al abrir pasó de ${sg(ctrl.diferencia)} a ${sg(c.apertura.diferencia)}` : ''}` : ''}`,
+        antes: `Quedó ${$(antes.queda)} · contado ${$(antes.contado)} · diferencia ${sg(antes.diferencia)}`,
+        despues: `Quedó ${$(despues.queda)} · contado ${$(despues.contado)} · diferencia ${sg(despues.diferencia)}`,
+      }], tx);
+      return {
+        sesion: turno, antes, despues,
+        siguiente: sig ? {
+          id: sig.id, montoInicial: money(sig.montoInicial),
+          controlCorregido: !!(ctrl && c.apertura),
+          /** Lo que separa con qué abrió el turno siguiente de lo que quedó (0 = cuadra). */
+          difApertura: money(money(sig.montoInicial) - despues.queda),
+        } : null,
+      };
+    });
+  }
+
+  /** El turno que vino después en la misma sucursal (el mismo orden que usa la conciliación). */
+  private async turnoSiguiente(db: any, s: { id: number; sucursalId: number }) {
+    const [sig] = await db.select().from(cajaSesiones).where(and(
+      eq(cajaSesiones.sucursalId, s.sucursalId),
+      /* Contra la fila misma, en la base: una fecha de JavaScript pierde los microsegundos y el turno se encontraba a sí mismo. */
+      sql`(${cajaSesiones.apertura}, ${cajaSesiones.id}) > (select p.apertura, p.id from caja_sesiones p where p.id = ${s.id})`,
+    )).orderBy(cajaSesiones.apertura, cajaSesiones.id).limit(1);
+    return sig ?? null;
+  }
+
+  /** El control que dejó la apertura de un turno (0239), el último si hubiera más de uno. */
+  private async controlApertura(db: any, cajaSesionId: number, candado = false) {
+    const q = db.select().from(cajaControles)
+      .where(and(eq(cajaControles.cajaSesionId, cajaSesionId), eq(cajaControles.apertura, true)))
+      .orderBy(desc(cajaControles.id)).limit(1);
+    const [c] = await (candado ? q.for('update') : q);
+    return c ?? null;
+  }
+
   /** El turno, candado y CERRADO: lo abierto se mueve por el camino de siempre (Ingreso / egreso). */
   private async turnoCerrado(tx: any, id: number) {
     const [sesion] = await tx.select().from(cajaSesiones).where(eq(cajaSesiones.id, id)).limit(1).for('update');
@@ -1301,7 +1524,7 @@ export class CajaController {
   abrir(@Body() dto: AbrirCajaDto, @Auth() sesion: Sesion) {
     const sucursalId = sucursalDeOperacion(sesion, dto.sucursalId);
     if (!sucursalId) throw new BadRequestException('Tu sesión no tiene sucursal: volvé a entrar eligiéndola.');
-    return this.svc.abrir(dto, sucursalId, esJefe(sesion));
+    return this.svc.abrir(dto, sucursalId, esJefe(sesion), sesion?.usuarioId ?? null);
   }
 
   /*
@@ -1397,6 +1620,19 @@ export class CajaController {
     @Body() dto: AnularPosteriorDto, @Auth() sesion: Sesion,
   ) {
     return this.svc.anularPosterior(id, movId, dto, sesion?.usuarioId ?? null);
+  }
+
+  /* Corregir lo que quedó en la caja de un cierre por envío (21/11/2026): solo el superadmin, como lo posterior. */
+  @Get(':id/correccion-queda')
+  @Permiso(PERMISO_CAJA_POSTERIOR)
+  infoCorreccionQueda(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.infoCorreccionQueda(id);
+  }
+
+  @Post(':id/corregir-queda')
+  @Permiso(PERMISO_CAJA_POSTERIOR)
+  corregirQueda(@Param('id', ParseIntPipe) id: number, @Body() dto: CorregirQuedaDto, @Auth() sesion: Sesion) {
+    return this.svc.corregirQueda(id, dto, sesion?.usuarioId ?? null);
   }
 }
 

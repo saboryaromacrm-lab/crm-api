@@ -41,7 +41,7 @@ async function main() {
   const evolucion = new HistorialPreciosService(db as any, cfgSvc);
   const precios = new PreciosService(db as any, evolucion);
   const pagosSvc = new PagosProveedorService(db as any);
-  const ctasDisp = new CuentasDisponiblesService(db as any, pagosSvc);
+  const ctasDisp = new CuentasDisponiblesService(db as any, pagosSvc, new AuditoriaService(db as any));
   const comp = new ComprobantesService(db as any, inv, precios, pagosSvc);
   const cfg = cfgSvc;
   const cli = new ClientesService(db as any);

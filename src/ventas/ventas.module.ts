@@ -593,6 +593,8 @@ class VentaPagoDto {
   @IsOptional() @IsInt() @IsIn(PLANES_CUOTAS) cuotas?: number;
   /** A qué cuenta disponible va, cuando el medio es 'transferencia_proveedor'. */
   @IsOptional() @IsInt() cuentaDisponibleId?: number;
+  /** El cliente YA le transfirió a esa cuenta más de lo que le faltaba (21/11/2026): entra entero. */
+  @IsOptional() @IsBoolean() deMas?: boolean;
   /** La nota de crédito del cambio, cuando el medio es 'nota_credito' (0236). */
   @IsOptional() @IsInt() ncVentaId?: number;
 }
@@ -3111,7 +3113,7 @@ export class VentasService {
       recargo: money((p as any).recargo ?? 0),
     }))).returning({ id: ventaPagos.id });
     const tercerizados = pagos
-      .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), ventaPagoId: filas[i].id, medio: p.medio }))
+      .map((p, i) => ({ cuentaDisponibleId: p.cuentaDisponibleId!, importe: money(p.importe), ventaPagoId: filas[i].id, medio: p.medio, deMas: p.deMas === true }))
       .filter((p) => p.medio === 'transferencia_proveedor');
     if (tercerizados.length) await this.ctasDisp.registrarDeVenta(tx, tercerizados, ctx);
   }

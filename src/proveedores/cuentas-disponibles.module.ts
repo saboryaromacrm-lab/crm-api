@@ -13,12 +13,17 @@
  *
  * Reglas que sostienen el circuito:
  *
- *   · NUNCA de más: un pago no puede superar lo que le falta a la cuenta. Si
- *     el cliente transfirió de más en la vida real, el dueño sube el importe
- *     de la cuenta (acción explícita, con nombre y hora) — no se "acepta".
- *     Salvo la cuenta que «puede pasarse del monto» (0177): ahí un pago puede
- *     superar lo que falta, ese pago la cierra, y lo de más queda a favor en
- *     la cuenta corriente del proveedor (el espejo es por el total).
+ *   · NUNCA de más POR ELECCIÓN: la caja no le ofrece a una cuenta más de lo
+ *     que le falta. Salvo la que «puede pasarse del monto» (0177): ahí un pago
+ *     puede superar lo que falta, ese pago la cierra, y lo de más queda a favor
+ *     en la cuenta corriente del proveedor (el espejo es por el total).
+ *   · DE MÁS COMO HECHO (21/11/2026, pedido del dueño): si el cliente YA le
+ *     transfirió de más (a Becchio le faltaban $101.200 y el cliente mandó
+ *     $159.262), el cajero lo dice (`deMas`) y entra el importe entero: la
+ *     cuenta queda «pasada», lo de más queda a favor del proveedor, y
+ *     administración recibe el aviso en rojo. Antes la caja recortaba sola a
+ *     lo que faltaba y el resto se cargaba como una transferencia propia que
+ *     nunca entraba a Mercado Pago: la plata «no estaba en ningún lado».
  *   · EL MÍNIMO DEL PROVEEDOR ("menos de $50.000 no"): cada pago lo respeta,
  *     salvo el que CIERRA la cuenta — el resto final es lo que es.
  *   · La cuenta se toma con candado (FOR UPDATE) al recibir un pago: dos
@@ -29,7 +34,7 @@
  *     su venta o recibo, y solo si todavía no se aplicó a una factura.
  */
 import {
-  BadRequestException, Body, Controller, Delete, Get, Inject, Injectable, Module,
+  BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable, Module,
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
@@ -37,14 +42,16 @@ import {
 } from 'class-validator';
 import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
-import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { Auth, CualquierUsuario, Permiso, type Sesion } from '../auth/auth.decoradores';
+import { esJefe } from '../auth/auth.guard';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { numeroDoc } from '../common/documentos';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
+import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { cuentaDeTransferencia } from '../pagos/cuentas-propias';
 import {
-  clientes, cobranzaPagos, cobranzas, cuentaDisponiblePagos, cuentasDisponibles,
+  clientes, cobranzaPagos, cobranzas, cuentaDisponibleAvisos, cuentaDisponiblePagos, cuentasDisponibles,
   proveedorCuentas, proveedorPagos, proveedores, usuarios, ventaPagos, ventas,
 } from '../db/schema';
 
@@ -53,6 +60,8 @@ const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const EPS = 0.009;
 const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_CUENTAS_BANCARIAS = 5;
+/** El aviso de «cuenta completa» se deja de mostrar solo a los 30 días, aunque nadie lo haya mirado. */
+const DIAS_AVISO_COMPLETA = 30;
 
 const fechaDe = (s?: string) => (s ? new Date(`${s}T00:00:00`) : undefined);
 
@@ -115,6 +124,17 @@ export interface PagoTercerizado {
   importe: number;
   ventaPagoId?: number;
   cobranzaPagoId?: number;
+  /** El cliente YA le transfirió más de lo que falta (21/11/2026): entra entero y la cuenta queda pasada. */
+  deMas?: boolean;
+}
+
+/** Corregir una transferencia ya cobrada que en realidad fue a esta cuenta (21/11/2026): solo el superadmin. */
+export const PERMISO_CORREGIR_TRANSFERENCIA = 'ventas.corregir-transferencia';
+
+class CorregirTransferenciaDto {
+  @IsInt() ventaPagoId!: number;
+  @IsString() @MaxLength(300) motivo!: string;
+  @IsBoolean() confirmado!: boolean;
 }
 
 export interface ContextoCobro {
@@ -134,6 +154,7 @@ export class CuentasDisponiblesService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly pagosProv: PagosProveedorService,
+    private readonly audit: AuditoriaService,
   ) {}
 
   /* ------------------------------ Lectura ------------------------------ */
@@ -160,6 +181,7 @@ export class CuentasDisponiblesService {
       enviado: cuentasDisponibles.enviado,
       corte: cuentasDisponibles.corte,
       corteEn: cuentasDisponibles.corteEn,
+      completaEn: cuentasDisponibles.completaEn,
       observaciones: cuentasDisponibles.observaciones,
       usuarioId: cuentasDisponibles.usuarioId,
       creadoEn: cuentasDisponibles.creadoEn,
@@ -375,6 +397,8 @@ export class CuentasDisponiblesService {
       if (dto.observaciones !== undefined) set.observaciones = dto.observaciones.trim();
 
       if (Object.keys(set).length) await tx.update(cuentasDisponibles).set(set).where(eq(cuentasDisponibles.id, id));
+      // Bajar el importe a lo ya pagado la completa; subirlo la reabre.
+      if (set.importe !== undefined) await this.recalcularCompleta(tx, [id]);
     });
     return this.get(id);
   }
@@ -401,6 +425,190 @@ export class CuentasDisponiblesService {
     return { pagado: money(Number(r?.pagado)), historia: Number(r?.historia) || 0 };
   }
 
+  /**
+   * CUÁNDO QUEDÓ COMPLETA (0238): después de cada pago, anulación o cambio de
+   * importe. Si recién se cubrió, anota la hora (dispara el aviso a
+   * administración); si se reabrió, la borra junto con los «Entendido», así
+   * cuando se vuelva a completar avisa de nuevo. Una cortada no cuenta: ese
+   * corte lo hizo alguien a mano.
+   */
+  private async recalcularCompleta(tx: any, ids: number[]) {
+    for (const id of new Set(ids)) {
+      const [c] = await tx.select({ importe: cuentasDisponibles.importe, completaEn: cuentasDisponibles.completaEn })
+        .from(cuentasDisponibles).where(eq(cuentasDisponibles.id, id)).limit(1);
+      if (!c) continue;
+      const { pagado } = await this.sumas(tx, id);
+      const completa = pagado > EPS && money(c.importe - pagado) <= EPS;
+      if (completa && !c.completaEn) {
+        await tx.update(cuentasDisponibles).set({ completaEn: new Date() }).where(eq(cuentasDisponibles.id, id));
+      } else if (!completa && c.completaEn) {
+        await tx.update(cuentasDisponibles).set({ completaEn: null }).where(eq(cuentasDisponibles.id, id));
+        await tx.delete(cuentaDisponibleAvisos).where(eq(cuentaDisponibleAvisos.cuentaId, id));
+      }
+    }
+  }
+
+  /**
+   * EL BANNER DE «CUENTA COMPLETA» (0238): las que se completaron en los
+   * últimos 30 días, siguen cubiertas, no están cortadas y ESTE usuario todavía
+   * no marcó «Entendido». La más nueva primero.
+   */
+  async completasParaAvisar(usuarioId: number) {
+    const desde = new Date(Date.now() - DIAS_AVISO_COMPLETA * 86_400_000);
+    const filas = await this.base()
+      .where(and(
+        eq(cuentasDisponibles.corte, false),
+        gte(cuentasDisponibles.completaEn, desde),
+        sql`not exists (select 1 from ${cuentaDisponibleAvisos} a where a.cuenta_id = ${cuentasDisponibles.id} and a.usuario_id = ${usuarioId})`,
+      ))
+      .having(sql`${this.faltaSql} <= ${EPS}`)
+      .orderBy(desc(cuentasDisponibles.completaEn));
+    return Promise.all(filas.map(async (r: any) => {
+      const d = this.decorar(r);
+      /* PASADA (21/11/2026): con qué cobro entró lo de más — el último pago vivo, el que la cerró. */
+      const ultimo = d.pasado > EPS ? (await this.pagos({ cuentaId: d.id, limit: 1 })).filas[0] ?? null : null;
+      return {
+        id: d.id, proveedorId: d.proveedorId, proveedorNombre: d.proveedorNombre,
+        titular: d.titular, cbuAlias: d.cbuAlias, importe: d.importe, pagado: d.pagado, pasado: d.pasado,
+        cant: d.cant, completaEn: d.completaEn, enviado: d.enviado,
+        ultimo: ultimo && {
+          fecha: ultimo.fecha, importe: ultimo.importe, clienteNombre: ultimo.clienteNombre,
+          usuarioNombre: ultimo.usuarioNombre, documento: ultimo.documento,
+        },
+      };
+    }));
+  }
+
+  /**
+   * SIN CUENTAS ABIERTAS (20/11/2026, pedido del dueño: «cuando no hay cuentas
+   * disponibles, que me salga un aviso y que me sugiera qué cuentas pueden
+   * ser: proveedores a los que les debo y que en su cuenta hayan recibido
+   * pagos de cuentas disponibles»).
+   *
+   * Abierta = no cortada y le falta algo: lo único que la caja ofrece. Con
+   * alguna abierta, nada que avisar. Sin ninguna, las sugerencias: cada
+   * proveedor con transferencias vivas de clientes o propias en alguna cuenta
+   * disponible (alguna vez) y que hoy tiene deuda NETA — facturas pendientes
+   * menos lo que se le pagó y todavía no se aplicó a nada—. Con la última
+   * cuenta bancaria que usó, para crearla igual con un toque.
+   */
+  async sinAbiertas() {
+    const [{ n }] = (await this.db.execute(sql`
+      select count(*)::int as n from (
+        select c.id from cuentas_disponibles c
+        left join cuenta_disponible_pagos p on p.cuenta_id = c.id and p.anulado_en is null
+        where c.corte = false
+        group by c.id, c.importe
+        having c.importe - coalesce(sum(p.importe), 0) > ${EPS}
+      ) x`)).rows as any[];
+    if (Number(n) > 0) return { abiertas: Number(n), sugerencias: [] };
+
+    const r = await this.db.execute(sql`
+      with usados as (
+        select c.proveedor_id, count(p.id)::int as cant, coalesce(sum(p.importe), 0) as transferido, max(p.fecha) as ultima_vez
+        from cuentas_disponibles c join cuenta_disponible_pagos p on p.cuenta_id = c.id and p.anulado_en is null
+        group by c.proveedor_id
+      ),
+      ultima as (
+        select distinct on (c.proveedor_id) c.proveedor_id, c.cuenta_id, c.titular, c.cbu_alias
+        from cuentas_disponibles c
+        where exists (select 1 from cuenta_disponible_pagos p where p.cuenta_id = c.id and p.anulado_en is null)
+        order by c.proveedor_id, c.fecha desc, c.id desc
+      ),
+      facturas as (
+        select proveedor_id, coalesce(sum(case
+          when tipo in ('factura','liquidacion','nota_debito') then total - pagado
+          when tipo = 'nota_credito' then -total else 0 end), 0) as pendiente
+        from comprobantes where estado = 'confirmado' group by proveedor_id
+      ),
+      sin_aplicar as (
+        select proveedor_id, coalesce(sum(importe - aplicado), 0) as monto
+        from proveedor_pagos where estado = 'activo' and destino = 'mercaderia' group by proveedor_id
+      )
+      select pr.id as "proveedorId", pr.nombre, pr.minimo_transferencia as minimo,
+        coalesce(f.pendiente, 0) - coalesce(sa.monto, 0) as deuda,
+        u.cant, u.transferido, u.ultima_vez as "ultimaVez",
+        ul.cuenta_id as "cuentaId", ul.titular, ul.cbu_alias as "cbuAlias"
+      from usados u
+      join proveedores pr on pr.id = u.proveedor_id
+      join ultima ul on ul.proveedor_id = u.proveedor_id
+      left join facturas f on f.proveedor_id = u.proveedor_id
+      left join sin_aplicar sa on sa.proveedor_id = u.proveedor_id
+      where coalesce(f.pendiente, 0) - coalesce(sa.monto, 0) > ${EPS}
+      order by deuda desc
+      limit 15`);
+    return {
+      abiertas: 0,
+      sugerencias: (r.rows as any[]).map((x) => ({
+        proveedorId: Number(x.proveedorId), nombre: x.nombre, deuda: money(Number(x.deuda)),
+        minimo: money(Number(x.minimo)), cant: Number(x.cant), transferido: money(Number(x.transferido)),
+        ultimaVez: x.ultimaVez, cuentaId: x.cuentaId == null ? null : Number(x.cuentaId),
+        titular: x.titular, cbuAlias: x.cbuAlias,
+      })),
+    };
+  }
+
+  /** «Entendido»: este usuario ya lo vio; a los demás les sigue saliendo. */
+  async avisoVisto(id: number, usuarioId: number) {
+    await this.db.insert(cuentaDisponibleAvisos).values({ cuentaId: id, usuarioId }).onConflictDoNothing();
+    return { ok: true };
+  }
+
+  /**
+   * LA TRANSFERENCIA QUE FUE A ESTA CUENTA Y SE CARGÓ COMO PROPIA (21/11/2026,
+   * pedido del dueño). El caso real: venta 00034-00002293, el cliente le
+   * transfirió todo a Becchio pero la caja cargó $58.061,50 como
+   * «Transferencia» — una plata que nunca iba a entrar a Mercado Pago ni
+   * figuraba pagada al proveedor. El renglón pasa a «Transf. a proveedor» de
+   * esta cuenta (aunque ya esté cubierta: la plata ya está ahí), con su espejo
+   * en la cuenta del proveedor, y deja de esperarse en la Conciliación MP.
+   * Solo una «Transferencia» que no esté atada a un movimiento de Mercado Pago:
+   * atada, la plata entró a la cuenta propia y no hay nada que corregir.
+   */
+  async corregirTransferenciaDeVenta(cuentaId: number, dto: CorregirTransferenciaDto, usuarioId: number | null) {
+    if (dto.confirmado !== true) throw new BadRequestException('Confirmá la corrección.');
+    const motivo = String(dto.motivo ?? '').trim();
+    if (motivo.length < 10) throw new BadRequestException('Escribí el motivo: qué pasó y cómo lo sabés (por ejemplo: «el cliente le transfirió todo a Becchio»).');
+    const pesos = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const referencia = await this.db.transaction(async (tx) => {
+      const [vp] = await tx.select().from(ventaPagos).where(eq(ventaPagos.id, dto.ventaPagoId)).limit(1).for('update');
+      if (!vp) throw new NotFoundException('Ese pago de venta no existe.');
+      if (vp.medio !== 'transferencia') {
+        throw new BadRequestException('Solo se corrige un pago cargado como «Transferencia».');
+      }
+      const [v] = await tx.select({
+        id: ventas.id, estado: ventas.estado, sucursalId: ventas.sucursalId, total: ventas.total,
+        puntoVenta: ventas.puntoVenta, numero: ventas.numero, cliente: clientes.nombre,
+      }).from(ventas).leftJoin(clientes, eq(clientes.id, ventas.clienteId)).where(eq(ventas.id, vp.ventaId)).limit(1);
+      if (!v || !['confirmada', 'pendiente_cae'].includes(v.estado)) {
+        throw new BadRequestException('Esa venta no está vigente: no hay pago que corregir.');
+      }
+      const [atado] = (await tx.execute(sql`
+        select mc.tipo from mp_conciliacion_erp ce join mp_conciliaciones mc on mc.id = ce.conciliacion_id
+         where ce.venta_pago_id = ${vp.id} limit 1`)).rows as { tipo: string }[];
+      if (atado) {
+        throw new BadRequestException(atado.tipo === 'sin_mp'
+          ? 'En Ventas › Conciliación MP ese pago está marcado «No entró a Mercado Pago»: deshacé esa marca y volvé a corregirlo acá.'
+          : 'Ese pago está atado a un movimiento de Mercado Pago: entró a tu cuenta. Si está mal atado, desatalo primero en Ventas › Conciliación MP.');
+      }
+      const documento = `Venta ${numeroDoc(v.puntoVenta, v.numero ?? 0)}`;
+      const r = await this.registrarPago(tx, { cuentaDisponibleId: cuentaId, importe: money(vp.importe), ventaPagoId: vp.id }, {
+        sucursalId: v.sucursalId, usuarioId, documento, clienteNombre: v.cliente ?? '', totalOperacion: money(v.total),
+      }, { yaTransferido: true });
+      await tx.update(ventaPagos).set({ medio: 'transferencia_proveedor', referencia: r.referencia }).where(eq(ventaPagos.id, vp.id));
+      await tx.update(cuentaDisponiblePagos).set({ observaciones: `Corregido: estaba cargado como «Transferencia» · ${motivo}`.slice(0, 300) })
+        .where(eq(cuentaDisponiblePagos.ventaPagoId, vp.id));
+      await this.audit.registrar([{
+        entidad: 'venta', entidadId: v.id, ambito: 'Ventas', campo: 'Medio de pago corregido', usuarioId,
+        detalle: `${documento} · ${motivo}`,
+        antes: `Transferencia ${pesos(vp.importe)}${vp.referencia ? ` · ${vp.referencia}` : ''}`,
+        despues: `Transf. a proveedor ${pesos(vp.importe)} · ${r.referencia}`,
+      }], tx);
+      return r.referencia;
+    });
+    return { ok: true, referencia, cuenta: await this.get(cuentaId) };
+  }
+
   /* --------------------- El puente con el cobro --------------------- */
 
   /**
@@ -412,7 +620,10 @@ export class CuentasDisponiblesService {
    * Sumar antes del candado es leer un resto que otra caja puede estar
    * gastando en este mismo momento.
    */
-  async registrarPago(tx: any, p: PagoTercerizado, ctx: ContextoCobro) {
+  async registrarPago(tx: any, p: PagoTercerizado, ctx: ContextoCobro, opciones: { yaTransferido?: boolean } = {}) {
+    /* `yaTransferido` (la corrección de un pago ya cobrado): la plata YA está en
+     * esa cuenta, así que no se juzga si se podía — se anota lo que pasó. */
+    const hecho = opciones.yaTransferido === true;
     const [c] = await tx.select().from(cuentasDisponibles)
       .where(eq(cuentasDisponibles.id, p.cuentaDisponibleId)).limit(1).for('update');
     if (!c) throw new BadRequestException('Esa cuenta disponible ya no existe: actualizá la pantalla de cobro.');
@@ -422,13 +633,13 @@ export class CuentasDisponiblesService {
     }).from(proveedores).where(eq(proveedores.id, c.proveedorId)).limit(1);
     const quien = `${prov.nombre} (${c.titular})`;
 
-    if (c.corte) {
+    if (c.corte && !hecho) {
       throw new BadRequestException(`La cuenta de ${quien} está cortada: no recibe más transferencias.`);
     }
     const importe = money(p.importe);
     if (importe <= 0) throw new BadRequestException('El importe de la transferencia tiene que ser mayor a 0.');
     const ventaMinima = money(c.ventaMinima);
-    if (ventaMinima > 0 && money(ctx.totalOperacion) < ventaMinima - EPS) {
+    if (!hecho && ventaMinima > 0 && money(ctx.totalOperacion) < ventaMinima - EPS) {
       throw new BadRequestException(
         `La cuenta de ${quien} es solo para ventas desde $${ventaMinima.toFixed(2)} y esta es de $${money(ctx.totalOperacion).toFixed(2)}: elegí otra cuenta u otro medio.`,
       );
@@ -436,19 +647,19 @@ export class CuentasDisponiblesService {
 
     const { pagado } = await this.sumas(tx, c.id);
     const falta = money(c.importe - pagado);
-    if (falta <= EPS) {
+    if (falta <= EPS && !hecho) {
       throw new BadRequestException(`La cuenta de ${quien} ya está cubierta: elegí otra.`);
     }
-    if (!c.puedePasarse && importe > falta + EPS) {
+    if (!c.puedePasarse && !p.deMas && !hecho && importe > falta + EPS) {
       throw new BadRequestException(
-        `A la cuenta de ${quien} le faltan $${falta.toFixed(2)} y se están cargando $${importe.toFixed(2)}: `
-        + 'no puede recibir de más. Cargá el resto en otra cuenta o en otro medio.',
+        `A la cuenta de ${quien} le faltan $${falta.toFixed(2)} y se están cargando $${importe.toFixed(2)}. `
+        + 'Si el cliente ya le transfirió de más, tildá «El cliente ya le transfirió de más»; si no, cargá el resto en otra cuenta o en otro medio.',
       );
     }
-    /* Cierra la cuenta: el resto exacto o, si puede pasarse (0177), más. */
+    /* Cierra la cuenta: el resto exacto o más (puede pasarse, 0177, o ya lo transfirió de más). */
     const cierra = importe >= falta - EPS;
     const minimo = money(Number(prov.minimo));
-    if (!cierra && minimo > 0 && importe < minimo - EPS) {
+    if (!hecho && !cierra && minimo > 0 && importe < minimo - EPS) {
       throw new BadRequestException(
         `${prov.nombre} no recibe transferencias menores a $${minimo.toFixed(2)}. `
         + `Cargá al menos ese importe, o cubrí el resto ($${falta.toFixed(2)}${c.puedePasarse ? ' o más' : ''}).`,
@@ -482,6 +693,7 @@ export class CuentasDisponiblesService {
       usuarioId: ctx.usuarioId ?? null,
     });
     await this.pagosProv.aplicarCuentaLibre(c.proveedorId, tx);
+    await this.recalcularCompleta(tx, [c.id]);
 
     return {
       referencia: `${prov.nombre} · ${c.titular} · ${c.cbuAlias}`,
@@ -552,6 +764,7 @@ export class CuentasDisponiblesService {
         observaciones: [ref, obs].filter(Boolean).join(' · '),
       });
       await this.pagosProv.aplicarCuentaLibre(c.proveedorId, tx);
+      await this.recalcularCompleta(tx, [c.id]);
     });
     return this.get(id);
   }
@@ -637,6 +850,7 @@ export class CuentasDisponiblesService {
     await tx.update(cuentaDisponiblePagos).set({ anuladoEn: new Date() })
       .where(inArray(cuentaDisponiblePagos.id, filas.map((f: any) => f.id)));
     for (const proveedorId of libres) await this.pagosProv.aplicarCuentaLibre(proveedorId, tx);
+    await this.recalcularCompleta(tx, filas.map((f: any) => f.cuentaId));
     return filas.length;
   }
 
@@ -801,6 +1015,26 @@ export class CuentasDisponiblesController {
     return this.svc.reporte({ desde, hasta, proveedorId: proveedorId ? Number(proveedorId) : undefined });
   }
 
+  /** El banner de «cuenta completa» (0238): lo ve administración (admin y superadmin), esté en la pantalla que esté. */
+  @Get('completas-aviso') @CualquierUsuario()
+  completasAviso(@Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('El aviso de cuentas completas lo ve administración.');
+    return this.svc.completasParaAvisar(sesion.usuarioId);
+  }
+
+  /** El banner de «no hay cuentas abiertas» con sus sugerencias: administración. */
+  @Get('sin-abiertas') @CualquierUsuario()
+  sinAbiertas(@Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('El aviso de cuentas disponibles lo ve administración.');
+    return this.svc.sinAbiertas();
+  }
+
+  @Post(':id/aviso-visto') @CualquierUsuario()
+  avisoVisto(@Param('id', ParseIntPipe) id: number, @Auth() sesion: Sesion) {
+    if (!esJefe(sesion)) throw new ForbiddenException('El aviso de cuentas completas lo ve administración.');
+    return this.svc.avisoVisto(id, sesion.usuarioId);
+  }
+
   @Get(':id') @Permiso('proveedores.cuentas')
   get(@Param('id', ParseIntPipe) id: number) { return this.svc.get(id); }
 
@@ -821,6 +1055,12 @@ export class CuentasDisponiblesController {
     return this.svc.anularPagoPropio(pagoId, dto.motivo);
   }
 
+  /** Una «Transferencia» ya cobrada que en realidad fue a esta cuenta (21/11/2026): solo el superadmin. */
+  @Post(':id/corregir-transferencia') @Permiso(PERMISO_CORREGIR_TRANSFERENCIA)
+  corregirTransferencia(@Param('id', ParseIntPipe) id: number, @Body() dto: CorregirTransferenciaDto, @Auth() sesion: Sesion) {
+    return this.svc.corregirTransferenciaDeVenta(id, dto, sesion?.usuarioId ?? null);
+  }
+
   @Patch(':id') @Permiso('proveedores.cuentas')
   editar(@Param('id', ParseIntPipe) id: number, @Body() dto: EditarCuentaDto) { return this.svc.editar(id, dto); }
 
@@ -829,7 +1069,7 @@ export class CuentasDisponiblesController {
 }
 
 @Module({
-  imports: [PagosModule],
+  imports: [PagosModule, AuditoriaModule],
   controllers: [CuentasDisponiblesController],
   providers: [CuentasDisponiblesService],
   exports: [CuentasDisponiblesService],

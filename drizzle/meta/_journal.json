@@ -1667,6 +1667,20 @@
       "when": 1795996800000,
       "tag": "0237_whatsapp_bot",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1796083200000,
+      "tag": "0238_cuenta_completa_aviso",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1796169600000,
+      "tag": "0239_caja_control_apertura",
+      "breakpoints": true
     }
   ]
 }
