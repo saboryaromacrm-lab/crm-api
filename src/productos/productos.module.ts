@@ -138,8 +138,14 @@ class UpsertProductoDto {
    * Para sumar más proveedores después está el Formato de Compra del producto.
    */
   @IsOptional() @IsInt() proveedorId?: number;
-  /** Costo de lista de ese proveedor, si ya se conoce (opcional). */
+  /** Costo de lista de ese proveedor, si ya se conoce (opcional): el de SU bulto (`cantidadFormato`). */
   @IsOptional() @IsNumber() costoInicial?: number;
+  /**
+   * Cuántas unidades (o kg, en granel) trae el bulto con que factura ese
+   * proveedor (solo alta, con proveedorId; 1 si no viene). Con la factura a la
+   * vista se sabe de entrada (21/11/2026: crear el producto desde la carga).
+   */
+  @IsOptional() @IsNumber() @Min(0.001, { message: 'El bulto del proveedor tiene que ser mayor que cero.' }) cantidadFormato?: number;
   /**
    * La ficha comercial del formato inicial (solo alta, con proveedorId): el
    * código con el que ESE proveedor llama al producto, su escala de descuentos
@@ -845,6 +851,15 @@ export class ProductosService {
 
     const valores = this.valores(dto);
     if (!valores.codigoPropio) valores.codigoPropio = await this.proximoCodigoPropio();
+    const bultoFormato = Number(dto.cantidadFormato) > 0 ? Number(dto.cantidadFormato) : 1;
+    if (prov && !dto.esGranel && !Number.isInteger(bultoFormato)) {
+      throw new BadRequestException('El bulto de un producto entero va en unidades enteras.');
+    }
+    /* El bulto de la ficha se completa con el del formato, con la misma regla
+       que al guardar formatos (25/8): solo si está vacío y es entero. */
+    if (prov && !dto.esGranel && bultoFormato > 1 && !(Number(valores.unidadesPorBulto) > 1)) {
+      valores.unidadesPorBulto = bultoFormato;
+    }
 
     const [p] = await this.db.insert(productos).values({
       ...valores,
@@ -859,7 +874,7 @@ export class ProductosService {
       await this.db.insert(productoProveedores).values({
         productoId: p.id,
         proveedorId: prov.id,
-        cantidad: 1,
+        cantidad: bultoFormato,
         costo: Number(dto.costoInicial) || 0,
         descuento: Number(dto.descuento) || 0,
         descuento2: Number(dto.descuento2) || 0,
