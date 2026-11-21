@@ -1681,6 +1681,13 @@
       "when": 1796169600000,
       "tag": "0239_caja_control_apertura",
       "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1796256000000,
+      "tag": "0240_proveedor_rubro_gasto",
+      "breakpoints": true
     }
   ]
 }

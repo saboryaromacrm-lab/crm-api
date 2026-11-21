@@ -220,6 +220,8 @@ export const proveedores = pgTable('proveedores', {
    * NULL = sin definir — el formulario usa su default de siempre.
    */
   letraGasto: letraComprobanteEnum('letra_gasto'),
+  /** El rubro de gastos que factura (0240): «Cargar gasto» lo elige solo al elegir el proveedor. */
+  rubroGastoId: integer('rubro_gasto_id').references((): AnyPgColumn => gastoCategorias.id, { onDelete: 'set null' }),
   /* ---- La ficha comercial (0068, del módulo Proveedores) ---- */
   condicionCompra: condicionCompraProvEnum('condicion_compra').notNull().default('factura'),
   /**

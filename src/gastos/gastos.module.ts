@@ -235,6 +235,8 @@ class GastoDto {
   @IsOptional() @IsInt() proveedorId?: number;
   @IsOptional() @IsString() proveedorTexto?: string;
   @IsInt() categoriaId!: number;
+  /** Dejar este rubro fijado en el proveedor (0240): la próxima vez se elige solo. Solo en el alta. */
+  @IsOptional() @IsBoolean() rubroDelProveedor?: boolean;
   @IsOptional() @IsInt() sucursalId?: number;
   @IsOptional() @IsString() descripcion?: string;
   @IsOptional() @IsIn(['contado', 'cuenta_corriente']) condicionPago?: string;
@@ -420,6 +422,8 @@ export class GastosService {
         // elegir el proveedor. Sin ella en ESTE select el modal no la ve —
         // el selector se alimenta del bootstrap, no del padrón completo.
         letraGasto: proveedores.letraGasto,
+        // El rubro que factura (0240): el formulario lo elige solo al elegir el proveedor.
+        rubroGastoId: proveedores.rubroGastoId,
       }).from(proveedores).orderBy(asc(proveedores.nombre)),
       this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa })
         .from(sucursales).orderBy(asc(sucursales.id)),
@@ -1052,6 +1056,10 @@ export class GastosService {
         await this.db.delete(gastos).where(and(eq(gastos.id, creado.id), sql`${gastos.pagado} = 0`));
         throw e;
       });
+    }
+    /* El rubro queda fijado en el proveedor (0240), recién cuando el gasto entró entero (con su pago, si lo traía). */
+    if (dto.rubroDelProveedor === true && proveedorId) {
+      await this.db.update(proveedores).set({ rubroGastoId: cat.id }).where(eq(proveedores.id, proveedorId));
     }
     return this.get(creado.id);
   }

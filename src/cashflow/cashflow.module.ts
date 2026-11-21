@@ -1020,10 +1020,25 @@ export class CashflowService {
 
   /* ------------------------------ Pago a proveedor ------------------------------ */
 
-  /** Los proveedores (no hay baja lógica en la tabla), para elegir a quién se le paga. */
-  proveedoresActivos() {
-    return this.db.select({ id: proveedores.id, nombre: proveedores.nombre, proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos })
-      .from(proveedores).orderBy(asc(proveedores.nombre));
+  /**
+   * Los proveedores (no hay baja lógica en la tabla), para elegir a quién se le
+   * paga. `deudaGastos` (21/11/2026): lo que se les debe en gastos cargados —
+   * la misma regla que los pendientes que se tildan al pagar—, para ofrecer los
+   * proveedores de gastos en «Sacar plata» con su deuda a la vista.
+   * `aFavorGastos`: lo que ya se le pagó para gastos y todavía no se aplicó a
+   * ninguno (pagos a cuenta): antes de pagarle de nuevo, hay que verlo.
+   * Las subconsultas nombran `"proveedores"."id"` literal: con la columna de
+   * drizzle sale sin la tabla y se compara contra el id del gasto.
+   */
+  async proveedoresActivos() {
+    const filas = await this.db.select({
+      id: proveedores.id, nombre: proveedores.nombre, proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos,
+      deudaGastos: sql<number>`(select coalesce(sum(g.total - g.pagado), 0) from gastos g
+        where g.proveedor_id = "proveedores"."id" and g.estado <> 'anulado' and g.total - g.pagado > 0.009)`,
+      aFavorGastos: sql<number>`(select coalesce(sum(pp.importe - pp.aplicado), 0) from proveedor_pagos pp
+        where pp.proveedor_id = "proveedores"."id" and pp.estado = 'activo' and pp.destino = 'gastos' and pp.importe - pp.aplicado > 0.009)`,
+    }).from(proveedores).orderBy(asc(proveedores.nombre));
+    return filas.map((p) => ({ ...p, deudaGastos: money(Number(p.deudaGastos)), aFavorGastos: money(Number(p.aFavorGastos)) }));
   }
 
   /** Las facturas (o los gastos cargados) de ese proveedor que todavía deben plata: lo que se tilda al pagar. */

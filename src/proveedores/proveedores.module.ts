@@ -9,7 +9,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
-import { facturaLecturas, productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
+import { facturaLecturas, gastoCategorias, productoProveedores, proveedorCuentas, proveedorPercepciones, proveedores } from '../db/schema';
 import { esNombreCoffit, sincronizarProveedorCoffit } from '../productos/proveedorCoffit';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 
@@ -36,6 +36,8 @@ class UpsertProveedorDto {
    * conservar la que tenía.
    */
   @IsOptional() @IsIn(['A', 'B', 'C', 'X', '']) letraGasto?: string;
+  /** El rubro de gastos que factura (0240). `null` = sin rubro, ausente = conservar el que tenía. */
+  @IsOptional() @IsInt() rubroGastoId?: number | null;
   /* ---- La ficha comercial (0068, módulo Proveedores) ---- */
   /** Qué emite: factura / liquidación (la mitad sin factura) / mixto. */
   @IsOptional() @IsIn(['factura', 'liquidacion', 'mixto']) condicionCompra?: string;
@@ -174,8 +176,16 @@ export class ProveedoresService {
     if (mismoNombre) throw new BadRequestException(`Ya existe "${mismoNombre.nombre}" (proveedor #${mismoNombre.id}).`);
   }
 
+  /** El rubro tiene que existir: un id inventado reventaría contra la clave foránea con un error que nadie entiende. */
+  private async exigirRubro(id: number | null | undefined) {
+    if (id == null) return;
+    const [c] = await this.db.select({ id: gastoCategorias.id }).from(gastoCategorias).where(eq(gastoCategorias.id, id)).limit(1);
+    if (!c) throw new BadRequestException('Ese rubro de gastos no existe: elegí otro.');
+  }
+
   async create(dto: UpsertProveedorDto) {
     await this.exigirIdentidad(dto.nombre ?? '', dto.cuit ?? '');
+    await this.exigirRubro(dto.rubroGastoId);
     const [p] = await this.db.insert(proveedores).values({
       nombre: dto.nombre.trim(), cuit: (dto.cuit ?? '').trim(), condicionIva: (dto.condicionIva ?? 'responsable_inscripto') as any, direccion: dto.direccion ?? '',
       telefono: dto.telefono ?? '', email: dto.email ?? '',
@@ -184,6 +194,7 @@ export class ProveedoresService {
       proveeGastos: dto.proveeGastos ?? false,
       esLocal: dto.esLocal ?? false,
       letraGasto: (dto.letraGasto || null) as any,
+      rubroGastoId: dto.rubroGastoId ?? null,
       condicionCompra: (dto.condicionCompra ?? 'factura') as any,
       medioHabitual: (dto.medioHabitual || null) as any,
       diasPago: dto.diasPago || null,
@@ -227,6 +238,7 @@ export class ProveedoresService {
         dto.nombre ?? '', cambiaCuit ? (dto.cuit ?? '') : '', id,
       );
     }
+    await this.exigirRubro(dto.rubroGastoId);
     const [p] = await this.db.update(proveedores).set({
       nombre: dto.nombre.trim(),
       // TODO el update es "ausente conserva, '' borra" — también la identidad:
@@ -243,6 +255,7 @@ export class ProveedoresService {
       esLocal: dto.esLocal ?? actual.esLocal,
       // '' borra a propósito; ausente conserva (mismo criterio que los flags).
       letraGasto: (dto.letraGasto === undefined ? actual.letraGasto : (dto.letraGasto || null)) as any,
+      rubroGastoId: dto.rubroGastoId === undefined ? actual.rubroGastoId : dto.rubroGastoId,
       /* La ficha comercial sigue el mismo contrato: ausente conserva, '' borra.
        * OJO con el medio habitual: cambiarlo NO toca compromisos ya generados
        * (el plazo pactado quedó congelado en cada compromiso, como en la app). */
