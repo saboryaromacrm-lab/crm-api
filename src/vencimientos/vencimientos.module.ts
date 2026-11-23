@@ -97,6 +97,10 @@ class ReglaDto {
   @IsOptional() @IsInt() paga!: number;
 }
 
+class AutomaticasDto {
+  @IsBoolean() activas!: boolean;
+}
+
 class GuardarReglasDto {
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(RANGOS_REGLA.length) @ValidateNested({ each: true }) @Type(() => ReglaDto)
   reglas!: ReglaDto[];
@@ -868,6 +872,11 @@ export class VencimientosController {
     const aplicado = await this.reglas.guardar(dto.reglas, sesion.usuarioId);
     return { aplicado, ...(await this.reglas.panel(soloSuSucursal(sesion))) };
   }
+  /** El interruptor de Ventas › Ofertas: prender o apagar las ofertas automáticas por vencimiento. */
+  @Put('reglas/automaticas')
+  @Permiso('ventas.ofertas', 'ofertas')
+  automaticas(@Body() dto: AutomaticasDto) { return this.reglas.cambiarAutomaticas(dto.activas); }
+
   @Post('reglas/aplicar')
   @Permiso('ventas.ofertas', 'ofertas')
   async aplicarReglas(@Auth() sesion: Sesion) {

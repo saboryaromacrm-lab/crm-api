@@ -106,6 +106,17 @@ export class ReglasVencimientoService implements OnModuleInit, OnModuleDestroy {
     return this.aplicar();
   }
 
+  /** ¿Las reglas arman solas las ofertas? (el interruptor de Ventas › Ofertas). */
+  async automaticas() {
+    return (await this.cfg.get('ventas')).ofertasVencimientoAuto !== false;
+  }
+
+  /** Prende o apaga las ofertas automáticas y lo aplica en el acto: apagar saca las que hay; prender las arma. */
+  async cambiarAutomaticas(activas: boolean) {
+    await this.cfg.set('ventas', { ofertasVencimientoAuto: activas });
+    return { activas, aplicado: await this.aplicar() };
+  }
+
   /* ========================= COTIZAR LO QUE VENCE ========================= */
 
   /**
@@ -230,15 +241,23 @@ export class ReglasVencimientoService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async aplicarYa(ids?: number[]) {
-    const [reglas, filas] = await Promise.all([this.reglas(), this.abiertos({ ids })]);
+    const [reglas, filas, encendidas] = await Promise.all([this.reglas(), this.abiertos({ ids }), this.automaticas()]);
     const porRango = new Map(reglas.map((r) => [r.rango, r]));
-    const arts = await this.articulos(filas.map((f) => ({ productoId: f.v.productoId, presentacionId: f.v.presentacionId })));
+    /* Apagadas no se cotiza nada: solo se sacan las automáticas que quedaron. */
+    const arts = encendidas
+      ? await this.articulos(filas.map((f) => ({ productoId: f.v.productoId, presentacionId: f.v.presentacionId })))
+      : new Map<string, Articulo>();
     const res = { creadas: 0, actualizadas: 0, quitadas: 0, iguales: 0, manuales: 0, sinOferta: 0 };
     for (const { v, dias, oferta: o } of filas) {
       const rango = rangoDe(Number(dias));
       /* Lo vencido no se toca: su oferta termina sola con el `hasta` y el registro se procesa. */
       if (rango === 'vencido') continue;
       if (o?.id && !o.auto) { res.manuales += 1; continue; }
+      if (!encendidas) {
+        /* La que ya se vendió queda desactivada (no se borra): no se vuelve a contar en cada pasada. */
+        if (o?.id && o.activa) { await this.ofertas.borrar(o.id); res.quitadas += 1; } else res.sinOferta += 1;
+        continue;
+      }
       const art = arts.get(clave(v.productoId, v.presentacionId));
       const p = art ? proponer(porRango.get(rango)!, art) : null;
       if (!p?.hay) {
@@ -267,6 +286,9 @@ export class ReglasVencimientoService implements OnModuleInit, OnModuleDestroy {
       .from(vencimientos).where(eq(vencimientos.id, id)).limit(1);
     if (!reg) throw new NotFoundException('Registro inexistente.');
     if (reg.procesado) throw new BadRequestException('Ya se procesó.');
+    if (!(await this.automaticas())) {
+      throw new BadRequestException('Las ofertas automáticas por vencimiento están apagadas: prendelas en Ventas › Ofertas.');
+    }
     if (reg.ofertaId) await this.db.update(ofertas).set({ autoVencimiento: true }).where(eq(ofertas.id, reg.ofertaId));
     return this.aplicar([id]);
   }

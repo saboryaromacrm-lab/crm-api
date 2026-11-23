@@ -161,6 +161,14 @@ export const VENTAS_DEFAULTS = {
   /** Lo mismo para los ENTEROS (1/10/2026, pedido del dueño): independiente del granel. */
   controlStockEnteros: true as boolean,
   /**
+   * OFERTAS AUTOMÁTICAS POR VENCIMIENTO (23/11/2026, pedido del dueño). `true`
+   * = como venía: las reglas de Almacén › Vencimientos arman, escalan y sacan
+   * solas la oferta de cada registro abierto. `false` = no se arma ninguna y las
+   * automáticas que había se sacan; las armadas a mano no se tocan. Se cambia
+   * desde Ventas › Ofertas (`PUT /vencimientos/reglas/automaticas`).
+   */
+  ofertasVencimientoAuto: true as boolean,
+  /**
    * BAJOS EN STOCK (12/10/2026, pedido del dueño). El mínimo automático de un
    * producto es su venta diaria (últimos 30 días) × estos días; y un proveedor
    * se pone en ROJO cuando este % de sus productos está sin stock o bajo
