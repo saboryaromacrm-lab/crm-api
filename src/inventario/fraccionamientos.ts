@@ -30,6 +30,8 @@ import { Auth, Permiso, Sesion } from '../auth/auth.decoradores';
 import { soloSuSucursal } from '../auth/auth.guard';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { fraccionOperadores, sucursales } from '../db/schema';
+import { deltasDe, type ItemFraccion } from './kardex';
+import { ESTADOS_EN_STOCK, SEMANAS_ATRAS, cuadreSemana, netoEnStock, semanaDe, type MovSemana } from './cuadre-fraccionado';
 
 const FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const ORIGENES = ['manual', 'correccion', 'pedido'] as const;
@@ -55,6 +57,12 @@ class FiltrosDto {
 class ListadoDto extends FiltrosDto {
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) offset?: number;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number;
+}
+
+class CuadreDto {
+  @Type(() => Number) @IsInt() sucursalId!: number;
+  /** Cualquier día de la semana que se quiere ver ('AAAA-MM-DD'); sin él, la de hoy. */
+  @IsOptional() @Matches(FECHA) semana?: string;
 }
 
 class OperadorDto {
@@ -392,6 +400,114 @@ export class FraccionamientosService {
     return op;
   }
 
+  /**
+   * EL CUADRE SEMANAL DEL FRACCIONADO de una sucursal (ver
+   * `cuadre-fraccionado.ts`): por producto de granel, lo que se armó, entró y
+   * salió de sus paquetes en la semana, en kilos, y lo que salió sin estar
+   * armado en el sistema. Solo lectura.
+   */
+  async cuadre(dto: CuadreDto) {
+    const hoyIso = new Date(Date.now() - 3 * 3_600_000).toISOString().slice(0, 10);
+    const pedido = dto.semana ?? hoyIso;
+    dia(pedido, '00:00:00');
+    const s = semanaDe(pedido);
+    if (s.desde.getTime() > Date.now()) throw new BadRequestException('Esa semana todavía no empezó.');
+    if (s.desde.getTime() < semanaDe(hoyIso).desde.getTime() - SEMANAS_ATRAS * 7 * 86_400_000) {
+      throw new BadRequestException(`Se puede mirar hasta ${SEMANAS_ATRAS} semanas para atrás.`);
+    }
+    const [suc] = await this.db.select({ id: sucursales.id, nombre: sucursales.nombre }).from(sucursales)
+      .where(eq(sucursales.id, dto.sucursalId)).limit(1);
+    if (!suc) throw new BadRequestException('Esa sucursal no existe.');
+
+    const [prods, pres, stockRows, movRows] = await Promise.all([
+      this.filas<any>(sql`select id, nombre from productos where tipo = 'granel'`),
+      this.filas<any>(sql`select pr.id, pr.producto_id, pr.tam_kg from presentaciones pr
+        join productos p on p.id = pr.producto_id where p.tipo = 'granel'`),
+      this.filas<any>(sql`select s.producto_id, s.presentacion_id, s.estado::text as estado, s.cantidad
+        from stock s join productos p on p.id = s.producto_id
+        where p.tipo = 'granel' and s.sucursal_id = ${suc.id}`),
+      this.filas<any>(sql`select m.id, m.fecha, m.producto_id, m.tipo::text as tipo, m.sucursal_id, m.presentacion_id,
+          m.signo, m.cantidad, m.estado_desde::text as estado_desde, m.estado_hacia::text as estado_hacia
+        from movimientos m join productos p on p.id = m.producto_id
+        where p.tipo = 'granel' and m.sucursal_id = ${suc.id} and m.fecha >= ${s.desde.toISOString()}::timestamptz
+        order by m.fecha, m.id`),
+    ]);
+    const idsFracc = movRows.filter((m) => m.tipo === 'fraccionamiento').map((m) => Number(m.id));
+    const itemRows = idsFracc.length
+      ? await this.filas<any>(sql`select movimiento_id, presentacion_id, paquetes, tam_kg from fraccionamiento_items
+          where movimiento_id in ${sql`(${sql.join(idsFracc.map((i) => sql`${i}`), sql`, `)})`}`)
+      : [];
+    const items = new Map<number, ItemFraccion[]>();
+    for (const it of itemRows) {
+      const l = items.get(Number(it.movimiento_id)) ?? [];
+      l.push({ presentacionId: Number(it.presentacion_id), paquetes: Number(it.paquetes), tamKg: Number(it.tam_kg) });
+      items.set(Number(it.movimiento_id), l);
+    }
+    const tam = new Map<number, number>(pres.map((p) => [Number(p.id), Number(p.tam_kg)]));
+
+    /* Por producto: el stock de hoy (en estados de stock) y lo que movió cada movimiento. */
+    const hoyDe = new Map<number, Map<number, number>>();
+    for (const r of stockRows) {
+      if (!ESTADOS_EN_STOCK.has(r.estado)) continue;
+      const m = hoyDe.get(Number(r.producto_id)) ?? new Map<number, number>();
+      const k = Number(r.presentacion_id ?? 0);
+      m.set(k, (m.get(k) ?? 0) + Number(r.cantidad));
+      hoyDe.set(Number(r.producto_id), m);
+    }
+    const movsDe = new Map<number, MovSemana[]>();
+    for (const m of movRows) {
+      const { deltas } = deltasDe({
+        id: Number(m.id), tipo: m.tipo, sucursalId: m.sucursal_id, presentacionId: m.presentacion_id, signo: Number(m.signo),
+        cantidad: Number(m.cantidad), estadoDesde: m.estado_desde, estadoHacia: m.estado_hacia,
+      }, items.get(Number(m.id)) ?? [], (p) => tam.get(p) ?? null);
+      const netos = netoEnStock(deltas, suc.id);
+      if (!netos.size) continue;
+      const l = movsDe.get(Number(m.producto_id)) ?? [];
+      l.push({ fecha: m.fecha, tipo: m.tipo, netos });
+      movsDe.set(Number(m.producto_id), l);
+    }
+
+    const COLS = ['armado', 'recibido', 'vendido', 'enviado', 'bajas', 'ajustes'] as const;
+    const filas: any[] = [];
+    for (const p of prods) {
+      const movs = movsDe.get(Number(p.id));
+      if (!movs?.length) continue;
+      const cuadro = cuadreSemana(movs, hoyDe.get(Number(p.id)) ?? new Map(), s.desde, s.hasta);
+      const paquetes = [...cuadro.values()]
+        .filter((c) => c.presentacionId !== 0 && tam.has(c.presentacionId))
+        .filter((c) => COLS.some((k) => Math.abs(c[k]) > 1e-9) || c.sinArmar > 0)
+        .map((c) => ({ ...c, tamKg: tam.get(c.presentacionId)! }))
+        .sort((a, b) => a.tamKg - b.tamKg);
+      if (!paquetes.length) continue;
+      const kg = (f: (c: (typeof paquetes)[number]) => number) => n3(paquetes.reduce((a, c) => a + f(c) * c.tamKg, 0));
+      filas.push({
+        productoId: Number(p.id), nombre: p.nombre,
+        inicioKg: kg((c) => c.inicio), finKg: kg((c) => c.fin),
+        ...Object.fromEntries(COLS.map((k) => [`${k}Kg`, kg((c) => c[k])])),
+        sinArmarKg: kg((c) => c.sinArmar),
+        sinArmarPaquetes: n3(paquetes.reduce((a, c) => a + c.sinArmar, 0)),
+        /* Lo que el sistema dice que queda en la bolsa grande al cerrar la semana: si salió sin armar, tiene esos kilos de más. */
+        bolsaKg: n3(cuadro.get(0)?.fin ?? (hoyDe.get(Number(p.id))?.get(0) ?? 0)),
+        paquetes,
+      });
+    }
+    filas.sort((a, b) => b.sinArmarKg - a.sinArmarKg || (a.vendidoKg + a.enviadoKg) - (b.vendidoKg + b.enviadoKg));
+    const suma = (k: string) => n3(filas.reduce((a, f) => a + f[k], 0));
+    return {
+      sucursal: suc,
+      semana: { lunes: s.lunes, domingo: s.domingo, enCurso: hoyIso <= s.domingo },
+      totales: {
+        productos: filas.length,
+        armadoKg: suma('armadoKg'), recibidoKg: suma('recibidoKg'),
+        salieronKg: n3(-(suma('vendidoKg') + suma('enviadoKg') + suma('bajasKg'))),
+        ajustesKg: suma('ajustesKg'),
+        sinArmarKg: suma('sinArmarKg'), sinArmarPaquetes: suma('sinArmarPaquetes'),
+        productosSinArmar: filas.filter((f) => f.sinArmarPaquetes > 0).length,
+      },
+      filas,
+    };
+  }
+
   async editarOperador(id: number, dto: EditarOperadorDto) {
     const patch: Record<string, unknown> = {};
     if (dto.nombre !== undefined) { await this.nombreLibre(dto.nombre, id); patch.nombre = dto.nombre; }
@@ -428,6 +544,14 @@ export class FraccionamientosController {
   @Permiso('almacen.fraccionamiento')
   exportar(@Query() q: FiltrosDto, @Auth() sesion: Sesion) {
     return this.svc.exportar(this.acotar(q, sesion));
+  }
+
+  /** El cuadre semanal: lo armado contra lo que salió, por producto (ver `cuadre`). El que no es jefe, el de su local. */
+  @Get('cuadre')
+  @Permiso('almacen.fraccionamiento')
+  cuadre(@Query() q: CuadreDto, @Auth() sesion: Sesion) {
+    const mia = soloSuSucursal(sesion);
+    return this.svc.cuadre(mia != null ? { ...q, sucursalId: mia } : q);
   }
 
   /** Los activos para elegir al fraccionar; `todos=1` suma los dados de baja (el filtro del historial y el ABM). */

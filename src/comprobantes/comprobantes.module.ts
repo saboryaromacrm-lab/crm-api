@@ -23,6 +23,7 @@ import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
+import { VENTANA_OTRA_MITAD, netoPorProducto, tipoDeLaOtraMitad } from './otra-mitad';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ajustePorAnulacion, fechaDeCuenta, finalCafeteria, importeEnCuenta } from '../cafeteria/cuenta';
 import { normalizarPuntoVenta } from '../facturas/comun';
@@ -719,6 +720,49 @@ export class ComprobantesService {
     } catch {
       return c;
     }
+  }
+
+  /**
+   * LA OTRA MITAD DEL PAPEL QUE SE ESTÁ CARGANDO (21/11/2026): la factura A de
+   * una liquidación o al revés, del mismo proveedor y a ±7 días. Devuelve el
+   * neto por unidad de cada producto en ella, para que «Impacto en precios»
+   * avise si las dos mitades no cobran lo mismo, y si el proveedor trabaja
+   * mitad y mitad, para recordar la mitad que falta. No graba nada.
+   */
+  async otraMitad(q: { proveedorId: number; tipo?: string; letra?: string; fecha?: string }) {
+    const [prov] = await this.db.select({ porc: proveedores.porcSinFactura, mensual: proveedores.facturaMensual })
+      .from(proveedores).where(eq(proveedores.id, q.proveedorId)).limit(1);
+    if (!prov) throw new NotFoundException('Proveedor inexistente.');
+    const buscar = tipoDeLaOtraMitad(String(q.tipo ?? ''), q.letra);
+    const porcFicha = Number(prov.porc) || 0;
+    /* El de «factura a fin de mes» (0158) no entrega mitades: sus remitos se facturan juntos. */
+    const vacio = { mitadYMitad: !!buscar && porcFicha > 0 && porcFicha < 100 && !prov.mensual, porcFicha, papeles: [] as any[], precios: [] as any[] };
+    if (!buscar) return vacio;
+    const dia = /^\d{4}-\d{2}-\d{2}$/.test(q.fecha ?? '')
+      ? sql`${q.fecha}::date`
+      : sql`(now() at time zone 'America/Argentina/Buenos_Aires')::date`;
+    const distancia = sql<number>`abs((${comprobantes.fecha} at time zone 'America/Argentina/Buenos_Aires')::date - ${dia})`;
+    const papeles = await this.db.select({
+      id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra,
+      puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero, fecha: comprobantes.fecha,
+    }).from(comprobantes).where(and(
+      eq(comprobantes.proveedorId, q.proveedorId),
+      eq(comprobantes.estado, 'confirmado'),
+      eq(comprobantes.tipo, buscar as any),
+      buscar === 'factura' ? eq(comprobantes.letra, 'A' as any) : undefined,
+      sql`${distancia} <= ${VENTANA_OTRA_MITAD}`,
+    )).orderBy(distancia, desc(comprobantes.id)).limit(20);
+    if (!papeles.length) return vacio;
+    const renglones = await this.db.select({
+      comprobanteId: comprobanteItems.comprobanteId, productoId: comprobanteItems.productoId,
+      cantidad: comprobanteItems.cantidad, subtotal: comprobanteItems.subtotal,
+    }).from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, papeles.map((p) => p.id)));
+    const precios = netoPorProducto(papeles.map((p) => p.id), renglones as any);
+    return {
+      ...vacio,
+      papeles: papeles.map((p) => ({ id: p.id, etiqueta: etiquetaDoc(p as any), fecha: p.fecha })),
+      precios: [...precios].map(([productoId, v]) => ({ productoId, ...v })),
+    };
   }
 
   async get(id: number) {
@@ -2650,6 +2694,22 @@ export class ComprobantesController {
   @Get('referenciables/:proveedorId')
   referenciables(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
     return this.svc.referenciables(proveedorId);
+  }
+
+  /**
+   * La otra mitad (factura A ↔ liquidación) del papel que se está cargando (ver
+   * `otraMitad`). Sin `liquidaciones` no viaja nada: compararla la mostraría.
+   */
+  @Get('otra-mitad')
+  otraMitad(
+    @Auth() auth: Sesion,
+    @Query('proveedorId', ParseIntPipe) proveedorId: number,
+    @Query('tipo') tipo?: string,
+    @Query('letra') letra?: string,
+    @Query('fecha') fecha?: string,
+  ) {
+    if (!tienePermiso(auth.permisos, ['liquidaciones'])) return { mitadYMitad: false, porcFicha: 0, papeles: [], precios: [] };
+    return this.svc.otraMitad({ proveedorId, tipo, letra, fecha });
   }
 
   /** Con el mismo corte que la lista: sin `liquidaciones`, la mitad no facturada no viaja. */
