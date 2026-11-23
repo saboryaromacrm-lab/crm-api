@@ -1688,6 +1688,13 @@
       "when": 1796256000000,
       "tag": "0240_proveedor_rubro_gasto",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1796515200000,
+      "tag": "0241_codigos_anteriores",
+      "breakpoints": true
     }
   ]
 }

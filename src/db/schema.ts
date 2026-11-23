@@ -495,6 +495,12 @@ export const productos = pgTable('productos', {
    * servicio, porque cruza dos tablas y ningún índice lo puede expresar. */
   codigoPropio: text('codigo_propio').notNull().default(''),
   codigoBarras: text('codigo_barras').notNull().default(''),
+  /**
+   * LOS CÓDIGOS DE BARRAS QUE TUVO (0241): la mercadería vieja sigue en la
+   * góndola con el código anterior y se tiene que seguir encontrando. Ver
+   * `productos/codigos-anteriores.ts`. Índice GIN en la migración.
+   */
+  codigosAnteriores: text('codigos_anteriores').array().notNull().default(sql`'{}'::text[]`),
   dun: text('dun').notNull().default(''),
   /** Cuántas unidades trae el bulto que identifica el DUN. */
   unidadesPorBulto: doublePrecision('unidades_por_bulto').notNull().default(1),

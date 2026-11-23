@@ -1987,6 +1987,8 @@ export class VentasService {
         unidadesPorBulto: bultoPorProd.get(p.id) ?? 0,
         iva: p.iva,
         codigoBarras: p.codigoBarras,
+        /** Los códigos que tuvo (0241): la caja también encuentra la mercadería vieja con ellos. */
+        codigosAnteriores: p.codigosAnteriores,
         precio: filaBase?.netoExacto ?? 0,
         /** El de la etiqueta: lo que paga el cliente. Solo para MOSTRAR. */
         precioFinal: money(filaBase?.finalUnitario ?? 0),

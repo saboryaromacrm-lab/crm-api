@@ -23,7 +23,7 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query,
 } from '@nestjs/common';
 import { ArrayMaxSize, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString } from 'class-validator';
-import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
+import { and, arrayOverlaps, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Permiso } from '../auth/auth.decoradores';
 import {
@@ -571,6 +571,7 @@ export class ListasService {
       const [enProductos, enPresentaciones, enFormatos] = await Promise.all([
         this.db.select({ id: productos.id }).from(productos).where(or(
           inArray(productos.codigoBarras, codigos), inArray(productos.dun, codigos), inArray(productos.codigoPropio, codigos),
+          arrayOverlaps(productos.codigosAnteriores, codigos),
         )),
         this.db.select({ id: presentaciones.id }).from(presentaciones)
           .where(inArray(presentaciones.codigoBarras, codigos)),

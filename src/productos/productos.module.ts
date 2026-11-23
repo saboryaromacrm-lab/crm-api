@@ -7,7 +7,8 @@ import {
   ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { and, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
+import { and, arrayOverlaps, asc, eq, gt, inArray, ne, or, sql } from 'drizzle-orm';
+import { MAX_CODIGOS_ANTERIORES, codigosAnteriores } from './codigos-anteriores';
 import { ALICUOTAS_TEXTO, esAlicuotaValida } from '../common/iva';
 import { DRIZZLE, Database } from '../db/drizzle';
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
@@ -83,6 +84,8 @@ class UpsertProductoDto {
 
   @IsOptional() @IsString() codigoPropio?: string;
   @IsOptional() @IsString() codigoBarras?: string;
+  /** Los códigos de barras anteriores (0241): ausente = se conservan los que tenía. */
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_CODIGOS_ANTERIORES) @IsString({ each: true }) codigosAnteriores?: string[];
   @IsOptional() @IsString() dun?: string;
   @IsOptional() @IsNumber() unidadesPorBulto?: number;
 
@@ -554,15 +557,19 @@ export class ProductosService {
    *
    * Los índices de la base garantizan la unicidad dentro de cada tabla; el
    * cruce entre `productos` y `presentaciones` solo se puede validar acá.
+   *
+   * Los CÓDIGOS ANTERIORES (0241) también identifican al producto en la caja:
+   * los suyos no pueden ser de otro, y ninguno de sus códigos puede ser un
+   * anterior de otro producto.
    */
-  private async validarCodigos(dto: UpsertProductoDto, exceptoId?: number) {
+  private async validarCodigos(dto: UpsertProductoDto, exceptoId?: number, anteriores: string[] = []) {
     const campos: [string, string][] = [
       ['código propio', (dto.codigoPropio ?? '').trim()],
       ['código de barras', (dto.codigoBarras ?? '').trim()],
       ['DUN', (dto.dun ?? '').trim()],
     ];
     const usados = campos.filter(([, v]) => v !== '');
-    if (!usados.length) return;
+    if (!usados.length && !anteriores.length) return;
 
     // Repetidos dentro del mismo formulario.
     const vistos = new Map<string, string>();
@@ -572,14 +579,18 @@ export class ProductosService {
       vistos.set(val, etq);
     }
 
-    const valores = usados.map(([, v]) => v);
+    const valores = [...usados.map(([, v]) => v), ...anteriores];
     const condProd = or(
       inArray(productos.codigoPropio, valores),
       inArray(productos.codigoBarras, valores),
       inArray(productos.dun, valores),
+      arrayOverlaps(productos.codigosAnteriores, valores),
     );
     const [choqueProd, choquePres] = await Promise.all([
-      this.db.select({ id: productos.id, nombre: productos.nombre })
+      this.db.select({
+        id: productos.id, nombre: productos.nombre,
+        propio: productos.codigoPropio, barras: productos.codigoBarras, dun: productos.dun,
+      })
         .from(productos)
         .where(exceptoId ? and(ne(productos.id, exceptoId), condProd) : condProd)
         .limit(1),
@@ -588,8 +599,13 @@ export class ProductosService {
         .where(inArray(presentaciones.codigoBarras, valores))
         .limit(1),
     ]);
-    if (choqueProd[0]) {
-      throw new BadRequestException(`Ese código ya lo usa el producto "${choqueProd[0].nombre}".`);
+    const otro = choqueProd[0];
+    if (otro) {
+      /* Si el choque es solo con un código ANTERIOR del otro, decirlo: en su ficha no se ve como el de barras. */
+      if (!valores.some((v) => v === otro.propio || v === otro.barras || v === otro.dun)) {
+        throw new BadRequestException(`Ese código es un código anterior del producto "${otro.nombre}": sacalo de su ficha primero.`);
+      }
+      throw new BadRequestException(`Ese código ya lo usa el producto "${otro.nombre}".`);
     }
     if (choquePres[0]) {
       throw new BadRequestException('Ese código ya lo usa una presentación de otro producto.');
@@ -626,13 +642,13 @@ export class ProductosService {
   private async codigosEnUso(): Promise<Set<string>> {
     const [prods, press, formatos] = await Promise.all([
       this.db.select({
-        barras: productos.codigoBarras, propio: productos.codigoPropio, dun: productos.dun,
+        barras: productos.codigoBarras, propio: productos.codigoPropio, dun: productos.dun, anteriores: productos.codigosAnteriores,
       }).from(productos),
       this.db.select({ codigo: presentaciones.codigoBarras }).from(presentaciones),
       this.db.select({ codigo: productoListas.codigoBarras }).from(productoListas),
     ]);
     const set = new Set<string>();
-    for (const p of prods) for (const c of [p.barras, p.propio, p.dun]) if (c) set.add(c);
+    for (const p of prods) for (const c of [p.barras, p.propio, p.dun, ...(p.anteriores ?? [])]) if (c) set.add(c);
     for (const p of press) if (p.codigo) set.add(p.codigo);
     for (const f of formatos) if (f.codigo) set.add(f.codigo);
     return set;
@@ -836,7 +852,8 @@ export class ProductosService {
     }
     this.validarIva(dto.iva);
     await this.validarClasificacion(dto);
-    await this.validarCodigos(dto);
+    const anteriores = codigosAnteriores({ pedidos: dto.codigosAnteriores, propios: [dto.codigoBarras, dto.codigoPropio, dto.dun] });
+    await this.validarCodigos(dto, undefined, anteriores);
 
     // Se valida ANTES de insertar: un proveedor inválido no puede dejar el
     // producto creado a medias, sin la relación que el alta prometía.
@@ -849,7 +866,7 @@ export class ProductosService {
       if (!prov) throw new BadRequestException('El proveedor elegido no existe.');
     }
 
-    const valores = this.valores(dto);
+    const valores = { ...this.valores(dto), codigosAnteriores: anteriores };
     if (!valores.codigoPropio) valores.codigoPropio = await this.proximoCodigoPropio();
     const bultoFormato = Number(dto.cantidadFormato) > 0 ? Number(dto.cantidadFormato) : 1;
     if (prov && !dto.esGranel && !Number.isInteger(bultoFormato)) {
@@ -942,12 +959,12 @@ export class ProductosService {
     // Todos los códigos de barras que ya usa el sistema (producto, presentación
     // o formato de venta): uno no puede identificar dos cosas distintas.
     const [barrasProd, barrasPres, barrasFmt] = await Promise.all([
-      this.db.select({ c: productos.codigoBarras, d: productos.dun, p: productos.codigoPropio }).from(productos),
+      this.db.select({ c: productos.codigoBarras, d: productos.dun, a: productos.codigosAnteriores }).from(productos),
       this.db.select({ c: presentaciones.codigoBarras }).from(presentaciones),
       this.db.select({ c: productoListas.codigoBarras }).from(productoListas),
     ]);
     const barrasUsadas = new Set([
-      ...barrasProd.flatMap((x) => [x.c, x.d]),
+      ...barrasProd.flatMap((x) => [x.c, x.d, ...(x.a ?? [])]),
       ...barrasPres.map((x) => x.c),
       ...barrasFmt.map((x) => x.c),
     ].filter(Boolean));
@@ -1801,10 +1818,18 @@ export class ProductosService {
 
     this.validarIva(dto.iva);
     await this.validarClasificacion(dto);
-    await this.validarCodigos(dto, id);
+    const base = this.valores(dto, p);
+    /* Cambiar el código de barras deja el que tenía como anterior (0241): la tanda vieja se sigue encontrando. */
+    const valores = {
+      ...base,
+      codigosAnteriores: codigosAnteriores({
+        pedidos: dto.codigosAnteriores, previos: p.codigosAnteriores, barrasAntes: p.codigoBarras,
+        propios: [base.codigoBarras, base.codigoPropio, base.dun],
+      }),
+    };
+    await this.validarCodigos(dto, id, valores.codigosAnteriores);
 
     await this.db.transaction(async (tx) => {
-      const valores = this.valores(dto, p);
       await tx.update(productos).set(valores).where(eq(productos.id, id));
       if (dto.soloCafeteria === true && !p.soloCafeteria) await this.cobrarStockAlMarcarExclusivo(tx, p, usuarioId);
       /* Cambió «lo elabora Coffit»: gana o pierde el proveedor COFFIT en la misma transacción. */
@@ -2224,6 +2249,7 @@ export class ProductosService {
           inArray(productos.codigoPropio, codigos),
           inArray(productos.codigoBarras, codigos),
           inArray(productos.dun, codigos),
+          arrayOverlaps(productos.codigosAnteriores, codigos),
         )).limit(1);
       if (ajeno) throw new BadRequestException(`Ese código ya lo usa el producto "${ajeno.nombre}".`);
 
