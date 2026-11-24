@@ -1702,6 +1702,13 @@
       "when": 1796601600000,
       "tag": "0242_renglones_prueba",
       "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "7",
+      "when": 1796688000000,
+      "tag": "0243_ventas_por_bulto",
+      "breakpoints": true
     }
   ]
 }

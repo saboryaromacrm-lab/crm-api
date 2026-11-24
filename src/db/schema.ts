@@ -27,6 +27,7 @@ import {
 import { sql } from 'drizzle-orm';
 import type { RepartoLocal } from '../resultados/reglas';
 import type { RenglonPrueba } from '../comprobantes/renglones-prueba';
+import type { VentaPorBulto } from '../comprobantes/venta-por-bulto';
 
 /* ---------------- Enums ---------------- */
 export const tipoProductoEnum = pgEnum('tipo_producto', ['granel', 'entero']);
@@ -1721,6 +1722,12 @@ export const comprobantes = pgTable('comprobantes', {
    * `comprobantes/renglones-prueba.ts`).
    */
   renglonesPrueba: jsonb('renglones_prueba').$type<RenglonPrueba[]>().notNull().default([]),
+  /**
+   * LA VENTA POR BULTO CERRADO que esta factura pasó al bulto nuevo (0243):
+   * la bolsa de 30 kg que llegó de 20. Se deshace al anular (ver
+   * `comprobantes/venta-por-bulto.ts`).
+   */
+  ventasPorBulto: jsonb('ventas_por_bulto').$type<VentaPorBulto[]>().notNull().default([]),
   /**
    * Cuánto de este comprobante ya se le pagó al proveedor. Suma de las
    * imputaciones de `proveedor_pagos` — se recalcula, no se acumula. Sin esto

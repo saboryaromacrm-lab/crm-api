@@ -7,13 +7,13 @@ import {
   ArrayMaxSize, ArrayNotEmpty, IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength,
   Min, ValidateNested,
 } from 'class-validator';
-import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
   comprobantes, comprobanteItems, comprobantePercepciones, facturaArchivos, facturaLecturas, proveedorArticulos,
   facturacionesMes, facturacionesMesFacturas,
   productoProveedores, productos, proveedores, proveedorCompromisos, proveedorEcheqs,
-  proveedorImputaciones, proveedorPagos, sucursales, usuarios, productoProveedorCostos, presentaciones,
+  proveedorImputaciones, proveedorPagos, sucursales, usuarios, productoProveedorCostos, presentaciones, productoListas,
 } from '../db/schema';
 /* "Factura A 0115-00193307" — la misma etiqueta en la tabla, el detalle, el error
  * y ahora también en Pagos. Vive en `common` y no acá porque `pagos` la necesita
@@ -21,6 +21,7 @@ import {
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { TIPOS_CON_PRUEBA, comoRenglonesDelPie, separarPruebas } from './renglones-prueba';
+import { ventasACambiar } from './venta-por-bulto';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
@@ -128,6 +129,12 @@ class ComprobanteItemDto {
    * es siempre, venga o no el tilde: la marca de la ficha no se destilda acá.
    */
   @IsOptional() @IsBoolean() paraCafeteria?: boolean;
+}
+
+/** Las listas que venden el bulto cerrado y pasan al bulto nuevo (0243). Ver `venta-por-bulto.ts`. */
+class VentaPorBultoDto {
+  @IsInt() productoId!: number;
+  @IsArray() @ArrayMaxSize(50) @IsInt({ each: true }) listas!: number[];
 }
 
 /** Un renglón DE PRUEBA (0242): suma a la factura, no es un producto. Ver `renglones-prueba.ts`. */
@@ -272,6 +279,9 @@ class CreateComprobanteDto {
   /** Los que el usuario tildó en "diferencias de costo" al cargar el comprobante. */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ActualizarCostoDto)
   actualizarCostos?: ActualizarCostoDto[];
+  /** La venta por bulto cerrado que pasa al bulto nuevo (0243): solo con su costo actualizado con ese bulto. */
+  @IsOptional() @IsArray() @ArrayMaxSize(200) @ValidateNested({ each: true }) @Type(() => VentaPorBultoDto)
+  ventaPorBulto?: VentaPorBultoDto[];
   /** Productos cuyo salto de costo por unidad (más de ×3) alguien confirmó. */
   @IsOptional() @IsArray() @IsInt({ each: true }) confirmarSaltos?: number[];
   /**
@@ -1283,7 +1293,7 @@ export class ComprobantesService {
      * "actualizar costos" y tiene que enterarse de que eso no se aplicó, no
      * descubrirlo la semana que viene mirando un margen que nunca cambió.
      */
-    if (!opciones.puedeTocarPrecios && (dto.actualizarCostos?.length || dto.activarProveedor?.length)) {
+    if (!opciones.puedeTocarPrecios && (dto.actualizarCostos?.length || dto.activarProveedor?.length || dto.ventaPorBulto?.length)) {
       throw new ForbiddenException(
         'Para actualizar costos o cambiar el proveedor activo hace falta el permiso de precios. '
         + 'Registrá el comprobante sin esa parte y pedile a quien maneja precios que la haga.',
@@ -1293,6 +1303,11 @@ export class ComprobantesService {
     const [prov] = await this.db.select().from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
     if (!prov) throw new BadRequestException('Proveedor inválido.');
     await exigirFueraDeConciliado(this.db, prov.id, dto.fecha, 'cargar un comprobante');
+    /* La venta por bulto (0243) cambia CON el bulto del formato: sin su costo actualizado con el bulto nuevo, no. */
+    const conBultoNuevo = new Set((dto.actualizarCostos ?? []).filter((x) => Number(x.costo) > 0 && Number(x.cantidad) > 0).map((x) => x.productoId));
+    if ((dto.ventaPorBulto ?? []).some((v) => !conBultoNuevo.has(v.productoId))) {
+      throw new BadRequestException('La venta por bulto cambia junto con el bulto y el costo del formato: tildá «Actualizar costo» de ese producto.');
+    }
     if (!dto.items?.length) throw new BadRequestException('Agregá al menos un ítem.');
     if (LLEVAN_NUMERO.has(dto.tipo) && !dto.numero) {
       throw new BadRequestException(`Poné el número ${NOMBRE_TIPO[dto.tipo] ? `de ${NOMBRE_TIPO[dto.tipo]}` : 'del comprobante'} (el del papel): sin número no se puede controlar que no esté cargado dos veces.`);
@@ -1615,6 +1630,27 @@ export class ComprobantesService {
             usuarioId: dto.usuarioId,
             comprobanteId: c.id,
           } as any, tx);
+        }
+
+        /* LA VENTA POR BULTO CERRADO (0243): las listas elegidas que vendían el
+         * bulto viejo pasan al nuevo, y el comprobante lo guarda para deshacerlo. */
+        if (dto.ventaPorBulto?.length) {
+          const bultos = new Map(pedidos.map((x) => [x.productoId, {
+            antes: Number(porProducto.get(x.productoId)?.cantidad) || 0, despues: Number(x.cantidad) || 0,
+          }]));
+          const filas = await tx.select({ productoId: productoListas.productoId, listaId: productoListas.listaId, unidades: productoListas.unidades })
+            .from(productoListas)
+            .where(and(inArray(productoListas.productoId, dto.ventaPorBulto.map((v) => v.productoId)), isNull(productoListas.presentacionId)));
+          const { cambios: ventas, errores } = ventasACambiar(dto.ventaPorBulto, bultos, filas);
+          if (errores.length) {
+            throw new BadRequestException('La venta por bulto solo cambia si cambia el bulto del formato de compra: actualizá la pantalla y revisalo.');
+          }
+          for (const v of ventas) {
+            await tx.update(productoListas).set({ unidades: v.despues }).where(and(
+              eq(productoListas.productoId, v.productoId), eq(productoListas.listaId, v.listaId), isNull(productoListas.presentacionId),
+            ));
+          }
+          if (ventas.length) await tx.update(comprobantes).set({ ventasPorBulto: ventas }).where(eq(comprobantes.id, c.id));
         }
       }
 
@@ -2176,7 +2212,17 @@ export class ComprobantesService {
       cuotasPendientes: compromisos.length,
       lectura: lectura?.id ?? null,
       lotes,
+      ventasPorBulto: await this.nombresVentasPorBulto(ex, c.ventasPorBulto ?? []),
     };
+  }
+
+  /** La venta por bulto que guarda el comprobante, con el nombre del producto y de la lista (para mostrarla al anular). */
+  private async nombresVentasPorBulto(ex: any, ventas: any[]) {
+    if (!ventas.length) return [];
+    const prods = await ex.select({ id: productos.id, nombre: productos.nombre }).from(productos)
+      .where(inArray(productos.id, [...new Set(ventas.map((v) => v.productoId))]));
+    const nombre = new Map(prods.map((p: any) => [p.id, p.nombre]));
+    return ventas.map((v) => ({ ...v, producto: nombre.get(v.productoId) ?? `#${v.productoId}` }));
   }
 
   /**
@@ -2219,6 +2265,20 @@ export class ComprobantesService {
       for (const lote of plan.lotes) {
         const rv = await this.precios.revertirLoteTx(tx, lote, dto.usuarioId ?? undefined);
         tocados.push(...rv.productoIds);
+      }
+      /* La venta por bulto cerrado (0243) vuelve con el bulto: solo donde el
+       * formato de este proveedor volvió al bulto viejo y la fila sigue con el nuevo. */
+      for (const v of (c.ventasPorBulto ?? []) as any[]) {
+        const [volvio] = await tx.select({ id: productoProveedores.id }).from(productoProveedores).where(and(
+          eq(productoProveedores.productoId, v.productoId), eq(productoProveedores.proveedorId, c.proveedorId),
+          sql`abs(${productoProveedores.cantidad} - ${v.antes}) < 0.0005`,
+        )).limit(1);
+        if (!volvio) continue;
+        await tx.update(productoListas).set({ unidades: v.antes }).where(and(
+          eq(productoListas.productoId, v.productoId), eq(productoListas.listaId, v.listaId), isNull(productoListas.presentacionId),
+          sql`abs(${productoListas.unidades} - ${v.despues}) < 0.0005`,
+        ));
+        tocados.push(v.productoId);
       }
 
       /* Las cuotas que todavía no se pagaron: sin factura no hay promesa. El echeq
