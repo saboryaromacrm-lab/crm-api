@@ -113,8 +113,18 @@ export async function leerHechos(c: PoolClient, inicio: string, finExclusivo: st
     c.query(`
       select to_char(${MES_GASTO}, 'YYYY-MM') as mes, g.sucursal_id as suc, g.categoria_id as rubro, g.reparto,
         coalesce(sum(g.total - case when g.letra = 'A' then g.iva else 0 end - g.perc_dgi - g.perc_dgr), 0) as importe,
+        /* La parte que es flete de mercadería de un proveedor que ya lo tiene en el costo (0244). */
+        coalesce(sum((g.total - case when g.letra = 'A' then g.iva else 0 end - g.perc_dgi - g.perc_dgr) * coalesce(fl.parte, 0)), 0) as flete,
         count(*)::int as cantidad
       from gastos g
+      left join lateral (
+        /* «Lo tiene en el costo» = el flete % de la mayoría de sus productos es mayor a 0 (como en Gastos › Fletes). */
+        select sum(i.monto) filter (where i.flete_origen = 'proveedor' and (
+                 select mode() within group (order by pp.flete) from producto_proveedores pp
+                  where pp.proveedor_id = i.flete_proveedor_id and pp.modo_costo = 'lista') > 0)
+               / nullif(sum(i.monto), 0) as parte
+          from gasto_items i where i.gasto_id = g.id
+      ) fl on true
       where g.estado <> 'anulado' and g.negocio <> 'cafeteria'
         and ${MES_GASTO} >= $1::date and ${MES_GASTO} < $2::date
       group by 1, 2, 3, 4`, p),
@@ -207,6 +217,7 @@ export async function leerCatalogos(c: PoolClient, anioDesde: number) {
       amortizaciones: cfg.amortizaciones === true,
       gananciasBase: cfg.gananciasBase === 'todo' ? 'todo' as const : 'facturado' as const,
       diferenciasInventario: cfg.diferenciasInventario !== false,
+      fletesEnCosto: cfg.fletesEnCosto === true,
     },
   };
 }

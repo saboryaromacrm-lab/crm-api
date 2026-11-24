@@ -22,6 +22,7 @@ import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
 import { TIPOS_CON_PRUEBA, comoRenglonesDelPie, separarPruebas } from './renglones-prueba';
 import { ventasACambiar } from './venta-por-bulto';
+import { TIPOS_CON_FLETE, desvincularFletes, fletesDelComprobante, fletesSinPapel, vincularFletes } from '../gastos/fletes';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
@@ -282,6 +283,8 @@ class CreateComprobanteDto {
   /** La venta por bulto cerrado que pasa al bulto nuevo (0243): solo con su costo actualizado con ese bulto. */
   @IsOptional() @IsArray() @ArrayMaxSize(200) @ValidateNested({ each: true }) @Type(() => VentaPorBultoDto)
   ventaPorBulto?: VentaPorBultoDto[];
+  /** Los fletes del transporte que trajo esta mercadería (0244): renglones de gasto que quedan vinculados a este papel. */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @IsInt({ each: true }) fletes?: number[];
   /** Productos cuyo salto de costo por unidad (más de ×3) alguien confirmó. */
   @IsOptional() @IsArray() @IsInt({ each: true }) confirmarSaltos?: number[];
   /**
@@ -789,6 +792,15 @@ export class ComprobantesService {
       papeles: papeles.map((p) => ({ id: p.id, etiqueta: etiquetaDoc(p as any), fecha: p.fecha })),
       precios: [...precios].map(([productoId, v]) => ({ productoId, ...v })),
     };
+  }
+
+  fletesSinPapel(proveedorId: number) {
+    return fletesSinPapel(this.db, proveedorId);
+  }
+
+  /** Lo que costó traerla (0244): los fletes del transporte vinculados a este papel. */
+  fletesDelComprobante(id: number) {
+    return fletesDelComprobante(this.db, id);
   }
 
   async get(id: number) {
@@ -1704,6 +1716,11 @@ export class ComprobantesService {
         // borra en la misma transacción, así si el alta se cae el papel queda.
         if (cerrada.length) await tx.delete(facturaArchivos).where(eq(facturaArchivos.lecturaId, dto.lecturaId));
       }
+
+      /* El flete de esta mercadería (0244): los renglones del transporte que esperaban este papel. */
+      if (dto.fletes?.length && (TIPOS_CON_FLETE as readonly string[]).includes(dto.tipo)) {
+        await vincularFletes(tx, c.id, prov.id, dto.fletes);
+      }
       return c.id;
     });
     // La evolución de precios se registra DESPUÉS del commit: dentro de la
@@ -2261,6 +2278,9 @@ export class ComprobantesService {
         });
       }
 
+      /* Sus fletes (0244) vuelven a esperar papel: se vinculan al cargarlo de nuevo. */
+      await desvincularFletes(tx, c.id);
+
       const tocados: number[] = [];
       for (const lote of plan.lotes) {
         const rv = await this.precios.revertirLoteTx(tx, lote, dto.usuarioId ?? undefined);
@@ -2772,6 +2792,12 @@ export class ComprobantesController {
     return this.svc.cuenta(proveedorId);
   }
 
+  /** Los fletes de este proveedor que esperan su factura o remito (0244): se tildan al cargarlo. */
+  @Get('fletes-sin-papel/:proveedorId')
+  fletesSinPapel(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
+    return this.svc.fletesSinPapel(proveedorId);
+  }
+
   /** Las facturas que una NC/ND de este proveedor puede ajustar, con su saldo. */
   @Get('referenciables/:proveedorId')
   referenciables(@Param('proveedorId', ParseIntPipe) proveedorId: number) {
@@ -2792,6 +2818,11 @@ export class ComprobantesController {
   ) {
     if (!tienePermiso(auth.permisos, ['liquidaciones'])) return { mitadYMitad: false, porcFicha: 0, papeles: [], precios: [] };
     return this.svc.otraMitad({ proveedorId, tipo, letra, fecha });
+  }
+
+  @Get(':id/fletes')
+  fletesDelComprobante(@Param('id', ParseIntPipe) id: number) {
+    return this.svc.fletesDelComprobante(id);
   }
 
   /** Con el mismo corte que la lista: sin `liquidaciones`, la mitad no facturada no viaja. */

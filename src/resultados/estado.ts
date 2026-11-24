@@ -55,11 +55,13 @@ export type HechosLeidos = {
 export type Catalogos = {
   rubros: Rubro[]; empleados: Empleado[]; bienes: Bien[]; tasas: Tasa[]; escalas: Escala[];
   /** `diferenciasInventario`: si los ajustes y controles de stock entran al margen (sin el dato, sí). */
-  config: { amortizaciones: boolean; gananciasBase: 'facturado' | 'todo'; diferenciasInventario?: boolean };
+  config: { amortizaciones: boolean; gananciasBase: 'facturado' | 'todo'; diferenciasInventario?: boolean; fletesEnCosto?: boolean };
   /** Los gastos fijos y los meses en que tienen gasto cargado (0216). */
   fijos: GastoFijo[]; emitidos: Map<number, Set<string>>;
 };
 /** Los papeles de rubro que tienen su propio estimado o no entran: un gasto fijo de esos no estima (0216). */
+/** Lo excluido por ser flete de mercadería ya incluido en el costo (0244); no es un rubro. */
+export const CLAVE_FLETE = 'flete_en_costo';
 const SIN_ESTIMADO_FIJO = new Set(['iibb', 'municipalidad', 'comisiones', 'ganancias', 'fuera']);
 type Origen = 'estimado' | 'real' | 'mixto';
 
@@ -184,7 +186,14 @@ export function armarEstado(h: HechosLeidos, cat: Catalogos, mesesCalculo: strin
         aBalde(g.suc, g.importe, rubro?.reparte ?? true, (x, v) => { x[grupo][clave] = r2((x[grupo][clave] ?? 0) + v); }, reparto);
       }
     };
-    for (const g of idx.gastos.get(mes) ?? []) ponerGasto(g);
+    /* EL FLETE DE MERCADERÍA QUE YA ESTÁ EN EL COSTO (0244): con la casilla, la parte
+     * de cada gasto que es flete de un proveedor con flete % en su formato no entra
+     * como gasto —ya está en el costo de lo vendido— y se informa aparte. */
+    for (const g of idx.gastos.get(mes) ?? []) {
+      const flete = cat.config.fletesEnCosto ? r2(Number(g.flete) || 0) : 0;
+      if (flete > 0.009) info.excluidos[CLAVE_FLETE] = r2((info.excluidos[CLAVE_FLETE] ?? 0) + flete);
+      ponerGasto(flete > 0.009 ? { ...g, importe: r2(g.importe - flete) } : g);
+    }
 
     /* 2 bis · Los gastos fijos sin gasto cargado este mes: su estimado (0216). */
     const enCurso = hoy.length === 10 && mes === hoy.slice(0, 7);

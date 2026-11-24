@@ -224,6 +224,8 @@ export const proveedores = pgTable('proveedores', {
   letraGasto: letraComprobanteEnum('letra_gasto'),
   /** El rubro de gastos que factura (0240): «Cargar gasto» lo elige solo al elegir el proveedor. */
   rubroGastoId: integer('rubro_gasto_id').references((): AnyPgColumn => gastoCategorias.id, { onDelete: 'set null' }),
+  /** Es un transporte que trae mercadería de otros proveedores (0244): cada renglón de su factura dice de quién trajo. */
+  traeMercaderia: boolean('trae_mercaderia').notNull().default(false),
   /* ---- La ficha comercial (0068, del módulo Proveedores) ---- */
   condicionCompra: condicionCompraProvEnum('condicion_compra').notNull().default('factura'),
   /**
@@ -3256,8 +3258,22 @@ export const gastoItems = pgTable('gasto_items', {
   monto: doublePrecision('monto').notNull().default(0),
   /** 0196: unidades del renglón, opcional (NULL = no va por unidad). El precio por unidad se calcula: monto / cantidad. */
   cantidad: doublePrecision('cantidad'),
+  /*
+   * EL FLETE DE MERCADERÍA (0244). En la factura de un transporte (`proveedores.traeMercaderia`)
+   * cada renglón dice de dónde vino: 'proveedor' (de quién trajo y, cuando se sabe, de qué
+   * factura o remito suyo) u 'otro' (algo que no es de un proveedor). NULL = renglón de un
+   * gasto común, o de un flete cargado antes de la regla (sin asignar todavía).
+   * `fleteReferencia` es el número de la factura o el remito del proveedor tal como se
+   * escribió cuando todavía no estaba cargada; al cargarla se vincula (`fleteComprobanteId`).
+   */
+  fleteOrigen: text('flete_origen').$type<'proveedor' | 'otro'>(),
+  fleteProveedorId: integer('flete_proveedor_id').references((): AnyPgColumn => proveedores.id, { onDelete: 'set null' }),
+  fleteComprobanteId: integer('flete_comprobante_id').references((): AnyPgColumn => comprobantes.id, { onDelete: 'set null' }),
+  fleteReferencia: text('flete_referencia').notNull().default(''),
 }, (t) => ({
   ixGasto: index('ix_gasto_items_gasto').on(t.gastoId),
+  ixFleteProveedor: index('ix_gasto_items_flete_proveedor').on(t.fleteProveedorId).where(sql`${t.fleteOrigen} = 'proveedor'`),
+  ixFleteComprobante: index('ix_gasto_items_flete_comprobante').on(t.fleteComprobanteId).where(sql`${t.fleteComprobanteId} is not null`),
 }));
 
 /* ============================================================================

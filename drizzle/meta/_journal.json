@@ -1709,6 +1709,13 @@
       "when": 1796688000000,
       "tag": "0243_ventas_por_bulto",
       "breakpoints": true
+    },
+    {
+      "idx": 244,
+      "version": "7",
+      "when": 1796774400000,
+      "tag": "0244_fletes_mercaderia",
+      "breakpoints": true
     }
   ]
 }

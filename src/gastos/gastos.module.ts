@@ -18,7 +18,7 @@
  */
 import {
   BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Injectable,
-  Module, NotFoundException, Param, ParseIntPipe, Patch, Post, Query, Res,
+  Module, NotFoundException, Param, ParseIntPipe, Patch, Post, Put, Query, Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { Type } from 'class-transformer';
@@ -33,8 +33,12 @@ import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ajustePorAnulacion, fechaDeCuenta, importeEnCuenta } from '../cafeteria/cuenta';
 import { DRIZZLE, Database } from '../db/drizzle';
 import {
-  auditoria, gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
+  auditoria, comprobantes, gastoAdjuntos, gastoCategorias, gastos, gastoItems, gastosRecurrentes, proveedores, sucursales, usuarios,
 } from '../db/schema';
+import {
+  NETO_DE_LA_ENTREGA, NETO_DEL_RENGLON, ORIGENES_FLETE, PAPELES_DE_LA_ENTREGA, TIPOS_CON_FLETE, coincideNumero, papelMasCercano,
+  sugerirProveedor, type FleteOrigen,
+} from './fletes';
 
 /**
  * LO QUE UN GASTO DE COFFIT LE SUMA A SU CUENTA: su TOTAL, con IVA y
@@ -220,11 +224,28 @@ class PagoDto {
   @IsOptional() @IsBoolean() confirmarDuplicado?: boolean;
 }
 
+/** De dónde vino un renglón de flete (0244): ver `fletes.ts`. */
+class FleteDeRenglonDto {
+  @IsOptional() @IsIn(ORIGENES_FLETE) fleteOrigen?: FleteOrigen | null;
+  @IsOptional() @IsInt() fleteProveedorId?: number | null;
+  @IsOptional() @IsInt() fleteComprobanteId?: number | null;
+  /** El número de la factura o el remito del proveedor, si todavía no está cargado. */
+  @IsOptional() @IsString() @MaxLength(40) fleteReferencia?: string;
+}
+
 /** Un renglón del gasto: concepto + importe del renglón, como se lee del papel; la cantidad, si va por unidad (0196). */
-class GastoItemDto {
+class GastoItemDto extends FleteDeRenglonDto {
   @IsString() @MaxLength(200) concepto!: string;
   @IsNumber() @Min(0.01) @Max(TOPE_IMPORTE) monto!: number;
   @IsOptional() @IsNumber() @Min(0.001) @Max(1_000_000) cantidad?: number | null;
+}
+
+/** Corregir de dónde vino un renglón ya cargado (0244): no toca importes, así que vale con pagos. */
+class AsignarFleteDto extends FleteDeRenglonDto {
+  @IsInt() itemId!: number;
+}
+class AsignarFletesDto {
+  @IsArray() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => AsignarFleteDto) renglones!: AsignarFleteDto[];
 }
 
 class GastoDto {
@@ -424,6 +445,8 @@ export class GastosService {
         letraGasto: proveedores.letraGasto,
         // El rubro que factura (0240): el formulario lo elige solo al elegir el proveedor.
         rubroGastoId: proveedores.rubroGastoId,
+        // Es un transporte (0244): sus renglones dicen de qué proveedor trajo.
+        traeMercaderia: proveedores.traeMercaderia,
       }).from(proveedores).orderBy(asc(proveedores.nombre)),
       this.db.select({ id: sucursales.id, nombre: sucursales.nombre, activa: sucursales.activa })
         .from(sucursales).orderBy(asc(sucursales.id)),
@@ -593,12 +616,21 @@ export class GastosService {
       eq(gastos.refGastoId, id), eq(gastos.tipoDoc, 'nota_credito'), ne(gastos.estado, 'anulado'),
     )).orderBy(asc(gastos.id));
     const acreditado = money(notasCredito.reduce((a, n) => a - n.total, 0));
+    /* El papel del proveedor al que quedó vinculado cada renglón de flete (0244). */
+    const idsPapel = [...new Set(items.map((i) => i.fleteComprobanteId).filter((x): x is number => !!x))];
+    const papelesFlete = idsPapel.length
+      ? await this.db.select({
+        id: comprobantes.id, tipo: comprobantes.tipo, letra: comprobantes.letra, puntoVenta: comprobantes.puntoVenta,
+        numero: comprobantes.numero, fecha: comprobantes.fecha,
+      }).from(comprobantes).where(inArray(comprobantes.id, idsPapel))
+      : [];
     const [refGasto] = g.refGastoId
       ? await this.db.select({ id: gastos.id, numero: gastos.numero, descripcion: gastos.descripcion })
         .from(gastos).where(eq(gastos.id, g.refGastoId)).limit(1)
       : [null];
     return {
-      ...g, saldo: money(g.total - g.pagado), pagos, adjuntos, items,
+      ...g, saldo: money(g.total - g.pagado), pagos, adjuntos,
+      items: items.map((i) => ({ ...i, fletePapel: papelesFlete.find((p) => p.id === i.fleteComprobanteId) ?? null })),
       notasCredito, acreditado, pagadoEnPlata: money(g.pagado - acreditado), refGasto: refGasto ?? null,
     };
   }
@@ -816,7 +848,11 @@ export class GastosService {
    */
   private importesDe(dto: GastoDto) {
     const renglones = (dto.items ?? [])
-      .map((i) => ({ concepto: (i.concepto ?? '').trim(), monto: money(i.monto), cantidad: i.cantidad || null }))
+      .map((i) => ({
+        concepto: (i.concepto ?? '').trim(), monto: money(i.monto), cantidad: i.cantidad || null,
+        fleteOrigen: i.fleteOrigen ?? null, fleteProveedorId: i.fleteProveedorId ?? null,
+        fleteComprobanteId: i.fleteComprobanteId ?? null, fleteReferencia: (i.fleteReferencia ?? '').trim(),
+      }))
       .filter((i) => i.concepto && i.monto > 0);
     if (!renglones.length) return { ...this.totalesDe(dto), items: null, descripcion: null };
 
@@ -852,6 +888,241 @@ export class GastosService {
       ...extras,
       items: renglones,
       descripcion,
+    };
+  }
+
+  /* ---------------- Fletes de mercadería (0244, ver `fletes.ts`) ---------------- */
+
+  private faltaOrigen(transporte: string, concepto?: string) {
+    return `${transporte} es un transporte: decí de qué proveedor trajo${concepto ? ` «${concepto}»` : ' cada renglón'}, o marcalo como otra cosa.`;
+  }
+
+  /**
+   * DE DÓNDE VINO CADA RENGLÓN, validado y completado. Con `transporte` (la factura
+   * de un transporte, no una NC) cada renglón TIENE que decirlo. El de un proveedor
+   * apunta a un proveedor de mercadería; su factura o remito, si se eligió, tiene que
+   * ser suyo y estar vigente; si solo se escribió el número y ese papel ya está
+   * cargado, se vincula solo. 'otro' y sin origen no llevan nada más.
+   */
+  private async resolverFletes<T extends { concepto: string } & FleteDeRenglonDto>(
+    renglones: T[], transporte: { nombre: string } | null,
+  ) {
+    if (transporte) {
+      const falta = renglones.find((r) => !r.fleteOrigen);
+      if (falta) throw new BadRequestException(this.faltaOrigen(transporte.nombre, falta.concepto));
+    }
+    const deProveedor = renglones.filter((r) => r.fleteOrigen === 'proveedor');
+    const sinProveedor = deProveedor.find((r) => !r.fleteProveedorId);
+    if (sinProveedor) throw new BadRequestException(`Elegí de qué proveedor trajo «${sinProveedor.concepto}».`);
+    const provIds = [...new Set(deProveedor.map((r) => Number(r.fleteProveedorId)))];
+    const [provs, papeles] = provIds.length
+      ? await Promise.all([
+        this.db.select({ id: proveedores.id, nombre: proveedores.nombre, proveeMercaderia: proveedores.proveeMercaderia })
+          .from(proveedores).where(inArray(proveedores.id, provIds)),
+        this.db.select({
+          id: comprobantes.id, proveedorId: comprobantes.proveedorId, puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero,
+        }).from(comprobantes).where(and(
+          inArray(comprobantes.proveedorId, provIds), eq(comprobantes.estado, 'confirmado'),
+          inArray(comprobantes.tipo, [...TIPOS_CON_FLETE]),
+        )),
+      ])
+      : [[], []];
+    return renglones.map((r) => {
+      if (r.fleteOrigen !== 'proveedor') {
+        return { ...r, fleteOrigen: r.fleteOrigen ?? null, fleteProveedorId: null, fleteComprobanteId: null, fleteReferencia: '' };
+      }
+      const prov = provs.find((x) => x.id === Number(r.fleteProveedorId));
+      if (!prov?.proveeMercaderia) {
+        throw new BadRequestException(`El proveedor elegido para «${r.concepto}» no vende mercadería: elegí de quién trajo o marcalo como otra cosa.`);
+      }
+      const suyos = papeles.filter((c) => c.proveedorId === prov.id);
+      const referencia = (r.fleteReferencia ?? '').trim();
+      let comprobanteId = r.fleteComprobanteId ?? null;
+      if (comprobanteId && !suyos.some((c) => c.id === comprobanteId)) {
+        throw new BadRequestException(`La factura o el remito elegido para «${r.concepto}» no es de ${prov.nombre} o está anulado.`);
+      }
+      if (!comprobanteId && referencia) {
+        const iguales = suyos.filter((c) => coincideNumero(referencia, c));
+        if (iguales.length === 1) comprobanteId = iguales[0].id;
+      }
+      return {
+        ...r, fleteOrigen: 'proveedor' as const, fleteProveedorId: prov.id,
+        fleteComprobanteId: comprobanteId, fleteReferencia: comprobanteId ? '' : referencia,
+      };
+    });
+  }
+
+  /** Corregir o completar de dónde vino cada renglón (el detalle del gasto, o las cargas viejas sin asignar). */
+  async asignarFletes(dto: AsignarFletesDto) {
+    const ids = [...new Set(dto.renglones.map((r) => r.itemId))];
+    if (!ids.length) throw new BadRequestException('No indicaste ningún renglón.');
+    const actuales = await this.db.select({ id: gastoItems.id, concepto: gastoItems.concepto, estado: gastos.estado })
+      .from(gastoItems).innerJoin(gastos, eq(gastos.id, gastoItems.gastoId)).where(inArray(gastoItems.id, ids));
+    const porId = new Map(actuales.map((a) => [a.id, a]));
+    for (const r of dto.renglones) {
+      const a = porId.get(r.itemId);
+      if (!a) throw new NotFoundException('Uno de los renglones ya no existe: actualizá la pantalla.');
+      if (a.estado === 'anulado') throw new BadRequestException(`«${a.concepto}» es de un gasto anulado.`);
+    }
+    const listos = await this.resolverFletes(dto.renglones.map((r) => ({ ...r, concepto: porId.get(r.itemId)!.concepto })), null);
+    await this.db.transaction(async (tx) => {
+      for (const r of listos) {
+        await tx.update(gastoItems).set({
+          fleteOrigen: r.fleteOrigen, fleteProveedorId: r.fleteProveedorId,
+          fleteComprobanteId: r.fleteComprobanteId, fleteReferencia: r.fleteReferencia,
+        }).where(eq(gastoItems.id, r.itemId));
+      }
+    });
+    return { ok: true, asignados: listos.length };
+  }
+
+  /** Las facturas y remitos recientes de un proveedor, para elegir de cuál fue el flete. */
+  async papelesParaFlete(proveedorId: number) {
+    const r: any = await this.db.execute(sql`
+      select c.id, c.tipo, c.letra, c.punto_venta, c.numero, c.fecha, c.subtotal_neto,
+             (select count(*)::int from gasto_items i join gastos g on g.id = i.gasto_id
+               where i.flete_comprobante_id = c.id and g.estado <> 'anulado') as fletes
+        from comprobantes c
+       where c.proveedor_id = ${proveedorId} and c.estado = 'confirmado'
+         and c.tipo in ('factura', 'remito', 'liquidacion') and c.fecha >= now() - interval '180 days'
+       order by c.fecha desc, c.id desc
+       limit 40`);
+    return ((r.rows ?? r) as any[]).map((x) => ({
+      id: Number(x.id), tipo: x.tipo, letra: x.letra, puntoVenta: x.punto_venta, numero: x.numero == null ? null : Number(x.numero),
+      fecha: x.fecha, neto: money(Number(x.subtotal_neto)), fletes: Number(x.fletes),
+    }));
+  }
+
+  /**
+   * EL FLETE REAL DE CADA PROVEEDOR en el período: lo que se le pagó al transporte por
+   * traer su mercadería (sin IVA, por la fecha de la factura del transporte) contra lo
+   * que se le compró (neto de sus facturas, remitos y liquidaciones), y al lado el
+   * flete % que cargan sus formatos de compra (lo que ya está en el costo). Con el
+   * detalle renglón por renglón y las cargas viejas sin asignar, con su sugerencia.
+   */
+  async reporteFletes(q: ConsultaGastosDto) {
+    const hoy = hoyAr();
+    const desde = q.desde ?? `${hoy.slice(0, 7)}-01`;
+    const hasta = q.hasta ?? hoy;
+    const ini = fechaLocal(desde)!;
+    const fin = new Date(`${hasta}T23:59:59.999`);
+    const filas = async (consulta: any) => { const r: any = await this.db.execute(consulta); return (r.rows ?? r) as any[]; };
+    const [renglones, compras, enCosto, viejos, transportes, sinMarcar, padron] = await Promise.all([
+      filas(sql`
+        select i.id, i.concepto, i.cantidad, i.flete_origen, i.flete_proveedor_id, i.flete_referencia, ${NETO_DEL_RENGLON} as neto,
+               o.nombre as proveedor, g.id as gasto_id, g.fecha, g.letra, g.numero, coalesce(t.nombre, g.proveedor_texto) as transporte,
+               c.id as papel_id, c.tipo as papel_tipo, c.letra as papel_letra, c.punto_venta as papel_pv, c.numero as papel_numero,
+               to_char(c.fecha, 'YYYY-MM-DD') as papel_dia, ${NETO_DE_LA_ENTREGA} as entrega_neto, ${PAPELES_DE_LA_ENTREGA} as entrega_papeles
+          from gasto_items i join gastos g on g.id = i.gasto_id
+          left join proveedores t on t.id = g.proveedor_id
+          left join proveedores o on o.id = i.flete_proveedor_id
+          left join comprobantes c on c.id = i.flete_comprobante_id
+         where i.flete_origen is not null and g.estado <> 'anulado' and g.fecha >= ${ini} and g.fecha <= ${fin}
+         order by g.fecha desc, i.id`),
+      filas(sql`
+        select c.proveedor_id, sum(c.subtotal_neto) as neto, count(*)::int as papeles
+          from comprobantes c
+         where c.estado = 'confirmado' and c.tipo in ('factura', 'remito', 'liquidacion') and c.fecha >= ${ini} and c.fecha <= ${fin}
+         group by 1`),
+      /* El flete % de sus formatos: el que tienen la mayoría de sus productos (y el rango). */
+      filas(sql`select proveedor_id, min(flete) as min, max(flete) as max, mode() within group (order by flete) as habitual
+                  from producto_proveedores where modo_costo = 'lista' group by 1`),
+      filas(sql`
+        select i.id, i.concepto, i.cantidad, ${NETO_DEL_RENGLON} as neto, g.id as gasto_id, g.fecha, g.letra, g.numero, t.nombre as transporte
+          from gasto_items i join gastos g on g.id = i.gasto_id join proveedores t on t.id = g.proveedor_id
+         where t.trae_mercaderia and i.flete_origen is null and g.estado <> 'anulado' and g.tipo_doc <> 'nota_credito'
+         order by g.fecha desc, i.id
+         limit 300`),
+      this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores)
+        .where(eq(proveedores.traeMercaderia, true)).orderBy(asc(proveedores.nombre)),
+      filas(sql`
+        select p.id, p.nombre, count(*)::int as gastos
+          from gastos g join proveedores p on p.id = g.proveedor_id join gasto_categorias gc on gc.id = g.categoria_id
+         where not p.trae_mercaderia and gc.nombre ilike '%flete%' and g.estado <> 'anulado' and g.fecha >= now() - interval '180 days'
+         group by 1, 2 order by 3 desc`),
+      this.db.select({ id: proveedores.id, nombre: proveedores.nombre }).from(proveedores)
+        .where(and(eq(proveedores.proveeMercaderia, true), eq(proveedores.traeMercaderia, false))),
+    ]);
+    const pct = (parte: number, todo: number) => (todo > 0 ? Math.round((parte / todo) * 1000) / 10 : null);
+    const detalle = renglones.map((x) => {
+      const neto = money(Number(x.neto));
+      const entregaNeto = money(Number(x.entrega_neto));
+      return {
+        itemId: Number(x.id), gastoId: Number(x.gasto_id), fecha: x.fecha, transporte: String(x.transporte ?? ''),
+        numero: x.numero ? `${x.letra} ${x.numero}` : '', concepto: String(x.concepto), cantidad: x.cantidad == null ? null : Number(x.cantidad),
+        neto, origen: x.flete_origen as FleteOrigen,
+        proveedorId: x.flete_proveedor_id == null ? null : Number(x.flete_proveedor_id), proveedor: x.proveedor ?? null,
+        referencia: String(x.flete_referencia ?? ''),
+        papel: x.papel_id == null ? null : {
+          id: Number(x.papel_id), tipo: x.papel_tipo, letra: x.papel_letra, puntoVenta: x.papel_pv,
+          numero: x.papel_numero == null ? null : Number(x.papel_numero),
+          /* La entrega: este papel y los otros del proveedor de ese día (la otra mitad). */
+          dia: String(x.papel_dia), netoEntrega: entregaNeto, papelesEntrega: Number(x.entrega_papeles), pct: pct(neto, entregaNeto),
+        },
+      };
+    });
+    const comprasDe = new Map(compras.map((c) => [Number(c.proveedor_id), { neto: money(Number(c.neto)), papeles: Number(c.papeles) }]));
+    const costoDe = new Map(enCosto.map((c) => [Number(c.proveedor_id), { min: Number(c.min), max: Number(c.max), habitual: Number(c.habitual) }]));
+    /*
+     * EL % REAL. Con fletes vinculados a su factura o remito, contra ESOS papeles: es lo
+     * exacto (el flete de noviembre puede ser de la factura de octubre). Sin ninguno
+     * vinculado, contra lo comprado en el período: una aproximación, y se dice cuál fue.
+     */
+    type Acum = { id: number; nombre: string; flete: number; renglones: number; sinPapel: number; fleteConPapel: number; entregas: Map<string, number> };
+    const porProveedor = new Map<number, Acum>();
+    for (const d of detalle) {
+      if (d.origen !== 'proveedor' || d.proveedorId == null) continue;
+      const p = porProveedor.get(d.proveedorId)
+        ?? { id: d.proveedorId, nombre: d.proveedor ?? '', flete: 0, renglones: 0, sinPapel: 0, fleteConPapel: 0, entregas: new Map() };
+      p.flete = money(p.flete + d.neto);
+      p.renglones += 1;
+      if (d.papel) { p.fleteConPapel = money(p.fleteConPapel + d.neto); p.entregas.set(d.papel.dia, d.papel.netoEntrega); } else p.sinPapel += 1;
+      porProveedor.set(d.proveedorId, p);
+    }
+    const proveedoresRes = [...porProveedor.values()].map(({ entregas, fleteConPapel, ...p }) => {
+      const netoPapeles = money([...entregas.values()].reduce((a, n) => a + n, 0));
+      const periodo = comprasDe.get(p.id) ?? { neto: 0, papeles: 0 };
+      const conPapeles = netoPapeles > 0;
+      return {
+        ...p, base: conPapeles ? 'papeles' as const : 'periodo' as const,
+        compras: conPapeles ? netoPapeles : periodo.neto, entregas: conPapeles ? entregas.size : periodo.papeles,
+        pctReal: conPapeles ? pct(fleteConPapel, netoPapeles) : pct(p.flete, periodo.neto), enCosto: costoDe.get(p.id) ?? null,
+      };
+    }).sort((a, b) => b.flete - a.flete);
+    const otros = detalle.filter((d) => d.origen === 'otro');
+    const viejosConSugerido = viejos.map((x) => ({ x, s: sugerirProveedor(String(x.concepto), padron) }));
+    /* Un papel se sugiere a UN solo flete de la tanda: si dos fletes caen en el mismo, el segundo se elige a mano. */
+    const papelesUsados = new Set<number>();
+    const idsSugeridos = [...new Set(viejosConSugerido.filter((v) => v.s).map((v) => v.s!.id))];
+    const papelesLibres = idsSugeridos.length ? await filas(sql`
+      select c.id, c.proveedor_id, c.tipo, c.letra, c.punto_venta, c.numero, c.fecha
+        from comprobantes c
+       where c.proveedor_id in (${sql.join(idsSugeridos.map((id) => sql`${id}`), sql`, `)})
+         and c.estado = 'confirmado' and c.tipo in ('factura', 'remito', 'liquidacion')
+         and not exists (select 1 from gasto_items i join gastos g on g.id = i.gasto_id
+                          where i.flete_comprobante_id = c.id and g.estado <> 'anulado')`) : [];
+    return {
+      desde, hasta,
+      proveedores: proveedoresRes,
+      otros: { neto: money(otros.reduce((a, d) => a + d.neto, 0)), renglones: otros.length },
+      detalle,
+      sinAsignar: viejosConSugerido.map(({ x, s }) => {
+        const cercano = s ? papelMasCercano(x.fecha, papelesLibres.filter((c) => Number(c.proveedor_id) === s.id)) : null;
+        const papel = cercano && !papelesUsados.has(Number(cercano.id)) ? cercano : null;
+        if (papel) papelesUsados.add(Number(papel.id));
+        return {
+          itemId: Number(x.id), gastoId: Number(x.gasto_id), fecha: x.fecha, transporte: String(x.transporte),
+          numero: x.numero ? `${x.letra} ${x.numero}` : '', concepto: String(x.concepto),
+          cantidad: x.cantidad == null ? null : Number(x.cantidad), neto: money(Number(x.neto)),
+          sugerido: s ? { id: s.id, nombre: s.nombre } : null,
+          papelSugerido: papel ? {
+            id: Number(papel.id), tipo: papel.tipo, letra: papel.letra, puntoVenta: papel.punto_venta,
+            numero: papel.numero == null ? null : Number(papel.numero), fecha: papel.fecha,
+          } : null,
+        };
+      }),
+      transportes,
+      sinMarcar: sinMarcar.map((x) => ({ id: Number(x.id), nombre: String(x.nombre), gastos: Number(x.gastos) })),
     };
   }
 
@@ -958,14 +1229,18 @@ export class GastosService {
     if (!cat.activa) throw new BadRequestException(`El rubro "${cat.nombre}" está dado de baja: elegí otro.`);
 
     let proveedorId: number | null = null;
+    let transporte: { nombre: string } | null = null;
     if (dto.proveedorId) {
       const [p] = await this.db.select().from(proveedores).where(eq(proveedores.id, Number(dto.proveedorId))).limit(1);
       if (!p) throw new BadRequestException('Proveedor inválido.');
       proveedorId = p.id;
+      if (p.traeMercaderia) transporte = p;
     }
 
     const calc = this.importesDe(dto);
     if (calc.total <= 0) throw new BadRequestException('El importe del gasto tiene que ser mayor a 0.');
+    if (calc.items) calc.items = await this.resolverFletes(calc.items, esNotaCredito(dto.tipoDoc) ? null : transporte);
+    else if (transporte && !esNotaCredito(dto.tipoDoc)) throw new BadRequestException(this.faltaOrigen(transporte.nombre));
     exigirFechasGasto(fechaLocal(dto.fecha), fechaLocal(dto.vencimiento));
     if (dto.pagoInmediato) exigirFechaPago(dto.pagoInmediato.fecha);
     const esNc = esNotaCredito(dto.tipoDoc);
@@ -1124,6 +1399,10 @@ export class GastosService {
        */
       const conRenglones = this.importesDe(dto);
       if (conRenglones.items) {
+        const provFinal = dto.proveedorId !== undefined ? (dto.proveedorId ?? null) : g.proveedorId;
+        const [pf] = provFinal ? await this.db.select().from(proveedores).where(eq(proveedores.id, provFinal)).limit(1) : [];
+        const esNcFinal = esNotaCredito(dto.tipoDoc ?? g.tipoDoc);
+        conRenglones.items = await this.resolverFletes(conRenglones.items, pf?.traeMercaderia && !esNcFinal ? pf : null);
         Object.assign(patch, {
           neto: conRenglones.neto, iva: conRenglones.iva, otros: conRenglones.otros,
           impInternos: conRenglones.impInternos, percDgi: conRenglones.percDgi, percDgr: conRenglones.percDgr,
@@ -1771,6 +2050,15 @@ export class GastosController {
   @Delete('adjuntos/:id') @Permiso('gastos.gastos') borrarAdjunto(@Param('id', ParseIntPipe) id: number) {
     return this.svc.borrarAdjunto(id);
   }
+
+  /* Los fletes de mercadería (0244). */
+  @Get('fletes') @Permiso('gastos.resumen', 'gastos.proveedores') fletes(@Query() q: ConsultaGastosDto) {
+    return this.svc.reporteFletes(q ?? {});
+  }
+  @Get('fletes/papeles/:proveedorId') @Permiso('gastos.gastos') papelesParaFlete(@Param('proveedorId', ParseIntPipe) id: number) {
+    return this.svc.papelesParaFlete(id);
+  }
+  @Put('fletes') @Permiso('gastos.gastos') asignarFletes(@Body() dto: AsignarFletesDto) { return this.svc.asignarFletes(dto); }
 
   @Get() @Permiso(...PERMISOS_VER) list(@Query() q: ConsultaGastosDto) { return this.svc.list(q ?? {}); }
   /*

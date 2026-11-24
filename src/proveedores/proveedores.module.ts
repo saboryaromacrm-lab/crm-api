@@ -38,6 +38,8 @@ class UpsertProveedorDto {
   @IsOptional() @IsIn(['A', 'B', 'C', 'X', '']) letraGasto?: string;
   /** El rubro de gastos que factura (0240). `null` = sin rubro, ausente = conservar el que tenía. */
   @IsOptional() @IsInt() rubroGastoId?: number | null;
+  /** Es un transporte que trae mercadería de otros proveedores (0244). Ausente = conservar. */
+  @IsOptional() @IsBoolean() traeMercaderia?: boolean;
   /* ---- La ficha comercial (0068, módulo Proveedores) ---- */
   /** Qué emite: factura / liquidación (la mitad sin factura) / mixto. */
   @IsOptional() @IsIn(['factura', 'liquidacion', 'mixto']) condicionCompra?: string;
@@ -195,6 +197,7 @@ export class ProveedoresService {
       esLocal: dto.esLocal ?? false,
       letraGasto: (dto.letraGasto || null) as any,
       rubroGastoId: dto.rubroGastoId ?? null,
+      traeMercaderia: dto.traeMercaderia ?? false,
       condicionCompra: (dto.condicionCompra ?? 'factura') as any,
       medioHabitual: (dto.medioHabitual || null) as any,
       diasPago: dto.diasPago || null,
@@ -256,6 +259,7 @@ export class ProveedoresService {
       // '' borra a propósito; ausente conserva (mismo criterio que los flags).
       letraGasto: (dto.letraGasto === undefined ? actual.letraGasto : (dto.letraGasto || null)) as any,
       rubroGastoId: dto.rubroGastoId === undefined ? actual.rubroGastoId : dto.rubroGastoId,
+      traeMercaderia: dto.traeMercaderia ?? actual.traeMercaderia,
       /* La ficha comercial sigue el mismo contrato: ausente conserva, '' borra.
        * OJO con el medio habitual: cambiarlo NO toca compromisos ya generados
        * (el plazo pactado quedó congelado en cada compromiso, como en la app). */

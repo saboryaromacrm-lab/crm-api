@@ -44,7 +44,7 @@ import { diasPorLocal, resumirActividad } from '../metricas/actividad';
 import { reporteIva } from '../metricas/iva';
 import { MetricasModule, MetricasService } from '../metricas/metricas.module';
 import { leerCatalogos, leerHechos, leerObjetivos } from './datos';
-import { ADMINISTRACION, SIN_LOCAL, armarEstado } from './estado';
+import { ADMINISTRACION, CLAVE_FLETE, SIN_LOCAL, armarEstado } from './estado';
 import { PERMISO_RESULTADOS } from './permiso';
 import { RepartoDto, exigirReparto } from './reparto';
 import { MES_RE, diasDelMes, mesesEntre, r2, sumarMeses, totalDeducciones } from './reglas';
@@ -82,6 +82,8 @@ class ConfigDto {
   @IsOptional() @IsBoolean() amortizaciones?: boolean;
   @IsOptional() @IsIn(['facturado', 'todo']) gananciasBase?: 'facturado' | 'todo';
   @IsOptional() @IsBoolean() diferenciasInventario?: boolean;
+  /** El flete de mercadería que ya está en el costo no se cuenta como gasto (0244). */
+  @IsOptional() @IsBoolean() fletesEnCosto?: boolean;
 }
 
 class TramoDto {
@@ -237,7 +239,9 @@ export class ResultadosService {
   private avisos(meses: any[], cat: any, avisosGanancias: string[], enCurso: boolean) {
     const out: { tono: 'warn' | 'info'; texto: string }[] = [];
     const nombreSuc = (id: number) => cat.sucursales.find((s: any) => s.id === id)?.nombre ?? `#${id}`;
-    const nombreRubro = (id: string) => cat.rubros.find((r: any) => String(r.id) === id)?.nombre ?? `#${id}`;
+    const nombreRubro = (id: string) => (id === CLAVE_FLETE
+      ? 'Flete de mercadería (ya está en el costo)'
+      : cat.rubros.find((r: any) => String(r.id) === id)?.nombre ?? `#${id}`);
     const suma = (f: (m: any) => number) => meses.reduce((a, m) => a + f(m), 0);
     const curso = meses.find((m) => m.enCurso)?.enCurso;
     if (enCurso) {
@@ -280,7 +284,7 @@ export class ResultadosService {
     const excl: Record<string, number> = {};
     for (const m of meses) for (const [k, v] of Object.entries(m.info.excluidos as Record<string, number>)) excl[k] = (excl[k] ?? 0) + v;
     const ex = Object.entries(excl).filter(([, v]) => Math.abs(v) > 0.009);
-    if (ex.length) out.push({ tono: 'info', texto: `No entran (por cómo está marcado su rubro): ${ex.map(([k, v]) => `${nombreRubro(k)} ${pesos(v)}`).join(' · ')}.` });
+    if (ex.length) out.push({ tono: 'info', texto: `No entran como gasto: ${ex.map(([k, v]) => `${nombreRubro(k)} ${pesos(v)}`).join(' · ')}.` });
     for (const t of avisosGanancias) out.push({ tono: 'warn', texto: t });
     const fuera = suma((m) => m.total.hechos.ajustesFuera);
     if (Math.abs(fuera) >= 0.5) {
@@ -382,6 +386,11 @@ export class ResultadosService {
       valor.diferenciasInventario = dto.diferenciasInventario;
       const txt = (b: boolean) => (b ? 'Se cuentan' : 'No se cuentan');
       cambios.push(['Diferencias de inventario', txt(antes.diferenciasInventario !== false), txt(dto.diferenciasInventario)]);
+    }
+    if (dto.fletesEnCosto != null && dto.fletesEnCosto !== (antes.fletesEnCosto === true)) {
+      valor.fletesEnCosto = dto.fletesEnCosto;
+      const txt = (b: boolean) => (b ? 'No se cuenta (ya está en el costo)' : 'Se cuenta como gasto');
+      cambios.push(['Flete de mercadería', txt(antes.fletesEnCosto === true), txt(dto.fletesEnCosto)]);
     }
     if (dto.gananciasBase && dto.gananciasBase !== (antes.gananciasBase ?? 'facturado')) {
       valor.gananciasBase = dto.gananciasBase;
