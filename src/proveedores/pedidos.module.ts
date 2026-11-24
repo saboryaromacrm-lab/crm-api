@@ -479,7 +479,8 @@ export class PedidosProveedorController {
   /* Al escribir el pedido (26/10/2026): cuánto entró la última vez. */
   @Get('proveedor/:id/ultimo-ingreso') ultimoIngresoDe(@Param('id', ParseIntPipe) id: number) { return this.svc.ultimoIngresoDe(id); }
   @Get('stats') stats() { return this.svc.stats(); }
-  @Get('recibidos') recibidos(
+  /* Almacén › Ingresos (24/11/2026): la sección tiene llave propia; antes era una vista de Pedidos. */
+  @Get('recibidos') @Permiso('almacen.ingresos') recibidos(
     @Query('filtro') filtro?: string,
     @Query('proveedorId') proveedorId?: string,
     @Query('buscar') buscar?: string,

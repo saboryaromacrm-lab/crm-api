@@ -1716,6 +1716,13 @@
       "when": 1796774400000,
       "tag": "0244_fletes_mercaderia",
       "breakpoints": true
+    },
+    {
+      "idx": 245,
+      "version": "7",
+      "when": 1796860800000,
+      "tag": "0245_almacen_ingresos",
+      "breakpoints": true
     }
   ]
 }

@@ -174,6 +174,8 @@ export const CATALOGO_PERMISOS = [
       { clave: 'almacen.bajos', nombre: 'Bajos en stock (por proveedor)' },
       /* Cuántas veces y cuántos días sin stock en un período, y lo que se dejó de vender (4/11/2026). */
       { clave: 'almacen.quiebres', nombre: 'Quiebres de stock (con la venta perdida)' },
+      /* Los pedidos a proveedores ya recibidos: cuándo se pidió, cuándo llegó, cuánto tardó (24/11/2026, venía de Proveedores › Pedidos). */
+      { clave: 'almacen.ingresos', nombre: 'Ingresos (pedidos recibidos)' },
       { clave: 'almacen.cafeteria', nombre: 'Coffit (envíos)' },
       /*
        * La pantalla DE la cafetería: armar el pedido a la distribuidora. Es la
