@@ -20,6 +20,7 @@ import {
  * y este módulo ya importa de `pagos`: exportarla desde acá cerraba el ciclo. */
 import { Auth, Permiso, type Sesion } from '../auth/auth.decoradores';
 import { ALICUOTAS_IVA, ALICUOTAS_TEXTO } from '../common/iva';
+import { TIPOS_CON_PRUEBA, comoRenglonesDelPie, separarPruebas } from './renglones-prueba';
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
@@ -127,6 +128,18 @@ class ComprobanteItemDto {
    * es siempre, venga o no el tilde: la marca de la ficha no se destilda acá.
    */
   @IsOptional() @IsBoolean() paraCafeteria?: boolean;
+}
+
+/** Un renglón DE PRUEBA (0242): suma a la factura, no es un producto. Ver `renglones-prueba.ts`. */
+class RenglonPruebaDto {
+  @IsString() @MaxLength(200) descripcion!: string;
+  @IsOptional() @IsString() @MaxLength(40) codigo?: string;
+  @IsNumber() @Min(0) @Max(1_000_000) cantidad!: number;
+  /** El neto del renglón como lo imprime el papel, antes de la bonificación general. */
+  @IsNumber() @Min(0.01) @Max(1_000_000_000) neto!: number;
+  @IsOptional() @IsNumber() @IsIn(ALICUOTAS_IVA as unknown as number[], {
+    message: `Alícuota de IVA inválida. Las válidas son: ${ALICUOTAS_TEXTO}%.`,
+  }) iva?: number;
 }
 
 /**
@@ -253,6 +266,9 @@ class CreateComprobanteDto {
   @IsOptional() @IsString() vencimientoPago?: string;
   @IsArray() @ArrayNotEmpty() @ValidateNested({ each: true }) @Type(() => ComprobanteItemDto)
   items!: ComprobanteItemDto[];
+  /** Los renglones del papel marcados «de prueba» (0242): suman al total, no entran al stock. */
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => RenglonPruebaDto)
+  renglonesPrueba?: RenglonPruebaDto[];
   /** Los que el usuario tildó en "diferencias de costo" al cargar el comprobante. */
   @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ActualizarCostoDto)
   actualizarCostos?: ActualizarCostoDto[];
@@ -1300,14 +1316,20 @@ export class ComprobantesService {
     const discriminaIva = fiscal && letraDoc === 'A';
     this.validarFechas(dto);
     await this.exigirUnidadesEnteras(dto.items);
+    if (dto.renglonesPrueba?.length && !TIPOS_CON_PRUEBA.has(dto.tipo)) {
+      throw new BadRequestException('Los renglones de prueba van en una factura o una liquidación.');
+    }
 
     /* EL PIE DE LA FACTURA — la cuenta vive en `armarPie()`, compartida con
      * `facturar()` (la conversión del remito): dos copias de esta matemática
      * habrían divergido tarde o temprano y el total dejaría de cerrar con el
      * papel según por qué puerta se cargó. */
-    const {
-      items, bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total,
-    } = this.armarPie(dto, fiscal, ivaDefault, discriminaIva);
+    /* Los de prueba (0242) pasan por el mismo pie y después se separan: no son productos. */
+    const pie = this.armarPie(
+      { ...dto, items: [...dto.items, ...comoRenglonesDelPie(dto.renglonesPrueba)] }, fiscal, ivaDefault, discriminaIva,
+    );
+    const { bonifPct, bonificacionImporte, subtotalNeto, ivaTotal, percepciones, percepcionesTotal, total } = pie;
+    const { productos: items, pruebas: renglonesPrueba } = separarPruebas(pie.items);
     /* Lo que de este papel es del café, congelado con el documento (0101): los
      * exclusivos siempre, y los que se tildaron al cargar (0119). */
     /* LA NOTA HEREDA LA MARCA DE SU FACTURA (0120, acordado en la conciliación
@@ -1475,7 +1497,7 @@ export class ComprobantesService {
         vencimientoPago: dto.vencimientoPago ? new Date(dto.vencimientoPago.length <= 10 ? `${dto.vencimientoPago}T00:00:00` : dto.vencimientoPago) : null,
         recepcion: !!dto.recepcion,
         bonificacion: bonifPct, bonificacionImporte: r2(bonificacionImporte),
-        subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total,
+        subtotalNeto, ivaTotal, percepcionesTotal: r2(percepcionesTotal), total, renglonesPrueba,
         netoCafeteria, finalCafeteria: finalCafe,
         /* Un comprobante no fiscal NO GUARDA CAE. Se podía cargar el papel de una
          * factura A real (con su CAE y su IVA) eligiendo tipo liquidación: la

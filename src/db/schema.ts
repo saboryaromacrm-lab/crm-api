@@ -26,6 +26,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { RepartoLocal } from '../resultados/reglas';
+import type { RenglonPrueba } from '../comprobantes/renglones-prueba';
 
 /* ---------------- Enums ---------------- */
 export const tipoProductoEnum = pgEnum('tipo_producto', ['granel', 'entero']);
@@ -1714,6 +1715,12 @@ export const comprobantes = pgTable('comprobantes', {
   /** Suma de las percepciones. NO es IVA: es pago a cuenta de otro impuesto. */
   percepcionesTotal: doublePrecision('percepciones_total').notNull().default(0),
   total: doublePrecision('total').notNull().default(0),
+  /**
+   * LOS RENGLONES DE PRUEBA (0242): lo que se pidió para probar y no se dio de
+   * alta. Están en el neto, el IVA y el total de arriba; no son productos (ver
+   * `comprobantes/renglones-prueba.ts`).
+   */
+  renglonesPrueba: jsonb('renglones_prueba').$type<RenglonPrueba[]>().notNull().default([]),
   /**
    * Cuánto de este comprobante ya se le pagó al proveedor. Suma de las
    * imputaciones de `proveedor_pagos` — se recalcula, no se acumula. Sin esto
