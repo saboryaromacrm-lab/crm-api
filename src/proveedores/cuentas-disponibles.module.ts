@@ -38,8 +38,9 @@ import {
   NotFoundException, Param, ParseIntPipe, Patch, Post, Query,
 } from '@nestjs/common';
 import {
-  IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min,
+  ArrayMaxSize, IsArray, IsBoolean, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { Auth, CualquierUsuario, Permiso, type Sesion } from '../auth/auth.decoradores';
@@ -50,6 +51,7 @@ import { numeroDoc } from '../common/documentos';
 import { PagosModule, PagosProveedorService } from '../pagos/pagos.module';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { cuentaDeTransferencia } from '../pagos/cuentas-propias';
+import { planDirecto, referenciaDirecta, referenciaOriginal } from './transferencia-directa';
 import {
   clientes, cobranzaPagos, cobranzas, cuentaDisponibleAvisos, cuentaDisponiblePagos, cuentasDisponibles,
   proveedorCuentas, proveedorPagos, proveedores, usuarios, ventaPagos, ventas,
@@ -58,6 +60,7 @@ import {
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Tolerancia de centavo: los importes son double. */
 const EPS = 0.009;
+const pesos = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const SOLO_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_CUENTAS_BANCARIAS = 5;
 /** El aviso de «cuenta completa» se deja de mostrar solo a los 30 días, aunque nadie lo haya mirado. */
@@ -135,6 +138,27 @@ class CorregirTransferenciaDto {
   @IsInt() ventaPagoId!: number;
   @IsString() @MaxLength(300) motivo!: string;
   @IsBoolean() confirmado!: boolean;
+}
+
+class ImputacionDirectaDto {
+  @IsOptional() @IsInt() comprobanteId?: number;
+  @IsOptional() @IsInt() gastoId?: number;
+  @IsNumber() @Min(0.01) @Max(1_000_000_000) importe!: number;
+}
+
+/** La «Transferencia» que fue directo a un proveedor (0246): a quién y, si se eligen, a qué documentos se aplica. */
+class TransferenciaDirectaDto extends CorregirTransferenciaDto {
+  @IsInt() proveedorId!: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(50) @ValidateNested({ each: true }) @Type(() => ImputacionDirectaDto)
+  imputaciones?: ImputacionDirectaDto[];
+}
+
+/** Las correcciones de una transferencia piden confirmarlas y decir qué pasó. */
+function motivoDe(dto: { motivo: string; confirmado: boolean }) {
+  if (dto.confirmado !== true) throw new BadRequestException('Confirmá la corrección.');
+  const motivo = String(dto.motivo ?? '').trim();
+  if (motivo.length < 10) throw new BadRequestException('Escribí el motivo: qué pasó y cómo lo sabés (por ejemplo: «el cliente le transfirió todo a Becchio»).');
+  return motivo;
 }
 
 export interface ContextoCobro {
@@ -566,32 +590,9 @@ export class CuentasDisponiblesService {
    * atada, la plata entró a la cuenta propia y no hay nada que corregir.
    */
   async corregirTransferenciaDeVenta(cuentaId: number, dto: CorregirTransferenciaDto, usuarioId: number | null) {
-    if (dto.confirmado !== true) throw new BadRequestException('Confirmá la corrección.');
-    const motivo = String(dto.motivo ?? '').trim();
-    if (motivo.length < 10) throw new BadRequestException('Escribí el motivo: qué pasó y cómo lo sabés (por ejemplo: «el cliente le transfirió todo a Becchio»).');
-    const pesos = (n: number) => `$${money(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const motivo = motivoDe(dto);
     const referencia = await this.db.transaction(async (tx) => {
-      const [vp] = await tx.select().from(ventaPagos).where(eq(ventaPagos.id, dto.ventaPagoId)).limit(1).for('update');
-      if (!vp) throw new NotFoundException('Ese pago de venta no existe.');
-      if (vp.medio !== 'transferencia') {
-        throw new BadRequestException('Solo se corrige un pago cargado como «Transferencia».');
-      }
-      const [v] = await tx.select({
-        id: ventas.id, estado: ventas.estado, sucursalId: ventas.sucursalId, total: ventas.total,
-        puntoVenta: ventas.puntoVenta, numero: ventas.numero, cliente: clientes.nombre,
-      }).from(ventas).leftJoin(clientes, eq(clientes.id, ventas.clienteId)).where(eq(ventas.id, vp.ventaId)).limit(1);
-      if (!v || !['confirmada', 'pendiente_cae'].includes(v.estado)) {
-        throw new BadRequestException('Esa venta no está vigente: no hay pago que corregir.');
-      }
-      const [atado] = (await tx.execute(sql`
-        select mc.tipo from mp_conciliacion_erp ce join mp_conciliaciones mc on mc.id = ce.conciliacion_id
-         where ce.venta_pago_id = ${vp.id} limit 1`)).rows as { tipo: string }[];
-      if (atado) {
-        throw new BadRequestException(atado.tipo === 'sin_mp'
-          ? 'En Ventas › Conciliación MP ese pago está marcado «No entró a Mercado Pago»: deshacé esa marca y volvé a corregirlo acá.'
-          : 'Ese pago está atado a un movimiento de Mercado Pago: entró a tu cuenta. Si está mal atado, desatalo primero en Ventas › Conciliación MP.');
-      }
-      const documento = `Venta ${numeroDoc(v.puntoVenta, v.numero ?? 0)}`;
+      const { vp, v, documento } = await this.transferenciaCorregible(tx, dto.ventaPagoId);
       const r = await this.registrarPago(tx, { cuentaDisponibleId: cuentaId, importe: money(vp.importe), ventaPagoId: vp.id }, {
         sucursalId: v.sucursalId, usuarioId, documento, clienteNombre: v.cliente ?? '', totalOperacion: money(v.total),
       }, { yaTransferido: true });
@@ -607,6 +608,133 @@ export class CuentasDisponiblesService {
       return r.referencia;
     });
     return { ok: true, referencia, cuenta: await this.get(cuentaId) };
+  }
+
+  /**
+   * El renglón «Transferencia» de una venta vigente que se corrige porque la
+   * plata fue a un proveedor, con candado. Solo uno que no esté atado a Mercado
+   * Pago: atado, la plata entró a la cuenta propia y no hay nada que corregir.
+   */
+  private async transferenciaCorregible(tx: any, ventaPagoId: number) {
+    const [vp] = await tx.select().from(ventaPagos).where(eq(ventaPagos.id, ventaPagoId)).limit(1).for('update');
+    if (!vp) throw new NotFoundException('Ese pago de venta no existe.');
+    if (vp.medio !== 'transferencia') {
+      throw new BadRequestException('Solo se corrige un pago cargado como «Transferencia».');
+    }
+    const [v] = await tx.select({
+      id: ventas.id, estado: ventas.estado, sucursalId: ventas.sucursalId, total: ventas.total, fecha: ventas.fecha,
+      puntoVenta: ventas.puntoVenta, numero: ventas.numero, cliente: clientes.nombre,
+    }).from(ventas).leftJoin(clientes, eq(clientes.id, ventas.clienteId)).where(eq(ventas.id, vp.ventaId)).limit(1);
+    if (!v || !['confirmada', 'pendiente_cae'].includes(v.estado)) {
+      throw new BadRequestException('Esa venta no está vigente: no hay pago que corregir.');
+    }
+    const [atado] = (await tx.execute(sql`
+      select mc.tipo from mp_conciliacion_erp ce join mp_conciliaciones mc on mc.id = ce.conciliacion_id
+       where ce.venta_pago_id = ${vp.id} limit 1`)).rows as { tipo: string }[];
+    if (atado) {
+      throw new BadRequestException(atado.tipo === 'sin_mp'
+        ? 'En Ventas › Conciliación MP ese pago está marcado «No entró a Mercado Pago»: deshacé esa marca y volvé a corregirlo acá.'
+        : 'Ese pago está atado a un movimiento de Mercado Pago: entró a tu cuenta. Si está mal atado, desatalo primero en Ventas › Conciliación MP.');
+    }
+    return { vp, v, documento: `Venta ${numeroDoc(v.puntoVenta, v.numero ?? 0)}` };
+  }
+
+  /**
+   * LA TRANSFERENCIA QUE FUE DIRECTO A UN PROVEEDOR, sin cuenta disponible
+   * (0246, 25/11/2026, pedido del dueño: «me mandó ese pago a otro proveedor y
+   * quiero poder aplicárselo»). El cliente le transfirió a un proveedor y la
+   * caja lo cargó como «Transferencia»: esa plata nunca entra a Mercado Pago.
+   *
+   * En UNA transacción: el renglón pasa a «Transf. a proveedor», el proveedor
+   * recibe su pago (transferencia, sin caja ni cuenta propia, con la fecha de
+   * la venta) atado a ese renglón, y se aplica a los documentos elegidos con la
+   * regla de «Aplicar a facturas» — cada uno por su saldo entero y el último
+   * llevándose lo que quede—. Lo que no se aplica queda a cuenta (en cuenta
+   * libre, va solo a lo más viejo). El importe es el del renglón: no se elige.
+   * Muere con la venta; si fue a otro, se deshace desde el detalle de la venta.
+   */
+  async transferenciaDirecta(dto: TransferenciaDirectaDto, usuarioId: number | null, cruzaSucursales: boolean) {
+    const motivo = motivoDe(dto);
+    const items = (dto.imputaciones ?? []).map((x) => ({ comprobanteId: x.comprobanteId, gastoId: x.gastoId, importe: money(x.importe) }));
+    const r = await this.db.transaction(async (tx) => {
+      const { vp, v, documento } = await this.transferenciaCorregible(tx, dto.ventaPagoId);
+      const [prov] = await tx.select({
+        id: proveedores.id, nombre: proveedores.nombre,
+        proveeMercaderia: proveedores.proveeMercaderia, proveeGastos: proveedores.proveeGastos,
+      }).from(proveedores).where(eq(proveedores.id, dto.proveedorId)).limit(1);
+      if (!prov) throw new BadRequestException('Ese proveedor no existe.');
+      const importe = money(vp.importe);
+      const plan = planDirecto(importe, items, prov.proveeGastos && !prov.proveeMercaderia);
+      if ('error' in plan) throw new BadRequestException(plan.error);
+      await exigirFueraDeConciliado(tx, prov.id, v.fecha, 'cargar un pago');
+
+      const [pp] = await tx.insert(proveedorPagos).values({
+        fecha: v.fecha,
+        proveedorId: prov.id,
+        medio: 'transferencia',
+        importe,
+        destino: plan.destino,
+        aplicado: 0,
+        concepto: `Transferencia de cliente · ${documento} · ${v.cliente ?? ''}`,
+        referencia: 'Directa del cliente, sin cuenta disponible',
+        sucursalId: v.sucursalId,
+        usuarioId,
+        estado: 'activo',
+        observaciones: motivo,
+        ventaPagoId: vp.id,
+      }).returning({ id: proveedorPagos.id });
+      if (items.length) await this.pagosProv.aplicarExistente(tx, pp.id, items, usuarioId, cruzaSucursales);
+      await this.pagosProv.aplicarCuentaLibre(prov.id, tx);
+      await tx.update(ventaPagos).set({ medio: 'transferencia_proveedor', referencia: referenciaDirecta(prov.nombre, vp.referencia) })
+        .where(eq(ventaPagos.id, vp.id));
+
+      const [{ aplicado }] = await tx.select({ aplicado: proveedorPagos.aplicado }).from(proveedorPagos).where(eq(proveedorPagos.id, pp.id));
+      const aCuenta = money(importe - aplicado);
+      await this.audit.registrar([{
+        entidad: 'venta', entidadId: v.id, ambito: 'Ventas', campo: 'Medio de pago corregido', usuarioId,
+        detalle: `${documento} · ${motivo}`,
+        antes: `Transferencia ${pesos(importe)}${vp.referencia ? ` · ${vp.referencia}` : ''}`,
+        despues: `Transf. directa a ${prov.nombre} ${pesos(importe)} · pago #${pp.id}`
+          + `${aplicado > EPS ? ` · aplicado ${pesos(aplicado)}` : ''}${aCuenta > EPS ? ` · a cuenta ${pesos(aCuenta)}` : ''}`,
+      }], tx);
+      return { proveedorPagoId: pp.id, proveedor: prov.nombre, aplicado: money(aplicado), aCuenta };
+    });
+    return { ok: true, ...r };
+  }
+
+  /**
+   * «NO FUE A ESTE PROVEEDOR»: deshace la transferencia directa (0246). El pago
+   * al proveedor se anula —si está aplicado a una factura se frena, como al
+   * anular la venta— y el renglón vuelve a «Transferencia» con su referencia
+   * de antes: otra vez se espera en la Conciliación MP.
+   */
+  async deshacerTransferenciaDirecta(dto: CorregirTransferenciaDto, usuarioId: number | null) {
+    const motivo = motivoDe(dto);
+    await this.db.transaction(async (tx) => {
+      const [vp] = await tx.select().from(ventaPagos).where(eq(ventaPagos.id, dto.ventaPagoId)).limit(1).for('update');
+      if (!vp) throw new NotFoundException('Ese pago de venta no existe.');
+      const [pp] = await tx.select({ id: proveedorPagos.id, proveedorId: proveedorPagos.proveedorId, fecha: proveedorPagos.fecha })
+        .from(proveedorPagos)
+        .where(and(eq(proveedorPagos.ventaPagoId, vp.id), eq(proveedorPagos.estado, 'activo'))).limit(1);
+      if (!pp || vp.medio !== 'transferencia_proveedor') {
+        throw new BadRequestException('Ese renglón no es una transferencia directa a un proveedor.');
+      }
+      const [v] = await tx.select({ id: ventas.id, puntoVenta: ventas.puntoVenta, numero: ventas.numero })
+        .from(ventas).where(eq(ventas.id, vp.ventaId)).limit(1);
+      const [prov] = await tx.select({ nombre: proveedores.nombre }).from(proveedores).where(eq(proveedores.id, pp.proveedorId!)).limit(1);
+      await exigirFueraDeConciliado(tx, pp.proveedorId, pp.fecha, 'anular un pago');
+      await this.anularEspejos(tx, [{ proveedorPagoId: pp.id, cuentaId: null }], motivo, 'Deshecho: no fue a este proveedor');
+      await tx.update(ventaPagos).set({ medio: 'transferencia', referencia: referenciaOriginal(prov.nombre, vp.referencia) })
+        .where(eq(ventaPagos.id, vp.id));
+      const documento = `Venta ${numeroDoc(v.puntoVenta, v.numero ?? 0)}`;
+      await this.audit.registrar([{
+        entidad: 'venta', entidadId: v.id, ambito: 'Ventas', campo: 'Medio de pago corregido', usuarioId,
+        detalle: `${documento} · ${motivo}`,
+        antes: `Transf. directa a ${prov.nombre} ${pesos(vp.importe)} · pago #${pp.id}`,
+        despues: `Transferencia ${pesos(vp.importe)} (se anuló el pago a ${prov.nombre})`,
+      }], tx);
+    });
+    return { ok: true };
   }
 
   /* --------------------- El puente con el cobro --------------------- */
@@ -820,45 +948,59 @@ export class CuentasDisponiblesService {
       proveedorPagoId: cuentaDisponiblePagos.proveedorPagoId,
     }).from(cuentaDisponiblePagos).where(and(cond, isNull(cuentaDisponiblePagos.anuladoEn))).for('update');
     if (!filas.length) return 0;
+    await this.anularEspejos(tx, filas, motivo, como);
+    await tx.update(cuentaDisponiblePagos).set({ anuladoEn: new Date() })
+      .where(inArray(cuentaDisponiblePagos.id, filas.map((f: any) => f.id)));
+    await this.recalcularCompleta(tx, filas.map((f: any) => f.cuentaId));
+    return filas.length;
+  }
 
+  /**
+   * Los espejos de transferencias de clientes en la cuenta del proveedor (los
+   * de una cuenta disponible, con su `cuentaId`, y los directos, 0246, sin).
+   * Aplicado a una factura se frena todo, salvo en cuenta libre: ahí se
+   * desaplica y la otra plata sin aplicar se vuelve a repartir.
+   */
+  private async anularEspejos(tx: any, espejos: Array<{ proveedorPagoId: number; cuentaId: number | null }>, motivo: string, como: string) {
     const libres = new Set<number>();
-    for (const f of filas) {
+    for (const f of espejos) {
       const [pp] = await tx.select().from(proveedorPagos)
         .where(eq(proveedorPagos.id, f.proveedorPagoId)).limit(1).for('update');
-      const [cuenta] = pp ? await tx.select({ modo: proveedores.modoCuenta }).from(proveedores)
-        .where(eq(proveedores.id, pp.proveedorId)).limit(1) : [];
-      if (pp && pp.aplicado > EPS && cuenta?.modo === 'libre') {
+      if (!pp) continue;
+      const [prov] = await tx.select({ modo: proveedores.modoCuenta, nombre: proveedores.nombre }).from(proveedores)
+        .where(eq(proveedores.id, pp.proveedorId)).limit(1);
+      if (pp.aplicado > EPS && prov?.modo === 'libre') {
         await this.pagosProv.quitarAplicaciones(tx, pp.id);
         libres.add(pp.proveedorId);
-      } else if (pp && pp.aplicado > EPS) {
-        const [c] = await tx.select({ titular: cuentasDisponibles.titular, proveedorId: cuentasDisponibles.proveedorId })
-          .from(cuentasDisponibles).where(eq(cuentasDisponibles.id, f.cuentaId)).limit(1);
-        const [prov] = await tx.select({ nombre: proveedores.nombre }).from(proveedores)
-          .where(eq(proveedores.id, c.proveedorId)).limit(1);
+      } else if (pp.aplicado > EPS) {
+        const [c] = f.cuentaId
+          ? await tx.select({ titular: cuentasDisponibles.titular }).from(cuentasDisponibles).where(eq(cuentasDisponibles.id, f.cuentaId)).limit(1)
+          : [];
         throw new BadRequestException(
-          `El pago a la cuenta de ${prov?.nombre ?? 'proveedor'} (${c.titular}) ya está aplicado a una factura. `
-          + 'Desaplicalo en Proveedores antes de anular.',
+          `El pago a ${c ? `la cuenta de ${prov?.nombre ?? 'proveedor'} (${c.titular})` : prov?.nombre ?? 'el proveedor'} ya está aplicado a una factura. `
+          + 'Desaplicalo en Proveedores y volvé a intentarlo.',
         );
       }
-      if (pp && pp.estado !== 'anulado') {
+      if (pp.estado !== 'anulado') {
         await tx.update(proveedorPagos).set({
           estado: 'anulado',
           observaciones: `${pp.observaciones ? `${pp.observaciones}\n` : ''}${como}: ${motivo}`,
         }).where(eq(proveedorPagos.id, pp.id));
       }
     }
-    await tx.update(cuentaDisponiblePagos).set({ anuladoEn: new Date() })
-      .where(inArray(cuentaDisponiblePagos.id, filas.map((f: any) => f.id)));
     for (const proveedorId of libres) await this.pagosProv.aplicarCuentaLibre(proveedorId, tx);
-    await this.recalcularCompleta(tx, filas.map((f: any) => f.cuentaId));
-    return filas.length;
   }
 
   async anularDeVenta(tx: any, ventaId: number, motivo: string) {
     const ids = (await tx.select({ id: ventaPagos.id }).from(ventaPagos).where(eq(ventaPagos.ventaId, ventaId)))
       .map((x: any) => x.id);
     if (!ids.length) return 0;
-    return this.anularPagos(tx, inArray(cuentaDisponiblePagos.ventaPagoId, ids), motivo);
+    const n = await this.anularPagos(tx, inArray(cuentaDisponiblePagos.ventaPagoId, ids), motivo);
+    /* Las transferencias directas a un proveedor (0246) mueren igual con su venta. */
+    const directas = await tx.select({ proveedorPagoId: proveedorPagos.id }).from(proveedorPagos)
+      .where(and(inArray(proveedorPagos.ventaPagoId, ids), eq(proveedorPagos.estado, 'activo')));
+    await this.anularEspejos(tx, directas.map((d: any) => ({ ...d, cuentaId: null })), motivo, 'Anulado con su cobro');
+    return n + directas.length;
   }
 
   async anularDeCobranza(tx: any, cobranzaId: number, motivo: string) {
@@ -1053,6 +1195,17 @@ export class CuentasDisponiblesController {
   @Post('pagos/:pagoId/anular') @Permiso('proveedores.cuentas')
   anularPagoPropio(@Param('pagoId', ParseIntPipe) pagoId: number, @Body() dto: AnularPagoPropioDto) {
     return this.svc.anularPagoPropio(pagoId, dto.motivo);
+  }
+
+  /** Una «Transferencia» ya cobrada que fue directo a un proveedor, sin cuenta disponible (0246): solo el superadmin. */
+  @Post('transferencia-directa') @Permiso(PERMISO_CORREGIR_TRANSFERENCIA)
+  transferenciaDirecta(@Body() dto: TransferenciaDirectaDto, @Auth() sesion: Sesion) {
+    return this.svc.transferenciaDirecta(dto, sesion?.usuarioId ?? null, esJefe(sesion));
+  }
+
+  @Post('transferencia-directa/deshacer') @Permiso(PERMISO_CORREGIR_TRANSFERENCIA)
+  deshacerTransferenciaDirecta(@Body() dto: CorregirTransferenciaDto, @Auth() sesion: Sesion) {
+    return this.svc.deshacerTransferenciaDirecta(dto, sesion?.usuarioId ?? null);
   }
 
   /** Una «Transferencia» ya cobrada que en realidad fue a esta cuenta (21/11/2026): solo el superadmin. */

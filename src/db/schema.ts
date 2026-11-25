@@ -3647,10 +3647,17 @@ export const proveedorPagos = pgTable('proveedor_pagos', {
   cuentaPropiaId: integer('cuenta_propia_id').references(() => cuentasPropias.id, { onDelete: 'restrict' }),
   /** 0215: otra cuenta, escrita a mano («la de mi hermano»), en vez de una de Mis cuentas. */
   cuentaAMano: text('cuenta_a_mano'),
+  /**
+   * La transferencia que un cliente le hizo DIRECTO a este proveedor (0246): el
+   * renglón de la venta que la cobró. Muere con la venta; no se anula ni se
+   * modifica desde Pagos, se deshace desde el detalle de la venta.
+   */
+  ventaPagoId: integer('venta_pago_id').references((): AnyPgColumn => ventaPagos.id, { onDelete: 'restrict' }),
 }, (t) => ({
   ixProveedor: index('ix_proveedor_pagos_proveedor').on(t.proveedorId, t.estado),
   ixFecha: index('ix_proveedor_pagos_fecha').on(t.fecha),
   ixCaja: index('ix_proveedor_pagos_caja').on(t.cajaSesionId),
+  uqVentaPago: uniqueIndex('uq_proveedor_pagos_venta_pago').on(t.ventaPagoId).where(sql`${t.ventaPagoId} IS NOT NULL AND ${t.estado} = 'activo'`),
 }));
 
 /**

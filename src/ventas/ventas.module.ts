@@ -38,7 +38,7 @@ import {
   cajaMovimientos, cajaSesiones,
   categorias, clientes, clienteListas, cobranzaImputaciones, cobranzas, descuentos, marcas,
   etiquetas, productoEtiquetas, productoListas, presentaciones, productoProveedores, productos,
-  presupuestoItems, presupuestos, proveedores, roles, stock, sucursales, usuarios,
+  presupuestoItems, presupuestos, proveedorPagos, proveedores, roles, stock, sucursales, usuarios,
   listasVenta, modalidadesVenta, mpCobros, padronCuit, ventaExtras, ventaItems, ventaPagos, ventas, cupones,
   type ReceptorVenta,
 } from '../db/schema';
@@ -1321,7 +1321,14 @@ export class VentasService {
       ? await this.lecturaMp(id, pagosFilas.some((p) => p.medio === 'qr' && p.referencia.startsWith('MP ')))
       : { atados: [], cobrosQr: [] };
     const mpDe = mpDeLosRenglones(pagosFilas, mpFilas.atados, mpFilas.cobrosQr);
-    const pagos = pagosFilas.map((p) => ({ ...p, mp: mpDe.get(p.id) ?? null }));
+    /* La transferencia que fue directo a un proveedor (0246): a quién, para poder deshacerla desde acá. */
+    const directos = new Map(pagosFilas.some((p) => p.medio === 'transferencia_proveedor')
+      ? (await this.db.select({ ventaPagoId: proveedorPagos.ventaPagoId, proveedor: proveedores.nombre })
+        .from(proveedorPagos).innerJoin(proveedores, eq(proveedores.id, proveedorPagos.proveedorId))
+        .where(and(inArray(proveedorPagos.ventaPagoId, pagosFilas.map((p) => p.id)), eq(proveedorPagos.estado, 'activo'))))
+        .map((x) => [x.ventaPagoId, x.proveedor])
+      : []);
+    const pagos = pagosFilas.map((p) => ({ ...p, mp: mpDe.get(p.id) ?? null, directoA: directos.get(p.id) ?? null }));
     const cobrado = imput.get(id) ?? 0;
 
     /*

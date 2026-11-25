@@ -26,6 +26,8 @@ export type InfoEdicion = {
   estado: string;
   medio: string;
   cuentaDisponible: boolean;
+  /** La transferencia directa de un cliente (0246): el importe es el que cobró la venta. */
+  deCliente?: boolean;
   desdeCashflow: boolean;
   conEcheq: boolean;
   cierraCompromisoManual: boolean;
@@ -39,6 +41,10 @@ export function bloqueosEdicion(p: InfoEdicion): Bloqueos {
   if (p.estado !== 'activo') return { plata: 'El pago está anulado.', fecha: 'El pago está anulado.' };
   if (p.cuentaDisponible) {
     const m = 'Nace de una cuenta disponible del proveedor: se corrige desde Proveedores › Cuentas disponibles.';
+    return { plata: m, fecha: m };
+  }
+  if (p.deCliente) {
+    const m = 'Es la transferencia que un cliente le hizo directo: se corrige desde el detalle de esa venta.';
     return { plata: m, fecha: m };
   }
   if (p.desdeCashflow) {

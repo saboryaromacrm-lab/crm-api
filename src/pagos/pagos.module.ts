@@ -1604,6 +1604,16 @@ export class PagosProveedorService implements OnApplicationBootstrap {
   }
 
   /**
+   * Aplicar un pago que YA existe dentro de una transacción ajena (0246: la
+   * transferencia directa de un cliente, que se crea y se aplica en el mismo
+   * acto). Misma regla que «Aplicar» (`imputar`): en «por facturas», cada
+   * documento por su saldo entero o el último llevándose TODO lo que le queda.
+   */
+  async aplicarExistente(tx: any, pagoId: number, items: ImputacionDto[], usuarioId: number | null, cruzaSucursales: boolean) {
+    await this.aplicar(tx, pagoId, items, usuarioId ?? undefined, cruzaSucursales, false, undefined, true);
+  }
+
+  /**
    * `enAltaComprobante` lo pone SOLO `comprobantes.module` cuando la factura se
    * está creando: ahí el total ya se valida completo por otra vía y el candado
    * del modo "por facturas" no corresponde. No viaja por el DTO a propósito —
@@ -1765,7 +1775,7 @@ export class PagosProveedorService implements OnApplicationBootstrap {
         (select s.estado = 'abierta' from caja_sesiones s where s.id = ${p.cajaSesionId ?? -1}) as "turnoAbierto"`)).rows;
     return {
       estado: p.estado, medio: p.medio, cajaMovimientoId: p.cajaMovimientoId ?? null,
-      cuentaDisponible: !!r?.cuentaDisponible, desdeCashflow: !!r?.desdeCashflow, conEcheq: !!r?.conEcheq,
+      cuentaDisponible: !!r?.cuentaDisponible, deCliente: p.ventaPagoId != null, desdeCashflow: !!r?.desdeCashflow, conEcheq: !!r?.conEcheq,
       cierraCompromisoManual: !!r?.cierraCompromisoManual, turnoAbierto: r?.turnoAbierto == null ? null : !!r.turnoAbierto,
     };
   }
@@ -1966,6 +1976,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
           `Este pago es de una cuenta disponible del proveedor: se anula anulando ${origen}, no desde acá.`,
         );
       }
+      /* La transferencia directa de un cliente (0246): vive atada a su venta. */
+      if (p.ventaPagoId) {
+        throw new BadRequestException(
+          `Es la transferencia que el cliente de ${await this.ventaDelRenglon(tx, p.ventaPagoId)} le hizo directo al proveedor: `
+          + 'se deshace desde el detalle de esa venta («No fue a este proveedor»), no desde acá.',
+        );
+      }
       if (p.aplicado > EPS) {
         throw new BadRequestException('El pago está aplicado a un documento: desaplicalo antes de anularlo.');
       }
@@ -2025,16 +2042,19 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       .limit(1);
     if (!f) return null;
     if (f.propio) return 'su pago propio o de un tercero (en Proveedores › Cuentas disponibles › Pagos)';
-    if (f.ventaPagoId) {
-      const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
-        .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
-        .where(eq(ventaPagos.id, f.ventaPagoId)).limit(1);
-      return v ? `la venta ${numeroDoc(v.puntoVenta, v.numero)}` : 'una venta';
-    }
+    if (f.ventaPagoId) return this.ventaDelRenglon(tx, f.ventaPagoId);
     const [r] = await tx.select({ puntoVenta: cobranzas.puntoVenta, numero: cobranzas.numero })
       .from(cobranzaPagos).innerJoin(cobranzas, eq(cobranzas.id, cobranzaPagos.cobranzaId))
       .where(eq(cobranzaPagos.id, f.cobranzaPagoId!)).limit(1);
     return r ? `el recibo ${numeroDoc(r.puntoVenta, r.numero)}` : 'un recibo';
+  }
+
+  /** «la venta 0034-00002430»: de qué venta es un renglón de pago. */
+  private async ventaDelRenglon(tx: any, ventaPagoId: number): Promise<string> {
+    const [v] = await tx.select({ puntoVenta: ventas.puntoVenta, numero: ventas.numero })
+      .from(ventaPagos).innerJoin(ventas, eq(ventas.id, ventaPagos.ventaId))
+      .where(eq(ventaPagos.id, ventaPagoId)).limit(1);
+    return v ? `la venta ${numeroDoc(v.puntoVenta, v.numero)}` : 'una venta';
   }
 
   /* ==================================================================== *
