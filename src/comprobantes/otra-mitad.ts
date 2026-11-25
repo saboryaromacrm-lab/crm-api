@@ -47,3 +47,38 @@ export function netoPorProducto(papeles: number[], renglones: RenglonMitad[]) {
   }
   return out;
 }
+
+/*
+ * LAS MITADES SIN CARGAR (25/11/2026, pedido del dueño: «si cargo solo la
+ * factura A y me olvido de la X, ¿cómo me entero?»). El costo no lo nota (lo
+ * mezcla el «Sin factura %» del formato), pero la mercadería, la deuda y la
+ * parte sin factura del IVA quedan con la mitad. El recordatorio al cargar se
+ * ve una sola vez: esto lista lo que sigue sin su otra mitad.
+ */
+export type PapelMitad = { id: number; proveedorId: number; tipo: string; letra?: string | null; dia: string };
+
+const diaNumero = (dia: string) => Math.round(Date.parse(`${dia}T00:00:00Z`) / 86_400_000);
+
+/**
+ * Los papeles (factura A o liquidación) desde `desde` (AAAA-MM-DD, día de
+ * Argentina) sin un papel de la otra mitad del mismo proveedor a ±7 días.
+ * `papeles` tiene que traer también los de los 7 días anteriores a `desde`,
+ * para que un papel del borde encuentre su pareja.
+ */
+export function sinSuOtraMitad<T extends PapelMitad>(papeles: T[], desde: string): T[] {
+  const porProveedor = new Map<number, { tipo: string; dia: number }[]>();
+  for (const p of papeles) {
+    const tipo = tipoDeLaOtraMitad(p.tipo, p.letra) ? p.tipo : null;
+    if (!tipo) continue;
+    const l = porProveedor.get(p.proveedorId) ?? [];
+    l.push({ tipo, dia: diaNumero(p.dia) });
+    porProveedor.set(p.proveedorId, l);
+  }
+  const d0 = diaNumero(desde);
+  return papeles.filter((p) => {
+    if (!tipoDeLaOtraMitad(p.tipo, p.letra) || diaNumero(p.dia) < d0) return false;
+    const dia = diaNumero(p.dia);
+    return !(porProveedor.get(p.proveedorId) ?? [])
+      .some((o) => o.tipo !== p.tipo && Math.abs(o.dia - dia) <= VENTANA_OTRA_MITAD);
+  });
+}

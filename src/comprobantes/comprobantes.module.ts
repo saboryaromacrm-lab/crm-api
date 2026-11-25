@@ -26,7 +26,7 @@ import { TIPOS_CON_FLETE, desvincularFletes, fletesDelComprobante, fletesSinPape
 import { esJefe, tienePermiso } from '../auth/auth.guard';
 import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
-import { VENTANA_OTRA_MITAD, netoPorProducto, tipoDeLaOtraMitad } from './otra-mitad';
+import { VENTANA_OTRA_MITAD, netoPorProducto, sinSuOtraMitad, tipoDeLaOtraMitad } from './otra-mitad';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { ajustePorAnulacion, fechaDeCuenta, finalCafeteria, importeEnCuenta } from '../cafeteria/cuenta';
 import { normalizarPuntoVenta } from '../facturas/comun';
@@ -794,6 +794,42 @@ export class ComprobantesService {
     };
   }
 
+  /**
+   * LAS MITADES SIN CARGAR (25/11/2026): de los proveedores mitad y mitad
+   * (ficha entre 0 y 100 % sin factura, sin «factura a fin de mes»), las
+   * facturas A y liquidaciones de los últimos `dias` sin la otra mitad a ±7
+   * días. Ver `sinSuOtraMitad`. No graba nada.
+   */
+  async mitadesSinCargar(dias = 60) {
+    const provs = await this.db.select({ id: proveedores.id, nombre: proveedores.nombre, porc: proveedores.porcSinFactura })
+      .from(proveedores).where(and(
+        sql`${proveedores.porcSinFactura} > 0 and ${proveedores.porcSinFactura} < 100`,
+        eq(proveedores.facturaMensual, false),
+      ));
+    if (!provs.length) return [];
+    const nombres = new Map(provs.map((p) => [p.id, p]));
+    const dia = sql<string>`to_char((${comprobantes.fecha} at time zone 'America/Argentina/Buenos_Aires')::date, 'YYYY-MM-DD')`;
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    const desde = new Date(Date.parse(`${hoy}T00:00:00Z`) - dias * 86_400_000).toISOString().slice(0, 10);
+    const papeles = await this.db.select({
+      id: comprobantes.id, proveedorId: comprobantes.proveedorId, tipo: comprobantes.tipo, letra: comprobantes.letra,
+      puntoVenta: comprobantes.puntoVenta, numero: comprobantes.numero, fecha: comprobantes.fecha, total: comprobantes.total, dia,
+    }).from(comprobantes).where(and(
+      eq(comprobantes.estado, 'confirmado'),
+      inArray(comprobantes.proveedorId, provs.map((p) => p.id)),
+      sql`((${comprobantes.tipo} = 'factura' and ${comprobantes.letra} = 'A') or ${comprobantes.tipo} = 'liquidacion')`,
+      sql`(${comprobantes.fecha} at time zone 'America/Argentina/Buenos_Aires')::date >= ${desde}::date - ${VENTANA_OTRA_MITAD}::int`,
+    ));
+    return sinSuOtraMitad(papeles as any[], desde)
+      .sort((a, b) => b.dia.localeCompare(a.dia) || b.id - a.id)
+      .map((p) => ({
+        id: p.id, proveedorId: p.proveedorId, proveedor: nombres.get(p.proveedorId)?.nombre ?? '',
+        porcFicha: Number(nombres.get(p.proveedorId)?.porc) || 0,
+        tipo: p.tipo, etiqueta: etiquetaDoc(p), fecha: p.fecha, total: Number(p.total) || 0,
+        falta: p.tipo === 'liquidacion' ? 'factura A' : 'liquidación',
+      }));
+  }
+
   fletesSinPapel(proveedorId: number) {
     return fletesSinPapel(this.db, proveedorId);
   }
@@ -1342,7 +1378,10 @@ export class ComprobantesService {
     }
     const discriminaIva = fiscal && letraDoc === 'A';
     this.validarFechas(dto);
-    await this.exigirUnidadesEnteras(dto.items);
+    /* Las unidades enteras son cosa del stock: un papel que no lo mueve (las
+     * hormas al peso que ya entraron a $0, 25/11/2026) graba las unidades con
+     * decimales, para que el costo por kg quede igual al del papel. */
+    if (dto.recepcion) await this.exigirUnidadesEnteras(dto.items);
     if (dto.renglonesPrueba?.length && !TIPOS_CON_PRUEBA.has(dto.tipo)) {
       throw new BadRequestException('Los renglones de prueba van en una factura o una liquidación.');
     }
@@ -2818,6 +2857,14 @@ export class ComprobantesController {
   ) {
     if (!tienePermiso(auth.permisos, ['liquidaciones'])) return { mitadYMitad: false, porcFicha: 0, papeles: [], precios: [] };
     return this.svc.otraMitad({ proveedorId, tipo, letra, fecha });
+  }
+
+  /** Facturas A y liquidaciones de proveedores mitad y mitad sin su otra mitad (ver `mitadesSinCargar`). */
+  @Get('mitades-sin-cargar')
+  mitadesSinCargar(@Auth() auth: Sesion, @Query('dias') dias?: string) {
+    if (!tienePermiso(auth.permisos, ['liquidaciones'])) return [];
+    const n = Number(dias);
+    return this.svc.mitadesSinCargar(Number.isInteger(n) && n > 0 && n <= 365 ? n : 60);
   }
 
   @Get(':id/fletes')
