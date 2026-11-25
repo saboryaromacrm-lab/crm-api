@@ -49,16 +49,38 @@ test('se ata solo: el QR del ERP por número, y por importe y hora lo que es tan
       pago('900', '10:01', 2500, 'qr'),
       pago('a', '10:11', 1500, 'tarjeta'),
       pago('b', '10:31', 1500, 'tarjeta'),
-      pago('c', '13:00', 800, 'qr'), // fuera de la ventana
+      pago('c', '13:00', 800, 'qr'), // fuera de la ventana, pero el mismo día y uno con uno
     ],
   );
-  assert.deepEqual(pares.map((p) => `${p.clave}=${p.mpId}`).sort(), ['v1=900', 'v2=a', 'v3=b']);
+  assert.deepEqual(pares.map((p) => `${p.clave}=${p.mpId}`).sort(), ['v1=900', 'v2=a', 'v3=b', 'v4=c']);
 });
 
 test('no se ata: dos cobros contra un pago (no se sabe cuál falta), otra sucursal u otro medio', () => {
   assert.deepEqual(atarSolos([cobro('v1', '10:00', 1500, 'qr'), cobro('v2', '10:05', 1500, 'qr')], [pago('a', '10:02', 1500, 'qr')]), []);
   assert.deepEqual(atarSolos([cobro('v1', '10:00', 1500, 'qr')], [pago('a', '10:01', 1500, 'qr', { sucursalId: 2 })]), []);
   assert.deepEqual(atarSolos([cobro('v1', '10:00', 1500, 'tarjeta')], [pago('a', '10:01', 1500, 'qr')]), []);
+});
+
+test('QR o tarjeta cargados tarde: se atan en el día solo si es uno contra uno', () => {
+  /* El caso del 11/11: Point 10:01, factura 11:40. */
+  assert.deepEqual(atarSolos([cobro('v1', '11:40', 11583, 'tarjeta')], [pago('a', '10:01', 11583, 'tarjeta')]), [{ clave: 'v1', mpId: 'a' }]);
+  /* Lo que se ata en la ventana no se vuelve a ofrecer en el día. */
+  assert.deepEqual(atarSolos(
+    [cobro('v1', '10:00', 1500, 'qr'), cobro('v2', '18:00', 1500, 'qr')],
+    [pago('a', '10:02', 1500, 'qr'), pago('b', '16:00', 1500, 'qr')],
+  ).map((p) => `${p.clave}=${p.mpId}`).sort(), ['v1=a', 'v2=b']);
+  /* Dos posibles en el día, otro día, otra sucursal u otro medio: no. */
+  assert.deepEqual(atarSolos([cobro('v1', '09:00', 1500, 'tarjeta'), cobro('v2', '17:00', 1500, 'tarjeta')], [pago('a', '12:00', 1500, 'tarjeta')]), []);
+  assert.deepEqual(atarSolos([cobro('v1', '11:40', 1500, 'tarjeta')], [pago('a', '10:01', 1500, 'tarjeta', { fecha: t('10:01', '2026-11-16') })]), []);
+  assert.deepEqual(atarSolos([cobro('v1', '11:40', 1500, 'tarjeta')], [pago('a', '10:01', 1500, 'tarjeta', { sucursalId: 2 })]), []);
+  assert.deepEqual(atarSolos([cobro('v1', '11:40', 1500, 'tarjeta')], [pago('a', '10:01', 1500, 'qr')]), []);
+  /* Pasada la medianoche cuenta el día de Argentina, no el de UTC. */
+  assert.deepEqual(atarSolos([cobro('v1', '22:30', 1500, 'qr')], [pago('a', '20:00', 1500, 'qr')]), [{ clave: 'v1', mpId: 'a' }]);
+});
+
+test('sugerencia «otra hora»: mismo importe y medio en el día, con más de uno posible', () => {
+  const s = sugerir([cobro('v1', '09:00', 1500, 'tarjeta'), cobro('v2', '17:00', 1500, 'tarjeta')], [pago('a', '12:00', 1500, 'tarjeta')]);
+  assert.deepEqual(s.map((x) => `${x.clave}=${x.mpId}:${x.motivo}`), ['v1=a:otra_hora']);
 });
 
 test('una transferencia de un pedido puede llegar días antes de la venta', () => {

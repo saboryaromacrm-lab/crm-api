@@ -15,7 +15,8 @@
  *    tiene tantos cobros del ERP como pagos de Mercado Pago, se atan en orden
  *    de hora (dos tickets de $1.500 contra dos pagos de $1.500: da lo mismo
  *    cuál con cuál). Si no son tantos como tantos, nadie sabe cuál falta: no se
- *    ata y queda sugerido.
+ *    ata y queda sugerido. Al final, el QR y la tarjeta que quedaron sueltos se
+ *    buscan en todo el día, uno con uno (la venta se cargó tarde).
  *  · `sugerir`: para lo que quedó suelto, el candidato más probable, con por
  *    qué («varios posibles», «otro medio», «monto distinto»). Lo confirma una
  *    persona.
@@ -130,6 +131,9 @@ const VENTANA: Record<Familia, [antes: number, despues: number]> = {
   transferencia: [3 * DIA, 1 * DIA],
 };
 
+const ZONA = 'America/Argentina/Buenos_Aires';
+const diaDe = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: ZONA });
+
 const dentro = (c: CobroErp, p: PagoMp, [antes, despues]: [number, number]) => {
   const dt = p.fecha.getTime() - c.fecha.getTime();
   return dt >= -antes && dt <= despues;
@@ -151,6 +155,54 @@ function porImporte(pagos: PagoMp[]) {
 /** Candidatos seguros: misma familia, mismo importe, misma sucursal (si se sabe), dentro de la ventana. */
 const esCandidato = (c: CobroErp, p: PagoMp) => c.familia === p.familia && mismaSucursal(c, p) && dentro(c, p, VENTANA[c.familia]);
 
+/**
+ * EL MISMO DÍA (25/11/2026, pedido del dueño): en el local a veces se cobra en
+ * el Point y la venta se carga una o dos horas después (11/11: Point 10:01,
+ * factura 11:40). QR o tarjeta, mismo importe al centavo, misma sucursal (si se
+ * sabe), mismo día. La transferencia ya tiene su ventana de días.
+ */
+const mismoDia = (c: CobroErp, p: PagoMp) => c.familia === p.familia && c.familia !== 'transferencia'
+  && mismaSucursal(c, p) && diaDe(c.fecha) === diaDe(p.fecha);
+
+/**
+ * Agrupa cobros y pagos de igual importe que `unidos` dice que pueden ser el
+ * mismo (componentes conexos) y ata los grupos de tantos como tantos, en orden
+ * de hora, si cada par así formado también es candidato. `soloUno`: además, cada
+ * grupo tiene que ser de uno contra uno.
+ */
+function emparejar(cobros: CobroErp[], pagos: PagoMp[], unidos: (c: CobroErp, p: PagoMp) => boolean, soloUno: boolean): Par[] {
+  const padre = new Map<string, string>();
+  const raiz = (x: string): string => { let r = x; while (padre.get(r) !== r) r = padre.get(r)!; padre.set(x, r); return r; };
+  const unir = (a: string, b: string) => { padre.set(raiz(a), raiz(b)); };
+  const indice = porImporte(pagos);
+  const aristas = new Set<string>();
+  for (const c of cobros) {
+    for (const p of indice.get(centavos(c.importe)) ?? []) {
+      if (!unidos(c, p)) continue;
+      for (const k of [`e${c.clave}`, `m${p.id}`]) if (!padre.has(k)) padre.set(k, k);
+      unir(`e${c.clave}`, `m${p.id}`);
+      aristas.add(`${c.clave}|${p.id}`);
+    }
+  }
+  const grupos = new Map<string, { erp: CobroErp[]; mp: PagoMp[] }>();
+  const grupo = (k: string) => { const r = raiz(k); let g = grupos.get(r); if (!g) { g = { erp: [], mp: [] }; grupos.set(r, g); } return g; };
+  for (const c of cobros) if (padre.has(`e${c.clave}`)) grupo(`e${c.clave}`).erp.push(c);
+  for (const p of pagos) if (padre.has(`m${p.id}`)) grupo(`m${p.id}`).mp.push(p);
+  const porHora = (a: { fecha: Date }, b: { fecha: Date }) => a.fecha.getTime() - b.fecha.getTime();
+  const pares: Par[] = [];
+  for (const g of grupos.values()) {
+    if (g.erp.length !== g.mp.length) continue;
+    /* Una transferencia solo se ata sola si es la única candidata de cada lado:
+     * entre dos de igual importe en días distintos, el orden de hora no dice cuál es de quién. */
+    if ((soloUno || g.erp[0].familia === 'transferencia') && g.erp.length > 1) continue;
+    g.erp.sort(porHora); g.mp.sort(porHora);
+    /* Cada par en orden de hora tiene que ser candidato él mismo; si no, el grupo se deja para una persona. */
+    if (!g.erp.every((c, i) => aristas.has(`${c.clave}|${g.mp[i].id}`))) continue;
+    g.erp.forEach((c, i) => pares.push({ clave: c.clave, mpId: g.mp[i].id }));
+  }
+  return pares;
+}
+
 /** Lo que se ata solo. Devuelve los pares; lo demás queda suelto. */
 export function atarSolos(cobros: CobroErp[], pagos: PagoMp[]): Par[] {
   const pares: Par[] = [];
@@ -165,39 +217,17 @@ export function atarSolos(cobros: CobroErp[], pagos: PagoMp[]): Par[] {
   const sueltosErp = cobros.filter((c) => !c.mpId);
   const sueltosMp = pagos.filter((p) => !usados.has(p.id));
 
-  /* 2. Grupos de candidatos (componentes conexos): tantos como tantos → en orden de hora. */
-  const padre = new Map<string, string>();
-  const raiz = (x: string): string => { let r = x; while (padre.get(r) !== r) r = padre.get(r)!; padre.set(x, r); return r; };
-  const unir = (a: string, b: string) => { padre.set(raiz(a), raiz(b)); };
-  const indice = porImporte(sueltosMp);
-  const aristas = new Set<string>();
-  for (const c of sueltosErp) {
-    for (const p of indice.get(centavos(c.importe)) ?? []) {
-      if (!esCandidato(c, p)) continue;
-      for (const k of [`e${c.clave}`, `m${p.id}`]) if (!padre.has(k)) padre.set(k, k);
-      unir(`e${c.clave}`, `m${p.id}`);
-      aristas.add(`${c.clave}|${p.id}`);
-    }
-  }
-  const grupos = new Map<string, { erp: CobroErp[]; mp: PagoMp[] }>();
-  const grupo = (k: string) => { const r = raiz(k); let g = grupos.get(r); if (!g) { g = { erp: [], mp: [] }; grupos.set(r, g); } return g; };
-  for (const c of sueltosErp) if (padre.has(`e${c.clave}`)) grupo(`e${c.clave}`).erp.push(c);
-  for (const p of sueltosMp) if (padre.has(`m${p.id}`)) grupo(`m${p.id}`).mp.push(p);
-  const porHora = (a: { fecha: Date }, b: { fecha: Date }) => a.fecha.getTime() - b.fecha.getTime();
-  for (const g of grupos.values()) {
-    if (g.erp.length !== g.mp.length) continue;
-    /* Una transferencia solo se ata sola si es la única candidata de cada lado:
-     * entre dos de igual importe en días distintos, el orden de hora no dice cuál es de quién. */
-    if (g.erp[0].familia === 'transferencia' && g.erp.length > 1) continue;
-    g.erp.sort(porHora); g.mp.sort(porHora);
-    /* Cada par en orden de hora tiene que ser candidato él mismo; si no, el grupo se deja para una persona. */
-    if (!g.erp.every((c, i) => aristas.has(`${c.clave}|${g.mp[i].id}`))) continue;
-    g.erp.forEach((c, i) => pares.push({ clave: c.clave, mpId: g.mp[i].id }));
-  }
+  /* 2. Grupos de candidatos dentro de la ventana: tantos como tantos → en orden de hora. */
+  const enVentana = emparejar(sueltosErp, sueltosMp, esCandidato, false);
+  pares.push(...enVentana);
+  /* 3. Lo que quedó, en todo el día: solo si es uno contra uno. */
+  const atadoErp = new Set(enVentana.map((x) => x.clave));
+  for (const x of enVentana) usados.add(x.mpId);
+  pares.push(...emparejar(sueltosErp.filter((c) => !atadoErp.has(c.clave)), sueltosMp.filter((p) => !usados.has(p.id)), mismoDia, true));
   return pares;
 }
 
-export type Motivo = 'varios' | 'otro_medio' | 'monto_distinto';
+export type Motivo = 'varios' | 'otro_medio' | 'otra_hora' | 'monto_distinto';
 export type Sugerencia = Par & { motivo: Motivo };
 
 /**
@@ -205,11 +235,12 @@ export type Sugerencia = Par & { motivo: Motivo };
  * sugerido una sola vez. En orden de confianza:
  *   · varios posibles: candidato seguro, pero el grupo no cerraba tantos como tantos;
  *   · otro medio: mismo importe, otra familia (se marcó tarjeta y pagó con QR), ±30 min;
+ *   · otra hora: mismo importe y medio, el mismo día (había más de uno posible);
  *   · monto distinto: misma familia, ±3 min (el monto se tipeó mal en el Point).
  * Una transferencia mira su ventana de días también en «otro medio».
  */
 export function sugerir(cobros: CobroErp[], pagos: PagoMp[]): Sugerencia[] {
-  const PRIORIDAD: Record<Motivo, number> = { varios: 0, otro_medio: 1, monto_distinto: 2 };
+  const PRIORIDAD: Record<Motivo, number> = { varios: 0, otro_medio: 1, otra_hora: 2, monto_distinto: 3 };
   const cerca: [number, number] = [30 * MIN, 30 * MIN];
   const opciones: (Sugerencia & { orden: number })[] = [];
   for (const c of cobros) {
@@ -220,6 +251,7 @@ export function sugerir(cobros: CobroErp[], pagos: PagoMp[]): Sugerencia[] {
       if (igual && esCandidato(c, p)) motivo = 'varios';
       else if (igual && c.familia !== p.familia
         && dentro(c, p, c.familia === 'transferencia' || p.familia === 'transferencia' ? VENTANA.transferencia : cerca)) motivo = 'otro_medio';
+      else if (igual && mismoDia(c, p)) motivo = 'otra_hora';
       else if (!igual && c.familia === p.familia && dentro(c, p, [3 * MIN, 3 * MIN])) motivo = 'monto_distinto';
       if (!motivo) continue;
       opciones.push({ clave: c.clave, mpId: p.id, motivo, orden: PRIORIDAD[motivo] * 1e13 + Math.abs(p.fecha.getTime() - c.fecha.getTime()) });
