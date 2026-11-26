@@ -39,7 +39,7 @@ import {
   cajaSesiones, cashflowCaja, cashflowConceptos, cashflowConteos, cashflowMovimientos, cashflowSobres, gastoCategorias,
   gastos, proveedorImputaciones, proveedorPagos, proveedores, sucursales,
 } from '../db/schema';
-import { DENOMINACIONES } from '../caja/caja.module';
+import { CajaModule, CajaService, DENOMINACIONES } from '../caja/caja.module';
 import { TURNO_TARDE_DESDE } from '../inventario/inventario.service';
 import { type EstadoTurno, estadoTurno } from './planilla';
 import { armarConciliacion, consultarConciliacion } from './conciliacion';
@@ -240,6 +240,7 @@ export class CashflowService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly pagos: PagosProveedorService,
     private readonly gastos: GastosService,
+    private readonly cajas: CajaService,
   ) {}
 
   /** La caja (una sola fila) o null si todavía no arrancó. */
@@ -674,6 +675,7 @@ export class CashflowService {
     /* Instantes en ISO: el formato de la base («2026-10-18 08:05:00-03») no lo lee cualquier navegador de celular. */
     const iso = (v: unknown) => (v ? new Date(v as string).toISOString() : null);
     const turnosDe = new Map<number, any[]>();
+    const abiertasHoy: any[] = [];
     for (const x of r.rows as any[]) {
       const envio = money(x.envio);
       const t = {
@@ -698,7 +700,9 @@ export class CashflowService {
       };
       const l = turnosDe.get(Number(x.sucursalId));
       if (l) l.push(t); else turnosDe.set(Number(x.sucursalId), [t]);
+      if (dia === hoy && x.estado === 'abierta') abiertasHoy.push(t);
     }
+    await this.efectivoAhora(abiertasHoy);
     const locales = sucs.map((su) => ({ ...su, turnos: turnosDe.get(su.id) ?? [] }));
     const todos = locales.flatMap((l) => l.turnos);
     const cuenta = (e: EstadoTurno) => todos.filter((t) => t.estado === e);
@@ -712,8 +716,40 @@ export class CashflowService {
         sinRendir: sinRendir.length, sinRendirTotal: money(sinRendir.reduce((a, t) => a + t.envio, 0)),
         rendidas: cuenta('rendida').length + cuenta('no_corresponde').length,
         sinCaja: locales.filter((l) => !l.turnos.length).length,
+        /** Hoy: el efectivo que tendría que haber en las cajas abiertas (sin los sobres, que van aparte). */
+        efectivoEnLocales: dia === hoy ? money(abiertasHoy.reduce((a, t) => a + (t.ahora?.esperado ?? 0), 0)) : null,
       },
     };
+  }
+
+  /**
+   * LO QUE TIENE QUE HABER AHORA EN CADA CAJA ABIERTA (26/11/2026, pedido del
+   * dueño: «hay cajas que hacen cierre una vez por semana, ¿dónde veo lo que
+   * tienen en efectivo en el momento?»). Es el MISMO «efectivo esperado» del
+   * arqueo del turno (fondo + cobrado en efectivo + ingresos − egresos), sacado
+   * de `CajaService.arqueo` para que los dos números no puedan diferir. Al lado,
+   * lo que contaron en el último arqueo de la noche, si hubo. Solo se mira: no
+   * mueve el Cash Flow. Solo hoy: el «ahora» de un día pasado no existe.
+   */
+  private async efectivoAhora(turnos: any[]) {
+    if (!turnos.length) return;
+    const ids = turnos.map((t) => t.id);
+    const [arqueos, ultimos] = await Promise.all([
+      Promise.all(ids.map((id) => this.cajas.arqueo(id))),
+      this.db.execute(sql`
+        select distinct on (cc.caja_sesion_id) cc.caja_sesion_id as id, cc.fecha, cc.contado_efectivo as contado, coalesce(u.nombre, '') as quien
+          from caja_controles cc left join usuarios u on u.id = cc.usuario_id
+         where cc.arqueo_dia and cc.caja_sesion_id in (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
+         order by cc.caja_sesion_id, cc.fecha desc`),
+    ]);
+    const ultimoDe = new Map((ultimos.rows as any[]).map((x) => [Number(x.id), x]));
+    turnos.forEach((t, i) => {
+      const u = ultimoDe.get(t.id);
+      t.ahora = {
+        esperado: money(arqueos[i].esperadoEfectivo ?? 0),
+        ultimoArqueo: u ? { fecha: new Date(u.fecha).toISOString(), contado: money(u.contado), quien: u.quien } : null,
+      };
+    });
   }
 
   /**
@@ -1259,7 +1295,7 @@ export class CashflowController {
 }
 
 @Module({
-  imports: [PagosModule, GastosModule],
+  imports: [PagosModule, GastosModule, CajaModule],
   controllers: [CashflowController],
   providers: [CashflowService],
   exports: [CashflowService],

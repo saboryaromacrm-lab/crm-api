@@ -1730,6 +1730,13 @@
       "when": 1796947200000,
       "tag": "0246_transferencia_directa",
       "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "7",
+      "when": 1797033600000,
+      "tag": "0247_saldos_cuentas",
+      "breakpoints": true
     }
   ]
 }

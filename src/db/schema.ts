@@ -3591,6 +3591,29 @@ export const cuentasPropias = pgTable('cuentas_propias', {
   /** Alias, CVU o lo que sirva para reconocerla. */
   detalle: text('detalle').notNull().default(''),
   activa: boolean('activa').notNull().default(true),
+  /** La cuenta de Mercado Pago conectada al ERP (0247): a esa le suman los cobros que baja la conciliación. Una sola. */
+  esMercadoPago: boolean('es_mercado_pago').notNull().default(false),
+});
+
+/**
+ * SALDOS CARGADOS A MANO (0247, «¿Dónde está mi plata?»): lo que el dueño ve en
+ * la app de cada cuenta. `estimado` es lo que el ERP calculaba en ese momento
+ * (el saldo anterior + lo que entró − lo que se pagó desde ahí); `diferencia`
+ * = saldo − estimado: plata que se movió por fuera del ERP. Null en el primero.
+ */
+export const cuentaSaldos = pgTable('cuenta_saldos', {
+  id: serial('id').primaryKey(),
+  cuentaPropiaId: integer('cuenta_propia_id').notNull().references(() => cuentasPropias.id, { onDelete: 'restrict' }),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  saldo: doublePrecision('saldo').notNull(),
+  estimado: doublePrecision('estimado'),
+  diferencia: doublePrecision('diferencia'),
+  nota: text('nota').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+  anuladoMotivo: text('anulado_motivo').notNull().default(''),
 });
 
 export const proveedorPagos = pgTable('proveedor_pagos', {

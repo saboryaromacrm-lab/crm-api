@@ -44,6 +44,7 @@ import { FeriadosModule } from './feriados/feriados.module';
 import { AnotacionesModule } from './anotaciones/anotaciones.module';
 import { AManoModule } from './ventas/a-mano.module';
 import { VistaProfesionalModule } from './gerencia/vista-profesional.module';
+import { PlataModule } from './gerencia/plata.module';
 import { CashflowModule } from './cashflow/cashflow.module';
 import { ResultadosModule } from './resultados/resultados.module';
 import { IndicadoresModule } from './indicadores/indicadores.module';
@@ -73,6 +74,7 @@ import { MercadoPagoModule } from './mercadopago/mercadopago.module';
     AnotacionesModule,
     AManoModule,
     VistaProfesionalModule,
+    PlataModule,
     IngredientesModule,
     InventarioModule,
     ComprobantesModule,
