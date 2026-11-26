@@ -1737,6 +1737,13 @@
       "when": 1797033600000,
       "tag": "0247_saldos_cuentas",
       "breakpoints": true
+    },
+    {
+      "idx": 248,
+      "version": "7",
+      "when": 1797120000000,
+      "tag": "0248_diferencias_entrega",
+      "breakpoints": true
     }
   ]
 }

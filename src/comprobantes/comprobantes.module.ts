@@ -28,6 +28,7 @@ import { imputarEcheqTx } from '../proveedores/echeqs';
 import { etiquetaDoc } from '../common/documentos';
 import { VENTANA_OTRA_MITAD, netoPorProducto, sinSuOtraMitad, tipoDeLaOtraMitad } from './otra-mitad';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { DiferenciasModule, DiferenciasService } from '../proveedores/diferencias.module';
 import { ajustePorAnulacion, fechaDeCuenta, finalCafeteria, importeEnCuenta } from '../cafeteria/cuenta';
 import { normalizarPuntoVenta } from '../facturas/comun';
 import { InventarioModule } from '../inventario/inventario.module';
@@ -230,6 +231,16 @@ type Promesas = {
   echeqs: Array<{ echeqId: number; importe: number }>;
 };
 
+class LlegadaDto {
+  @IsInt() productoId!: number;
+  @IsOptional() @IsInt() presentacionId?: number | null;
+  @IsNumber() @Min(0) cantidad!: number;
+}
+class CubreDiferenciaDto {
+  @IsInt() diferenciaId!: number;
+  @IsNumber() @Min(0.001) cantidad!: number;
+}
+
 class CreateComprobanteDto {
   @IsIn(TIPOS as unknown as string[]) tipo!: (typeof TIPOS)[number];
   @IsOptional() @IsIn(['A', 'B', 'C', 'X']) letra?: 'A' | 'B' | 'C' | 'X';
@@ -294,6 +305,23 @@ class CreateComprobanteDto {
    */
   @IsOptional() @IsArray() @IsInt({ each: true })
   activarProveedor?: number[];
+
+  /**
+   * LO QUE LLEGÓ (0248): de los productos que se contaron, cuánto llegó (en
+   * unidades del stock). Lo que no está, llegó como dice el papel. Solo en un
+   * papel que ingresa stock. Ver `DiferenciasService.alCargarEntrega`.
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(300) @ValidateNested({ each: true }) @Type(() => LlegadaDto)
+  llegaron?: LlegadaDto[];
+  /** El papel de la otra mitad (mitad y mitad) que se sumó a lo esperado al contar. */
+  @IsOptional() @IsInt() otraMitadId?: number;
+  /**
+   * Las diferencias pendientes que este papel cubre (0248): en una factura, lo
+   * que había venido de más y recién cobra (no vuelve a entrar al stock); en
+   * una nota de crédito, lo que faltó (no saca stock: nunca entró).
+   */
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @ValidateNested({ each: true }) @Type(() => CubreDiferenciaDto)
+  cubreDiferencias?: CubreDiferenciaDto[];
 
   /** El resto que se paga ahora (contado). Ver `PagoContadoDto`. */
   @IsOptional() @ValidateNested() @Type(() => PagoContadoDto)
@@ -471,7 +499,13 @@ export class ComprobantesService {
     private readonly precios: PreciosService,
     /** El pago es del proveedor, no del comprobante: acá solo se lo invoca. */
     private readonly pagos: PagosProveedorService,
+    private readonly diferencias: DiferenciasService,
   ) {}
+
+  /** El tipo de un comprobante, para decidir quién lo ve. */
+  tipoDe(id: number) {
+    return this.db.select({ tipo: comprobantes.tipo }).from(comprobantes).where(eq(comprobantes.id, id)).limit(1);
+  }
 
   private async withItems(c: any) {
     const items = await this.db.select().from(comprobanteItems).where(eq(comprobanteItems.comprobanteId, c.id));
@@ -787,10 +821,18 @@ export class ComprobantesService {
       cantidad: comprobanteItems.cantidad, subtotal: comprobanteItems.subtotal,
     }).from(comprobanteItems).where(inArray(comprobanteItems.comprobanteId, papeles.map((p) => p.id)));
     const precios = netoPorProducto(papeles.map((p) => p.id), renglones as any);
+    /* Lo que ingresó la otra mitad, para comparar lo que llegó contra las dos juntas (0248). */
+    const m = await this.diferencias.otraMitadDeLaEntrega(this.db, {
+      proveedorId: q.proveedorId, tipo: String(q.tipo ?? ''), letra: q.letra, fecha: /^\d{4}-\d{2}-\d{2}$/.test(q.fecha ?? '') ? `${q.fecha}T12:00:00-03:00` : new Date(),
+    });
     return {
       ...vacio,
       papeles: papeles.map((p) => ({ id: p.id, etiqueta: etiquetaDoc(p as any), fecha: p.fecha })),
       precios: [...precios].map(([productoId, v]) => ({ productoId, ...v })),
+      llegada: m && {
+        id: m.id, etiqueta: m.etiqueta, conDiferencias: m.conDiferencias,
+        porProducto: [...m.porClave].map(([k, entro]) => { const [productoId, pres] = k.split(':').map(Number); return { productoId, presentacionId: pres || null, entro }; }),
+      },
     };
   }
 
@@ -1452,6 +1494,15 @@ export class ComprobantesService {
     if ((ingresaStock || egresaStock) && !dto.sucursalId) {
       throw new BadRequestException('Indicá la sucursal de recepción.');
     }
+    /* LO QUE LLEGÓ Y LAS DIFERENCIAS QUE CUBRE (0248): ver `DiferenciasService`. */
+    if ((dto.llegaron?.length || dto.otraMitadId) && !ingresaStock) {
+      throw new BadRequestException('Lo que llegó se cuenta en un papel que ingresa mercadería (con recepción).');
+    }
+    if (dto.cubreDiferencias?.length && (dto.tipo === 'nota_credito' ? egresaStock : !ingresaStock)) {
+      throw new BadRequestException(dto.tipo === 'nota_credito'
+        ? 'Una nota de crédito por lo que faltó no saca stock (nunca entró): destildá «devuelve mercadería».'
+        : 'Solo una nota de crédito o un papel que ingresa mercadería cubre diferencias de entrega.');
+    }
 
     /**
      * LA FACTURA QUE LA NOTA AJUSTA.
@@ -1575,13 +1626,29 @@ export class ComprobantesService {
         refComprobanteId: dto.refComprobanteId ?? null, observaciones: dto.observaciones ?? '', usuarioId: dto.usuarioId ?? null,
       }).returning();
 
-      await tx.insert(comprobanteItems).values(items.map((it) => ({
+      /* LO QUE NO ENTRA de cada renglón (0248): lo que faltó, o lo que ya había
+       * entrado de más y este papel recién cobra. El neto que cobra el papel,
+       * con su bonificación general, valoriza cada diferencia. */
+      const brutoPapel = pie.items.reduce((a, it) => a + (Number(it.subtotal) || 0), 0);
+      const noEntra = ingresaStock
+        ? await this.diferencias.alCargarEntrega(tx, {
+          comprobante: { ...c, sucursalId: dto.sucursalId! }, usuarioId: dto.usuarioId ?? null, items: items as any,
+          factorNeto: brutoPapel > 0 ? (brutoPapel - bonificacionImporte) / brutoPapel : 1,
+          llegaron: dto.llegaron, otraMitadId: dto.otraMitadId, cubreSobrantes: dto.cubreDiferencias,
+        })
+        : items.map(() => 0);
+      if (dto.tipo === 'nota_credito' && dto.cubreDiferencias?.length) {
+        await this.diferencias.alCargarNota(tx, c, dto.cubreDiferencias, dto.usuarioId ?? null);
+      }
+
+      await tx.insert(comprobanteItems).values(items.map((it, i) => ({
         comprobanteId: c.id, productoId: it.productoId, presentacionId: it.presentacionId ?? null,
         cantidad: Number(it.cantidad) || 0, costoUnitario: Number(it.costoUnitario) || 0,
         descuento: Number(it.descuento) || 0, iva: it.iva, subtotal: it.subtotal,
         paraCafeteria: esDelCafe(it as any),
         porBulto: Number(it.porBulto) > 1 ? Number(it.porBulto) : null,
         porDisplay: Number(it.porDisplay) > 1 ? Number(it.porDisplay) : null,
+        noEntra: noEntra[i],
       })));
 
       /*
@@ -1628,7 +1695,8 @@ export class ComprobantesService {
       if (ingresaStock) {
         await this.inv.ingresarStockItems(tx, {
           sucursalId: dto.sucursalId, proveedorId: prov.id, proveedorNombre: prov.nombre, usuarioId: dto.usuarioId,
-          descripcion: `Recepción ${dto.tipo} ${c.puntoVenta}-${c.numero ?? c.id}`, items: dto.items,
+          descripcion: `Recepción ${dto.tipo} ${c.puntoVenta}-${c.numero ?? c.id}`,
+          items: dto.items.map((it, i) => ({ ...it, cantidad: (Number(it.cantidad) || 0) - noEntra[i] })),
         });
       }
 
@@ -2227,7 +2295,13 @@ export class ComprobantesService {
     const items = await ex.select().from(comprobanteItems).where(eq(comprobanteItems.comprobanteId, c.id));
     const sentido: 0 | 1 | -1 = !c.recepcion || !c.sucursalId ? 0
       : (['factura', 'remito', 'liquidacion'].includes(c.tipo) ? -1 : (c.tipo === 'nota_credito' ? 1 : 0));
-    const renglones = items.map((it: any) => ({ productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: Number(it.cantidad) || 0 }));
+    /* Sale lo que ENTRÓ (0248): lo facturado menos lo que no entró, más lo que vino de más con este papel. */
+    const dif = await this.diferencias.planAnulacion(ex, c.id);
+    bloqueos.push(...dif.bloqueos);
+    const renglones = [
+      ...items.map((it: any) => ({ productoId: it.productoId, presentacionId: it.presentacionId ?? null, cantidad: (Number(it.cantidad) || 0) - (Number(it.noEntra) || 0) })),
+      ...dif.sobrantes,
+    ];
     const stock = sentido === 0 ? [] : (await this.inv.stockDeRenglones(c.sucursalId, renglones))
       .map((x) => ({ ...x, alcanza: sentido > 0 || x.libre || x.hay + 1e-9 >= x.cantidad }));
     const noAlcanza = stock.filter((x) => !x.alcanza);
@@ -2319,6 +2393,8 @@ export class ComprobantesService {
 
       /* Sus fletes (0244) vuelven a esperar papel: se vinculan al cargarlo de nuevo. */
       await desvincularFletes(tx, c.id);
+      /* Sus diferencias de entrega se anulan y lo que resolvió vuelve a quedar pendiente (0248). */
+      await this.diferencias.alAnular(tx, c.id, dto.usuarioId ?? null);
 
       const tocados: number[] = [];
       for (const lote of plan.lotes) {
@@ -2787,7 +2863,7 @@ export class ComprobantesService {
 @Controller('comprobantes')
 @Permiso('compras.facturacion')
 export class ComprobantesController {
-  constructor(private readonly svc: ComprobantesService) {}
+  constructor(private readonly svc: ComprobantesService, private readonly diferencias: DiferenciasService) {}
 
   /** La góndola que dejaría la factura, sin grabar nada (ver `proyectarPrecios`). */
   @Post('proyectar-precios')
@@ -2847,6 +2923,17 @@ export class ComprobantesController {
    * La otra mitad (factura A ↔ liquidación) del papel que se está cargando (ver
    * `otraMitad`). Sin `liquidaciones` no viaja nada: compararla la mostraría.
    */
+  /**
+   * Las diferencias de entrega pendientes de un proveedor (0248), para que el
+   * papel nuevo las cubra: los faltantes en una nota de crédito, lo que vino
+   * de más en una factura que lo cobra.
+   */
+  @Get('diferencias-pendientes')
+  diferenciasPendientes(@Query('proveedorId', ParseIntPipe) proveedorId: number, @Query('tipo') tipo?: string) {
+    if (tipo !== 'faltante' && tipo !== 'sobrante') throw new BadRequestException('El tipo es «faltante» o «sobrante».');
+    return this.diferencias.listar({ estado: 'pendientes', proveedorId, tipo });
+  }
+
   @Get('otra-mitad')
   otraMitad(
     @Auth() auth: Sesion,
@@ -2886,6 +2973,18 @@ export class ComprobantesController {
    * `precios`, porque también puede actualizar costos por adentro.
    */
   /** Qué pasaría al anular: lo que frena y lo que se deshace (0106). */
+  /** Lo que llegó distinto de este papel y las diferencias de otros que cubrió (0248). */
+  @Get(':id/diferencias')
+  async diferenciasDelPapel(@Auth() auth: Sesion, @Param('id', ParseIntPipe) id: number) {
+    const [c] = await this.svc.tipoDe(id);
+    if (!c || (c.tipo === 'liquidacion' && !tienePermiso(auth.permisos, ['liquidaciones']))) throw new NotFoundException('Comprobante inexistente.');
+    const [diferencias, cubre] = await Promise.all([
+      this.diferencias.listar({ estado: 'todas', comprobanteIds: [id], conResoluciones: true }),
+      this.diferencias.cubiertasPor(id),
+    ]);
+    return { diferencias, cubre };
+  }
+
   @Get(':id/anulacion')
   anulacion(@Param('id', ParseIntPipe) id: number) {
     return this.svc.previsualizarAnulacion(id);
@@ -2934,7 +3033,7 @@ export class ComprobantesController {
 }
 
 @Module({
-  imports: [InventarioModule, PreciosModule, PagosModule],
+  imports: [InventarioModule, PreciosModule, PagosModule, DiferenciasModule],
   controllers: [ComprobantesController],
   providers: [ComprobantesService],
 })

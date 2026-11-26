@@ -1882,6 +1882,12 @@ export const comprobanteItems = pgTable('comprobante_items', {
   porBulto: doublePrecision('por_bulto'),
   /** EL RENGLÓN SE CARGÓ POR DISPLAY (0203): unidades por display, congelado. NULL = no. */
   porDisplay: doublePrecision('por_display'),
+  /**
+   * LO FACTURADO QUE NO ENTRA AL STOCK CON ESTE PAPEL (0248): lo que faltó en
+   * la entrega, o lo que ya había entrado antes como «de más» y este papel
+   * recién cobra. Al stock entra `cantidad − noEntra` (y sale eso al anular).
+   */
+  noEntra: doublePrecision('no_entra').notNull().default(0),
 }, (t) => ({
   /** Lo comprado para Coffit por artículo, para el cupo de los envíos (0119). */
   ixCafe: index('ix_comprobante_items_cafe').on(t.productoId).where(sql`${t.paraCafeteria}`),
@@ -4240,6 +4246,47 @@ export const proveedorReposicionItems = pgTable('proveedor_reposicion_items', {
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixReposicion: index('ix_reposicion_items_reposicion').on(t.reposicionId),
+}));
+
+/**
+ * DIFERENCIAS DE ENTREGA (0248): lo que llegó distinto de lo que dice el papel,
+ * pendiente con el proveedor hasta que se resuelve. Ver `diferencias.module.ts`.
+ */
+export const entregaDiferencias = pgTable('entrega_diferencias', {
+  id: serial('id').primaryKey(),
+  comprobanteId: integer('comprobante_id').notNull().references(() => comprobantes.id, { onDelete: 'restrict' }),
+  proveedorId: integer('proveedor_id').notNull().references(() => proveedores.id, { onDelete: 'restrict' }),
+  sucursalId: integer('sucursal_id').notNull().references(() => sucursales.id, { onDelete: 'restrict' }),
+  productoId: integer('producto_id').notNull().references(() => productos.id, { onDelete: 'restrict' }),
+  presentacionId: integer('presentacion_id').references(() => presentaciones.id, { onDelete: 'set null' }),
+  /** `faltante`: el papel cobra algo que no llegó · `sobrante`: llegó algo que el papel no cobra. */
+  tipo: text('tipo').$type<'faltante' | 'sobrante'>().notNull(),
+  cantidad: doublePrecision('cantidad').notNull(),
+  /** Neto por unidad, congelado: el del papel (con su bonificación) o, si no lo cobra, el costo de ese día. */
+  costoUnitario: doublePrecision('costo_unitario').notNull().default(0),
+  estado: text('estado').$type<'pendiente' | 'resuelta' | 'anulada'>().notNull().default('pendiente'),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  creadoEn: timestamp('creado_en', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ixEstado: index('ix_entrega_diferencias_estado').on(t.estado, t.proveedorId),
+  ixComprobante: index('ix_entrega_diferencias_comprobante').on(t.comprobanteId),
+}));
+
+/** Cómo se fue resolviendo cada diferencia (en partes, si hace falta). Una anulada deja de contar. */
+export const entregaDiferenciaResoluciones = pgTable('entrega_diferencia_resoluciones', {
+  id: serial('id').primaryKey(),
+  diferenciaId: integer('diferencia_id').notNull().references(() => entregaDiferencias.id, { onDelete: 'cascade' }),
+  como: text('como').$type<'llego' | 'nota_credito' | 'perdido' | 'facturado' | 'devuelto' | 'sin_cargo'>().notNull(),
+  cantidad: doublePrecision('cantidad').notNull(),
+  /** La nota de crédito o la factura que la resolvió: si se anula, la resolución se cae con ella. */
+  comprobanteId: integer('comprobante_id').references(() => comprobantes.id, { onDelete: 'restrict' }),
+  nota: text('nota').notNull().default(''),
+  usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
+  fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
+  anuladoEn: timestamp('anulado_en', { withTimezone: true }),
+  anuladoPor: integer('anulado_por').references(() => usuarios.id, { onDelete: 'set null' }),
+}, (t) => ({
+  ixDiferencia: index('ix_entrega_resoluciones_diferencia').on(t.diferenciaId),
 }));
 
 /** Ajustes manuales del estado de cuenta. Importe CON SIGNO (+debe / −haber)

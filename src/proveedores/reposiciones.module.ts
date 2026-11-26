@@ -34,7 +34,8 @@ import {
 } from '../db/schema';
 import { InventarioModule } from '../inventario/inventario.module';
 import { InventarioService } from '../inventario/inventario.service';
-import { costosFormato, escalaPaquete, formatoDeCosto } from '../inventario/pricing';
+import { costosDeHoy } from '../inventario/costo-hoy';
+import { DiferenciasModule, DiferenciasService } from './diferencias.module';
 
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Lo repuesto alcanza lo mandado con un centavo de tolerancia. */
@@ -64,7 +65,7 @@ class RecibirDto {
 
 @Injectable()
 export class ReposicionesService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database, private readonly inv: InventarioService) {}
+  constructor(@Inject(DRIZZLE) private readonly db: Database, private readonly inv: InventarioService, private readonly diferencias: DiferenciasService) {}
 
   /**
    * El costo NETO de hoy de cada renglón, el mismo que se congela en una venta
@@ -73,28 +74,17 @@ export class ReposicionesService {
    * mostrador: paquetes y unidades enteros, y nada sin costo.
    */
   private async conCosto(tx: Database, items: RenglonDto[], paraMover: boolean) {
-    const ids = [...new Set(items.map((it) => it.productoId))];
-    const presIds = [...new Set(items.map((it) => it.presentacionId).filter((x): x is number => !!x))];
-    const [prods, provs] = await Promise.all([
-      tx.select().from(productos).where(inArray(productos.id, ids)),
-      tx.select().from(productoProveedores).where(inArray(productoProveedores.productoId, ids)),
-    ]);
-    const pres = presIds.length ? await tx.select().from(presentaciones).where(inArray(presentaciones.id, presIds)) : [];
-    return items.map((it) => {
-      const prod = prods.find((p) => p.id === it.productoId);
-      if (!prod) throw new BadRequestException('Uno de los productos ya no existe.');
-      const p = it.presentacionId ? pres.find((x) => x.id === it.presentacionId && x.productoId === prod.id) : null;
-      if (it.presentacionId && !p) throw new BadRequestException(`El envasado elegido no es de ${prod.nombre}.`);
-      const cf = costosFormato(formatoDeCosto(prod as any, provs.filter((x) => x.productoId === prod.id)) as any, prod.iva);
-      const costoUnitario = Math.round(cf.costoNetoUnitario * (p ? escalaPaquete(p.tamKg, prod.merma) : 1) * 1e4) / 1e4;
+    const costos = await costosDeHoy(tx, items);
+    return items.map((it, i) => {
+      const { prod, presentacionId, costoUnitario } = costos[i];
       const cantidad = Number(it.cantidad);
       if (paraMover) {
-        this.inv.exigirEntero(prod, p?.id ?? null, cantidad);
+        this.inv.exigirEntero(prod, presentacionId, cantidad);
         if (!(costoUnitario > 0)) {
           throw new BadRequestException(`${prod.nombre} no tiene costo cargado: sin costo no se puede medir el cambio. Cargáselo en su ficha.`);
         }
       }
-      return { productoId: prod.id, presentacionId: p?.id ?? null, cantidad, costoUnitario };
+      return { productoId: prod.id as number, presentacionId, cantidad, costoUnitario };
     });
   }
 
@@ -133,13 +123,23 @@ export class ReposicionesService {
     return this.filas(conds, 300);
   }
 
-  /** Lo que cada proveedor te debe en cambios pendientes (para su tarjeta en Pedidos). */
+  /**
+   * Lo que cada proveedor tiene pendiente con vos, a costo (para su tarjeta en
+   * Pedidos): los cambios y lo que faltó en una entrega (`debe`, te debe) y lo
+   * que vino de más (`sobrantes`, le debés). Ver `diferencias.module.ts`.
+   */
   async pendientesPorProveedor() {
-    const por = new Map<number, { proveedorId: number; cambios: number; debe: number }>();
+    const por = new Map<number, { proveedorId: number; cambios: number; debe: number; faltantes: number; sobrantes: number }>();
+    const de = (id: number) => por.get(id) ?? { proveedorId: id, cambios: 0, debe: 0, faltantes: 0, sobrantes: 0 };
     for (const f of await this.filas([eq(proveedorReposiciones.estado, 'pendiente')])) {
-      const x = por.get(f.proveedorId) ?? { proveedorId: f.proveedorId, cambios: 0, debe: 0 };
+      const x = de(f.proveedorId);
       x.cambios += 1; x.debe = money(x.debe + f.debe);
       por.set(f.proveedorId, x);
+    }
+    for (const [proveedorId, d] of await this.diferencias.pendientesPorProveedor()) {
+      const x = de(proveedorId);
+      x.faltantes = d.faltantes; x.sobrantes = d.sobrantes; x.debe = money(x.debe + d.faltantes);
+      por.set(proveedorId, x);
     }
     return [...por.values()];
   }
@@ -296,7 +296,7 @@ export class ReposicionesController {
 }
 
 @Module({
-  imports: [InventarioModule],
+  imports: [InventarioModule, DiferenciasModule],
   controllers: [ReposicionesController],
   providers: [ReposicionesService],
 })

@@ -52,6 +52,7 @@ import { nombreCuentaSql } from '../pagos/cuentas-propias';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
 import { NETO_DEL_RENGLON, NETO_DE_LA_ENTREGA } from '../gastos/fletes';
+import { DiferenciasModule, DiferenciasService } from './diferencias.module';
 import {
   ECHEQ_EN_CARTERA, ECHEQ_VIVOS, deudaACuentaCorriente, faltaCompromiso, imputarEcheqTx, sinFacturaEcheq,
 } from './echeqs';
@@ -177,6 +178,7 @@ export class FinanzasProveedorService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly pagos: PagosProveedorService,
     private readonly audit: AuditoriaService,
+    private readonly diferencias: DiferenciasService,
   ) {}
 
   /* ==================================================================== *
@@ -1604,6 +1606,7 @@ export class FinanzasProveedorService {
       });
     }
     await this.colgarFletes(proveedorId, movs);
+    await this.colgarDiferencias(movs);
     movs.sort((a, b) => new Date(b.fecha).getTime() - new Date(a.fecha).getTime() || b.id - a.id);
 
     const totDebe = money(movs.reduce((s, m) => s + m.debe, 0));
@@ -1693,6 +1696,21 @@ export class FinanzasProveedorService {
    * esperan la factura no tienen a qué pedido pegarse. Si la entrega es un remito
    * todavía sin facturar, no está en esta cuenta y su flete tampoco.
    */
+  /**
+   * LAS DIFERENCIAS DE ENTREGA DE CADA PAPEL (0248): lo que faltó o vino de
+   * más, colgado de su papel. Solo a la vista: la deuda sigue al papel, así que
+   * no tocan el saldo.
+   */
+  private async colgarDiferencias(movs: any[]) {
+    const papeles = movs.filter((m) => m.kind === 'comprobante');
+    if (!papeles.length) return;
+    const difs = await this.diferencias.listar({ estado: 'todas', comprobanteIds: papeles.map((m) => m.id) });
+    for (const m of papeles) {
+      const d = difs.filter((x) => x.comprobanteId === m.id);
+      if (d.length) m.diferencias = d;
+    }
+  }
+
   private async colgarFletes(proveedorId: number, movs: any[]) {
     const r: any = await this.db.execute(sql`
       select i.id, i.concepto, i.cantidad, ${NETO_DEL_RENGLON} as neto, ${NETO_DE_LA_ENTREGA} as entrega_neto,
@@ -1917,7 +1935,7 @@ export class EdocController {
 }
 
 @Module({
-  imports: [PagosModule, AuditoriaModule],
+  imports: [PagosModule, AuditoriaModule, DiferenciasModule],
   controllers: [CompromisosController, EcheqsController, EdocController],
   providers: [FinanzasProveedorService],
   /* Gerencia › Vista profesional (5/11/2026) lee la deuda con proveedores de acá. */

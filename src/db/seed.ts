@@ -24,6 +24,7 @@ import { CajaService } from '../caja/caja.module';
 import { GastosService } from '../gastos/gastos.module';
 import { HistorialPreciosService, PreciosService } from '../precios/precios.module';
 import { ListasService } from '../listas/listas.module';
+import { DiferenciasService } from '../proveedores/diferencias.module';
 import { hashPassword } from '../usuarios/usuarios.module';
 
 /**
@@ -42,7 +43,7 @@ async function main() {
   const precios = new PreciosService(db as any, evolucion);
   const pagosSvc = new PagosProveedorService(db as any);
   const ctasDisp = new CuentasDisponiblesService(db as any, pagosSvc, new AuditoriaService(db as any));
-  const comp = new ComprobantesService(db as any, inv, precios, pagosSvc);
+  const comp = new ComprobantesService(db as any, inv, precios, pagosSvc, new DiferenciasService(db as any, inv));
   const cfg = cfgSvc;
   const cli = new ClientesService(db as any);
   const caja = new CajaService(db as any, new AuditoriaService(db as any), new GastosService(db as any, pagosSvc));
