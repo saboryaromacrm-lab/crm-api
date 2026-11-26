@@ -51,6 +51,7 @@ import { FormaPagoDto, PagosModule, PagosProveedorService, exigirFechaPago } fro
 import { nombreCuentaSql } from '../pagos/cuentas-propias';
 import { AuditoriaModule, AuditoriaService } from '../auditoria/auditoria.module';
 import { exigirFueraDeConciliado } from '../common/conciliacion';
+import { NETO_DEL_RENGLON, NETO_DE_LA_ENTREGA } from '../gastos/fletes';
 import {
   ECHEQ_EN_CARTERA, ECHEQ_VIVOS, deudaACuentaCorriente, faltaCompromiso, imputarEcheqTx, sinFacturaEcheq,
 } from './echeqs';
@@ -1602,6 +1603,7 @@ export class FinanzasProveedorService {
         haber: esDebe ? 0 : money(-a.importe),
       });
     }
+    await this.colgarFletes(proveedorId, movs);
     movs.sort((a, b) => new Date(b.fecha).getTime() - new Date(a.fecha).getTime() || b.id - a.id);
 
     const totDebe = money(movs.reduce((s, m) => s + m.debe, 0));
@@ -1675,6 +1677,69 @@ export class FinanzasProveedorService {
       echeqs: echeqs.filas,
       cuentas,
     };
+  }
+
+  /**
+   * EL FLETE QUE TRAJO CADA ENTREGA, A LA VISTA (26/11/2026, pedido del dueño:
+   * «que en la cuenta del proveedor también aparezca el movimiento del flete, de
+   * cuánto salió, con un porcentaje con respecto al total del pedido… todo
+   * informativo»).
+   *
+   * El flete lo factura el TRANSPORTE (es un gasto suyo, en su cuenta): acá no
+   * suma ni resta un peso. Se cuelga como `flete` de la factura o liquidación de
+   * la entrega —los papeles de este proveedor de ese día, igual que Gastos ›
+   * Fletes, así los dos % coinciden— y la pantalla lo dibuja como un renglón gris
+   * debajo, sin debe ni haber. Solo los fletes ya vinculados a su papel: los que
+   * esperan la factura no tienen a qué pedido pegarse. Si la entrega es un remito
+   * todavía sin facturar, no está en esta cuenta y su flete tampoco.
+   */
+  private async colgarFletes(proveedorId: number, movs: any[]) {
+    const r: any = await this.db.execute(sql`
+      select i.id, i.concepto, i.cantidad, ${NETO_DEL_RENGLON} as neto, ${NETO_DE_LA_ENTREGA} as entrega_neto,
+             /* El papel de la entrega que está en esta cuenta (factura o liquidación), el primero que se cargó. */
+             (select min(e.id) from comprobantes e
+               where e.proveedor_id = c.proveedor_id and e.estado = 'confirmado' and e.tipo in ('factura', 'liquidacion')
+                 and e.fecha::date = c.fecha::date) as ancla,
+             g.id as gasto_id, g.fecha, g.letra, g.numero, coalesce(t.nombre, g.proveedor_texto) as transporte
+        from gasto_items i
+        join gastos g on g.id = i.gasto_id
+        left join proveedores t on t.id = g.proveedor_id
+        join comprobantes c on c.id = i.flete_comprobante_id
+       where c.proveedor_id = ${proveedorId} and c.estado = 'confirmado' and g.estado <> 'anulado'
+       order by g.fecha, i.id`);
+    const renglones = (r.rows ?? r) as any[];
+    if (!renglones.length) return;
+    const [costo] = ((await this.db.execute(sql`
+      select mode() within group (order by flete) as habitual from producto_proveedores
+       where proveedor_id = ${proveedorId} and modo_costo = 'lista'`)) as any).rows as any[];
+    const enCosto = costo?.habitual == null ? null : Number(costo.habitual);
+
+    /* Un renglón por entrega, colgado de su papel en esta cuenta. */
+    const porPapel = new Map<number, { neto: number; entregaNeto: number; items: any[] }>();
+    for (const x of renglones) {
+      if (x.ancla == null) continue;
+      const ancla = Number(x.ancla);
+      const e = porPapel.get(ancla) ?? { neto: 0, entregaNeto: money(Number(x.entrega_neto)), items: [] };
+      const neto = money(Number(x.neto));
+      e.neto = money(e.neto + neto);
+      e.items.push({
+        itemId: Number(x.id), gastoId: Number(x.gasto_id), fecha: x.fecha, transporte: String(x.transporte ?? ''),
+        numero: x.numero ? `${x.letra ? `${x.letra} ` : ''}${x.numero}` : '', concepto: String(x.concepto ?? ''),
+        cantidad: x.cantidad == null ? null : Number(x.cantidad), neto,
+      });
+      porPapel.set(ancla, e);
+    }
+    for (const m of movs) {
+      const e = m.kind === 'comprobante' ? porPapel.get(m.id) : undefined;
+      if (!e) continue;
+      m.flete = {
+        neto: e.neto,
+        netoEntrega: e.entregaNeto,
+        pct: e.entregaNeto > 0 ? Math.round((e.neto / e.entregaNeto) * 1000) / 10 : null,
+        enCosto,
+        items: e.items,
+      };
+    }
   }
 
   /**
