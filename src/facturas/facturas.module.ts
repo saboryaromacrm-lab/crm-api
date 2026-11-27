@@ -417,9 +417,18 @@ export class FacturasService {
    * La bandeja. El duplicado se resuelve en la misma consulta: preguntarlo fila
    * por fila era una consulta por factura.
    */
-  async list(o: { estado?: string; limit?: number } = {}) {
+  async list(o: { estado?: string; limit?: number; q?: string } = {}) {
     const estado = o.estado && ['pendiente', 'cargada', 'descartada'].includes(o.estado)
       ? (o.estado as 'pendiente' | 'cargada' | 'descartada') : null;
+    /* Buscar por proveedor (27/11/2026): en la base, no sobre las 200 que viajan, así encuentra
+     * también las viejas. Nombre del proveedor, o su CUIT (el del papel o el de la ficha). */
+    const q = String(o.q ?? '').trim().slice(0, 80);
+    const digitos = soloDigitos(q);
+    const porNombre = sql`${proveedores.nombre} ilike ${`%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`}`;
+    const porCuit = digitos.length >= 3
+      ? sql` or ${facturaLecturas.cuit} like ${`%${digitos}%`} or ${proveedores.cuit} like ${`%${digitos}%`}`
+      : sql``;
+    const porProveedor = q ? sql`(${porNombre}${porCuit})` : undefined;
 
     const { ia: _ia, ...columnas } = getTableColumns(facturaLecturas);
     const filas = await this.db.select({
@@ -457,7 +466,7 @@ export class FacturasService {
       .leftJoin(proveedores, eq(proveedores.id, facturaLecturas.proveedorId))
       .leftJoin(sucursales, eq(sucursales.id, facturaLecturas.sucursalId))
       .leftJoin(usuarios, eq(usuarios.id, facturaLecturas.usuarioId))
-      .where(estado ? eq(facturaLecturas.estado, estado) : undefined)
+      .where(and(estado ? eq(facturaLecturas.estado, estado) : undefined, porProveedor))
       .orderBy(desc(facturaLecturas.subidoEn))
       .limit(Math.min(Math.max(Number(o.limit) || 200, 1), 500));
 
@@ -705,8 +714,8 @@ export class FacturasService {
 export class FacturasController {
   constructor(private readonly svc: FacturasService, private readonly ia: FacturasIaService) {}
 
-  @Get('lecturas') list(@Query('estado') estado?: string, @Query('limit') limit?: string) {
-    return this.svc.list({ estado, limit: limit ? Number(limit) : undefined });
+  @Get('lecturas') list(@Query('estado') estado?: string, @Query('limit') limit?: string, @Query('q') q?: string) {
+    return this.svc.list({ estado, limit: limit ? Number(limit) : undefined, q });
   }
 
   @Get('pendientes') pendientes() {
