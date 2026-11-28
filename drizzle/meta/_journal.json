@@ -1751,6 +1751,13 @@
       "when": 1797206400000,
       "tag": "0249_imputar_ajustes",
       "breakpoints": true
+    },
+    {
+      "idx": 250,
+      "version": "7",
+      "when": 1797292800000,
+      "tag": "0250_kg_papel",
+      "breakpoints": true
     }
   ]
 }

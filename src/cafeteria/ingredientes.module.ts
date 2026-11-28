@@ -75,6 +75,8 @@ function paraCoffitcost(costo: number, unidad: string): { costo: number; unidad:
 export type CostoComprobante = {
   costoBase: number;           // $ por unidad base: por unidad (entero) o por kg (granel)
   conIva: boolean;
+  /** Lo que pesó de verdad cada unidad en ese papel, si vino al peso (0250): la horma de «3,5 kg» que pesó 3,74. */
+  kgPorUnidad: number | null;
   comprobante: { id: number; tipo: string; letra: string; numero: string; fecha: string; proveedor: string };
   aConfirmar: { tipo: string; letra: string; numero: string; fecha: string; precio: number }[];
 };
@@ -89,7 +91,7 @@ export async function costosIngredientes(db: any, ids: number[]): Promise<Map<nu
   if (!ids.length) return out;
   const r = await db.execute(sql`
     select * from (
-      select ci.producto_id as "productoId", ci.subtotal, ci.cantidad, ci.iva, coalesce(pr.tam_kg, 1) as tam,
+      select ci.producto_id as "productoId", ci.subtotal, ci.cantidad, ci.iva, coalesce(pr.tam_kg, 1) as tam, ci.kg_papel as "kgPapel",
         c.id as "comprobanteId", c.tipo::text as tipo, c.letra::text as letra,
         c.punto_venta || '-' || lpad(coalesce(c.numero, 0)::text, 8, '0') as numero, c.fecha,
         coalesce(pv.nombre, '') as proveedor,
@@ -125,6 +127,7 @@ export async function costosIngredientes(db: any, ids: number[]): Promise<Map<nu
       aConfirmar = []; // los «a confirmar» que importan son los MÁS NUEVOS que el elegido
       elegido = {
         costoBase: r4(precio), conIva: !remito,
+        kgPorUnidad: Number(f.kgPapel) > 0 ? Number(f.kgPapel) / Number(f.cantidad) : null,
         comprobante: { id: Number(f.comprobanteId), ...doc, proveedor: f.proveedor },
         aConfirmar,
       };
@@ -138,10 +141,16 @@ export async function costosIngredientes(db: any, ids: number[]): Promise<Map<nu
  * El costo convertido: el de la unidad base pasado a la unidad pedida.
  * Entero → contenido del envase (200 g); granel → la base ya es el kg.
  */
-export function convertir(costoBase: number, tipo: string, ing: { contenido: number | null; contenidoUnidad: string; unidadCosto: string }) {
+export function convertir(
+  costoBase: number, tipo: string, ing: { contenido: number | null; contenidoUnidad: string; unidadCosto: string },
+  kgPorUnidad: number | null = null,
+) {
   if (ing.unidadCosto === 'u') return tipo === 'granel' ? null : costoBase;
   if (ing.unidadCosto === 'doc') return tipo === 'granel' ? null : r4(costoBase * 12);
-  const gramosPorBase = tipo === 'granel' ? 1000 : (Number(ing.contenido) || 0) * (BASE[ing.contenidoUnidad] ?? 0);
+  /* AL PESO (28/11/2026, pedido del dueño): si el papel dijo los kg, la unidad pesa lo que
+   * pesó de verdad (14,97 kg en 4 hormas = 3,74 kg), no los 3,5 del envase configurado. */
+  const pesoReal = tipo !== 'granel' && MASA.has(ing.unidadCosto) && Number(kgPorUnidad) > 0 ? Number(kgPorUnidad) * 1000 : 0;
+  const gramosPorBase = tipo === 'granel' ? 1000 : pesoReal || (Number(ing.contenido) || 0) * (BASE[ing.contenidoUnidad] ?? 0);
   if (!(gramosPorBase > 0)) return null;
   return r4((costoBase / gramosPorBase) * BASE[ing.unidadCosto]);
 }
@@ -218,7 +227,8 @@ export class IngredientesService implements OnModuleInit, OnModuleDestroy {
         ...f, ...ing,
         actualizadoEn: f.actualizadoEn ? new Date(f.actualizadoEn).toISOString() : null,
         costoBase: c?.costoBase ?? null,
-        costoConvertido: c ? convertir(c.costoBase, f.tipo, ing) : null,
+        costoConvertido: c ? convertir(c.costoBase, f.tipo, ing, c.kgPorUnidad) : null,
+        kgPorUnidad: c?.kgPorUnidad ?? null,
         conIva: c?.conIva ?? null,
         comprobante: c?.comprobante ?? null,
         aConfirmar: c?.aConfirmar ?? [],

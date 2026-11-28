@@ -1882,6 +1882,8 @@ export const comprobanteItems = pgTable('comprobante_items', {
   porBulto: doublePrecision('por_bulto'),
   /** EL RENGLÓN SE CARGÓ POR DISPLAY (0203): unidades por display, congelado. NULL = no. */
   porDisplay: doublePrecision('por_display'),
+  /** Los kg del papel si el renglón vino al peso (0250): la horma de «3,5 kg» que pesó 3,74. */
+  kgPapel: doublePrecision('kg_papel'),
   /**
    * LO FACTURADO QUE NO ENTRA AL STOCK CON ESTE PAPEL (0248): lo que faltó en
    * la entrega, o lo que ya había entrado antes como «de más» y este papel
