@@ -52,6 +52,10 @@ import {
   sucursales, usuarios, ventaPagos, ventas,
 } from '../db/schema';
 
+/** Cómo se nombra un ajuste al debe al que se aplicó un pago (0249). */
+const etiquetaAjuste = (fecha: Date) =>
+  `Ajuste del ${new Date(fecha).toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`;
+
 const money = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 /** Tolerancia de centavo: los importes son double y no hay que pelearse con eso. */
 const EPS = 0.009;
@@ -649,15 +653,18 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       letra: comprobantes.letra,
       puntoVenta: comprobantes.puntoVenta,
       numero: comprobantes.numero,
+      ajusteId: proveedorImputaciones.ajusteId,
+      ajusteFecha: proveedorAjustes.fecha,
     })
       .from(proveedorImputaciones)
       .leftJoin(gastos, eq(gastos.id, proveedorImputaciones.gastoId))
       .leftJoin(comprobantes, eq(comprobantes.id, proveedorImputaciones.comprobanteId))
+      .leftJoin(proveedorAjustes, eq(proveedorAjustes.id, proveedorImputaciones.ajusteId))
       .where(inArray(proveedorImputaciones.pagoId, ids))
       .orderBy(proveedorImputaciones.id);
 
     for (const f of filas) {
-      const etiqueta = f.gastoId
+      const etiqueta = f.ajusteId ? etiquetaAjuste(f.ajusteFecha!) : f.gastoId
         ? `Gasto #${f.gastoId}${f.gastoNumero ? ` · ${f.gastoNumero}` : ''}`
         : etiquetaDoc({ tipo: f.tipo!, letra: f.letra, puntoVenta: f.puntoVenta, numero: f.numero, id: f.comprobanteId! });
       const arr = porId.get(f.pagoId) ?? [];
@@ -692,9 +699,13 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       comprobanteLetra: comprobantes.letra,
       comprobantePv: comprobantes.puntoVenta,
       comprobanteNumero: comprobantes.numero,
+      ajusteId: proveedorImputaciones.ajusteId,
+      ajusteFecha: proveedorAjustes.fecha,
+      ajusteMotivo: proveedorAjustes.motivo,
     }).from(proveedorImputaciones)
       .leftJoin(gastos, eq(gastos.id, proveedorImputaciones.gastoId))
       .leftJoin(comprobantes, eq(comprobantes.id, proveedorImputaciones.comprobanteId))
+      .leftJoin(proveedorAjustes, eq(proveedorAjustes.id, proveedorImputaciones.ajusteId))
       .where(eq(proveedorImputaciones.pagoId, pagoId))
       .orderBy(proveedorImputaciones.id);
 
@@ -702,10 +713,10 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       id: f.id,
       importe: f.importe,
       fecha: f.fecha,
-      tipo: f.gastoId ? 'gasto' : 'comprobante',
-      docId: f.gastoId ?? f.comprobanteId,
+      tipo: f.ajusteId ? 'ajuste' : f.gastoId ? 'gasto' : 'comprobante',
+      docId: f.ajusteId ?? f.gastoId ?? f.comprobanteId,
       // Acá se veía `nota_debito 0001-123`: el valor crudo del enum, en pantalla.
-      etiqueta: f.gastoId
+      etiqueta: f.ajusteId ? `${etiquetaAjuste(f.ajusteFecha!)} · ${f.ajusteMotivo}` : f.gastoId
         ? `Gasto #${f.gastoId}${f.gastoNumero ? ` · ${f.gastoNumero}` : ''}${f.gastoDescripcion ? ` · ${f.gastoDescripcion}` : ''}`
         : etiquetaDoc({
           tipo: f.comprobanteTipo ?? 'comprobante',
@@ -1266,14 +1277,24 @@ export class PagosProveedorService implements OnApplicationBootstrap {
           sql`${proveedorPagos.importe} - ${proveedorPagos.aplicado} > ${EPS}`,
         )).orderBy(proveedorPagos.fecha, proveedorPagos.id);
         if (!pagos.length) return;
-        const docs = await this.documentosPendientes(proveedorId, undefined, sp);
+        /* Los ajustes al debe también son deuda (0249, 27/11/2026: la del sistema anterior de 3 ARROYOS
+         * se cargó así y sus pagos iban a la factura nueva). Por fecha, como el resto; van con mercadería. */
+        const docs: Array<{ tipo: string; docId: number; fecha: Date; saldo: number }> = [
+          ...await this.documentosPendientes(proveedorId, undefined, sp),
+          ...await this.ajustesPorPagar(proveedorId, sp),
+        ].sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime());
         for (const pago of pagos) {
           let libre = money(pago.importe - pago.aplicado);
           for (const d of docs) {
             if (libre <= EPS) break;
             if (d.saldo <= EPS || (d.tipo === 'gasto') !== (pago.destino === 'gastos')) continue;
             const importe = money(Math.min(libre, d.saldo));
-            await this.aplicar(sp, pago.id, [d.tipo === 'gasto' ? { gastoId: d.docId, importe } : { comprobanteId: d.docId, importe }], undefined, true);
+            if (d.tipo === 'ajuste') {
+              await sp.insert(proveedorImputaciones).values({ pagoId: pago.id, ajusteId: d.docId, importe });
+              await this.recalcularPago(sp, pago.id);
+            } else {
+              await this.aplicar(sp, pago.id, [d.tipo === 'gasto' ? { gastoId: d.docId, importe } : { comprobanteId: d.docId, importe }], undefined, true);
+            }
             d.saldo = money(d.saldo - importe);
             libre = money(libre - importe);
           }
@@ -1281,6 +1302,40 @@ export class PagosProveedorService implements OnApplicationBootstrap {
       });
     } catch (e) {
       this.log.warn(`Cuenta libre del proveedor ${proveedorId}: quedó sin aplicar (${(e as Error).message})`);
+    }
+  }
+
+  /** Lo que los pagos vivos ya cubrieron de cada ajuste: `{ ajusteId => importe }`. */
+  async cubiertoDeAjustes(ids: number[], ex: any = this.db) {
+    const porId = new Map<number, number>();
+    if (!ids.length) return porId;
+    const filas = await ex.select({
+      ajusteId: proveedorImputaciones.ajusteId,
+      total: sql<number>`coalesce(sum(${proveedorImputaciones.importe}), 0)`,
+    }).from(proveedorImputaciones)
+      .innerJoin(proveedorPagos, eq(proveedorPagos.id, proveedorImputaciones.pagoId))
+      .where(and(inArray(proveedorImputaciones.ajusteId, ids), eq(proveedorPagos.estado, 'activo')))
+      .groupBy(proveedorImputaciones.ajusteId);
+    for (const f of filas) porId.set(f.ajusteId!, money(Number(f.total) || 0));
+    return porId;
+  }
+
+  /** Los ajustes al debe del proveedor con lo que todavía deben (para la cuenta libre). */
+  private async ajustesPorPagar(proveedorId: number, ex: any) {
+    const ajs = await ex.select().from(proveedorAjustes)
+      .where(and(eq(proveedorAjustes.proveedorId, proveedorId), sql`${proveedorAjustes.importe} > ${EPS}`));
+    const cubierto = await this.cubiertoDeAjustes(ajs.map((a: any) => a.id), ex);
+    return ajs.map((a: any) => ({
+      tipo: 'ajuste', docId: a.id, fecha: a.fecha, saldo: money(a.importe - (cubierto.get(a.id) ?? 0)),
+    }));
+  }
+
+  /** Antes de borrar un ajuste: sus pagos vuelven a quedar libres (con el pago recalculado). */
+  async soltarAjuste(tx: any, ajusteId: number) {
+    const imps = await tx.select().from(proveedorImputaciones).where(eq(proveedorImputaciones.ajusteId, ajusteId));
+    for (const imp of imps) {
+      await tx.select({ id: proveedorPagos.id }).from(proveedorPagos).where(eq(proveedorPagos.id, imp.pagoId)).limit(1).for('update');
+      await this.borrarImputacion(tx, imp);
     }
   }
 

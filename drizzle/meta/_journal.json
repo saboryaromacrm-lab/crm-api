@@ -1744,6 +1744,13 @@
       "when": 1797120000000,
       "tag": "0248_diferencias_entrega",
       "breakpoints": true
+    },
+    {
+      "idx": 249,
+      "version": "7",
+      "when": 1797206400000,
+      "tag": "0249_imputar_ajustes",
+      "breakpoints": true
     }
   ]
 }

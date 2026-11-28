@@ -3704,11 +3704,14 @@ export const proveedorImputaciones = pgTable('proveedor_imputaciones', {
   pagoId: integer('pago_id').notNull().references(() => proveedorPagos.id, { onDelete: 'cascade' }),
   gastoId: integer('gasto_id').references(() => gastos.id, { onDelete: 'cascade' }),
   comprobanteId: integer('comprobante_id').references(() => comprobantes.id, { onDelete: 'cascade' }),
+  /** Un ajuste al debe (0249): en cuenta libre se paga por fecha, como una factura. */
+  ajusteId: integer('ajuste_id').references((): AnyPgColumn => proveedorAjustes.id, { onDelete: 'cascade' }),
   importe: doublePrecision('importe').notNull().default(0),
   fecha: timestamp('fecha', { withTimezone: true }).notNull().defaultNow(),
   usuarioId: integer('usuario_id').references(() => usuarios.id, { onDelete: 'set null' }),
 }, (t) => ({
   ixPago: index('ix_prov_imput_pago').on(t.pagoId),
+  ixAjuste: index('ix_prov_imput_ajuste').on(t.ajusteId),
   ixGasto: index('ix_prov_imput_gasto').on(t.gastoId),
   ixComprobante: index('ix_prov_imput_comprobante').on(t.comprobanteId),
 }));

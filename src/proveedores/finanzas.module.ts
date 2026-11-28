@@ -1592,6 +1592,8 @@ export class FinanzasProveedorService {
         haber: 0,
       });
     }
+    /* Lo que los pagos ya cubrieron de cada ajuste al debe (0249): el resto se ve como «Queda debiendo». */
+    const cubiertoAj = await this.pagos.cubiertoDeAjustes(ajs.filter((a) => a.importe > 0).map((a) => a.id));
     for (const a of ajs) {
       const esDebe = a.importe >= 0;
       movs.push({
@@ -1603,6 +1605,7 @@ export class FinanzasProveedorService {
         detalle: a.motivo,
         debe: esDebe ? money(a.importe) : 0,
         haber: esDebe ? 0 : money(-a.importe),
+        saldoDoc: esDebe ? money(a.importe - (cubiertoAj.get(a.id) ?? 0)) : null,
       });
     }
     await this.colgarFletes(proveedorId, movs);
@@ -1803,6 +1806,8 @@ export class FinanzasProveedorService {
         entidad: 'proveedor', entidadId: dto.proveedorId, ambito: 'Estado de cuenta',
         campo: `Ajuste #${a.id} cargado`, antes: '', despues: this.legibleAjuste(a), usuarioId,
       }], tx);
+      // Un ajuste al debe es deuda (0249): en cuenta libre toma la plata sin aplicar que haya.
+      if (importe > 0) await this.pagos.aplicarCuentaLibre(dto.proveedorId, tx);
       return a;
     });
   }
@@ -1812,12 +1817,15 @@ export class FinanzasProveedorService {
     if (!a) throw new NotFoundException('Ajuste inexistente.');
     await this.exigirFechaAjuste(a.proveedorId, new Date(Math.min(new Date(a.fecha).getTime(), Date.now())));
     await this.db.transaction(async (tx) => {
+      // Los pagos que lo cubrían quedan libres y, en cuenta libre, van a lo que siga debiendo (0249).
+      await this.pagos.soltarAjuste(tx, id);
       await tx.delete(proveedorAjustes).where(eq(proveedorAjustes.id, id));
       await this.audit.registrar([{
         entidad: 'proveedor', entidadId: a.proveedorId, ambito: 'Estado de cuenta',
         campo: `Ajuste #${a.id} borrado`, antes: this.legibleAjuste(a),
         despues: `Borrado: ${motivo.trim().slice(0, 280)}`, usuarioId,
       }], tx);
+      await this.pagos.aplicarCuentaLibre(a.proveedorId, tx);
     });
     return { ok: true };
   }
