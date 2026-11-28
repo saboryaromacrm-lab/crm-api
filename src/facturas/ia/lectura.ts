@@ -45,7 +45,7 @@ PIE
 - bonificacionPct y bonificacionImporte: la bonificación o descuento general, si hay.
 - ivas: cada línea de IVA con su alícuota e importe.
 - percepciones: cada percepción o retención (IIBB, IVA, etc.) con su nombre como figura, alícuota e importe.
-- impuestosInternos, otrosImpuestos y total: como están impresos.
+- impuestosInternos, otrosImpuestos y total: como están impresos. Una percepción va SOLO en percepciones: no la repitas en otrosImpuestos aunque el papel la sume en un renglón «Otros impuestos» o «Total impuestos».
 
 nota: una línea corta solo si algo impide leer bien (una página cortada, borrosa o que falta); si no, "".`;
 

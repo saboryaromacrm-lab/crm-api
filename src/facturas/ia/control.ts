@@ -57,6 +57,12 @@ export function controlar(l: Pick<LecturaIa, 'renglones' | 'pie' | 'encabezado'>
   if (p.total > 0 && !esRemito) {
     const base = p.subtotal > 0 ? p.subtotal : suma;
     const opciones = [r2(base - bonif + impuestos), r2(base + impuestos)];
+    /* LA PERCEPCIÓN ANOTADA DOS VECES (28/11/2026, La Serenísima): el papel la suma en
+     * «Otros impuestos» y la IA la puso en percepciones Y en otros. Si internos + otros es
+     * exactamente lo de las percepciones, se prueba también sin ellos. */
+    const perc = r2(p.percepciones.reduce((a, x) => a + x.importe, 0));
+    const extra = r2(p.impuestosInternos + p.otrosImpuestos);
+    if (perc > 0 && Math.abs(extra - perc) <= 0.05) opciones.push(r2(base - bonif + impuestos - extra), r2(base + impuestos - extra));
     totalCalculado = opciones.find((t) => Math.abs(t - p.total) <= tolTotal(p.total)) ?? opciones[0];
     if (Math.abs(totalCalculado - p.total) > tolTotal(p.total)) {
       problemas.push(`Subtotal − bonificación + impuestos da ${pesos(totalCalculado)} y el total impreso es ${pesos(p.total)}.`);

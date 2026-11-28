@@ -85,6 +85,14 @@ test('la cuenta de una factura A: renglones, subtotal, IVA, percepciones y total
   assert.match(mal.problemas[0], /total impreso/);
 });
 
+test('la percepción anotada también en «otros impuestos» no se cuenta dos veces', () => {
+  const r = [renglon({ cantidad: 14.97, precioUnitario: 14496, descuentos: [10], importe: 195304.61 })];
+  const pie = { subtotal: 195304.61, ivas: [{ alicuota: 21, importe: 41013.97 }], percepciones: [{ nombre: 'IIBB', alicuota: 6, importe: 11718.28 }], total: 248036.86 };
+  assert.deepEqual(controlar(leida(r, { ...pie, otrosImpuestos: 11718.28 })).problemas, []);
+  // Otro importe en «otros» sí es otro impuesto: si no cierra, se avisa.
+  assert.match(controlar(leida(r, { ...pie, otrosImpuestos: 5000 })).problemas.join(' '), /total impreso/);
+});
+
 test('la cuenta de una B (IVA adentro), con renglón mal y contra el QR', () => {
   const b = controlar(leida([renglon({ importe: 12100, precioUnitario: 1210 })], { total: 12100 }));
   assert.equal(b.cierra, true);
